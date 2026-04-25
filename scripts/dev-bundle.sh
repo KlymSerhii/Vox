@@ -21,15 +21,26 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+# Tauri 2.x writes `--debug` bundles under `target/debug/bundle/macos/`.
+# Older toolchains and some target-triple combos still drop them under
+# `target/release/bundle/macos/`; we accept either path.
+BUNDLE_DEBUG="src-tauri/target/debug/bundle/macos/Vox.app"
+BUNDLE_RELEASE="src-tauri/target/release/bundle/macos/Vox.app"
+
+# If a previous bundle exists, remove it before rebuilding so TCC sees a
+# fresh signature when the new bundle launches. Without this step, TCC
+# may (sometimes — it's not deterministic) carry a stale grant forward
+# from the previous compile, which is convenient until it isn't and you
+# end up with a half-permitted state that's hard to diagnose.
+echo "==> Removing any previous Vox.app bundle so TCC sees a fresh signature..."
+rm -rf "$BUNDLE_DEBUG" "$BUNDLE_RELEASE" 2>/dev/null || true
+
 echo "==> Building debug .app bundle (this is slower than 'tauri dev')..."
 npm run tauri build -- --debug --bundles app
 
-# Tauri 2.x writes `--debug` bundles to `target/debug/bundle/macos/`.
-# Older toolchains and some target-triple combos still drop them under
-# `target/release/bundle/macos/`; we accept either to stay forward-compat.
-APP="src-tauri/target/debug/bundle/macos/Vox.app"
+APP="$BUNDLE_DEBUG"
 if [ ! -d "$APP" ]; then
-  APP="src-tauri/target/release/bundle/macos/Vox.app"
+  APP="$BUNDLE_RELEASE"
 fi
 
 if [ ! -d "$APP" ]; then
@@ -38,11 +49,27 @@ if [ ! -d "$APP" ]; then
   exit 1
 fi
 
+# Resolve to an absolute path so the user can paste it into TCC if they
+# need to add Vox manually via the "+" button.
+APP_ABS="$(cd "$(dirname "$APP")" && pwd)/$(basename "$APP")"
+
 echo
 echo "==> Bundle identifier:"
 /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Contents/Info.plist" || true
 echo "==> Code signature:"
 codesign -dv "$APP" 2>&1 | sed 's/^/    /' || true
 echo
-echo "==> Launching $APP"
+echo "==> Launching $APP_ABS"
 open "$APP"
+
+echo
+echo "============================================================="
+echo "Now: open System Settings → Privacy & Security → Accessibility"
+echo "and toggle 'Vox' on. If Vox doesn't appear in the list, click"
+echo "'+' and paste this absolute path (Cmd+Shift+G works too):"
+echo
+echo "    $APP_ABS"
+echo
+echo "Then hold Option+Control in any text field — the listening pill"
+echo "should appear. Release to transcribe and paste."
+echo "============================================================="
