@@ -247,11 +247,23 @@ pub fn replay_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) {
+pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     settings::mark_onboarded(&app);
+    log::info!("onboarding: finished, marked onboarded=true");
     if let Some(win) = app.get_webview_window(onboarding::LABEL) {
-        let _ = win.hide();
+        // We use `close()` rather than `hide()` so the wizard truly goes
+        // away — the frontmost-window settings/back/forth state is gone
+        // and a relaunch via `replay_onboarding` rebuilds it cleanly. The
+        // `WindowEvent::CloseRequested` handler in `lib.rs` lets the
+        // onboarding window close without intercepting.
+        win.close().map_err(|e| {
+            log::error!("onboarding: failed to close window: {e}");
+            e.to_string()
+        })?;
+    } else {
+        log::warn!("onboarding: finish called but window not found");
     }
+    Ok(())
 }
 
 #[tauri::command]
