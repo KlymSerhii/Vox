@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime, Webview};
+use tauri_plugin_autostart::ManagerExt as _;
 
-use crate::{llm, onboarding, pill, settings, stt, transcripts};
+use crate::{llm, onboarding, pill, session, settings, stt, transcripts};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TestConnectionResult {
@@ -276,4 +277,149 @@ pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) {
 #[tauri::command]
 pub fn show_tray_popover<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     crate::tray::show_popover(&app).map_err(|e| e.to_string())
+}
+
+// -------- Launch-at-login ----------------------------------------------------
+
+#[tauri::command]
+pub fn get_launch_at_login<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
+    let mgr = app.autolaunch();
+    mgr.is_enabled().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_launch_at_login<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mgr = app.autolaunch();
+    if enabled {
+        mgr.enable().map_err(|e| e.to_string())?;
+    } else {
+        mgr.disable().map_err(|e| e.to_string())?;
+    }
+    // Mirror to settings store as a cache so the UI doesn't have to round-trip
+    // through the OS on every render. The OS state is the source of truth on
+    // load (we re-read it on Settings open).
+    let mut s = settings::load(&app);
+    s.launch_at_login = enabled;
+    let _ = settings::save(&app, &s);
+    Ok(())
+}
+
+// -------- Paste-last-transcript ----------------------------------------------
+
+/// Re-paste the most recent transcript from the in-memory ring buffer.
+/// Returns Err if the buffer is empty or another paste is mid-flight.
+#[tauri::command]
+pub fn paste_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    // If a real session is currently mid-pipeline, ignore the press — the
+    // user is still dictating something fresh.
+    if let Some(ctx) = app.try_state::<session::SessionCtx>() {
+        if ctx.is_pipeline_active() {
+            return Err("Vox is busy with another dictation.".into());
+        }
+    }
+
+    let snap = transcripts::snapshot();
+    let Some(latest) = snap.first() else {
+        // No history — surface an error pill, then propagate to caller.
+        pill::show(&app);
+        pill::emit_state(
+            &app,
+            pill::PillState::Error,
+            Some("No recent transcript yet.".into()),
+        );
+        let app_arc = std::sync::Arc::new(app.clone());
+        pill::hide_after(&app_arc, 2000);
+        return Err("No recent transcript.".into());
+    };
+
+    let text = latest.text.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            crate::inject::paste_text(&text)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                pill::show(&app);
+                pill::emit_state(&app, pill::PillState::Done, None);
+                let app_arc = std::sync::Arc::new(app.clone());
+                pill::hide_after(&app_arc, 700);
+            }
+            Ok(Err(e)) => {
+                log::error!("paste-last failed: {e}");
+                pill::show(&app);
+                pill::emit_state(
+                    &app,
+                    pill::PillState::Error,
+                    Some("Copied — press Cmd+V to paste.".into()),
+                );
+                let app_arc = std::sync::Arc::new(app.clone());
+                pill::hide_after(&app_arc, 3000);
+            }
+            Err(e) => {
+                log::error!("paste-last task panicked: {e}");
+            }
+        }
+    });
+    Ok(())
+}
+
+// -------- Auto-update --------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct UpdateCheckResult {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[tauri::command]
+pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResult {
+    use tauri_plugin_updater::UpdaterExt as _;
+
+    let cur = app.package_info().version.to_string();
+
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(e) => {
+            // No updater configured (or signing key missing). For Phase 3 we
+            // don't have a real release server yet — see
+            // `docs/signing-and-notarization.md` for the runbook.
+            return UpdateCheckResult {
+                status: "unconfigured".into(),
+                current_version: Some(cur),
+                available_version: None,
+                message: Some(format!("Auto-update not yet configured ({e}).")),
+            };
+        }
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => UpdateCheckResult {
+            status: "available".into(),
+            current_version: Some(cur),
+            available_version: Some(update.version.clone()),
+            message: Some(format!("Vox {} is available.", update.version)),
+        },
+        Ok(None) => UpdateCheckResult {
+            status: "up-to-date".into(),
+            current_version: Some(cur),
+            available_version: None,
+            message: Some("Vox is up to date.".into()),
+        },
+        Err(e) => UpdateCheckResult {
+            status: "error".into(),
+            current_version: Some(cur),
+            available_version: None,
+            message: Some(format!("Update check failed: {e}")),
+        },
+    }
 }

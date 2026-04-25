@@ -16,6 +16,7 @@ const KEY_GROQ: &str = "groq_api_key";
 const KEY_ANTHROPIC: &str = "anthropic_api_key";
 const KEY_HOTKEY: &str = "hotkey";
 const KEY_CANCEL_HOTKEY: &str = "cancel_hotkey";
+const KEY_PASTE_LAST_HOTKEY: &str = "paste_last_hotkey";
 const KEY_CLEANUP_ENABLED: &str = "cleanup_enabled";
 const KEY_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const KEY_PLAY_SOUND: &str = "play_sound";
@@ -23,6 +24,8 @@ const KEY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
 const KEY_ONBOARDED: &str = "onboarded";
 const KEY_DICTATION_ENABLED: &str = "dictation_enabled";
 const KEY_DICTIONARY: &str = "dictionary";
+const KEY_HANDS_FREE: &str = "hands_free_enabled";
+const KEY_LANGUAGE: &str = "language";
 
 const KEYRING_SERVICE: &str = "app.vox.vox";
 const KEYRING_ACCOUNT_GROQ: &str = "groq";
@@ -33,6 +36,12 @@ fn default_hotkey() -> String {
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
+}
+fn default_paste_last_hotkey() -> String {
+    "Alt+Shift+V".to_string()
+}
+fn default_language() -> String {
+    "auto".to_string()
 }
 fn default_true() -> bool {
     true
@@ -51,6 +60,8 @@ pub struct Settings {
     pub hotkey: String,
     #[serde(default = "default_cancel_hotkey")]
     pub cancel_hotkey: String,
+    #[serde(default = "default_paste_last_hotkey")]
+    pub paste_last_hotkey: String,
 
     #[serde(default = "default_true")]
     pub cleanup_enabled: bool,
@@ -62,6 +73,11 @@ pub struct Settings {
     pub send_audio_to_cloud: bool,
     #[serde(default = "default_true")]
     pub dictation_enabled: bool,
+
+    #[serde(default)]
+    pub hands_free_enabled: bool,
+    #[serde(default = "default_language")]
+    pub language: String,
 
     #[serde(default)]
     pub onboarded: bool,
@@ -77,11 +93,14 @@ impl Default for Settings {
             anthropic_api_key: String::new(),
             hotkey: default_hotkey(),
             cancel_hotkey: default_cancel_hotkey(),
+            paste_last_hotkey: default_paste_last_hotkey(),
             cleanup_enabled: true,
             launch_at_login: false,
             play_sound: false,
             send_audio_to_cloud: true,
             dictation_enabled: true,
+            hands_free_enabled: false,
+            language: default_language(),
             onboarded: false,
             dictionary: Vec::new(),
         }
@@ -214,6 +233,14 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .get(KEY_CANCEL_HOTKEY)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(default_cancel_hotkey);
+    let paste_last_hotkey = store
+        .get(KEY_PASTE_LAST_HOTKEY)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_paste_last_hotkey);
+    let language = store
+        .get(KEY_LANGUAGE)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_language);
 
     let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
@@ -222,6 +249,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let play_sound = get_bool(KEY_PLAY_SOUND, false);
     let send_audio_to_cloud = get_bool(KEY_SEND_AUDIO_CLOUD, true);
     let dictation_enabled = get_bool(KEY_DICTATION_ENABLED, true);
+    let hands_free_enabled = get_bool(KEY_HANDS_FREE, false);
     let onboarded = get_bool(KEY_ONBOARDED, false);
 
     let dictionary = store
@@ -246,11 +274,14 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         anthropic_api_key,
         hotkey,
         cancel_hotkey,
+        paste_last_hotkey,
         cleanup_enabled,
         launch_at_login,
         play_sound,
         send_audio_to_cloud,
         dictation_enabled,
+        hands_free_enabled,
+        language,
         onboarded,
         dictionary,
     }
@@ -307,6 +338,18 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         serde_json::Value::String(settings.cancel_hotkey.clone()),
     );
     store.set(
+        KEY_PASTE_LAST_HOTKEY,
+        serde_json::Value::String(settings.paste_last_hotkey.clone()),
+    );
+    store.set(
+        KEY_LANGUAGE,
+        serde_json::Value::String(settings.language.clone()),
+    );
+    store.set(
+        KEY_HANDS_FREE,
+        serde_json::Value::Bool(settings.hands_free_enabled),
+    );
+    store.set(
         KEY_CLEANUP_ENABLED,
         serde_json::Value::Bool(settings.cleanup_enabled),
     );
@@ -355,6 +398,12 @@ pub struct Prefs {
     pub cleanup_enabled: bool,
     pub send_audio_to_cloud: bool,
     pub dictation_enabled: bool,
+    pub hands_free_enabled: bool,
+    /// Whisper language code or "auto". Consumed by the STT engine; the
+    /// local-first STT/LLM rewrite should plumb this into the request.
+    /// TODO local-first: pass `prefs.language` to the STT call.
+    #[allow(dead_code)]
+    pub language: String,
     pub dictionary: Vec<String>,
 }
 
@@ -364,6 +413,8 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
             cleanup_enabled: true,
             send_audio_to_cloud: true,
             dictation_enabled: true,
+            hands_free_enabled: false,
+            language: default_language(),
             dictionary: Vec::new(),
         };
     };
@@ -380,10 +431,17 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         })
         .unwrap_or_default();
 
+    let language = store
+        .get(KEY_LANGUAGE)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_language);
+
     Prefs {
         cleanup_enabled: get_bool(KEY_CLEANUP_ENABLED, true),
         send_audio_to_cloud: get_bool(KEY_SEND_AUDIO_CLOUD, true),
         dictation_enabled: get_bool(KEY_DICTATION_ENABLED, true),
+        hands_free_enabled: get_bool(KEY_HANDS_FREE, false),
+        language,
         dictionary,
     }
 }

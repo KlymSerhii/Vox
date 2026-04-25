@@ -10,6 +10,8 @@ mod settings;
 mod stt;
 mod transcripts;
 mod tray;
+mod tray_glyphs;
+mod tray_icon;
 
 use tauri::Manager;
 
@@ -27,6 +29,11 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             commands::get_settings,
             commands::get_public_settings,
@@ -47,6 +54,10 @@ pub fn run() {
             commands::replay_onboarding,
             commands::finish_onboarding,
             commands::show_tray_popover,
+            commands::get_launch_at_login,
+            commands::set_launch_at_login,
+            commands::paste_last_transcript,
+            commands::check_for_updates,
         ])
         .setup(|app| {
             // macOS: accessory mode — no Dock icon.
@@ -66,7 +77,13 @@ pub fn run() {
             let s = settings::load(app_handle);
 
             // Register global hotkeys.
-            match hotkey::register(app_handle, &s.hotkey, &s.cancel_hotkey, ctx.clone()) {
+            match hotkey::register(
+                app_handle,
+                &s.hotkey,
+                &s.cancel_hotkey,
+                &s.paste_last_hotkey,
+                ctx.clone(),
+            ) {
                 Ok(resolved) => log::info!("push-to-talk bound to {resolved}"),
                 Err(e) => log::error!(
                     "failed to register global shortcut '{}': {e}. Grant Accessibility and restart.",

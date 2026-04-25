@@ -22,6 +22,8 @@
     "core:event:allow-emit-to",
     "core:webview:allow-create-webview-window",
     "global-shortcut:default",
-    "store:default"
+    "store:default",
+    "autostart:default",
+    "updater:default"
   ]
 }

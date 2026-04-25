@@ -5,13 +5,14 @@
 
 use parking_lot::Mutex;
 use tauri::{
-    image::Image,
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, LogicalPosition, LogicalSize, Manager, PhysicalPosition, Runtime, WebviewUrl,
 };
 
 use once_cell::sync::OnceCell;
+
+use crate::tray_icon;
 
 pub const POPOVER_LABEL: &str = "tray-popover";
 const POPOVER_W: f64 = 320.0;
@@ -29,8 +30,6 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let open_item = MenuItem::with_id(app, "open-settings", "Open Settings", true, None::<&str>)?;
     let quit_item = MenuItem::with_id(app, "quit", "Quit Vox", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open_item, &quit_item])?;
-
-    let icon = Some(placeholder_icon());
 
     let mut builder = TrayIconBuilder::with_id("vox-tray")
         .tooltip("Vox — hold hotkey to dictate")
@@ -65,11 +64,21 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             }
         });
 
-    if let Some(img) = icon {
-        builder = builder.icon(img).icon_as_template(true);
-    }
+    // Initial icon — start with the idle frame, tray_icon::init() will
+    // upgrade to Permission if Accessibility/Mic isn't granted.
+    let initial_icon = tauri::image::Image::new_owned(
+        crate::tray_glyphs::idle(32),
+        32,
+        32,
+    );
+    builder = builder.icon(initial_icon).icon_as_template(true);
 
     builder.build(app)?;
+
+    // Now that the tray exists by id, hand control over to the state machine
+    // so it can pick up the current permission situation (or fall back to
+    // Idle if everything's granted).
+    tray_icon::init(app);
     Ok(())
 }
 
@@ -147,26 +156,3 @@ pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Return a simple programmatic tray icon. In Phase 1 we skip bundled PNGs
-/// and draw a minimal alpha-only "mic" template so the app always boots.
-fn placeholder_icon() -> Image<'static> {
-    const W: u32 = 16;
-    const H: u32 = 16;
-    let mut rgba = vec![0u8; (W * H * 4) as usize];
-    for y in 2..13 {
-        for x in 6..10 {
-            let i = ((y * W + x) * 4) as usize;
-            rgba[i] = 0;
-            rgba[i + 1] = 0;
-            rgba[i + 2] = 0;
-            rgba[i + 3] = 255;
-        }
-    }
-    for y in 12..15 {
-        for x in 7..9 {
-            let i = ((y * W + x) * 4) as usize;
-            rgba[i + 3] = 255;
-        }
-    }
-    Image::new_owned(rgba, W, H)
-}

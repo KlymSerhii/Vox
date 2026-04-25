@@ -5,8 +5,12 @@ import {
   testGroqConnection,
   testAnthropicConnection,
   replayOnboarding,
+  getLaunchAtLogin,
+  setLaunchAtLogin,
+  checkForUpdates,
   type Settings,
   type TestConnectionResult,
+  type UpdateCheckResult,
 } from "../lib/ipc";
 
 type Tab =
@@ -41,6 +45,28 @@ const CANCEL_HOTKEY_OPTIONS: { value: string; label: string }[] = [
   { value: "F15", label: "F15" },
 ];
 
+const PASTE_LAST_HOTKEY_OPTIONS: { value: string; label: string }[] = [
+  { value: "Alt+Shift+V", label: "⌥⇧V" },
+  { value: "CommandOrControl+Shift+V", label: "⌘⇧V" },
+  { value: "F13", label: "F13" },
+  { value: "F14", label: "F14" },
+  { value: "F15", label: "F15" },
+];
+
+const LANGUAGE_OPTIONS: { value: string; label: string }[] = [
+  { value: "auto", label: "Auto (detect)" },
+  { value: "en", label: "English" },
+  { value: "es", label: "Spanish" },
+  { value: "fr", label: "French" },
+  { value: "de", label: "German" },
+  { value: "it", label: "Italian" },
+  { value: "pt", label: "Portuguese" },
+  { value: "ja", label: "Japanese" },
+  { value: "zh", label: "Chinese" },
+  { value: "ru", label: "Russian" },
+  { value: "ar", label: "Arabic" },
+];
+
 export default function SettingsView() {
   const [tab, setTab] = createSignal<Tab>("general");
   const [loaded, setLoaded] = createSignal(false);
@@ -50,6 +76,16 @@ export default function SettingsView() {
   onMount(async () => {
     try {
       const s = await getSettings();
+      // Reconcile launch-at-login with the OS state (which is the source
+      // of truth — the settings store is just a cache for the toggle).
+      try {
+        const osLaunch = await getLaunchAtLogin();
+        if (osLaunch !== s.launch_at_login) {
+          s.launch_at_login = osLaunch;
+        }
+      } catch (e) {
+        console.warn("getLaunchAtLogin failed:", e);
+      }
       setState(s);
     } finally {
       setLoaded(true);
@@ -296,16 +332,25 @@ function GeneralTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
 }) {
+  async function toggleLaunchAtLogin(v: boolean) {
+    try {
+      await setLaunchAtLogin(v);
+      props.update({ launch_at_login: v });
+    } catch (err) {
+      console.error("Launch-at-login change failed:", err);
+    }
+  }
+
   return (
     <>
       <Card>
         <Row
           label="Launch at login"
-          hint="Vox will start quietly in your menu bar. (Phase 3 — not yet wired.)"
+          hint="Vox will start quietly in your menu bar."
         >
           <Toggle
             checked={props.s.launch_at_login}
-            onChange={(v) => props.update({ launch_at_login: v })}
+            onChange={(v) => void toggleLaunchAtLogin(v)}
           />
         </Row>
         <Row
@@ -326,6 +371,45 @@ function GeneralTab(props: {
             checked={props.s.play_sound}
             onChange={(v) => props.update({ play_sound: v })}
           />
+        </Row>
+      </Card>
+
+      <Card>
+        <Row
+          label="Hotkey behavior"
+          hint="Push-to-talk (hold) or hands-free toggle (press to start, press to stop)."
+          last
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.hands_free_enabled ? "toggle" : "ptt"}
+            onChange={(e) =>
+              props.update({
+                hands_free_enabled: e.currentTarget.value === "toggle",
+              })
+            }
+          >
+            <option value="ptt">Push-to-talk (hold)</option>
+            <option value="toggle">Hands-free toggle</option>
+          </select>
+        </Row>
+      </Card>
+
+      <Card>
+        <Row
+          label="Language"
+          hint="Whisper language hint. Auto detects from speech."
+          last
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.language}
+            onChange={(e) => props.update({ language: e.currentTarget.value })}
+          >
+            <For each={LANGUAGE_OPTIONS}>
+              {(o) => <option value={o.value}>{o.label}</option>}
+            </For>
+          </select>
         </Row>
       </Card>
 
@@ -353,7 +437,11 @@ function HotkeysTab(props: {
       <Card>
         <Row
           label="Push-to-talk"
-          hint="Hold this key to record; release to transcribe."
+          hint={
+            props.s.hands_free_enabled
+              ? "Press once to start recording, press again to stop. (Hands-free is on.)"
+              : "Hold this key to record; release to transcribe."
+          }
         >
           <select
             class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
@@ -370,7 +458,6 @@ function HotkeysTab(props: {
         <Row
           label="Cancel while recording"
           hint="Abort the pipeline without pasting."
-          last
         >
           <select
             class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
@@ -380,6 +467,23 @@ function HotkeysTab(props: {
             }
           >
             <For each={CANCEL_HOTKEY_OPTIONS}>
+              {(o) => <option value={o.value}>{o.label}</option>}
+            </For>
+          </select>
+        </Row>
+        <Row
+          label="Paste last transcript"
+          hint="Re-paste the most recent dictation at the cursor."
+          last
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.paste_last_hotkey}
+            onChange={(e) =>
+              props.update({ paste_last_hotkey: e.currentTarget.value })
+            }
+          >
+            <For each={PASTE_LAST_HOTKEY_OPTIONS}>
               {(o) => <option value={o.value}>{o.label}</option>}
             </For>
           </select>
@@ -638,6 +742,11 @@ function PrivacyTab(props: {
 }
 
 function AboutTab() {
+  const [checking, setChecking] = createSignal(false);
+  const [updateResult, setUpdateResult] = createSignal<UpdateCheckResult | null>(
+    null,
+  );
+
   async function onReplay() {
     try {
       await replayOnboarding();
@@ -645,6 +754,23 @@ function AboutTab() {
       console.error(err);
     }
   }
+
+  async function onCheckUpdates() {
+    setChecking(true);
+    setUpdateResult(null);
+    try {
+      const r = await checkForUpdates();
+      setUpdateResult(r);
+    } catch (err) {
+      setUpdateResult({
+        status: "error",
+        message: String(err),
+      });
+    } finally {
+      setChecking(false);
+    }
+  }
+
   return (
     <>
       <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-5 ring-1 ring-[var(--color-border)]">
@@ -653,10 +779,41 @@ function AboutTab() {
           Talk to any app.
         </div>
         <div class="mt-3 text-[11px] text-[var(--color-ink-faint)]">
-          Version 0.1.0 · Phase 2 · Built with Tauri
+          Version 0.1.0 · Phase 3 · Built with Tauri
         </div>
       </div>
       <Card>
+        <Row
+          label="Check for updates"
+          hint="Auto-update requires a signed release (see docs/signing-and-notarization.md)."
+        >
+          <button
+            type="button"
+            onClick={onCheckUpdates}
+            disabled={checking()}
+            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10 disabled:opacity-40"
+          >
+            {checking() ? "Checking…" : "Check now"}
+          </button>
+        </Row>
+        <Show when={updateResult()}>
+          {(r) => (
+            <div class="px-4 py-3 border-b border-[var(--color-border)]">
+              <span
+                class="text-[12px]"
+                classList={{
+                  "text-[var(--color-success)]": r().status === "available",
+                  "text-[var(--color-ink-mute)]":
+                    r().status === "up-to-date" ||
+                    r().status === "unconfigured",
+                  "text-[var(--color-danger)]": r().status === "error",
+                }}
+              >
+                {r().message ?? r().status}
+              </span>
+            </div>
+          )}
+        </Show>
         <Row label="Replay onboarding" hint="Walk through the setup wizard again.">
           <button
             type="button"

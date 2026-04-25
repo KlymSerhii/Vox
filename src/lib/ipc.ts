@@ -5,13 +5,23 @@ export interface Settings {
   anthropic_api_key: string;
   hotkey: string;
   cancel_hotkey: string;
+  paste_last_hotkey: string;
   cleanup_enabled: boolean;
   launch_at_login: boolean;
   play_sound: boolean;
   send_audio_to_cloud: boolean;
   dictation_enabled: boolean;
+  hands_free_enabled: boolean;
+  language: string;
   onboarded: boolean;
   dictionary: string[];
+}
+
+export interface UpdateCheckResult {
+  status: "available" | "up-to-date" | "error" | "unconfigured";
+  current_version?: string;
+  available_version?: string;
+  message?: string;
 }
 
 export interface TestConnectionResult {
@@ -99,4 +109,20 @@ export async function replayOnboarding(): Promise<void> {
 
 export async function finishOnboarding(): Promise<void> {
   await invoke("finish_onboarding");
+}
+
+export async function getLaunchAtLogin(): Promise<boolean> {
+  return invoke<boolean>("get_launch_at_login");
+}
+
+export async function setLaunchAtLogin(enabled: boolean): Promise<void> {
+  await invoke("set_launch_at_login", { enabled });
+}
+
+export async function pasteLastTranscript(): Promise<void> {
+  await invoke("paste_last_transcript");
+}
+
+export async function checkForUpdates(): Promise<UpdateCheckResult> {
+  return invoke<UpdateCheckResult>("check_for_updates");
 }
