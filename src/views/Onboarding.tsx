@@ -1,4 +1,5 @@
 import { createSignal, For, type JSX, onCleanup, onMount, Show } from "solid-js";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   acceptGemmaTos,
   checkPermissions,
@@ -105,12 +106,21 @@ export default function OnboardingView() {
   }
 
   async function handleFinish() {
-    console.info("[onboarding] finish: starting");
+    console.info("[onboarding] finish: click registered");
     try {
       await finishOnboarding();
-      console.info("[onboarding] finish: done");
+      console.info("[onboarding] finish: backend ack");
     } catch (err) {
-      console.error("[onboarding] finish: failed", err);
+      console.error("[onboarding] finish: backend failed", err);
+    }
+    // Close from the frontend regardless. Backend already calls close()
+    // too, but if the IPC errored or the window handle was lost, this
+    // guarantees the user gets out of the wizard.
+    try {
+      await getCurrentWindow().close();
+      console.info("[onboarding] finish: window closed");
+    } catch (err) {
+      console.error("[onboarding] finish: close failed", err);
     }
   }
 
