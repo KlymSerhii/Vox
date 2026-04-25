@@ -357,6 +357,24 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
 
     let cur = app.package_info().version.to_string();
 
+    // Stub-config short-circuit. The released bundles ship with the
+    // placeholder endpoint `https://updates.vox.local/...` and an empty
+    // pubkey until signing is wired up (see
+    // `docs/signing-and-notarization.md`). In that state we MUST NOT
+    // make a real network request: the placeholder host won't resolve
+    // (5-15 s DNS timeout, leaks "Vox is running" to anyone watching
+    // the resolver), and an empty pubkey + a real GET would have no
+    // signature pin to fail-closed against if the endpoint config is
+    // ever flipped to a hostile host.
+    if updater_is_stub(&app) {
+        return UpdateCheckResult {
+            status: "unconfigured".into(),
+            current_version: Some(cur),
+            available_version: None,
+            message: Some("Auto-update is not yet configured for this build.".into()),
+        };
+    }
+
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
@@ -389,6 +407,39 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
             message: Some(format!("Update check failed: {e}")),
         },
     }
+}
+
+/// True if the running config is the documented stub (placeholder host
+/// or empty pubkey). When this is the case `check_for_updates` returns
+/// `"unconfigured"` *without* hitting the network.
+fn updater_is_stub<R: Runtime>(app: &AppHandle<R>) -> bool {
+    let cfg = app.config();
+    // Walk the plugin config raw — we don't depend on a typed view since
+    // `tauri_plugin_updater::Config` shape may shift.
+    let plugins = match cfg.plugins.0.get("updater") {
+        Some(v) => v,
+        None => return true, // no config at all → stub
+    };
+    let pubkey = plugins
+        .get("pubkey")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if pubkey.trim().is_empty() {
+        return true;
+    }
+    let endpoints = plugins.get("endpoints").and_then(|v| v.as_array());
+    let Some(endpoints) = endpoints else {
+        return true;
+    };
+    if endpoints.is_empty() {
+        return true;
+    }
+    // Any endpoint pointing at the placeholder host counts as stub.
+    endpoints.iter().any(|e| {
+        e.as_str()
+            .map(|s| s.contains("updates.vox.local") || s.contains("placeholder"))
+            .unwrap_or(false)
+    })
 }
 
 // -------- Models tab ---------------------------------------------------------
