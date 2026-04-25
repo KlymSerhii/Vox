@@ -32,10 +32,10 @@
 //! (we'd need to feature-gate `objc2-core-foundation` either way). The
 //! code mirrors the FFI style already used by `mac_perm.rs`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as PMutex;
 
@@ -225,6 +225,10 @@ pub fn install(
     // receive events. Better to surface the error so the caller can
     // fall back to a regular shortcut.
     let trusted = unsafe { AXIsProcessTrusted() };
+    log::error!(
+        "mac_chord: AXIsProcessTrusted={trusted} spec={spec:?} required_mask={:#x}",
+        spec.required_mask()
+    );
     if !trusted {
         return Err(ChordError::PermissionDenied);
     }
@@ -235,6 +239,9 @@ pub fn install(
         on_release: PMutex::new(Box::new(on_release)),
         armed: AtomicBool::new(false),
         last_seq: AtomicU64::new(0),
+        log_counter: AtomicUsize::new(0),
+        log_window_start_ms: AtomicU64::new(0),
+        log_window_count: AtomicU64::new(0),
     });
 
     let inner = Box::new(Inner {
@@ -378,6 +385,15 @@ struct Shared {
     /// stale debounce timer if the modifier state changed before the
     /// debounce window expired.
     last_seq: AtomicU64,
+    /// Diagnostic counter — number of flagsChanged events we've logged
+    /// the raw bits for. Used to throttle to ~10/sec so we don't flood
+    /// the terminal while the user is just typing.
+    log_counter: AtomicUsize,
+    /// Monotonic millis-since-process-start when we last printed a
+    /// throttle log line. Reset when a full second elapses, allowing 10
+    /// per-second log lines.
+    log_window_start_ms: AtomicU64,
+    log_window_count: AtomicU64,
 }
 
 struct Inner {
@@ -397,6 +413,14 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
     // Cast the user_info pointer through `*mut c_void`.
     let user_info = inner_ptr as *mut std::ffi::c_void;
 
+    log::error!(
+        "mac_chord: run-loop thread started (tid={:?}); calling \
+         CGEventTapCreate(loc=session, place=head, opts=listenOnly, \
+         mask={:#x} = 1<<kCGEventFlagsChanged)",
+        thread::current().id(),
+        mask,
+    );
+
     let port = unsafe {
         CGEventTapCreate(
             K_CG_SESSION_EVENT_TAP,
@@ -411,13 +435,23 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
     if port.is_null() {
         // Failed — likely missing Accessibility despite our pre-check
         // (e.g. revoked between AXIsProcessTrusted and TapCreate).
+        log::error!(
+            "mac_chord: CGEventTapCreate returned NULL — Accessibility was \
+             likely revoked between the pre-check and the tap install. The \
+             chord will not fire. Grant Accessibility in System Settings → \
+             Privacy & Security → Accessibility."
+        );
         notify_ready(inner, Err(ChordError::TapCreateFailed));
         return;
     }
+    log::error!("mac_chord: CGEventTapCreate ok (port={:p})", port);
 
     let source =
         unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
     if source.is_null() {
+        log::error!(
+            "mac_chord: CFMachPortCreateRunLoopSource returned NULL"
+        );
         unsafe {
             CGEventTapEnable(port, false);
             CFRelease(port);
@@ -431,6 +465,12 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
         CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
         CGEventTapEnable(port, true);
     }
+    log::error!(
+        "mac_chord: source added to run loop (rl={:p}); tap enabled; \
+         entering CFRunLoopRun. Press your chord — flagsChanged events \
+         should now log.",
+        rl,
+    );
 
     if let Ok(mut g) = inner.run_loop.lock() {
         *g = rl;
@@ -450,7 +490,7 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
     unsafe { CFRunLoopRun() };
 
     // Run loop has stopped — the drop handler will CFRelease + free.
-    log::debug!("mac_chord: run loop exited");
+    log::error!("mac_chord: CFRunLoopRun exited; thread terminating");
 }
 
 fn notify_ready(inner: &Inner, result: Result<(), ChordError>) {
@@ -483,8 +523,9 @@ extern "C" fn tap_callback(
             let port = *g;
             if !port.is_null() {
                 unsafe { CGEventTapEnable(port, true) };
-                log::warn!(
-                    "mac_chord: tap disabled by macOS ({:#x}); re-enabled",
+                log::error!(
+                    "mac_chord: tap disabled by macOS ({:#x}); re-enabled. \
+                     If this happens repeatedly the callback is too slow.",
                     ty
                 );
             }
@@ -500,6 +541,11 @@ extern "C" fn tap_callback(
     let flags = raw_flags & MOD_MASK;
     let shared = inner.shared.clone();
     let required = shared.spec.required_mask();
+
+    // Throttle raw-flags logs to ~10/sec. Useful when the user reports
+    // "nothing happens" — the terminal will tell us if the tap is even
+    // receiving flagsChanged events.
+    log_throttled_flags(&shared, raw_flags, flags, required);
 
     let armed_now = shared.armed.load(Ordering::SeqCst);
     let chord_held = if shared.spec.strict_all_or_none {
@@ -518,21 +564,42 @@ extern "C" fn tap_callback(
             // the debounce thread — debounce threads can outlive
             // `Inner` (the box behind `user_info`) without UAF because
             // all the data they touch lives in `Shared`.
+            log::error!(
+                "mac_chord: chord raise detected (flags={:#x} \
+                 required={:#x}); arming after 60ms debounce (seq={seq})",
+                flags,
+                required
+            );
             let shared_for_debounce = shared;
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(60));
                 if shared_for_debounce.last_seq.load(Ordering::SeqCst) != seq {
+                    log::error!(
+                        "mac_chord: debounce cancelled (seq {seq} superseded)"
+                    );
                     return; // superseded by another flag change
                 }
                 if shared_for_debounce.armed.swap(true, Ordering::SeqCst) {
+                    log::error!(
+                        "mac_chord: debounce no-op (already armed by a parallel raise)"
+                    );
                     return; // already armed by a parallel raise
                 }
+                log::error!(
+                    "mac_chord: debounce fired — calling on_press (seq={seq})"
+                );
                 let cb = shared_for_debounce.on_press.lock();
                 (cb)();
             });
         }
         (true, false) => {
             // Released: fire on_release.
+            log::error!(
+                "mac_chord: chord release detected (flags={:#x} \
+                 required={:#x}); calling on_release",
+                flags,
+                required
+            );
             shared.armed.store(false, Ordering::SeqCst);
             let cb = shared.on_release.lock();
             (cb)();
@@ -541,6 +608,31 @@ extern "C" fn tap_callback(
     }
 
     event
+}
+
+/// Print at most ~10 raw-flag log lines per second. We use a coarse
+/// 100ms-bucket scheme: any second where 10 or more events arrive we
+/// print only the first 10 — the rest are silently dropped. After
+/// 1000ms the counter resets.
+fn log_throttled_flags(shared: &Shared, raw: u64, masked: u64, required: u64) {
+    // Cheap millis-since-startup using a per-process Instant baseline.
+    static BASELINE: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
+    let base = BASELINE.get_or_init(Instant::now);
+    let now_ms = base.elapsed().as_millis() as u64;
+
+    let window_start = shared.log_window_start_ms.load(Ordering::Relaxed);
+    if now_ms.saturating_sub(window_start) >= 1000 {
+        shared.log_window_start_ms.store(now_ms, Ordering::Relaxed);
+        shared.log_window_count.store(0, Ordering::Relaxed);
+    }
+    let count = shared.log_window_count.fetch_add(1, Ordering::Relaxed);
+    if count >= 10 {
+        return;
+    }
+    let total = shared.log_counter.fetch_add(1, Ordering::Relaxed) + 1;
+    log::error!(
+        "mac_chord: flagsChanged #{total} raw={raw:#x} masked={masked:#x} required={required:#x}"
+    );
 }
 
 // ---------- Spec parsing ---------------------------------------------------
