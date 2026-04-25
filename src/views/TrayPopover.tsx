@@ -58,7 +58,12 @@ export default function TrayPopoverView() {
     const cur = s();
     if (!cur) return { label: "Loading…", tone: "ok" };
     if (!cur.dictation_enabled) return { label: "Dictation off", tone: "off" };
-    if (!cur.groq_api_key) return { label: "Add your Groq key", tone: "off" };
+    if (cur.stt_engine === "groq" && !cur.groq_api_key) {
+      return { label: "Add your Groq key", tone: "off" };
+    }
+    if (cur.stt_engine === "whisper-local") {
+      return { label: "Local · ready", tone: "ok" };
+    }
     return { label: "Listening ready", tone: "ok" };
   }
 

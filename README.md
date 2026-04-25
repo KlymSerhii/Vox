@@ -1,12 +1,18 @@
 # Vox
 
 A macOS menu-bar dictation app. Hold a hotkey, speak, and your words are
-transcribed via Groq Whisper, optionally polished by Claude Haiku 4.5, and
-pasted into the currently focused text field.
+transcribed and pasted into the currently focused text field.
 
-This is the **Phase 2** build: core dictation loop plus LLM cleanup, a
-floating listening pill, a tabbed settings window, a tray popover, a
-first-run onboarding wizard, and macOS Keychain-backed API keys.
+**Vox runs offline by default** — local Whisper for speech-to-text and
+Gemma 4 for transcript cleanup, both via Metal/Core ML on Apple Silicon.
+Cloud (Groq Whisper Turbo + Claude Haiku 4.5) is an opt-in fallback for
+users who prefer the extra 200–400 ms of speed.
+
+This is the **local-first** build: core dictation loop, on-device
+inference, model catalog + downloader, a floating listening pill, a
+tabbed settings window with a Models tab, a tray popover, a first-run
+onboarding wizard, a soft migration dialog for existing cloud users,
+and macOS Keychain-backed API keys for cloud-mode.
 
 ## Requirements
 
@@ -29,12 +35,17 @@ On first launch the onboarding wizard walks you through:
 2. **Accessibility** permission — required for the global hotkey and the
    simulated Cmd+V paste. macOS won't prompt for this; the wizard opens the
    right settings pane and polls for the grant every 2s.
-3. **API keys** — Groq (required) and Anthropic (optional, enables cleanup).
-4. **Try it** — a live text field; hold the hotkey and speak.
+3. **Choose your stack** — Run offline (recommended; ~1.9 GB download of
+   Whisper + Gemma 4) or Use cloud (BYO API keys).
+4. **API keys** (cloud branch only) — Groq + Anthropic.
+   **Download models** (offline branch only) — single combined progress
+   bar; on completion the next step works fully offline.
+5. **Try it** — a live text field; hold the hotkey and speak.
 
-Keys are written to the macOS Keychain under service `app.vox.vox`
-(accounts `groq` and `anthropic`). If Keychain access is denied we fall
-back to the plaintext settings store and log a warning.
+Cloud API keys (when used) live in the macOS Keychain under service
+`app.vox.vox`. Local model files live under
+`~/Library/Application Support/com.vox.app/models/<stt|llm>/<id>/` and
+can be managed from Settings → Models.
 
 ## Using Vox
 
@@ -80,12 +91,22 @@ All changes save immediately. Hotkey rebinding requires a restart.
 ## Build a release `.app`
 
 ```bash
+# Cloud-only build (fast, ~7 MB binary, no local STT/LLM):
 npm run tauri build -- --bundles app
+
+# Local-first build (links whisper.cpp + llama.cpp via Metal —
+# requires Xcode CLT + cmake; ~2 min cold compile):
+npm run tauri build -- --bundles app --features local-engines
+
 # .app at src-tauri/target/release/bundle/macos/Vox.app
 ```
 
 The built app is **not signed or notarized** yet. If macOS Gatekeeper
 blocks it, control-click → Open once to trust it.
+
+For local-first builds the hardened runtime needs
+`com.apple.security.cs.allow-jit` (already present in
+`src-tauri/entitlements.plist`) so the Metal shader cache can compile.
 
 ## Privacy
 
@@ -98,9 +119,14 @@ blocks it, control-click → Open once to trust it.
 
 Data that does leave the device when you dictate:
 
-- Audio is sent to Groq for Whisper transcription.
-- The resulting transcript is sent to Anthropic for Claude Haiku cleanup
-  **only if** cleanup is enabled and an Anthropic key is set.
+- **Local STT (default):** nothing — audio stays on device.
+- **Cloud STT:** audio is sent to Groq for Whisper transcription.
+- **Local cleanup (default):** nothing — transcript stays on device.
+- **Cloud cleanup:** transcript is sent to Anthropic for Claude Haiku.
+- **Off:** transcript stays on device, no cleanup applied.
+
+The Privacy tab shows a derived chip (LOCAL/CLOUD) for each direction
+so you always know what's leaving your machine.
 
 ## Project layout
 

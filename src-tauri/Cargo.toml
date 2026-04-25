@@ -14,6 +14,16 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 png = "0.17"
 
+[features]
+# Heavy native engines (whisper-rs + llama-cpp-2). NOT on by default so
+# `cargo check` and clippy stay fast on CI; production builds (`tauri
+# build`) opt in via `--features local-engines` (or `--all-features`).
+# The engine traits + registry + downloader all compile either way; the
+# local engines fall back to a clear runtime error when the feature is
+# off, so the app still builds and runs in cloud-only mode.
+default = []
+local-engines = ["dep:whisper-rs", "dep:llama-cpp-2", "dep:encoding_rs"]
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
@@ -23,7 +33,9 @@ tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls"] }
+tokio-util = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls", "stream"] }
+futures-util = "0.3"
 cpal = "0.15"
 hound = "3.5"
 enigo = "0.2"
@@ -33,9 +45,18 @@ env_logger = "0.11"
 thiserror = "1"
 parking_lot = "0.12"
 anyhow = "1"
+async-trait = "0.1"
 keyring = { version = "3", features = ["apple-native"] }
 once_cell = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sha2 = "0.10"
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+dirs = "5"
+num_cpus = "1"
+# Heavy native engines — see `local-engines` feature above.
+whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
+llama-cpp-2 = { version = "0.1", default-features = false, features = ["metal"], optional = true }
+encoding_rs = { version = "0.8", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

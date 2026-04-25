@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Runtime, Webview};
+use tauri::{AppHandle, Manager, Runtime, Webview, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 
-use crate::{llm, onboarding, pill, session, settings, stt, transcripts};
+use crate::engines::{anthropic, groq};
+use crate::{models, onboarding, pill, session, settings, transcripts};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TestConnectionResult {
@@ -10,10 +11,7 @@ pub struct TestConnectionResult {
     pub message: String,
 }
 
-/// Windows that are allowed to read/write API keys via `get_settings` /
-/// `set_settings`. Other windows (the pill, the tray popover) must use
-/// `get_public_settings` instead, which strips secrets.
-const SECRET_WINDOWS: &[&str] = &["settings", "onboarding"];
+const SECRET_WINDOWS: &[&str] = &["settings", "onboarding", "migration"];
 
 fn caller_label<R: Runtime>(webview: &Webview<R>) -> String {
     webview.label().to_string()
@@ -25,13 +23,11 @@ fn assert_secret_window<R: Runtime>(webview: &Webview<R>) -> Result<(), String> 
         Ok(())
     } else {
         Err(format!(
-            "command not available from window '{label}' — secrets are scoped to settings/onboarding"
+            "command not available from window '{label}' — secrets are scoped to settings/onboarding/migration"
         ))
     }
 }
 
-/// Settings WITH API keys. Only callable from the settings + onboarding
-/// windows. Always prefer `get_public_settings` from anywhere else.
 #[tauri::command]
 pub fn get_settings<R: Runtime>(
     app: AppHandle<R>,
@@ -41,11 +37,6 @@ pub fn get_settings<R: Runtime>(
     Ok(settings::load(&app))
 }
 
-/// Secrets-stripped settings — safe to call from any window. The
-/// `groq_api_key` and `anthropic_api_key` fields are reused as
-/// non-empty/empty *flags*: `"set"` if a key exists, otherwise `""`.
-/// This lets the tray popover show "Listening ready" vs "Add your Groq
-/// key" without ever shipping the secret over IPC.
 #[tauri::command]
 pub fn get_public_settings<R: Runtime>(app: AppHandle<R>) -> settings::Settings {
     let mut s = settings::load(&app);
@@ -72,9 +63,6 @@ pub fn set_settings<R: Runtime>(
     settings::save(&app, &settings).map_err(|e| e.to_string())
 }
 
-/// Allow non-secret windows (tray popover) to flip the dictation toggle and
-/// nothing else. Pass-through for safety: ignores any keys/hotkeys/dictionary
-/// the caller might smuggle in.
 #[tauri::command]
 pub fn set_dictation_enabled<R: Runtime>(
     app: AppHandle<R>,
@@ -87,7 +75,7 @@ pub fn set_dictation_enabled<R: Runtime>(
 
 #[tauri::command]
 pub async fn test_groq_connection(api_key: String) -> TestConnectionResult {
-    match stt::test_key(&api_key).await {
+    match groq::test_key(&api_key).await {
         Ok(_) => TestConnectionResult {
             ok: true,
             message: "OK — key accepted.".into(),
@@ -101,7 +89,7 @@ pub async fn test_groq_connection(api_key: String) -> TestConnectionResult {
 
 #[tauri::command]
 pub async fn test_anthropic_connection(api_key: String) -> TestConnectionResult {
-    match llm::test_key(&api_key).await {
+    match anthropic::test_key(&api_key).await {
         Ok(_) => TestConnectionResult {
             ok: true,
             message: "OK — key accepted.".into(),
@@ -124,7 +112,6 @@ pub fn open_settings<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         win.show().map_err(|e| e.to_string())?;
         win.set_focus().map_err(|e| e.to_string())?;
     }
-    // Hide the tray popover if it's open.
     if let Some(win) = app.get_webview_window("tray-popover") {
         let _ = win.hide();
     }
@@ -173,11 +160,6 @@ pub struct PermissionStatus {
     pub accessibility: bool,
 }
 
-/// macOS permission check — cheap, repeatable.
-/// - Microphone: we can't check TCC without triggering a prompt, so we probe
-///   cpal's default input device. If we got samples through before, this will
-///   succeed.
-/// - Accessibility: uses `AXIsProcessTrusted`.
 #[tauri::command]
 pub fn check_permissions<R: Runtime>(_app: AppHandle<R>) -> PermissionStatus {
     let microphone = probe_microphone();
@@ -209,8 +191,6 @@ fn probe_microphone() -> bool {
     }
 }
 
-/// Trigger the OS mic permission prompt by opening + immediately dropping
-/// an input stream. Returns true if we were able to open one.
 #[tauri::command]
 pub fn request_microphone() -> bool {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -239,7 +219,6 @@ pub fn request_microphone() -> bool {
     match stream {
         Ok(s) => {
             let _ = s.play();
-            // Immediately drop.
             true
         }
         Err(e) => {
@@ -272,8 +251,6 @@ pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) {
     }
 }
 
-/// Anchor + show the tray popover next to the tray icon. The frontend
-/// drives content; we just position it.
 #[tauri::command]
 pub fn show_tray_popover<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     crate::tray::show_popover(&app).map_err(|e| e.to_string())
@@ -298,9 +275,6 @@ pub fn set_launch_at_login<R: Runtime>(
     } else {
         mgr.disable().map_err(|e| e.to_string())?;
     }
-    // Mirror to settings store as a cache so the UI doesn't have to round-trip
-    // through the OS on every render. The OS state is the source of truth on
-    // load (we re-read it on Settings open).
     let mut s = settings::load(&app);
     s.launch_at_login = enabled;
     let _ = settings::save(&app, &s);
@@ -309,12 +283,8 @@ pub fn set_launch_at_login<R: Runtime>(
 
 // -------- Paste-last-transcript ----------------------------------------------
 
-/// Re-paste the most recent transcript from the in-memory ring buffer.
-/// Returns Err if the buffer is empty or another paste is mid-flight.
 #[tauri::command]
 pub fn paste_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    // If a real session is currently mid-pipeline, ignore the press — the
-    // user is still dictating something fresh.
     if let Some(ctx) = app.try_state::<session::SessionCtx>() {
         if ctx.is_pipeline_active() {
             return Err("Vox is busy with another dictation.".into());
@@ -323,7 +293,6 @@ pub fn paste_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String
 
     let snap = transcripts::snapshot();
     let Some(latest) = snap.first() else {
-        // No history — surface an error pill, then propagate to caller.
         pill::show(&app);
         pill::emit_state(
             &app,
@@ -390,9 +359,6 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
-            // No updater configured (or signing key missing). For Phase 3 we
-            // don't have a real release server yet — see
-            // `docs/signing-and-notarization.md` for the runbook.
             return UpdateCheckResult {
                 status: "unconfigured".into(),
                 current_version: Some(cur),
@@ -422,4 +388,89 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
             message: Some(format!("Update check failed: {e}")),
         },
     }
+}
+
+// -------- Models tab ---------------------------------------------------------
+
+#[tauri::command]
+pub fn list_models(app: AppHandle<Wry>) -> Vec<models::ModelStatus> {
+    models::list(&app)
+}
+
+#[tauri::command]
+pub async fn download_model(app: AppHandle<Wry>, id: String) -> Result<(), String> {
+    models::download_model(app, id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_download(id: String) -> bool {
+    models::cancel_download(&id)
+}
+
+#[tauri::command]
+pub fn delete_model(app: AppHandle<Wry>, id: String) -> Result<(), String> {
+    models::delete_model(&app, &id).map_err(|e| e.to_string())
+}
+
+/// Pre-warm an engine into RAM. Used by onboarding's "Set up local
+/// models" step so the first dictation doesn't pay the cold-load tax.
+#[tauri::command]
+pub async fn load_model_warm(app: AppHandle<Wry>, id: String) -> Result<(), String> {
+    let descriptor = models::descriptor_for(&id)
+        .ok_or_else(|| format!("unknown model id: {id}"))?;
+    let registry = app
+        .try_state::<crate::engines::Registry>()
+        .ok_or_else(|| "engine registry missing".to_string())?;
+    match descriptor.kind {
+        models::ModelKind::Stt => {
+            let _ = registry.stt(&app, descriptor.engine, descriptor.id);
+        }
+        models::ModelKind::Llm => {
+            let _ = registry.llm(&app, descriptor.engine, descriptor.id);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+pub struct TierRecommendation {
+    pub tier: String,
+    pub stt_model_id: String,
+    pub llm_model_id: String,
+    pub physical_ram_gb: u64,
+    pub low_ram_warning: bool,
+}
+
+#[tauri::command]
+pub fn recommend_tier() -> TierRecommendation {
+    let ram = models::physical_ram_gb();
+    let tier = models::recommend_tier();
+    TierRecommendation {
+        tier: tier.to_string(),
+        stt_model_id: models::recommended_stt_model_id().to_string(),
+        llm_model_id: models::recommended_llm_model_id().to_string(),
+        physical_ram_gb: ram,
+        low_ram_warning: ram > 0 && ram < 12,
+    }
+}
+
+#[tauri::command]
+pub fn accept_gemma_tos<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    s.gemma_tos_accepted = true;
+    settings::save(&app, &s).map_err(|e| e.to_string())
+}
+
+/// Persist the migration dialog dismissal. Frontend should patch
+/// `stt_engine` / `llm_engine` via `set_settings` *before* calling this
+/// — we just flip the seen flag here.
+#[tauri::command]
+pub fn dismiss_migration<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    settings::mark_migration_seen(&app);
+    if let Some(win) = app.get_webview_window(crate::migration::LABEL) {
+        let _ = win.hide();
+    }
+    Ok(())
 }

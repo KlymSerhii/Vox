@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface Settings {
   groq_api_key: string;
@@ -6,15 +7,20 @@ export interface Settings {
   hotkey: string;
   cancel_hotkey: string;
   paste_last_hotkey: string;
-  cleanup_enabled: boolean;
   launch_at_login: boolean;
   play_sound: boolean;
-  send_audio_to_cloud: boolean;
   dictation_enabled: boolean;
   hands_free_enabled: boolean;
   language: string;
   onboarded: boolean;
   dictionary: string[];
+  // Local-first.
+  stt_engine: string;        // "whisper-local" | "groq"
+  stt_model_id: string;
+  llm_engine: string;        // "gemma-local" | "anthropic" | "none"
+  llm_model_id: string;
+  migration_seen: boolean;
+  gemma_tos_accepted: boolean;
 }
 
 export interface UpdateCheckResult {
@@ -39,14 +45,44 @@ export interface PermissionStatus {
   accessibility: boolean;
 }
 
+export interface ModelDescriptor {
+  id: string;
+  kind: "stt" | "llm";
+  name: string;
+  size_bytes: number;
+  sha256: string | null;
+  url: string;
+  engine: string;
+  ram_peak_mb: number;
+  tier: string;
+}
+
+export interface ModelStatus {
+  descriptor: ModelDescriptor;
+  installed: boolean;
+  bytes_on_disk: number;
+  path: string | null;
+}
+
+export interface ModelProgress {
+  id: string;
+  bytes_downloaded: number;
+  total_bytes: number;
+  eta_secs: number | null;
+}
+
+export interface TierRecommendation {
+  tier: string;
+  stt_model_id: string;
+  llm_model_id: string;
+  physical_ram_gb: number;
+  low_ram_warning: boolean;
+}
+
 export async function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
-/**
- * Settings WITHOUT API keys. Safe to call from any window. Use this from
- * the pill, tray popover, or any non-secret context.
- */
 export async function getPublicSettings(): Promise<Settings> {
   return invoke<Settings>("get_public_settings");
 }
@@ -125,4 +161,67 @@ export async function pasteLastTranscript(): Promise<void> {
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke<UpdateCheckResult>("check_for_updates");
+}
+
+// ---- Models ----
+
+export async function listModels(): Promise<ModelStatus[]> {
+  return invoke<ModelStatus[]>("list_models");
+}
+
+export async function downloadModel(id: string): Promise<void> {
+  await invoke("download_model", { id });
+}
+
+export async function cancelDownload(id: string): Promise<boolean> {
+  return invoke<boolean>("cancel_download", { id });
+}
+
+export async function deleteModel(id: string): Promise<void> {
+  await invoke("delete_model", { id });
+}
+
+export async function loadModelWarm(id: string): Promise<void> {
+  await invoke("load_model_warm", { id });
+}
+
+export async function recommendTier(): Promise<TierRecommendation> {
+  return invoke<TierRecommendation>("recommend_tier");
+}
+
+export async function acceptGemmaTos(): Promise<void> {
+  await invoke("accept_gemma_tos");
+}
+
+export async function dismissMigration(): Promise<void> {
+  await invoke("dismiss_migration");
+}
+
+export async function onModelProgress(
+  cb: (p: ModelProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<ModelProgress>("model:progress", (e) => cb(e.payload));
+}
+
+export async function onModelDone(
+  cb: (p: { id: string; already_installed?: boolean }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string; already_installed?: boolean }>(
+    "model:done",
+    (e) => cb(e.payload),
+  );
+}
+
+export async function onModelError(
+  cb: (p: { id: string; error: string }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string; error: string }>("model:error", (e) =>
+    cb(e.payload),
+  );
+}
+
+export async function onModelCanceled(
+  cb: (p: { id: string }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string }>("model:canceled", (e) => cb(e.payload));
 }

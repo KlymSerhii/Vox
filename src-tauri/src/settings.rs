@@ -5,10 +5,17 @@
 //! into the Keychain and clears them from disk. If Keychain access fails,
 //! we transparently fall back to the plaintext store and log a warning —
 //! dictation should still work.
+//!
+//! Local-first migration: existing users who already have a `groq_api_key`
+//! keep their cloud engine assignments; new installs get
+//! `stt_engine = "whisper-local"`, `llm_engine = "gemma-local"`. Either
+//! group sees the migration dialog at most once.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
 use tauri_plugin_store::StoreExt;
+
+use crate::models;
 
 pub const STORE_FILE: &str = "vox-settings.json";
 
@@ -17,15 +24,25 @@ const KEY_ANTHROPIC: &str = "anthropic_api_key";
 const KEY_HOTKEY: &str = "hotkey";
 const KEY_CANCEL_HOTKEY: &str = "cancel_hotkey";
 const KEY_PASTE_LAST_HOTKEY: &str = "paste_last_hotkey";
-const KEY_CLEANUP_ENABLED: &str = "cleanup_enabled";
 const KEY_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const KEY_PLAY_SOUND: &str = "play_sound";
-const KEY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
 const KEY_ONBOARDED: &str = "onboarded";
 const KEY_DICTATION_ENABLED: &str = "dictation_enabled";
 const KEY_DICTIONARY: &str = "dictionary";
 const KEY_HANDS_FREE: &str = "hands_free_enabled";
 const KEY_LANGUAGE: &str = "language";
+
+// New local-first keys.
+const KEY_STT_ENGINE: &str = "stt_engine";
+const KEY_STT_MODEL_ID: &str = "stt_model_id";
+const KEY_LLM_ENGINE: &str = "llm_engine";
+const KEY_LLM_MODEL_ID: &str = "llm_model_id";
+const KEY_MIGRATION_SEEN: &str = "migration_seen";
+const KEY_GEMMA_TOS_ACCEPTED: &str = "gemma_tos_accepted";
+
+// Legacy keys we still read for migration but no longer write.
+const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
+const KEY_LEGACY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
 
 const KEYRING_SERVICE: &str = "app.vox.vox";
 const KEYRING_ACCOUNT_GROQ: &str = "groq";
@@ -46,6 +63,18 @@ fn default_language() -> String {
 fn default_true() -> bool {
     true
 }
+fn default_stt_engine() -> String {
+    "whisper-local".into()
+}
+fn default_llm_engine() -> String {
+    "gemma-local".into()
+}
+fn default_stt_model_id() -> String {
+    models::recommended_stt_model_id().to_string()
+}
+fn default_llm_model_id() -> String {
+    models::recommended_llm_model_id().to_string()
+}
 
 /// User-visible settings. API keys live in `Settings` so the UI can edit
 /// them, but they are not persisted to disk — only to the Keychain.
@@ -63,14 +92,10 @@ pub struct Settings {
     #[serde(default = "default_paste_last_hotkey")]
     pub paste_last_hotkey: String,
 
-    #[serde(default = "default_true")]
-    pub cleanup_enabled: bool,
     #[serde(default)]
     pub launch_at_login: bool,
     #[serde(default)]
     pub play_sound: bool,
-    #[serde(default = "default_true")]
-    pub send_audio_to_cloud: bool,
     #[serde(default = "default_true")]
     pub dictation_enabled: bool,
 
@@ -84,6 +109,20 @@ pub struct Settings {
 
     #[serde(default)]
     pub dictionary: Vec<String>,
+
+    // ---- Local-first ----
+    #[serde(default = "default_stt_engine")]
+    pub stt_engine: String,
+    #[serde(default = "default_stt_model_id")]
+    pub stt_model_id: String,
+    #[serde(default = "default_llm_engine")]
+    pub llm_engine: String,
+    #[serde(default = "default_llm_model_id")]
+    pub llm_model_id: String,
+    #[serde(default)]
+    pub migration_seen: bool,
+    #[serde(default)]
+    pub gemma_tos_accepted: bool,
 }
 
 impl Default for Settings {
@@ -94,15 +133,19 @@ impl Default for Settings {
             hotkey: default_hotkey(),
             cancel_hotkey: default_cancel_hotkey(),
             paste_last_hotkey: default_paste_last_hotkey(),
-            cleanup_enabled: true,
             launch_at_login: false,
             play_sound: false,
-            send_audio_to_cloud: true,
             dictation_enabled: true,
             hands_free_enabled: false,
             language: default_language(),
             onboarded: false,
             dictionary: Vec::new(),
+            stt_engine: default_stt_engine(),
+            stt_model_id: default_stt_model_id(),
+            llm_engine: default_llm_engine(),
+            llm_model_id: default_llm_model_id(),
+            migration_seen: false,
+            gemma_tos_accepted: false,
         }
     }
 }
@@ -136,7 +179,6 @@ fn keyring_set(account: &str, value: &str) -> bool {
         return false;
     };
     if value.is_empty() {
-        // Delete the entry on empty.
         match entry.delete_credential() {
             Ok(_) => true,
             Err(keyring::Error::NoEntry) => true,
@@ -162,13 +204,11 @@ pub fn get_groq_key<R: Runtime>(app: &AppHandle<R>) -> String {
     if let Some(s) = keyring_get(KEYRING_ACCOUNT_GROQ) {
         return s;
     }
-    // Fallback: plaintext store.
     read_string(app, KEY_GROQ)
 }
 
 pub fn set_groq_key<R: Runtime>(app: &AppHandle<R>, value: &str) {
     if keyring_set(KEYRING_ACCOUNT_GROQ, value) {
-        // Clear any plaintext copy.
         clear_string(app, KEY_GROQ);
     } else {
         write_string(app, KEY_GROQ, value);
@@ -244,13 +284,13 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
 
     let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
-    let cleanup_enabled = get_bool(KEY_CLEANUP_ENABLED, true);
     let launch_at_login = get_bool(KEY_LAUNCH_AT_LOGIN, false);
     let play_sound = get_bool(KEY_PLAY_SOUND, false);
-    let send_audio_to_cloud = get_bool(KEY_SEND_AUDIO_CLOUD, true);
     let dictation_enabled = get_bool(KEY_DICTATION_ENABLED, true);
     let hands_free_enabled = get_bool(KEY_HANDS_FREE, false);
     let onboarded = get_bool(KEY_ONBOARDED, false);
+    let migration_seen = get_bool(KEY_MIGRATION_SEEN, false);
+    let gemma_tos_accepted = get_bool(KEY_GEMMA_TOS_ACCEPTED, false);
 
     let dictionary = store
         .get(KEY_DICTIONARY)
@@ -261,6 +301,50 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    // Engine selection. New keys override; if absent, fall back to a
+    // migration of the legacy `cleanup_enabled` / `send_audio_to_cloud`
+    // pair.
+    let legacy_cleanup_enabled =
+        store.get(KEY_LEGACY_CLEANUP_ENABLED).and_then(|v| v.as_bool());
+    let legacy_send_audio_cloud =
+        store.get(KEY_LEGACY_SEND_AUDIO_CLOUD).and_then(|v| v.as_bool());
+
+    let stt_engine = store
+        .get(KEY_STT_ENGINE)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            // Existing user: had cloud STT. Brand-new: default local.
+            if legacy_send_audio_cloud.is_some() && !get_groq_key(app).is_empty() {
+                "groq".into()
+            } else {
+                default_stt_engine()
+            }
+        });
+    let stt_model_id = store
+        .get(KEY_STT_MODEL_ID)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_stt_model_id);
+
+    let llm_engine = store
+        .get(KEY_LLM_ENGINE)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| {
+            if legacy_cleanup_enabled == Some(false) {
+                "none".into()
+            } else if !get_anthropic_key(app).is_empty() {
+                "anthropic".into()
+            } else if legacy_send_audio_cloud.is_some() {
+                // Existing cloud user without an Anthropic key: cleanup off.
+                "none".into()
+            } else {
+                default_llm_engine()
+            }
+        });
+    let llm_model_id = store
+        .get(KEY_LLM_MODEL_ID)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_llm_model_id);
 
     // Migrate plaintext keys → Keychain once.
     migrate_key_from_store(app, &store, KEY_GROQ, KEYRING_ACCOUNT_GROQ);
@@ -275,15 +359,19 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         hotkey,
         cancel_hotkey,
         paste_last_hotkey,
-        cleanup_enabled,
         launch_at_login,
         play_sound,
-        send_audio_to_cloud,
         dictation_enabled,
         hands_free_enabled,
         language,
         onboarded,
         dictionary,
+        stt_engine,
+        stt_model_id,
+        llm_engine,
+        llm_model_id,
+        migration_seen,
+        gemma_tos_accepted,
     }
 }
 
@@ -316,9 +404,7 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         .store(STORE_FILE)
         .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
 
-    // Secrets → Keychain. Refuse to wipe a stored key if the incoming value
-    // is empty — empty almost always means a UI race or an out-of-date
-    // snapshot, never a real "the user typed nothing on purpose."
+    // Secrets → Keychain.
     let groq = settings.groq_api_key.trim();
     if !groq.is_empty() || get_groq_key(app).is_empty() {
         set_groq_key(app, groq);
@@ -328,7 +414,6 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         set_anthropic_key(app, anthropic);
     }
 
-    // Non-secret fields.
     store.set(
         KEY_HOTKEY,
         serde_json::Value::String(settings.hotkey.clone()),
@@ -350,18 +435,10 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         serde_json::Value::Bool(settings.hands_free_enabled),
     );
     store.set(
-        KEY_CLEANUP_ENABLED,
-        serde_json::Value::Bool(settings.cleanup_enabled),
-    );
-    store.set(
         KEY_LAUNCH_AT_LOGIN,
         serde_json::Value::Bool(settings.launch_at_login),
     );
     store.set(KEY_PLAY_SOUND, serde_json::Value::Bool(settings.play_sound));
-    store.set(
-        KEY_SEND_AUDIO_CLOUD,
-        serde_json::Value::Bool(settings.send_audio_to_cloud),
-    );
     store.set(
         KEY_DICTATION_ENABLED,
         serde_json::Value::Bool(settings.dictation_enabled),
@@ -378,6 +455,35 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         ),
     );
 
+    store.set(
+        KEY_STT_ENGINE,
+        serde_json::Value::String(settings.stt_engine.clone()),
+    );
+    store.set(
+        KEY_STT_MODEL_ID,
+        serde_json::Value::String(settings.stt_model_id.clone()),
+    );
+    store.set(
+        KEY_LLM_ENGINE,
+        serde_json::Value::String(settings.llm_engine.clone()),
+    );
+    store.set(
+        KEY_LLM_MODEL_ID,
+        serde_json::Value::String(settings.llm_model_id.clone()),
+    );
+    store.set(
+        KEY_MIGRATION_SEEN,
+        serde_json::Value::Bool(settings.migration_seen),
+    );
+    store.set(
+        KEY_GEMMA_TOS_ACCEPTED,
+        serde_json::Value::Bool(settings.gemma_tos_accepted),
+    );
+
+    // Drop the deprecated keys on save — they're superseded.
+    store.delete(KEY_LEGACY_CLEANUP_ENABLED);
+    store.delete(KEY_LEGACY_SEND_AUDIO_CLOUD);
+
     store
         .save()
         .map_err(|e| anyhow::anyhow!("save store: {e}"))?;
@@ -391,57 +497,55 @@ pub fn mark_onboarded<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+pub fn mark_migration_seen<R: Runtime>(app: &AppHandle<R>) {
+    if let Ok(store) = app.store(STORE_FILE) {
+        store.set(KEY_MIGRATION_SEEN, serde_json::Value::Bool(true));
+        let _ = store.save();
+    }
+}
+
+/// True if a previous Vox install on this machine had cloud config. Used
+/// to decide whether to surface the soft migration dialog.
+pub fn is_legacy_cloud_user<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if get_groq_key(app).trim().is_empty() {
+        return false;
+    }
+    let Ok(store) = app.store(STORE_FILE) else {
+        return false;
+    };
+    // If the user already has explicit local-first keys, we treat them as
+    // already-migrated regardless of the legacy bool.
+    if store.get(KEY_STT_ENGINE).is_some() {
+        return false;
+    }
+    true
+}
+
 /// Lightweight, secret-free view of the user's preferences. Cheap enough
 /// to call on the hotkey thread because it never touches the Keychain.
 #[derive(Debug, Clone)]
 pub struct Prefs {
-    pub cleanup_enabled: bool,
-    pub send_audio_to_cloud: bool,
     pub dictation_enabled: bool,
     pub hands_free_enabled: bool,
-    /// Whisper language code or "auto". Consumed by the STT engine; the
-    /// local-first STT/LLM rewrite should plumb this into the request.
-    /// TODO local-first: pass `prefs.language` to the STT call.
-    #[allow(dead_code)]
     pub language: String,
     pub dictionary: Vec<String>,
+
+    pub stt_engine: String,
+    pub stt_model_id: String,
+    pub llm_engine: String,
+    pub llm_model_id: String,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
-    let Ok(store) = app.store(STORE_FILE) else {
-        return Prefs {
-            cleanup_enabled: true,
-            send_audio_to_cloud: true,
-            dictation_enabled: true,
-            hands_free_enabled: false,
-            language: default_language(),
-            dictionary: Vec::new(),
-        };
-    };
-
-    let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
-
-    let dictionary = store
-        .get(KEY_DICTIONARY)
-        .and_then(|v| v.as_array().cloned())
-        .map(|arr| {
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-
-    let language = store
-        .get(KEY_LANGUAGE)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_language);
-
+    let s = load(app);
     Prefs {
-        cleanup_enabled: get_bool(KEY_CLEANUP_ENABLED, true),
-        send_audio_to_cloud: get_bool(KEY_SEND_AUDIO_CLOUD, true),
-        dictation_enabled: get_bool(KEY_DICTATION_ENABLED, true),
-        hands_free_enabled: get_bool(KEY_HANDS_FREE, false),
-        language,
-        dictionary,
+        dictation_enabled: s.dictation_enabled,
+        hands_free_enabled: s.hands_free_enabled,
+        language: s.language,
+        dictionary: s.dictionary,
+        stt_engine: s.stt_engine,
+        stt_model_id: s.stt_model_id,
+        llm_engine: s.llm_engine,
+        llm_model_id: s.llm_model_id,
     }
 }

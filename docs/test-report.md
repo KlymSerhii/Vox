@@ -2,9 +2,16 @@
 
 > Tester: QA / Automated verification
 > Date: 2026-04-24
-> Scope: Phase 1 + Phase 2 + Staff review fixes
+> Scope: Phase 1 + Phase 2 + Phase 3 polish + Local-first pivot
 > Verdict: **SHIP-WITH-CAVEATS** — see "Final regression matrix" and
 > "Open caveats" below.
+>
+> The local-first pivot replaces the cloud-only defaults with on-device
+> Whisper + Gemma 4 inference; cloud is now opt-in. See
+> `docs/local-first-impl-notes.md` for the full diff and known TODOs
+> (model sha256 pinning, Core ML encoder companion downloads, memory
+> pressure unload). New manual smoke-tests are documented in §10 of
+> that file.
 
 ---
 

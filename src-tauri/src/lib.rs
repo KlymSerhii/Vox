@@ -1,13 +1,14 @@
 mod audio;
 mod commands;
+mod engines;
 mod hotkey;
 mod inject;
-mod llm;
+mod migration;
+mod models;
 mod onboarding;
 mod pill;
 mod session;
 mod settings;
-mod stt;
 mod transcripts;
 mod tray;
 mod tray_glyphs;
@@ -20,7 +21,6 @@ use crate::session::SessionCtx;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Best-effort logger init. Set VOX_LOG=debug to get more output.
     let _ = env_logger::Builder::from_env(
         env_logger::Env::default().filter_or("VOX_LOG", "info"),
     )
@@ -58,9 +58,16 @@ pub fn run() {
             commands::set_launch_at_login,
             commands::paste_last_transcript,
             commands::check_for_updates,
+            commands::list_models,
+            commands::download_model,
+            commands::cancel_download,
+            commands::delete_model,
+            commands::load_model_warm,
+            commands::recommend_tier,
+            commands::accept_gemma_tos,
+            commands::dismiss_migration,
         ])
         .setup(|app| {
-            // macOS: accessory mode — no Dock icon.
             #[cfg(target_os = "macos")]
             {
                 app.set_activation_policy(tauri::ActivationPolicy::Accessory);
@@ -72,6 +79,9 @@ pub fn run() {
             let audio = AudioHandle::spawn();
             let ctx = SessionCtx::new(audio);
             app.manage(ctx.clone());
+
+            // Engine registry — lazy-built, kept warm.
+            app.manage(crate::engines::Registry::new());
 
             // Load settings (also migrates plaintext keys into the Keychain).
             let s = settings::load(app_handle);
@@ -106,10 +116,15 @@ pub fn run() {
                 let _ = win.hide();
             }
 
-            // Launch onboarding on first run.
+            // Local-first soft migration: existing cloud users see a
+            // one-time dialog. New installs go to onboarding instead.
             if !s.onboarded {
                 if let Err(e) = onboarding::show(app_handle) {
                     log::warn!("failed to show onboarding: {e}");
+                }
+            } else if !s.migration_seen && settings::is_legacy_cloud_user(app_handle) {
+                if let Err(e) = migration::show(app_handle) {
+                    log::warn!("failed to show migration dialog: {e}");
                 }
             }
 
@@ -118,7 +133,7 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
-                    "settings" | "tray-popover" | "pill" => {
+                    "settings" | "tray-popover" | "pill" | "migration" => {
                         let _ = window.hide();
                         api.prevent_close();
                     }
@@ -128,7 +143,6 @@ pub fn run() {
                     _ => {}
                 }
             }
-            // Hide the tray popover on blur (standard popover UX).
             if let tauri::WindowEvent::Focused(false) = event {
                 if window.label() == "tray-popover" {
                     let _ = window.hide();

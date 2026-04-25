@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for Vox windows.",
-  "windows": ["settings", "pill", "onboarding", "tray-popover"],
+  "windows": ["settings", "pill", "onboarding", "tray-popover", "migration"],
   "permissions": [
     "core:default",
     "core:window:allow-show",

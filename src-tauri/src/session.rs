@@ -1,47 +1,36 @@
 //! Orchestrates the dictation pipeline.
 //!
 //! Flow: hotkey down → show pill (Listening) → mic capture + emit levels.
-//! Hotkey up → stop mic → STT → optional LLM cleanup → paste → Done pill.
+//! Hotkey up → stop mic → STT (engine of user's choice) → optional LLM
+//! cleanup (engine of user's choice) → paste → Done pill.
+//!
+//! STT and cleanup engines are resolved from the per-app
+//! `engines::Registry` based on `prefs.stt_engine` / `prefs.llm_engine`.
+//! Engines are lazy-loaded and kept warm.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime, Wry};
 
 use crate::audio::AudioHandle;
+use crate::engines::Registry;
 use crate::pill::{self, PillState};
-use crate::{inject, llm, settings, stt, transcripts};
+use crate::{inject, settings, transcripts};
 
-/// Max continuous hold before we auto-stop (safety net).
 const MAX_RECORD_SECS: u64 = 60;
-
-/// Minimum recording duration we'll consider valid (misfire guard).
-/// PRD §3.1: <300 ms is treated as a misfire.
 const MIN_RECORD_MS: u128 = 300;
-
-/// Threshold (peak amplitude in [0,1]) below which we treat the buffer as
-/// silence and surface "No audio detected" instead of sending it to STT.
-/// -50 dBFS ≈ 0.003.
 const SILENCE_PEAK_THRESHOLD: f32 = 0.003;
 
 #[derive(Clone)]
 pub struct SessionCtx {
     pub audio: AudioHandle,
     pub recording: Arc<AtomicBool>,
-    /// Monotonically incremented on each session; used to cancel stale work.
     pub session_id: Arc<AtomicU64>,
-    /// When the current recording started (Some iff recording).
     started_at: Arc<Mutex<Option<Instant>>>,
-    /// Per-session boolean flipped by `cancel()` while the current pipeline
-    /// is in flight. Reset to false at the start of every new session so a
-    /// stale cancel from a previous session can't bleed into a fresh one.
     canceled: Arc<AtomicBool>,
-    /// True from begin_recording until the post-release pipeline has either
-    /// pasted, errored, or been canceled. Lets `cancel()` distinguish "Esc
-    /// during a real session" from "Esc with nothing in flight" so we don't
-    /// flash a Canceled pill when there's nothing to cancel.
     pipeline_active: Arc<AtomicBool>,
 }
 
@@ -57,7 +46,6 @@ impl SessionCtx {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::SeqCst)
     }
@@ -72,32 +60,11 @@ impl SessionCtx {
 }
 
 pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
-    // Cheap, secret-free pref read — the keychain is *not* hit on the
-    // hotkey thread (latency budget per PRD §6.1).
     let prefs = settings::prefs(&app);
     if !prefs.dictation_enabled {
         log::info!("dictation is disabled; hotkey press ignored");
         return;
     }
-    if !prefs.send_audio_to_cloud {
-        log::info!("'send audio to cloud' is off; dictation is unavailable");
-        pill::show(&app);
-        pill::emit_state(
-            &app,
-            PillState::Error,
-            Some("Cloud dictation is off — enable it in Privacy.".into()),
-        );
-        let app_arc = Arc::new(app.clone());
-        pill::hide_after(&app_arc, 2500);
-        return;
-    }
-
-    // Note: we do *not* notify_one() here. The cancel_notify is reserved for
-    // explicit user cancels. Re-press supersession is observed by in-flight
-    // tasks via the session_id mismatch checked at every await boundary —
-    // they'll bail in at most one HTTP RTT, which is acceptable. Sending a
-    // notify here would also leave a stale permit on the Notify that the
-    // *new* session's pipeline could mistakenly consume as a cancel.
 
     if ctx.recording.swap(true, Ordering::SeqCst) {
         log::debug!("begin_recording called while already recording; ignored");
@@ -128,11 +95,7 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
         return;
     }
 
-    // Start a safety-net watcher that auto-ends the session if the user
-    // holds the key past MAX_RECORD_SECS.
     spawn_max_record_guard(app.clone(), ctx.clone(), MAX_RECORD_SECS);
-
-    // Start an RMS sampler that emits pill:audio_level events at ~20 Hz.
     spawn_audio_level_sampler(app, ctx.clone());
 }
 
@@ -151,20 +114,11 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 
     let app_for_pill = app.clone();
 
-    // Move stop + upload + paste off the hotkey callback thread.
     tauri::async_runtime::spawn(async move {
-        // Drop guard clears `pipeline_active` no matter which return path
-        // the task takes (cancel, stale, error, or success). This lets
-        // `cancel()` distinguish "Esc with a real session in flight" from
-        // "Esc with nothing happening" so we don't flash a Canceled pill
-        // when the user presses Esc with no session running.
         let _pipeline_guard = PipelineGuard::new(&ctx, my_sid);
 
-        // Always fetch audio to flush it, even if we'll discard it.
         let wav_result = ctx.audio.stop_and_encode();
 
-        // Bail-out helper — used at every async boundary in the pipeline so
-        // a cancel or a fresh-press takes effect within ~one I/O round trip.
         let stale = || ctx.session_id.load(Ordering::SeqCst) != my_sid;
 
         if ctx.is_canceled() {
@@ -204,8 +158,6 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
-        // PRD §3.2: if the buffer is silent, surface "No audio detected"
-        // rather than burning an STT request.
         if wav_peak_pcm16(&wav) < SILENCE_PEAK_THRESHOLD {
             log::info!("silent buffer; skipping STT");
             pill::emit_state(
@@ -217,20 +169,66 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
-        // Read full settings (incl. keychain keys) only here — off the hotkey
-        // thread.
-        let groq_key = settings::get_groq_key(&app_for_pill);
-        let anthropic_key = settings::get_anthropic_key(&app_for_pill);
         let prefs = settings::prefs(&app_for_pill);
+
+        // Engine resolution. We narrow `AppHandle<R>` to the production
+        // `Wry` runtime via a type-id check: at startup we always build
+        // with the default Wry runtime, so this should always succeed.
+        // If the registry isn't installed for some reason we fall back
+        // to a clear error pill.
+        let app_wry: AppHandle<Wry> = match try_into_wry(&app_for_pill) {
+            Some(a) => a,
+            None => {
+                log::error!("session: not running on Wry — engine registry unavailable");
+                pill::emit_state(
+                    &app_for_pill,
+                    PillState::Error,
+                    Some("Internal error.".into()),
+                );
+                hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
+                return;
+            }
+        };
+
+        let registry = match app_wry.try_state::<Registry>() {
+            Some(r) => r.inner().clone(),
+            None => {
+                log::error!("engine registry missing — onboarding never finished?");
+                pill::emit_state(
+                    &app_for_pill,
+                    PillState::Error,
+                    Some("Engines not initialised — restart Vox.".into()),
+                );
+                hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
+                return;
+            }
+        };
+
+        let stt_engine = match registry.stt(&app_wry, &prefs.stt_engine, &prefs.stt_model_id) {
+            Some(e) => e,
+            None => {
+                pill::emit_state(
+                    &app_for_pill,
+                    PillState::Error,
+                    Some("STT engine not configured. Open Settings → Models.".into()),
+                );
+                hide_after_session(&app_for_pill, &ctx, my_sid, 3000);
+                return;
+            }
+        };
+
+        let llm_engine = registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id);
 
         pill::emit_state(&app_for_pill, PillState::Transcribing, None);
 
+        let language = if prefs.language == "auto" {
+            None
+        } else {
+            Some(prefs.language.as_str())
+        };
+
         let transcript = {
-            let stt_fut = stt::transcribe_wav(wav, &groq_key, &prefs.dictionary);
-            // Race the HTTP call against a 50 ms-tick cancel watcher. The
-            // watcher wakes the select whenever `canceled` flips or the
-            // session id moves, so cancel takes effect within ~50 ms even
-            // if the HTTP call would otherwise hang for the full timeout.
+            let stt_fut = stt_engine.transcribe(&wav, language, &prefs.dictionary);
             tokio::select! {
                 biased;
                 () = wait_for_cancel(&ctx, my_sid) => {
@@ -253,7 +251,7 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                         pill::emit_state(
                             &app_for_pill,
                             PillState::Error,
-                            Some(friendly_stt_error(&e)),
+                            Some(friendly_stt_error(&e, &prefs.stt_engine)),
                         );
                         hide_after_session(&app_for_pill, &ctx, my_sid, 3000);
                         return;
@@ -271,31 +269,31 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
-        // Decide whether to run LLM cleanup.
-        let cleaned = if prefs.cleanup_enabled && !anthropic_key.trim().is_empty() {
-            pill::emit_state(&app_for_pill, PillState::Polishing, None);
-            let llm_fut = llm::cleanup(&transcript, &anthropic_key, &prefs.dictionary);
-            tokio::select! {
-                biased;
-                () = wait_for_cancel(&ctx, my_sid) => {
-                    log::info!("LLM canceled / superseded; dropping request");
-                    if ctx.is_canceled() && !stale() {
-                        pill::emit_state(&app_for_pill, PillState::Canceled, None);
-                        hide_after_session(&app_for_pill, &ctx, my_sid, 600);
+        let cleaned = match llm_engine {
+            Some(engine) if engine.id() != "none" => {
+                pill::emit_state(&app_for_pill, PillState::Polishing, None);
+                let llm_fut = engine.cleanup(&transcript, "", &prefs.dictionary);
+                tokio::select! {
+                    biased;
+                    () = wait_for_cancel(&ctx, my_sid) => {
+                        log::info!("LLM canceled / superseded; dropping request");
+                        if ctx.is_canceled() && !stale() {
+                            pill::emit_state(&app_for_pill, PillState::Canceled, None);
+                            hide_after_session(&app_for_pill, &ctx, my_sid, 600);
+                        }
+                        return;
                     }
-                    return;
-                }
-                result = llm_fut => match result {
-                    Ok(t) => t,
-                    Err(llm::LlmError::TooShort) => transcript.clone(),
-                    Err(e) => {
-                        log::warn!("LLM cleanup failed: {e}; falling back to raw transcript");
-                        transcript.clone()
+                    result = llm_fut => match result {
+                        Ok(t) if !t.trim().is_empty() => t,
+                        Ok(_) => transcript.clone(),
+                        Err(e) => {
+                            log::warn!("LLM cleanup failed: {e}; falling back to raw transcript");
+                            transcript.clone()
+                        }
                     }
                 }
             }
-        } else {
-            transcript.clone()
+            _ => transcript.clone(),
         };
 
         if ctx.is_canceled() || stale() {
@@ -309,16 +307,12 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 
         log::info!("pasting {} chars (sid={my_sid})", cleaned.len());
 
-        // Record before paste (paste may fail but we still want the history).
         transcripts::push(&cleaned);
 
         let t = cleaned.clone();
         let paste_result =
             tauri::async_runtime::spawn_blocking(move || inject::paste_text(&t)).await;
 
-        // Last cancel check — by now the user has the text on their
-        // clipboard regardless, but suppress the Done state if we were
-        // canceled at the last moment.
         if ctx.is_canceled() || stale() {
             return;
         }
@@ -346,39 +340,23 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
     });
 }
 
-/// User triggered the cancel hotkey. Aborts whatever phase we're in:
-/// recording, transcribing, polishing, or just-before-paste.
 pub fn cancel<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
-    // No-op if there's nothing in flight. Without this guard, pressing the
-    // cancel hotkey with no session running would flash a stray "Canceled"
-    // pill, since the global hotkey listener fires unconditionally.
     if !ctx.is_pipeline_active() {
         log::debug!("cancel: no active pipeline; ignoring");
         return;
     }
 
-    // Flip the flag — any in-flight pipeline observes it within one cancel
-    // tick (50 ms) via `wait_for_cancel`.
     ctx.canceled.store(true, Ordering::SeqCst);
 
     if ctx.recording.load(Ordering::SeqCst) {
-        // Mid-recording: end_recording will see canceled=true and emit the
-        // Canceled pill while dropping the audio.
         end_recording(app, ctx);
     } else {
-        // Mid-pipeline: the in-flight task's wait_for_cancel poll will
-        // observe `canceled=true` and drop the HTTP future. Flash the pill
-        // for instant feedback.
         pill::emit_state(&app, PillState::Canceled, None);
         let app_arc = Arc::new(app.clone());
         pill::hide_after(&app_arc, 600);
     }
 }
 
-/// RAII guard that clears `pipeline_active` when the post-release pipeline
-/// task ends, however it ends — but only if our session id is still the
-/// active one. A re-press supersedes the old session and starts a new
-/// pipeline; the *old* task's guard must not clobber the new task's flag.
 struct PipelineGuard {
     flag: Arc<AtomicBool>,
     session_id: Arc<AtomicU64>,
@@ -403,14 +381,8 @@ impl Drop for PipelineGuard {
     }
 }
 
-/// Future that resolves when the active session changes (re-press) or a
-/// cancel is signaled for our session id. Used to race against in-flight
-/// HTTP calls so cancel takes effect quickly without a per-session async
-/// channel allocation.
 async fn wait_for_cancel(ctx: &SessionCtx, my_sid: u64) {
     loop {
-        // Check first so a cancel that fired before we were polled is
-        // observed immediately.
         if ctx.session_id.load(Ordering::SeqCst) != my_sid
             || ctx.canceled.load(Ordering::SeqCst)
         {
@@ -420,9 +392,6 @@ async fn wait_for_cancel(ctx: &SessionCtx, my_sid: u64) {
     }
 }
 
-/// Schedule a `pill::hide` after `ms`, but only if our session id is still
-/// the active one when the timer fires. Avoids hiding a fresh pill if the
-/// user re-pressed the hotkey during the timeout.
 fn hide_after_session<R: Runtime>(
     app: &AppHandle<R>,
     ctx: &SessionCtx,
@@ -439,9 +408,6 @@ fn hide_after_session<R: Runtime>(
     });
 }
 
-/// Approximate peak amplitude over a PCM16 WAV byte buffer (after the 44-byte
-/// header). Returns a value in [0, 1]. Cheap — used only as a "is this all
-/// silence?" check.
 fn wav_peak_pcm16(wav: &[u8]) -> f32 {
     let body = wav.get(44..).unwrap_or(&[]);
     let mut peak = 0i16;
@@ -455,14 +421,27 @@ fn wav_peak_pcm16(wav: &[u8]) -> f32 {
     peak as f32 / i16::MAX as f32
 }
 
-fn friendly_stt_error(e: &stt::SttError) -> String {
-    match e {
-        stt::SttError::MissingKey => "Add your Groq key in Settings.".into(),
-        stt::SttError::Network(_) => "Offline — Vox needs internet.".into(),
-        stt::SttError::Api { status, .. } if *status == 401 => "Groq key rejected.".into(),
-        stt::SttError::Api { .. } => "Transcription failed.".into(),
-        stt::SttError::Parse(_) => "Unexpected response from Groq.".into(),
+fn friendly_stt_error(e: &anyhow::Error, engine_id: &str) -> String {
+    let s = format!("{e}");
+    if engine_id == "groq" {
+        if s.contains("401") {
+            return "Groq key rejected.".into();
+        }
+        if s.contains("API key missing") {
+            return "Add your Groq key in Settings.".into();
+        }
+        if s.contains("network") {
+            return "Offline — Vox needs internet.".into();
+        }
+        return "Transcription failed.".into();
     }
+    if s.contains("not downloaded") {
+        return "Local model not downloaded — open Settings → Models.".into();
+    }
+    if s.contains("compiled out") {
+        return "Local engines not enabled in this build.".into();
+    }
+    "Transcription failed.".into()
 }
 
 fn spawn_max_record_guard<R: Runtime>(
@@ -499,4 +478,14 @@ fn spawn_audio_level_sampler<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             pill::emit_audio_level(&app, level);
         }
     });
+}
+
+/// Best-effort downcast of a generic AppHandle into the concrete Wry
+/// runtime we use in production. Returns `None` for non-Wry runtimes
+/// (only relevant for headless tests).
+fn try_into_wry<R: Runtime>(app: &AppHandle<R>) -> Option<AppHandle<Wry>> {
+    use std::any::Any;
+    // 'static guarantees Any-eligibility; AppHandle<R> is 'static.
+    let any: &dyn Any = app as &dyn Any;
+    any.downcast_ref::<AppHandle<Wry>>().cloned()
 }

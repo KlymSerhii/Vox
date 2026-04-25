@@ -1,13 +1,22 @@
-import { createMemo, createSignal, For, onMount, Show } from "solid-js";
+import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
-  getSettings,
-  setSettings,
-  testGroqConnection,
-  testAnthropicConnection,
-  replayOnboarding,
-  getLaunchAtLogin,
-  setLaunchAtLogin,
+  cancelDownload,
   checkForUpdates,
+  deleteModel,
+  downloadModel,
+  getLaunchAtLogin,
+  getSettings,
+  listModels,
+  onModelCanceled,
+  onModelDone,
+  onModelError,
+  onModelProgress,
+  replayOnboarding,
+  setLaunchAtLogin,
+  setSettings,
+  testAnthropicConnection,
+  testGroqConnection,
+  type ModelStatus,
   type Settings,
   type TestConnectionResult,
   type UpdateCheckResult,
@@ -16,6 +25,7 @@ import {
 type Tab =
   | "general"
   | "hotkeys"
+  | "models"
   | "keys"
   | "dictionary"
   | "privacy"
@@ -24,6 +34,7 @@ type Tab =
 const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "general", label: "General", icon: "sliders" },
   { id: "hotkeys", label: "Hotkeys", icon: "keyboard" },
+  { id: "models", label: "Models", icon: "cube" },
   { id: "keys", label: "API Keys", icon: "key" },
   { id: "dictionary", label: "Dictionary", icon: "book" },
   { id: "privacy", label: "Privacy", icon: "lock" },
@@ -76,8 +87,6 @@ export default function SettingsView() {
   onMount(async () => {
     try {
       const s = await getSettings();
-      // Reconcile launch-at-login with the OS state (which is the source
-      // of truth — the settings store is just a cache for the toggle).
       try {
         const osLaunch = await getLaunchAtLogin();
         if (osLaunch !== s.launch_at_login) {
@@ -90,7 +99,6 @@ export default function SettingsView() {
     } finally {
       setLoaded(true);
     }
-    // Cmd+, should just focus the window — already the case.
   });
 
   async function update(patch: Partial<Settings>) {
@@ -121,6 +129,9 @@ export default function SettingsView() {
               <Show when={tab() === "hotkeys"}>
                 <HotkeysTab s={s()} update={update} />
               </Show>
+              <Show when={tab() === "models"}>
+                <ModelsTab s={s()} update={update} />
+              </Show>
               <Show when={tab() === "keys"}>
                 <KeysTab s={s()} update={update} />
               </Show>
@@ -128,7 +139,7 @@ export default function SettingsView() {
                 <DictionaryTab s={s()} update={update} />
               </Show>
               <Show when={tab() === "privacy"}>
-                <PrivacyTab s={s()} update={update} />
+                <PrivacyTab s={s()} />
               </Show>
               <Show when={tab() === "about"}>
                 <AboutTab />
@@ -248,6 +259,13 @@ function TabIcon(props: { name: string; active: boolean }) {
           <line x1="12" y1="8" x2="12.01" y2="8" />
         </>
       )}
+      {props.name === "cube" && (
+        <>
+          <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+          <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
+          <line x1="12" y1="22.08" x2="12" y2="12" />
+        </>
+      )}
     </svg>
   );
 }
@@ -265,8 +283,6 @@ function Header(props: { tab: Tab; savedFlash: boolean }) {
     </header>
   );
 }
-
-// -------- Card/Row primitives --------
 
 function Card(props: { children: any }) {
   return (
@@ -354,15 +370,6 @@ function GeneralTab(props: {
           />
         </Row>
         <Row
-          label="Clean up with LLM"
-          hint="Polish punctuation, remove filler words via Claude Haiku 4.5."
-        >
-          <Toggle
-            checked={props.s.cleanup_enabled}
-            onChange={(v) => props.update({ cleanup_enabled: v })}
-          />
-        </Row>
-        <Row
           label="Play sound on start / stop"
           hint="Subtle audio cues when recording begins and ends. (Stub.)"
           last
@@ -416,7 +423,7 @@ function GeneralTab(props: {
       <Card>
         <Row
           label="Default microphone"
-          hint="Vox uses the current system default input device. (Phase 3 — device picker.)"
+          hint="Vox uses the current system default input device."
           last
         >
           <span class="text-[12px] text-[var(--color-ink-mute)]">
@@ -446,9 +453,7 @@ function HotkeysTab(props: {
           <select
             class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
             value={props.s.hotkey}
-            onChange={(e) =>
-              props.update({ hotkey: e.currentTarget.value })
-            }
+            onChange={(e) => props.update({ hotkey: e.currentTarget.value })}
           >
             <For each={HOTKEY_OPTIONS}>
               {(o) => <option value={o.value}>{o.label}</option>}
@@ -496,6 +501,357 @@ function HotkeysTab(props: {
   );
 }
 
+// -------- Models --------
+
+function ModelsTab(props: {
+  s: Settings;
+  update: (p: Partial<Settings>) => void;
+}) {
+  const [models, setModels] = createSignal<ModelStatus[]>([]);
+  const [progress, setProgress] = createSignal<
+    Record<string, { downloaded: number; total: number; eta: number | null }>
+  >({});
+  const [downloading, setDownloading] = createSignal<Set<string>>(new Set());
+
+  async function refresh() {
+    try {
+      setModels(await listModels());
+    } catch (e) {
+      console.error("listModels:", e);
+    }
+  }
+
+  let unlistens: (() => void)[] = [];
+  onMount(async () => {
+    await refresh();
+    unlistens.push(
+      await onModelProgress((p) => {
+        setProgress((prev) => ({
+          ...prev,
+          [p.id]: {
+            downloaded: p.bytes_downloaded,
+            total: p.total_bytes,
+            eta: p.eta_secs,
+          },
+        }));
+      }),
+    );
+    unlistens.push(
+      await onModelDone(async (p) => {
+        setDownloading((prev) => {
+          const next = new Set(prev);
+          next.delete(p.id);
+          return next;
+        });
+        setProgress((prev) => {
+          const { [p.id]: _, ...rest } = prev;
+          return rest;
+        });
+        await refresh();
+      }),
+    );
+    unlistens.push(
+      await onModelError((p) => {
+        console.error("model error", p);
+        setDownloading((prev) => {
+          const next = new Set(prev);
+          next.delete(p.id);
+          return next;
+        });
+      }),
+    );
+    unlistens.push(
+      await onModelCanceled((p) => {
+        setDownloading((prev) => {
+          const next = new Set(prev);
+          next.delete(p.id);
+          return next;
+        });
+        setProgress((prev) => {
+          const { [p.id]: _, ...rest } = prev;
+          return rest;
+        });
+      }),
+    );
+  });
+
+  onCleanup(() => {
+    unlistens.forEach((u) => u());
+  });
+
+  async function startDownload(id: string) {
+    setDownloading((prev) => {
+      const next = new Set(prev);
+      next.add(id);
+      return next;
+    });
+    try {
+      await downloadModel(id);
+    } catch (e) {
+      console.error("download:", e);
+      setDownloading((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
+  async function cancel(id: string) {
+    await cancelDownload(id);
+  }
+
+  async function remove(id: string) {
+    if (!confirm(`Delete the cached model ${id}?`)) return;
+    try {
+      await deleteModel(id);
+    } catch (e) {
+      console.error("delete:", e);
+    }
+    await refresh();
+  }
+
+  function setActiveStt(modelId: string) {
+    const desc = models().find((m) => m.descriptor.id === modelId)?.descriptor;
+    props.update({
+      stt_engine: desc?.engine === "whisper-local" ? "whisper-local" : "groq",
+      stt_model_id: modelId,
+    });
+  }
+
+  function setActiveLlm(modelId: string) {
+    const desc = models().find((m) => m.descriptor.id === modelId)?.descriptor;
+    props.update({
+      llm_engine: desc?.engine === "gemma-local" ? "gemma-local" : props.s.llm_engine,
+      llm_model_id: modelId,
+    });
+  }
+
+  const sttModels = createMemo(() =>
+    models().filter((m) => m.descriptor.kind === "stt"),
+  );
+  const llmModels = createMemo(() =>
+    models().filter((m) => m.descriptor.kind === "llm"),
+  );
+
+  return (
+    <>
+      <Card>
+        <Row
+          label="Speech-to-text engine"
+          hint="Local runs offline on your Mac. Cloud (Groq) is faster but sends audio off-device."
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.stt_engine}
+            onChange={(e) =>
+              props.update({ stt_engine: e.currentTarget.value })
+            }
+          >
+            <option value="whisper-local">Local (Whisper)</option>
+            <option value="groq">Cloud (Groq)</option>
+          </select>
+        </Row>
+      </Card>
+      <Show when={props.s.stt_engine === "whisper-local"}>
+        <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+          Whisper models
+        </div>
+        <For each={sttModels()}>
+          {(m) => (
+            <ModelRow
+              m={m}
+              isActive={props.s.stt_model_id === m.descriptor.id}
+              progress={progress()[m.descriptor.id]}
+              downloading={downloading().has(m.descriptor.id)}
+              onUse={() => setActiveStt(m.descriptor.id)}
+              onDownload={() => startDownload(m.descriptor.id)}
+              onCancel={() => cancel(m.descriptor.id)}
+              onDelete={() => remove(m.descriptor.id)}
+            />
+          )}
+        </For>
+      </Show>
+      <Show when={props.s.stt_engine === "groq"}>
+        <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)] text-[12px] text-[var(--color-ink-mute)]">
+          Cloud STT uses your Groq API key.{" "}
+          <Show when={!props.s.groq_api_key}>
+            <span class="text-[var(--color-danger)]">
+              Add one in API Keys.
+            </span>
+          </Show>
+        </div>
+      </Show>
+
+      <Card>
+        <Row
+          label="Cleanup engine"
+          hint="Polish punctuation, remove filler words. Set to Off to paste raw transcripts."
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.llm_engine}
+            onChange={(e) =>
+              props.update({ llm_engine: e.currentTarget.value })
+            }
+          >
+            <option value="gemma-local">Local (Gemma 4)</option>
+            <option value="anthropic">Cloud (Claude Haiku)</option>
+            <option value="none">Off (raw transcript)</option>
+          </select>
+        </Row>
+      </Card>
+      <Show when={props.s.llm_engine === "gemma-local"}>
+        <Show when={!props.s.gemma_tos_accepted}>
+          <div class="mb-3 rounded-[10px] bg-[rgba(124,156,255,0.08)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
+            You'll be asked to accept the{" "}
+            <a
+              class="underline"
+              href="https://ai.google.dev/gemma/terms"
+              target="_blank"
+            >
+              Gemma Terms of Use
+            </a>{" "}
+            on first download.
+          </div>
+        </Show>
+        <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+          Cleanup models
+        </div>
+        <For each={llmModels()}>
+          {(m) => (
+            <ModelRow
+              m={m}
+              isActive={props.s.llm_model_id === m.descriptor.id}
+              progress={progress()[m.descriptor.id]}
+              downloading={downloading().has(m.descriptor.id)}
+              onUse={() => setActiveLlm(m.descriptor.id)}
+              onDownload={() => startDownload(m.descriptor.id)}
+              onCancel={() => cancel(m.descriptor.id)}
+              onDelete={() => remove(m.descriptor.id)}
+            />
+          )}
+        </For>
+      </Show>
+      <Show when={props.s.llm_engine === "anthropic"}>
+        <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)] text-[12px] text-[var(--color-ink-mute)]">
+          Cloud cleanup uses your Anthropic API key.{" "}
+          <Show when={!props.s.anthropic_api_key}>
+            <span class="text-[var(--color-danger)]">
+              Add one in API Keys.
+            </span>
+          </Show>
+        </div>
+      </Show>
+    </>
+  );
+}
+
+function ModelRow(props: {
+  m: ModelStatus;
+  isActive: boolean;
+  progress?: { downloaded: number; total: number; eta: number | null };
+  downloading: boolean;
+  onUse: () => void;
+  onDownload: () => void;
+  onCancel: () => void;
+  onDelete: () => void;
+}) {
+  const sizeMb = () => Math.round(props.m.descriptor.size_bytes / 1_000_000);
+  const ramMb = () => props.m.descriptor.ram_peak_mb;
+
+  function formatBytes(b: number) {
+    if (b < 1024) return `${b} B`;
+    if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
+    if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
+    return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  }
+
+  return (
+    <div class="mb-3 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1">
+          <div class="flex items-center gap-2">
+            <span class="text-[13px] font-medium">{props.m.descriptor.name}</span>
+            <Show when={props.isActive}>
+              <span class="rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">
+                Active
+              </span>
+            </Show>
+          </div>
+          <div class="mt-0.5 text-[11px] text-[var(--color-ink-mute)]">
+            ~{sizeMb()} MB on disk · ~{ramMb()} MB peak RAM · tier:{" "}
+            {props.m.descriptor.tier}
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <Show when={props.m.installed && !props.isActive}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-black hover:bg-[var(--color-accent)]"
+              onClick={props.onUse}
+            >
+              Use
+            </button>
+          </Show>
+          <Show when={!props.m.installed && !props.downloading}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-black hover:brightness-110"
+              onClick={props.onDownload}
+            >
+              Download
+            </button>
+          </Show>
+          <Show when={props.downloading}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+              onClick={props.onCancel}
+            >
+              Cancel
+            </button>
+          </Show>
+          <Show when={props.m.installed}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+              onClick={props.onDelete}
+              title="Delete cached model"
+            >
+              Delete
+            </button>
+          </Show>
+        </div>
+      </div>
+      <Show when={props.downloading && props.progress}>
+        {(p) => (
+          <div class="mt-3">
+            <div class="flex justify-between text-[11px] text-[var(--color-ink-mute)]">
+              <span>
+                {formatBytes(p().downloaded)} / {formatBytes(p().total)}
+              </span>
+              <Show when={p().eta != null}>
+                <span>ETA {p().eta}s</span>
+              </Show>
+            </div>
+            <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-white/8">
+              <div
+                class="h-full rounded-full bg-[var(--color-accent)]"
+                style={{
+                  width: `${p().total > 0 ? Math.min(100, (p().downloaded / p().total) * 100) : 0}%`,
+                }}
+              />
+            </div>
+          </div>
+        )}
+      </Show>
+    </div>
+  );
+}
+
+// -------- Keys / Dictionary / Privacy / About --------
+
 function KeysTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
@@ -504,14 +860,14 @@ function KeysTab(props: {
     <>
       <ProviderKey
         title="Groq"
-        description="Used for Whisper transcription. Get a key at console.groq.com."
+        description="Used for cloud STT. Only required when STT engine is set to Cloud (Groq)."
         value={props.s.groq_api_key}
         onChange={(v) => props.update({ groq_api_key: v })}
         tester={testGroqConnection}
       />
       <ProviderKey
         title="Anthropic"
-        description="Used for LLM cleanup (Claude Haiku 4.5). Optional."
+        description="Used for cloud cleanup (Claude Haiku 4.5). Only required when Cleanup engine is set to Cloud."
         value={props.s.anthropic_api_key}
         onChange={(v) => props.update({ anthropic_api_key: v })}
         tester={testAnthropicConnection}
@@ -634,7 +990,7 @@ function DictionaryTab(props: {
         <div class="px-4 py-3">
           <p class="mb-3 text-[11px] text-[var(--color-ink-mute)]">
             Names, acronyms, and technical terms Vox should spell correctly.
-            Applied during the LLM cleanup step.
+            Applied during STT bias and the cleanup step.
           </p>
           <div class="mb-3 flex gap-2">
             <input
@@ -688,42 +1044,61 @@ function DictionaryTab(props: {
         </div>
       </Card>
       <p class="text-[11px] text-[var(--color-ink-mute)]">
-        {props.s.dictionary.length} term{props.s.dictionary.length === 1 ? "" : "s"}
-        .
+        {props.s.dictionary.length} term
+        {props.s.dictionary.length === 1 ? "" : "s"}.
       </p>
     </>
   );
 }
 
-function PrivacyTab(props: {
-  s: Settings;
-  update: (p: Partial<Settings>) => void;
-}) {
+function PrivacyTab(props: { s: Settings }) {
+  const audioGoes = () => {
+    if (props.s.stt_engine === "whisper-local") return "Stays on this Mac.";
+    return "Sent to Groq (cloud).";
+  };
+  const transcriptGoes = () => {
+    if (props.s.llm_engine === "none") return "Not sent anywhere.";
+    if (props.s.llm_engine === "gemma-local") return "Stays on this Mac.";
+    return "Sent to Anthropic (cloud).";
+  };
   return (
     <>
       <Card>
-        <Row
-          label="Send audio to cloud"
-          hint="When off, dictation is disabled — Vox has no local STT yet."
-          last
-        >
-          <Toggle
-            checked={props.s.send_audio_to_cloud}
-            onChange={(v) => props.update({ send_audio_to_cloud: v })}
-          />
+        <Row label="Audio" hint={audioGoes()} last>
+          <span
+            class="rounded-full px-2 py-0.5 text-[10px]"
+            classList={{
+              "bg-[var(--color-success)]/20 text-[var(--color-success)]":
+                props.s.stt_engine === "whisper-local",
+              "bg-[var(--color-accent)]/20 text-[var(--color-accent)]":
+                props.s.stt_engine !== "whisper-local",
+            }}
+          >
+            {props.s.stt_engine === "whisper-local" ? "LOCAL" : "CLOUD"}
+          </span>
+        </Row>
+      </Card>
+      <Card>
+        <Row label="Transcript cleanup" hint={transcriptGoes()} last>
+          <span
+            class="rounded-full px-2 py-0.5 text-[10px]"
+            classList={{
+              "bg-[var(--color-success)]/20 text-[var(--color-success)]":
+                props.s.llm_engine === "gemma-local" ||
+                props.s.llm_engine === "none",
+              "bg-[var(--color-accent)]/20 text-[var(--color-accent)]":
+                props.s.llm_engine === "anthropic",
+            }}
+          >
+            {props.s.llm_engine === "anthropic" ? "CLOUD" : "LOCAL"}
+          </span>
         </Row>
       </Card>
 
-      <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
-        <h3 class="mb-2 text-[13px] font-medium">What leaves your device</h3>
-        <ul class="space-y-1 text-[12px] text-[var(--color-ink-mute)]">
-          <li>• Audio → Groq (Whisper transcription)</li>
-          <li>
-            • Transcripts → Anthropic (only if cleanup is enabled and a key is
-            set)
-          </li>
-        </ul>
-      </div>
+      <p class="mb-4 text-[11px] text-[var(--color-ink-mute)]">
+        Change these in the Models tab. Engine choice is the source of truth
+        for what leaves your device.
+      </p>
 
       <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
         <h3 class="mb-2 text-[13px] font-medium">What never leaves</h3>
@@ -776,10 +1151,10 @@ function AboutTab() {
       <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-5 ring-1 ring-[var(--color-border)]">
         <div class="mb-1 text-[20px] font-semibold">Vox</div>
         <div class="text-[13px] text-[var(--color-ink-mute)]">
-          Talk to any app.
+          Talk to any app — now offline by default.
         </div>
         <div class="mt-3 text-[11px] text-[var(--color-ink-faint)]">
-          Version 0.1.0 · Phase 3 · Built with Tauri
+          Version 0.1.0 · Local-first · Built with Tauri
         </div>
       </div>
       <Card>
@@ -814,7 +1189,10 @@ function AboutTab() {
             </div>
           )}
         </Show>
-        <Row label="Replay onboarding" hint="Walk through the setup wizard again.">
+        <Row
+          label="Replay onboarding"
+          hint="Walk through the setup wizard again."
+        >
           <button
             type="button"
             onClick={onReplay}
@@ -836,4 +1214,3 @@ function AboutTab() {
     </>
   );
 }
-
