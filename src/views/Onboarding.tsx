@@ -269,7 +269,14 @@ function PrimaryButton(props: {
     <button
       type="button"
       disabled={disabled()}
-      onClick={isFinish() ? props.onFinish : props.onNext}
+      onClick={() => {
+        console.info("[onboarding] PrimaryButton click", { step: props.step, isFinish: isFinish() });
+        if (isFinish()) {
+          props.onFinish();
+        } else {
+          props.onNext();
+        }
+      }}
       class="inline-flex h-9 items-center gap-2 rounded-[8px] bg-[var(--color-accent)] px-4 text-[13px] font-medium text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
     >
       <Show

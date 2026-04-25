@@ -248,20 +248,20 @@ pub fn replay_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 
 #[tauri::command]
 pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    // Logged at error level so it's visible regardless of VOX_LOG/RUST_LOG.
+    log::error!("onboarding: finish_onboarding IPC entered");
     settings::mark_onboarded(&app);
-    log::info!("onboarding: finished, marked onboarded=true");
     if let Some(win) = app.get_webview_window(onboarding::LABEL) {
-        // We use `close()` rather than `hide()` so the wizard truly goes
-        // away — the frontmost-window settings/back/forth state is gone
-        // and a relaunch via `replay_onboarding` rebuilds it cleanly. The
-        // `WindowEvent::CloseRequested` handler in `lib.rs` lets the
-        // onboarding window close without intercepting.
-        win.close().map_err(|e| {
-            log::error!("onboarding: failed to close window: {e}");
-            e.to_string()
-        })?;
+        // Use `destroy()` to bypass any close-event handlers and tear the
+        // window down unconditionally. `close()` can race with rebuilds
+        // and silently no-op in dev when the window handle is stale.
+        if let Err(e) = win.destroy() {
+            log::error!("onboarding: destroy failed: {e}");
+            return Err(e.to_string());
+        }
+        log::error!("onboarding: window destroyed");
     } else {
-        log::warn!("onboarding: finish called but window not found");
+        log::error!("onboarding: finish called but window not found");
     }
     Ok(())
 }
