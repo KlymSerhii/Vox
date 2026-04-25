@@ -157,7 +157,17 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
-                    "settings" | "tray-popover" | "pill" | "migration" => {
+                    "migration" => {
+                        // Closing the title-bar X has the same dismissive
+                        // effect as the "Keep using cloud" button: we
+                        // flip `migration_seen = true` so the dialog
+                        // doesn't re-appear on every launch. Engine
+                        // settings are left untouched.
+                        crate::settings::mark_migration_seen(window.app_handle());
+                        let _ = window.hide();
+                        api.prevent_close();
+                    }
+                    "settings" | "tray-popover" | "pill" => {
                         let _ = window.hide();
                         api.prevent_close();
                     }
