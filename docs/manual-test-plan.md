@@ -338,6 +338,259 @@ not steal focus.
 
 ---
 
+## 10. Voice Modes (Round-2 differentiator)
+
+### 10.1 Built-ins seed on first run **[SMOKE]**
+1. Settings → **Modes** tab.
+2. **Expected:** five built-in modes are listed in this exact order:
+   General, Email, Chat, Code Comment, Notes. Each row shows an icon,
+   name, and short description; the active one is marked with a check.
+3. Confirm `~/Library/Application Support/com.vox.app/modes/` contains
+   five files (`general.json`, `email.json`, `chat.json`,
+   `code-comment.json`, `notes.json`).
+4. **Pass / Fail:** ___
+
+### 10.2 Mode chip on listening pill **[SMOKE]**
+1. With the Modes tab still active, click "Use" on Email.
+2. Click in TextEdit. Hold ⌥. **Expected:** the listening pill shows a
+   small "📧 Email" chip in addition to the waveform during recording.
+3. Release. The cleanup output should be in formal-sentence form (no
+   "hi"/"thanks" greeting auto-added).
+4. **Pass / Fail:** ___
+
+### 10.3 Tray popover dropdown
+1. Click the menu-bar icon. **Expected:** a "Voice mode" row appears
+   below the Dictation toggle, showing the active mode and a list of
+   all modes.
+2. Click "Chat" in the dropdown. Close the popover. Hold ⌥, dictate,
+   release. **Expected:** chat-style cleanup (lowercase ok, minimal
+   punctuation, capped at ~280 chars).
+3. **Pass / Fail:** ___
+
+### 10.4 Cycle hotkey ⌥M
+1. Without recording, press **⌥M**. **Expected:** the pill flashes the
+   next-mode chip for ~800 ms then hides. Each press advances to the
+   next mode in display order; wraps around at the end.
+2. **Expected (per round-2 review I8):** the cycle HUD also fires when
+   `dictation_enabled = false` — this is intentional.
+3. **Pass / Fail:** ___
+
+### 10.5 Suggestion HUD (auto-suggest)
+1. Settings → Modes → confirm "Show suggestion HUD" is on. Active mode
+   is, say, "General."
+2. Open Slack. Click into the message composer. Hold ⌥, start
+   speaking.
+3. **Expected:** within ~250 ms the right edge of the pill shows
+   "Switch to Chat? ⌥M". Pressing ⌥M during the recording switches the
+   mode for the *next* utterance (not this one — see I3 in code review).
+4. **Expected (mode-swap mid-flight contract):** if you cycle modes
+   *between* hotkey-release and STT-completion, the swap takes effect
+   on the next dictation. The current utterance was already committed
+   to the mode active at end-recording.
+5. Settings → Modes → toggle "Show suggestion HUD" off. Repeat — no
+   hint should appear.
+6. **Pass / Fail:** ___
+
+### 10.6 Duplicate / edit / save
+1. Settings → Modes → click "Duplicate to edit" on Email.
+2. **Expected:** a new "Email (Copy)" mode appears with `built_in:
+   false`; the editor opens with all fields editable.
+3. Change Name to "My Email", trim the system prompt, click Save.
+4. **Expected:** the row updates; reload Settings → Modes; the change
+   persists.
+5. Try saving an edit on a built-in mode (drive Save directly via
+   devtools if needed). **Expected:** rejected with `is_builtin`.
+6. **Pass / Fail:** ___
+
+### 10.7 Export / import .voxmode
+1. Click "Export" on the "My Email" mode from §10.6. **Expected:** a
+   `my-email.voxmode` (or similar slug) file lands in `~/Downloads`.
+2. **Drag** the `.voxmode` back onto the Modes tab. **Expected:** Vox
+   imports it; because the id collides with the original, the new id
+   gets a `-2` suffix; `built_in` stays false.
+3. Click "Import .voxmode" and pick the same file again. **Expected:**
+   id becomes `-3`. Each file roundtrips with no field loss.
+4. **Pass / Fail:** ___
+
+### 10.8 Reset to defaults
+1. Manually delete `email.json` from `~/Library/Application
+   Support/com.vox.app/modes/` in Finder.
+2. Settings → Modes → click "Reset to defaults".
+3. **Expected:** Email reappears in the list; user-edited modes are
+   not touched.
+4. **Pass / Fail:** ___
+
+---
+
+## 11. Local-model setup (Round-2 local-first pivot)
+
+### 11.1 First-run download flow **[SMOKE]**
+1. After a clean install (see "Before you start"), open Onboarding.
+2. Reach "Choose your stack" — by default "Run offline (recommended)"
+   is selected.
+3. **Expected (low-RAM Mac, < 12 GB):** the tier auto-pick shows
+   "Small tier" with a soft banner explaining why; you can override.
+4. **Expected (≥ 12 GB):** Balanced tier is recommended.
+5. Accept the Gemma TOS click-through. **Expected:** "Continue"
+   becomes enabled; clicking starts a parallel Whisper + Gemma
+   download with a single progress bar.
+6. **Expected:** progress events fire at most every 200 ms (no spam).
+   ETA decreases monotonically; total bytes match the catalog.
+7. On a flaky network, kill Wi-Fi mid-download and re-enable.
+   **Expected:** a resume picks up via HTTP `Range`; sha256 stays
+   correct.
+8. **Pass / Fail:** ___
+
+### 11.2 Models tab — switch tier
+1. Settings → Models. **Expected:** rows show Downloaded /
+   Downloading X% / Use / Delete. The default Whisper + Gemma rows
+   are marked Downloaded after onboarding.
+2. Click "Download" on a Quality tier model. While downloading, click
+   "Download" on the *same* row again.
+3. **Expected (round-2 C4 fix):** the second click is rejected with a
+   visible "already downloading" error — *not* a silent overwrite
+   that races on the same `.partial` file.
+4. Cancel. **Expected:** the partial file is preserved on disk
+   (resumable). Click Download again — resume kicks in.
+5. Switch active STT to the Quality model via "Use." Dictate. Verify
+   the engine label flips in the privacy chip.
+6. **Pass / Fail:** ___
+
+### 11.3 Migration dialog **[SMOKE — upgrade users only]**
+Skip if you are not upgrading from a pre-round-2 install.
+
+1. Start with a settings store that has `groq_api_key` set,
+   `cleanup_enabled = true`, `send_audio_to_cloud = true`,
+   `migration_seen` absent.
+2. Launch Vox. **Expected:** the migration dialog appears once.
+3. Click the title-bar **X** to close (do *not* click either of the
+   two dialog buttons).
+4. **Expected (round-2 C3 fix):** quit and relaunch — the dialog does
+   *not* re-appear. `migration_seen` was flipped on title-bar close.
+5. **Pass / Fail:** ___
+
+### 11.4 Privacy chips
+1. Settings → Privacy. **Expected:** read-only chips show LOCAL or
+   CLOUD per data flow direction (audio + transcript) based on the
+   active engines.
+2. Switch the STT engine to Groq in Models. **Expected:** the audio
+   chip flips to CLOUD. The chips are derived, not editable here.
+3. **Pass / Fail:** ___
+
+### 11.5 No GGUF in the bundle
+1. Build with `npm run tauri build -- --bundles app`.
+2. `find src-tauri/target/release/bundle/macos/Vox.app -name "*.gguf"
+   -o -name "*.bin" -o -name "*.ggml"` — should output nothing.
+3. **Expected:** bundle stays under ~25 MB; models live only in
+   `~/Library/Application Support/com.vox.app/models/`.
+4. **Pass / Fail:** ___
+
+---
+
+## 12. Multi-monitor pill placement
+
+1. Connect a secondary display (or use a virtual one). Move your
+   cursor onto the secondary screen and hold ⌥.
+2. **Expected:** the pill renders bottom-center of the *secondary*
+   screen, 96 px above the bottom edge.
+3. Move the cursor back to the primary; press again. **Expected:**
+   pill moves to the primary.
+4. Try a screen *above* the primary (System Settings → Displays →
+   drag the secondary above). **Expected:** the AppKit↔Tauri
+   coordinate flip is correct (Tauri Y becomes negative for
+   above-primary screens) and the pill still lands bottom-center of
+   the chosen display.
+5. **Pass / Fail:** ___
+
+---
+
+## 13. Paste-last-transcript hotkey (⌥⇧V)
+
+1. Dictate something into TextEdit. Confirm it pasted.
+2. Click somewhere else. Press **⌥⇧V**.
+3. **Expected:** the *most recent* transcript pastes into the new
+   focus — pulled from the in-memory ring buffer.
+4. Restart Vox. Press ⌥⇧V again.
+5. **Expected:** error pill "No recent transcript." (ring buffer is
+   memory-only, never persisted).
+6. While a real dictation is mid-pipeline (Transcribing or
+   Polishing), press ⌥⇧V. **Expected:** "Vox is busy with another
+   dictation." pill — the paste-last is refused mid-pipeline.
+7. **Pass / Fail:** ___
+
+---
+
+## 14. Security smoke (Round-2)
+
+These verify the staff-review fixes (C1, C2, C4).
+
+### 14.1 Mode-id path traversal (C1)
+1. Create a file `evil.voxmode` with this exact JSON:
+   ```json
+   {
+     "id": "../../../tmp/vox-pwned",
+     "name": "Pwned",
+     "icon": "💣",
+     "description": "",
+     "system_prompt": "x",
+     "punctuation": "Standard",
+     "case": "Sentence",
+     "created_at": 0,
+     "updated_at": 0
+   }
+   ```
+2. Drag it onto Settings → Modes.
+3. **Expected:** import succeeds, but the id is rewritten to a safe
+   slug (e.g. `pwned`). The mode lives in
+   `~/Library/Application Support/com.vox.app/modes/pwned.json` —
+   *not* `/tmp/vox-pwned.json`.
+4. Verify: `ls /tmp/vox-pwned.json 2>&1` should report "No such file."
+5. Try a `.voxmode` with `"id": "/etc/passwd-test"`. **Expected:**
+   same — re-slugged to safe shape; no write outside the modes dir.
+6. **Pass / Fail:** ___
+
+### 14.2 Updater stub does NOT call the network (C2)
+1. Verify the running config has `pubkey: ""` and an endpoint
+   containing `updates.vox.local`. (See `tauri.conf.json` plugins
+   section.)
+2. Open Settings → About → click "Check for updates".
+3. **Expected:** within ~50 ms (NOT 5–15 s) the UI shows
+   "Auto-update is not yet configured for this build." status:
+   `unconfigured`. No DNS lookup, no TCP handshake.
+4. Verification options (any one is enough):
+   - Run Little Snitch (or LuLu) and confirm no outgoing connection
+     to `updates.vox.local`.
+   - In a terminal: `sudo tcpdump -i any host updates.vox.local`
+     before clicking, and confirm no packets after the click.
+   - Read `commands.rs::check_for_updates` and confirm
+     `updater_is_stub()` short-circuits *before* `app.updater()` is
+     even invoked. (Code already verified by QA.)
+5. **Pass / Fail:** ___
+
+### 14.3 Mismatched-sha256 deletes the partial (download integrity)
+1. Wait for sha256s to be pinned in the catalog (T-01 in
+   `local-first-impl-notes.md`). Until then, this test is N/A —
+   `descriptor.sha256` is `None` and any byte stream is accepted.
+2. Once pinned: deliberately corrupt `model.bin.partial` mid-resume
+   (e.g. `dd if=/dev/urandom of=…/<id>/model.bin.partial conv=notrunc
+   bs=1 count=1024 seek=0`).
+3. Click Download to resume. **Expected:** sha256 mismatch detected;
+   the partial file is removed from disk (`std::fs::remove_file` at
+   `models.rs:480`); user can retry from scratch.
+4. **Pass / Fail:** ___
+
+### 14.4 Concurrent-download dedup (C4)
+1. Settings → Models → click "Download" on a not-yet-downloaded
+   model.
+2. *Immediately* (while the progress bar is moving) click "Download"
+   on the same model again.
+3. **Expected:** the second invocation surfaces an "already
+   downloading" error event (model:error). The first download
+   continues uninterrupted; the `.partial` file is not corrupted.
+4. **Pass / Fail:** ___
+
+---
+
 ## Summary checklist
 
 Smoke (10 minutes):
@@ -348,8 +601,12 @@ Smoke (10 minutes):
 - [ ] §3 golden path dictation in TextEdit
 - [ ] §6.1 misfire
 - [ ] §6.3 cancel mid-recording
+- [ ] §10.1 built-in modes seed
+- [ ] §10.2 mode chip on pill
+- [ ] §11.1 first-run local model download
+- [ ] §11.3 migration dialog (upgrade only)
 
-Full (45 minutes): everything above.
+Full (60 minutes): everything above.
 
 If everything in the smoke pass works and you're a small audience of
 willing dogfooders, you can ship. If anything in the smoke pass fails,
