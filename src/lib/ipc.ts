@@ -306,8 +306,23 @@ export interface ActiveHotkey {
   configured: string;
   bound: string;
   fell_back: boolean;
+  /** "shortcut" | "chord" | "" — which mechanism the binding uses.
+   *  "chord" means a CGEventTap modifier-only listener; "shortcut" is
+   *  the standard `tauri-plugin-global-shortcut` (Carbon) path. */
+  mechanism: string;
   error: string | null;
   error_chain: string[];
+}
+
+export interface DevBinaryInfo {
+  binary_path: string;
+  bundle_identifier: string;
+  is_dev_build: boolean;
+  accessibility_granted: boolean;
+}
+
+export async function revealDevBinaryPath(): Promise<DevBinaryInfo> {
+  return invoke<DevBinaryInfo>("reveal_dev_binary_path");
 }
 
 export interface HotkeyDiagnostic {

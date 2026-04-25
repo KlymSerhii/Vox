@@ -145,6 +145,47 @@ pub fn open_accessibility_settings<R: Runtime>(_app: AppHandle<R>) -> Result<(),
     Ok(())
 }
 
+/// Reveal the absolute path of the currently-running binary so the user
+/// can paste it into System Settings → Privacy & Security → Accessibility
+/// (the "+" button on that pane accepts a file path via Cmd+Shift+G).
+///
+/// Returned struct is consumed by the Settings → About row in dev mode:
+/// the UI copies `binary_path` to the clipboard and shows
+/// `bundle_identifier` so the user can verify whether they're looking
+/// at the dev binary (`vox-<hash>`) or the proper bundle (`com.vox.app`).
+#[derive(Debug, Serialize)]
+pub struct DevBinaryInfo {
+    pub binary_path: String,
+    pub bundle_identifier: String,
+    pub is_dev_build: bool,
+    pub accessibility_granted: bool,
+}
+
+#[tauri::command]
+pub fn reveal_dev_binary_path<R: Runtime>(app: AppHandle<R>) -> DevBinaryInfo {
+    let binary_path = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|e| format!("<unknown: {e}>"));
+    let bundle_identifier = app
+        .config()
+        .identifier
+        .clone();
+    // A "dev build" is any binary whose path contains `target/debug` /
+    // `target/release` AND whose parent isn't a `.app` bundle's MacOS
+    // dir. The .app bundle path looks like
+    // `<...>/target/debug/bundle/macos/Vox.app/Contents/MacOS/vox`,
+    // which we want to treat as "real bundle, not dev".
+    let is_dev_build = (binary_path.contains("/target/debug/")
+        || binary_path.contains("/target/release/"))
+        && !binary_path.contains(".app/Contents/MacOS/");
+    DevBinaryInfo {
+        binary_path,
+        bundle_identifier,
+        is_dev_build,
+        accessibility_granted: probe_accessibility(),
+    }
+}
+
 #[tauri::command]
 pub fn open_microphone_settings<R: Runtime>(_app: AppHandle<R>) -> Result<(), String> {
     #[cfg(target_os = "macos")]

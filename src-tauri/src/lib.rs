@@ -85,6 +85,7 @@ pub fn run() {
             commands::suggest_active_mode,
             commands::get_active_hotkey,
             commands::diagnose_hotkeys,
+            commands::reveal_dev_binary_path,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
