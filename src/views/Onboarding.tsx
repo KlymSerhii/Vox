@@ -3,6 +3,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   acceptGemmaTos,
   checkPermissions,
+  diagnoseHotkeys,
   downloadModel,
   finishOnboarding,
   getSettings,
@@ -16,6 +17,7 @@ import {
   setSettings,
   testAnthropicConnection,
   testGroqConnection,
+  type HotkeyDiagnostic,
   type PermissionStatus,
   type Settings,
   type TierRecommendation,
@@ -28,11 +30,15 @@ const LAST_STEP: Step = 6;
 const MODELS_STEP: Step = 5;
 
 /**
- * Render a Tauri global-shortcut spec like "Alt+Shift+V" or "AltRight"
- * as a compact glyph string, e.g. "⌥⇧V" / "⌥".
+ * Render a Tauri global-shortcut spec like "Alt+Shift+V" or "F13" as a
+ * compact glyph string, e.g. "⌥⇧V" / "F13".
  *
- * - The push-to-talk default in Rust is the literal `"AltRight"` — we
- *   special-case it to a bare `⌥` (right-Option).
+ * - Bare modifier IDs like `AltRight` / `AltLeft` are rendered as `⌥`
+ *   so the keycap row reads naturally even when the user has chosen
+ *   Right-Option (which we now warn about separately because it's
+ *   unreliable through tauri-plugin-global-shortcut on macOS).
+ * - The Tauri spec `"CommandOrControl+Shift+Space"` is collapsed to
+ *   `⌘⇧Space` rather than `CommandOrControl⇧Space`.
  * - Other shortcuts are split on `+` and each token mapped through the
  *   modifier table; unknown tokens fall through verbatim.
  */
@@ -51,6 +57,8 @@ export function formatHotkey(spec: string | null | undefined): string {
     Super: "⌘",
     Ctrl: "⌃",
     Control: "⌃",
+    CommandOrControl: "⌘",
+    Semicolon: ";",
   };
   return trimmed
     .split("+")
@@ -748,10 +756,43 @@ function TryStep() {
 }
 
 function HowToUseStep(props: { s: Settings | null }) {
-  const pttGlyph = () => formatHotkey(props.s?.hotkey) || "⌥";
-  const cycleGlyph = () => formatHotkey(props.s?.mode_cycle_hotkey) || "⌥M";
+  // Always render the BOUND hotkey (what the OS will actually fire),
+  // not the configured one — they can differ when the configured key
+  // wasn't registerable and the runtime fell back. We fetch the active
+  // bindings on mount so the keycaps read the truth even on a fresh
+  // install where settings haven't been touched.
+  const [diags, setDiags] = createSignal<Map<string, HotkeyDiagnostic>>(
+    new Map(),
+  );
+
+  onMount(async () => {
+    try {
+      const d = await diagnoseHotkeys();
+      const map = new Map<string, HotkeyDiagnostic>();
+      for (const e of d.entries) map.set(e.purpose, e);
+      setDiags(map);
+    } catch (err) {
+      console.warn("diagnoseHotkeys failed:", err);
+    }
+  });
+
+  const ptt = () => diags().get("push-to-talk");
+  const cycle = () => diags().get("mode-cycle");
+  const paste = () => diags().get("paste-last");
+
+  const pttGlyph = () =>
+    formatHotkey(ptt()?.bound) ||
+    formatHotkey(props.s?.hotkey) ||
+    "F13";
+  const cycleGlyph = () =>
+    formatHotkey(cycle()?.bound) ||
+    formatHotkey(props.s?.mode_cycle_hotkey) ||
+    "⌥M";
   const pasteGlyph = () =>
-    formatHotkey(props.s?.paste_last_hotkey) || "⌥⇧V";
+    formatHotkey(paste()?.bound) ||
+    formatHotkey(props.s?.paste_last_hotkey) ||
+    "⌥⇧V";
+
   return (
     <div class="flex w-full max-w-[420px] flex-col gap-5">
       <div class="flex flex-col gap-2">
@@ -768,14 +809,17 @@ function HowToUseStep(props: { s: Settings | null }) {
         <TipRow
           label={<>Hold <span class="keycap">{pttGlyph()}</span></>}
           description="to start dictating in any text field. Release when done."
+          fellBackNote={fellBackNote(ptt())}
         />
         <TipRow
           label={<span class="keycap">{cycleGlyph()}</span>}
           description="to cycle Voice Modes. Match your tone to the app you're in."
+          fellBackNote={fellBackNote(cycle())}
         />
         <TipRow
           label={<span class="keycap">{pasteGlyph()}</span>}
           description="to paste your last transcript again."
+          fellBackNote={fellBackNote(paste())}
         />
       </ul>
 
@@ -787,18 +831,33 @@ function HowToUseStep(props: { s: Settings | null }) {
   );
 }
 
+function fellBackNote(d: HotkeyDiagnostic | undefined): string | null {
+  if (!d || !d.fell_back || !d.bound) return null;
+  const cfg = formatHotkey(d.configured) || d.configured;
+  const bnd = formatHotkey(d.bound) || d.bound;
+  return `Configured ${cfg} wasn't available on your Mac — Vox is using ${bnd}.`;
+}
+
 function TipRow(props: {
   label: JSX.Element;
   description: string;
+  fellBackNote?: string | null;
 }) {
   return (
-    <li class="flex items-baseline gap-2 rounded-[10px] bg-white/4 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
-      <span class="text-[13px] font-medium text-[var(--color-ink)]">
-        {props.label}
-      </span>
-      <span class="text-[13px] text-[var(--color-ink-mute)]">
-        {props.description}
-      </span>
+    <li class="flex flex-col gap-1 rounded-[10px] bg-white/4 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+      <div class="flex items-baseline gap-2">
+        <span class="text-[13px] font-medium text-[var(--color-ink)]">
+          {props.label}
+        </span>
+        <span class="text-[13px] text-[var(--color-ink-mute)]">
+          {props.description}
+        </span>
+      </div>
+      <Show when={props.fellBackNote}>
+        <span class="text-[11px] text-[var(--color-ink-faint)]">
+          {props.fellBackNote}
+        </span>
+      </Show>
     </li>
   );
 }

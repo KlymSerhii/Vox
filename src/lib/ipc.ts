@@ -300,6 +300,37 @@ export async function suggestActiveMode(): Promise<string | null> {
   return invoke<string | null>("suggest_active_mode");
 }
 
+// ---- Hotkey diagnostics ----
+
+export interface ActiveHotkey {
+  configured: string;
+  bound: string;
+  fell_back: boolean;
+  error: string | null;
+  error_chain: string[];
+}
+
+export interface HotkeyDiagnostic {
+  purpose: string;
+  configured: string;
+  bound: string;
+  fell_back: boolean;
+  error: string | null;
+  error_chain: string[];
+}
+
+export interface DiagnoseHotkeys {
+  entries: HotkeyDiagnostic[];
+}
+
+export async function getActiveHotkey(): Promise<ActiveHotkey> {
+  return invoke<ActiveHotkey>("get_active_hotkey");
+}
+
+export async function diagnoseHotkeys(): Promise<DiagnoseHotkeys> {
+  return invoke<DiagnoseHotkeys>("diagnose_hotkeys");
+}
+
 export interface ActiveModePayload {
   id: string;
   name: string;

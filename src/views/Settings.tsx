@@ -1,12 +1,22 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import {
+  createMemo,
+  createSignal,
+  For,
+  type JSX,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import {
   cancelDownload,
   checkForUpdates,
   deleteMode,
   deleteModel,
+  diagnoseHotkeys,
   downloadModel,
   duplicateMode,
   exportMode,
+  getActiveHotkey,
   getLaunchAtLogin,
   getSettings,
   importModeJson,
@@ -24,6 +34,8 @@ import {
   testAnthropicConnection,
   testGroqConnection,
   type CaseStyle,
+  type DiagnoseHotkeys,
+  type HotkeyDiagnostic,
   type ModelStatus,
   type PunctuationStyle,
   type Settings,
@@ -53,22 +65,41 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "about", label: "About", icon: "info" },
 ];
 
-const HOTKEY_OPTIONS: { value: string; label: string }[] = [
-  { value: "AltRight", label: "Right Option (⌥)" },
-  { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
-  { value: "F13", label: "F13" },
+interface HotkeyOption {
+  value: string;
+  label: string;
+  /** When true the picker renders a small ⚠︎ glyph and a tooltip
+   * explaining the runtime fallback. Right-Option falls into this
+   * bucket because `tauri-plugin-global-shortcut` reports an
+   * "Unknown scancode for AltRight" error on most macOS keymaps and
+   * the dictation hotkey would silently fail to bind. */
+  warn?: string;
+}
+
+const HOTKEY_OPTIONS: HotkeyOption[] = [
+  { value: "F13", label: "F13 (recommended)" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
+  { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
+  { value: "CommandOrControl+Shift+Semicolon", label: "⌘⇧;" },
+  {
+    value: "AltRight",
+    label: "Right Option (⌥)",
+    warn:
+      "Right-Option fails to bind on most Macs through " +
+      "tauri-plugin-global-shortcut. If it doesn't work, Vox will " +
+      "automatically fall back to F13 — but the picker won't update.",
+  },
 ];
 
-const CANCEL_HOTKEY_OPTIONS: { value: string; label: string }[] = [
+const CANCEL_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "Escape", label: "Esc" },
   { value: "F13", label: "F13" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
 ];
 
-const PASTE_LAST_HOTKEY_OPTIONS: { value: string; label: string }[] = [
+const PASTE_LAST_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "Alt+Shift+V", label: "⌥⇧V" },
   { value: "CommandOrControl+Shift+V", label: "⌘⇧V" },
   { value: "F13", label: "F13" },
@@ -76,7 +107,7 @@ const PASTE_LAST_HOTKEY_OPTIONS: { value: string; label: string }[] = [
   { value: "F15", label: "F15" },
 ];
 
-const MODE_CYCLE_HOTKEY_OPTIONS: { value: string; label: string }[] = [
+const MODE_CYCLE_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "Alt+M", label: "⌥M" },
   { value: "Alt+Shift+M", label: "⌥⇧M" },
   { value: "CommandOrControl+Shift+M", label: "⌘⇧M" },
@@ -485,82 +516,210 @@ function HotkeysTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
 }) {
+  const [diags, setDiags] = createSignal<Map<string, HotkeyDiagnostic>>(
+    new Map(),
+  );
+  const [testStatus, setTestStatus] = createSignal<string | null>(null);
+
+  async function refreshDiagnostics() {
+    try {
+      const r = await diagnoseHotkeys();
+      const map = new Map<string, HotkeyDiagnostic>();
+      for (const e of r.entries) map.set(e.purpose, e);
+      setDiags(map);
+    } catch (e) {
+      console.warn("diagnoseHotkeys failed:", e);
+    }
+  }
+
+  onMount(() => {
+    void refreshDiagnostics();
+  });
+
+  async function onTest() {
+    setTestStatus("Reading…");
+    try {
+      const a = await getActiveHotkey();
+      if (!a.bound) {
+        setTestStatus(`Failed: ${a.error ?? "no fallback succeeded"}`);
+      } else if (a.fell_back) {
+        setTestStatus(`Bound to ${a.bound} (fallback from ${a.configured})`);
+      } else {
+        setTestStatus(`Bound to ${a.bound}`);
+      }
+    } catch (e) {
+      setTestStatus(`Failed: ${String(e)}`);
+    }
+  }
+
+  const ptt = () => diags().get("push-to-talk") ?? null;
+  const cancel = () => diags().get("cancel") ?? null;
+  const paste = () => diags().get("paste-last") ?? null;
+  const cycle = () => diags().get("mode-cycle") ?? null;
+
   return (
     <>
       <Card>
-        <Row
+        <HotkeyRow
           label="Push-to-talk"
           hint={
             props.s.hands_free_enabled
               ? "Press once to start recording, press again to stop. (Hands-free is on.)"
               : "Hold this key to record; release to transcribe."
           }
-        >
-          <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.hotkey}
-            onChange={(e) => props.update({ hotkey: e.currentTarget.value })}
-          >
-            <For each={HOTKEY_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
-            </For>
-          </select>
-        </Row>
-        <Row
+          configured={props.s.hotkey}
+          diagnostic={ptt()}
+          options={HOTKEY_OPTIONS}
+          onChange={(v) => props.update({ hotkey: v })}
+          extra={
+            <>
+              <button
+                type="button"
+                onClick={() => void onTest()}
+                class="rounded-[6px] bg-white/8 px-3 py-1 text-[11px] hover:bg-white/12"
+                title="Read the current binding from the runtime"
+              >
+                Test
+              </button>
+              <Show when={testStatus()}>
+                <span
+                  class="rounded-full bg-black/40 px-2 py-0.5 text-[10px]"
+                  classList={{
+                    "text-[var(--color-success)]":
+                      testStatus()?.startsWith("Bound") ?? false,
+                    "text-[var(--color-danger)]":
+                      testStatus()?.startsWith("Failed") ?? false,
+                    "text-[var(--color-ink-mute)]":
+                      testStatus() === "Reading…",
+                  }}
+                >
+                  {testStatus()}
+                </span>
+              </Show>
+            </>
+          }
+        />
+        <HotkeyRow
           label="Cancel while recording"
           hint="Abort the pipeline without pasting."
-        >
-          <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.cancel_hotkey}
-            onChange={(e) =>
-              props.update({ cancel_hotkey: e.currentTarget.value })
-            }
-          >
-            <For each={CANCEL_HOTKEY_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
-            </For>
-          </select>
-        </Row>
-        <Row
+          configured={props.s.cancel_hotkey}
+          diagnostic={cancel()}
+          options={CANCEL_HOTKEY_OPTIONS}
+          onChange={(v) => props.update({ cancel_hotkey: v })}
+        />
+        <HotkeyRow
           label="Paste last transcript"
           hint="Re-paste the most recent dictation at the cursor."
-        >
-          <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.paste_last_hotkey}
-            onChange={(e) =>
-              props.update({ paste_last_hotkey: e.currentTarget.value })
-            }
-          >
-            <For each={PASTE_LAST_HOTKEY_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
-            </For>
-          </select>
-        </Row>
-        <Row
+          configured={props.s.paste_last_hotkey}
+          diagnostic={paste()}
+          options={PASTE_LAST_HOTKEY_OPTIONS}
+          onChange={(v) => props.update({ paste_last_hotkey: v })}
+        />
+        <HotkeyRow
           label="Cycle voice mode"
           hint="Press to advance through Voice Modes in display order."
+          configured={props.s.mode_cycle_hotkey}
+          diagnostic={cycle()}
+          options={MODE_CYCLE_HOTKEY_OPTIONS}
+          onChange={(v) => props.update({ mode_cycle_hotkey: v })}
           last
-        >
-          <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.mode_cycle_hotkey}
-            onChange={(e) =>
-              props.update({ mode_cycle_hotkey: e.currentTarget.value })
-            }
-          >
-            <For each={MODE_CYCLE_HOTKEY_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
-            </For>
-          </select>
-        </Row>
+        />
       </Card>
       <p class="text-[11px] text-[var(--color-ink-mute)]">
-        Hotkey changes take effect after the app restarts.
+        Hotkey changes take effect after the app restarts. If the
+        configured key fails to bind on macOS, Vox falls back to the
+        next compatible shortcut and shows it under the picker.
       </p>
     </>
   );
+}
+
+function HotkeyRow(props: {
+  label: string;
+  hint: string;
+  configured: string;
+  diagnostic: HotkeyDiagnostic | null;
+  options: HotkeyOption[];
+  onChange: (v: string) => void;
+  extra?: JSX.Element;
+  last?: boolean;
+}) {
+  const boundLabel = () => {
+    const d = props.diagnostic;
+    if (!d) return null;
+    if (!d.bound) return null;
+    return labelForValue(props.options, d.bound) ?? d.bound;
+  };
+  const configuredLabel = () =>
+    labelForValue(props.options, props.configured) ?? props.configured;
+  const showBoundOverride = () => {
+    const d = props.diagnostic;
+    return d && d.fell_back && d.bound && d.bound !== props.configured;
+  };
+  const failed = () => {
+    const d = props.diagnostic;
+    return d != null && !d.bound && props.configured !== "";
+  };
+  return (
+    <div
+      class="flex items-start justify-between gap-4 px-4 py-3"
+      classList={{
+        "border-b border-[var(--color-border)]": !props.last,
+      }}
+    >
+      <div class="flex flex-col">
+        <div class="flex items-center gap-2">
+          <span class="text-[13px] text-[var(--color-ink)]">{props.label}</span>
+          <Show when={showBoundOverride()}>
+            <span class="rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">
+              Bound to {boundLabel()}
+            </span>
+          </Show>
+          <Show when={failed()}>
+            <span class="rounded-full bg-[var(--color-danger)]/20 px-2 py-0.5 text-[10px] text-[var(--color-danger)]">
+              Not bound
+            </span>
+          </Show>
+        </div>
+        <span class="text-[11px] text-[var(--color-ink-mute)]">
+          {props.hint}
+        </span>
+        <Show when={showBoundOverride()}>
+          <span class="text-[11px] text-[var(--color-ink-faint)]">
+            Configured {configuredLabel()} couldn't be bound on this
+            Mac — Vox is using {boundLabel()}.
+          </span>
+        </Show>
+        <Show when={failed() && props.diagnostic?.error}>
+          <span class="text-[11px] text-[var(--color-danger)]">
+            {props.diagnostic?.error}
+          </span>
+        </Show>
+      </div>
+      <div class="flex shrink-0 items-center gap-2">
+        <select
+          class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          value={props.configured}
+          onChange={(e) => props.onChange(e.currentTarget.value)}
+        >
+          <For each={props.options}>
+            {(o) => (
+              <option value={o.value}>
+                {o.warn ? "⚠︎ " : ""}
+                {o.label}
+              </option>
+            )}
+          </For>
+        </select>
+        {props.extra}
+      </div>
+    </div>
+  );
+}
+
+function labelForValue(opts: HotkeyOption[], value: string): string | null {
+  const m = opts.find((o) => o.value === value);
+  return m?.label ?? null;
 }
 
 // -------- Models --------
@@ -1816,12 +1975,24 @@ function AboutTab() {
   const [updateResult, setUpdateResult] = createSignal<UpdateCheckResult | null>(
     null,
   );
+  const [diag, setDiag] = createSignal<DiagnoseHotkeys | null>(null);
+  const [diagErr, setDiagErr] = createSignal<string | null>(null);
 
   async function onReplay() {
     try {
       await replayOnboarding();
     } catch (err) {
       console.error(err);
+    }
+  }
+
+  async function onDiagnostics() {
+    setDiagErr(null);
+    setDiag(null);
+    try {
+      setDiag(await diagnoseHotkeys());
+    } catch (err) {
+      setDiagErr(String(err));
     }
   }
 
@@ -1897,6 +2068,32 @@ function AboutTab() {
           </button>
         </Row>
         <Row
+          label="Diagnostics"
+          hint="Print hotkey bindings and any registration errors."
+        >
+          <button
+            type="button"
+            onClick={() => void onDiagnostics()}
+            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+          >
+            Run
+          </button>
+        </Row>
+        <Show when={diagErr()}>
+          <div class="px-4 py-3 text-[12px] text-[var(--color-danger)] border-b border-[var(--color-border)]">
+            {diagErr()}
+          </div>
+        </Show>
+        <Show when={diag()}>
+          {(d) => (
+            <div class="px-4 py-3 border-b border-[var(--color-border)]">
+              <pre class="overflow-x-auto rounded-[6px] bg-black/40 p-3 text-[11px] text-[var(--color-ink)]">
+                {formatDiagnostics(d())}
+              </pre>
+            </div>
+          )}
+        </Show>
+        <Row
           label="GitHub"
           hint="Report an issue or read the source."
           last
@@ -1908,4 +2105,25 @@ function AboutTab() {
       </Card>
     </>
   );
+}
+
+function formatDiagnostics(d: DiagnoseHotkeys): string {
+  if (d.entries.length === 0) {
+    return "No hotkey state available — restart the app.";
+  }
+  const lines: string[] = [];
+  for (const e of d.entries) {
+    const cfg = e.configured || "<off>";
+    const bnd = e.bound || "<unbound>";
+    lines.push(
+      `${e.purpose.padEnd(14)} configured=${cfg.padEnd(28)} bound=${bnd}` +
+        (e.fell_back ? "  [fallback]" : ""),
+    );
+    if (e.error_chain.length > 0) {
+      for (const err of e.error_chain) {
+        lines.push(`               · ${err}`);
+      }
+    }
+  }
+  return lines.join("\n");
 }

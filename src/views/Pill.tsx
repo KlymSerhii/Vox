@@ -87,16 +87,23 @@ export default function PillView() {
     for (const u of unlisten) u();
   });
 
+  // Done state should show a brief green flash before the pill auto-
+  // hides (Rust calls hide_after with 700ms). We mirror that timing on
+  // the visual layer so the inset glow runs for the full visible
+  // window. CSS handles the actual transition.
+  const isDone = () => state() === "done";
+
   return (
     <div class="flex h-screen w-screen items-center justify-center bg-transparent">
       <div
-        class="animate-pill-in pointer-events-none flex h-14 w-[272px] items-center gap-3 rounded-full px-4"
+        class="animate-pill-in pointer-events-none flex h-14 w-[272px] items-center gap-3 rounded-full px-4 transition-shadow duration-300"
         style={{
           background: "rgba(11, 11, 13, 0.82)",
           "backdrop-filter": "blur(24px) saturate(180%)",
           "-webkit-backdrop-filter": "blur(24px) saturate(180%)",
-          "box-shadow":
-            "0 8px 32px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(255,255,255,0.08)",
+          "box-shadow": isDone()
+            ? "0 8px 32px rgba(0,0,0,0.32), inset 0 0 0 2px var(--color-success), 0 0 24px rgba(74, 222, 128, 0.55)"
+            : "0 8px 32px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(255,255,255,0.08)",
         }}
         role="status"
         aria-live="polite"
