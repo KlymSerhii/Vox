@@ -26,14 +26,17 @@ import {
   onModelDone,
   onModelError,
   onModelProgress,
+  openAccessibilitySettings,
   replayOnboarding,
   resetDefaultModes,
+  revealDevBinaryPath,
   saveMode,
   setLaunchAtLogin,
   setSettings,
   testAnthropicConnection,
   testGroqConnection,
   type CaseStyle,
+  type DevBinaryInfo,
   type DiagnoseHotkeys,
   type HotkeyDiagnostic,
   type ModelStatus,
@@ -82,20 +85,28 @@ const HOTKEY_OPTIONS: HotkeyOption[] = [
   // and they're the whispr-flow style hold-to-talk UX. Storage uses
   // the canonical `Alt+...` token name; the label uses macOS naming
   // ("Option" not "Alt") to match what's printed on the keys.
+  //
+  // Chord configurations require Accessibility permission and never
+  // auto-fall-back to a key. If the chord install fails the picker
+  // surfaces a clear "Not bound — Accessibility required" chip and a
+  // link into System Settings — see `HotkeyRow.failed`.
   { value: "Alt+Control", label: "Option + Control (recommended)" },
   { value: "Alt+Shift", label: "Option + Shift" },
+  // Explicit-key options. These users have full-size keyboards or
+  // prefer a press-and-release single key; we keep F13/F14/F15 here
+  // for them but they are NEVER auto-substituted in for a chord.
+  { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
+  { value: "CommandOrControl+Shift+Semicolon", label: "⌘⇧;" },
   { value: "F13", label: "F13" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
-  { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
-  { value: "CommandOrControl+Shift+Semicolon", label: "⌘⇧;" },
   {
     value: "AltRight",
     label: "Right Option (⌥)",
     warn:
       "Right-Option fails to bind on most Macs through " +
-      "tauri-plugin-global-shortcut. If it doesn't work, Vox will " +
-      "automatically fall back to F13 — but the picker won't update.",
+      "tauri-plugin-global-shortcut. If it doesn't work the picker will " +
+      "show a 'Not bound' chip — choose another option from this list.",
   },
 ];
 
@@ -663,6 +674,19 @@ function HotkeyRow(props: {
     const d = props.diagnostic;
     return d != null && !d.bound && props.configured !== "";
   };
+  const chordRequiresAx = () => {
+    const d = props.diagnostic;
+    if (!d || d.bound) return false;
+    // Heuristic: any failed binding whose error mentions Accessibility
+    // OR whose configured value parses as a chord (only modifier
+    // tokens). Keeps the link visible even if the underlying error
+    // string changes wording — modifier-only specs only ever fail for
+    // permission reasons.
+    if (d.error?.toLowerCase().includes("accessibility")) return true;
+    return isModifierOnlySpec(d.configured);
+  };
+  const failedChip = () =>
+    chordRequiresAx() ? "Not bound — Accessibility required" : "Not bound";
   return (
     <div
       class="flex items-start justify-between gap-4 px-4 py-3"
@@ -680,7 +704,7 @@ function HotkeyRow(props: {
           </Show>
           <Show when={failed()}>
             <span class="rounded-full bg-[var(--color-danger)]/20 px-2 py-0.5 text-[10px] text-[var(--color-danger)]">
-              Not bound
+              {failedChip()}
             </span>
           </Show>
         </div>
@@ -697,6 +721,15 @@ function HotkeyRow(props: {
           <span class="text-[11px] text-[var(--color-danger)]">
             {props.diagnostic?.error}
           </span>
+        </Show>
+        <Show when={chordRequiresAx()}>
+          <button
+            type="button"
+            onClick={() => void openAccessibilitySettings()}
+            class="mt-1 self-start rounded-[6px] bg-[var(--color-danger)]/15 px-2 py-1 text-[11px] text-[var(--color-danger)] hover:bg-[var(--color-danger)]/25"
+          >
+            Open Accessibility settings
+          </button>
         </Show>
       </div>
       <div class="flex shrink-0 items-center gap-2">
@@ -723,6 +756,27 @@ function HotkeyRow(props: {
 function labelForValue(opts: HotkeyOption[], value: string): string | null {
   const m = opts.find((o) => o.value === value);
   return m?.label ?? null;
+}
+
+/** True if the hotkey id is composed only of modifier tokens (no base
+ * key). Mirrors the parser in `mac_chord::try_parse_chord`. */
+function isModifierOnlySpec(spec: string | null | undefined): boolean {
+  if (!spec) return false;
+  const tokens = spec.split("+").map((t) => t.trim());
+  if (tokens.length === 0 || tokens.some((t) => !t)) return false;
+  const MODS = new Set([
+    "Alt",
+    "Option",
+    "Ctrl",
+    "Control",
+    "Cmd",
+    "Command",
+    "Meta",
+    "Super",
+    "CommandOrControl",
+    "Shift",
+  ]);
+  return tokens.every((t) => MODS.has(t));
 }
 
 /** Subtext under the push-to-talk row. When the bound hotkey is a
@@ -1996,6 +2050,8 @@ function AboutTab() {
   );
   const [diag, setDiag] = createSignal<DiagnoseHotkeys | null>(null);
   const [diagErr, setDiagErr] = createSignal<string | null>(null);
+  const [devInfo, setDevInfo] = createSignal<DevBinaryInfo | null>(null);
+  const [devCopied, setDevCopied] = createSignal(false);
 
   async function onReplay() {
     try {
@@ -2012,6 +2068,25 @@ function AboutTab() {
       setDiag(await diagnoseHotkeys());
     } catch (err) {
       setDiagErr(String(err));
+    }
+  }
+
+  async function onRevealDevPath() {
+    try {
+      const info = await revealDevBinaryPath();
+      setDevInfo(info);
+      // Best-effort: copy the dev binary path to the clipboard so the
+      // user can paste it into System Settings → Privacy & Security →
+      // Accessibility's Cmd+Shift+G "Go to folder" prompt.
+      try {
+        await navigator.clipboard.writeText(info.binary_path);
+        setDevCopied(true);
+      } catch {
+        setDevCopied(false);
+      }
+      await openAccessibilitySettings();
+    } catch (err) {
+      console.error(err);
     }
   }
 
@@ -2098,6 +2173,41 @@ function AboutTab() {
             Run
           </button>
         </Row>
+        <Row
+          label="Open Accessibility settings"
+          hint="Copies this build's binary path to the clipboard so you can paste it into Privacy & Security → Accessibility (Cmd+Shift+G)."
+        >
+          <button
+            type="button"
+            onClick={() => void onRevealDevPath()}
+            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+          >
+            Open & copy path
+          </button>
+        </Row>
+        <Show when={devInfo()}>
+          {(d) => (
+            <div class="px-4 py-3 border-b border-[var(--color-border)] flex flex-col gap-1">
+              <span class="text-[11px] text-[var(--color-ink-mute)]">
+                Bundle id: <code class="text-[var(--color-ink)]">{d().bundle_identifier}</code>
+                <Show when={d().is_dev_build}>
+                  <span class="ml-2 rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">dev build</span>
+                </Show>
+                <Show when={!d().accessibility_granted}>
+                  <span class="ml-2 rounded-full bg-[var(--color-danger)]/20 px-2 py-0.5 text-[10px] text-[var(--color-danger)]">accessibility denied</span>
+                </Show>
+              </span>
+              <span class="text-[11px] text-[var(--color-ink-faint)] break-all">
+                {d().binary_path}
+              </span>
+              <Show when={devCopied()}>
+                <span class="text-[11px] text-[var(--color-success)]">
+                  Path copied to clipboard.
+                </span>
+              </Show>
+            </div>
+          )}
+        </Show>
         <Show when={diagErr()}>
           <div class="px-4 py-3 text-[12px] text-[var(--color-danger)] border-b border-[var(--color-border)]">
             {diagErr()}

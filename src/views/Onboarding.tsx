@@ -808,8 +808,18 @@ function HowToUseStep(props: { s: Settings | null }) {
       <ul class="flex flex-col gap-3">
         <TipRow
           label={<>Hold <span class="keycap">{pttGlyph()}</span></>}
-          description="to start dictating in any text field. Release when done."
+          description={
+            pttFailed(ptt())
+              ? "— Vox can't listen yet, grant Accessibility to enable."
+              : "to start dictating in any text field. Release when done."
+          }
           fellBackNote={fellBackNote(ptt())}
+          errorAction={
+            pttFailed(ptt())
+              ? () => void openAccessibilitySettings()
+              : undefined
+          }
+          errorActionLabel={pttFailed(ptt()) ? "Grant Accessibility" : undefined}
         />
         <TipRow
           label={<span class="keycap">{cycleGlyph()}</span>}
@@ -838,10 +848,21 @@ function fellBackNote(d: HotkeyDiagnostic | undefined): string | null {
   return `Configured ${cfg} wasn't available on your Mac — Vox is using ${bnd}.`;
 }
 
+/** True if push-to-talk diagnostic exists, has no binding, and the user
+ * has a non-empty configured hotkey. The "You're ready" view uses this
+ * to swap in actionable copy ("grant Accessibility") in place of the
+ * normal "to start dictating" hint. */
+function pttFailed(d: HotkeyDiagnostic | undefined): boolean {
+  if (!d) return false;
+  return !d.bound && d.configured !== "";
+}
+
 function TipRow(props: {
   label: JSX.Element;
   description: string;
   fellBackNote?: string | null;
+  errorAction?: (() => void) | undefined;
+  errorActionLabel?: string | undefined;
 }) {
   return (
     <li class="flex flex-col gap-1 rounded-[10px] bg-white/4 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
@@ -849,7 +870,13 @@ function TipRow(props: {
         <span class="text-[13px] font-medium text-[var(--color-ink)]">
           {props.label}
         </span>
-        <span class="text-[13px] text-[var(--color-ink-mute)]">
+        <span
+          class="text-[13px]"
+          classList={{
+            "text-[var(--color-ink-mute)]": !props.errorAction,
+            "text-[var(--color-danger)]": !!props.errorAction,
+          }}
+        >
           {props.description}
         </span>
       </div>
@@ -857,6 +884,15 @@ function TipRow(props: {
         <span class="text-[11px] text-[var(--color-ink-faint)]">
           {props.fellBackNote}
         </span>
+      </Show>
+      <Show when={props.errorAction && props.errorActionLabel}>
+        <button
+          type="button"
+          onClick={props.errorAction}
+          class="self-start mt-1 rounded-[6px] bg-[var(--color-danger)]/15 px-2 py-1 text-[11px] text-[var(--color-danger)] hover:bg-[var(--color-danger)]/25"
+        >
+          {props.errorActionLabel}
+        </button>
       </Show>
     </li>
   );
