@@ -187,6 +187,16 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
+        // Read prefs ONCE per utterance — both engine choices, the
+        // active voice mode, the language, and the dictionary all
+        // originate from this snapshot. If the user switches an engine
+        // or mode between hotkey-release and STT completion, the
+        // change takes effect on the *next* utterance, not this one.
+        // This is the right behavior (changing mid-flight would let a
+        // user pin a different prompt to a transcript that was
+        // recorded under the old mode), but it's load-bearing — please
+        // don't add a second `settings::prefs(&...)` call below this
+        // line without thinking about the ordering invariants.
         let prefs = settings::prefs(&app_for_pill);
 
         // Engine resolution. We narrow `AppHandle<R>` to the production
