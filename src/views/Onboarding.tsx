@@ -1,4 +1,4 @@
-import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { createSignal, For, type JSX, onCleanup, onMount, Show } from "solid-js";
 import {
   acceptGemmaTos,
   checkPermissions,
@@ -20,7 +20,46 @@ import {
   type TierRecommendation,
 } from "../lib/ipc";
 
-type Step = 0 | 1 | 2 | 3 | 4 | 5;
+type Step = 0 | 1 | 2 | 3 | 4 | 5 | 6;
+
+const STEP_COUNT = 7;
+const LAST_STEP: Step = 6;
+const MODELS_STEP: Step = 5;
+
+/**
+ * Render a Tauri global-shortcut spec like "Alt+Shift+V" or "AltRight"
+ * as a compact glyph string, e.g. "⌥⇧V" / "⌥".
+ *
+ * - The push-to-talk default in Rust is the literal `"AltRight"` — we
+ *   special-case it to a bare `⌥` (right-Option).
+ * - Other shortcuts are split on `+` and each token mapped through the
+ *   modifier table; unknown tokens fall through verbatim.
+ */
+export function formatHotkey(spec: string | null | undefined): string {
+  if (!spec) return "";
+  const trimmed = spec.trim();
+  if (!trimmed) return "";
+  if (trimmed === "AltRight" || trimmed === "AltLeft") return "⌥";
+  const MODS: Record<string, string> = {
+    Alt: "⌥",
+    Option: "⌥",
+    Shift: "⇧",
+    Cmd: "⌘",
+    Command: "⌘",
+    Meta: "⌘",
+    Super: "⌘",
+    Ctrl: "⌃",
+    Control: "⌃",
+  };
+  return trimmed
+    .split("+")
+    .map((tok) => {
+      const t = tok.trim();
+      if (!t) return "";
+      return MODS[t] ?? t;
+    })
+    .join("");
+}
 
 export default function OnboardingView() {
   const [step, setStep] = createSignal<Step>(0);
@@ -66,21 +105,27 @@ export default function OnboardingView() {
   }
 
   async function handleFinish() {
-    await finishOnboarding();
+    console.info("[onboarding] finish: starting");
+    try {
+      await finishOnboarding();
+      console.info("[onboarding] finish: done");
+    } catch (err) {
+      console.error("[onboarding] finish: failed", err);
+    }
   }
 
   function next() {
-    let n = Math.min(5, step() + 1) as Step;
+    let n = Math.min(LAST_STEP, step() + 1) as Step;
     // Skip the API-keys step (step 4) when the user picks local.
     if (step() === 3 && stackChoice() === "local") {
-      n = 5 as Step;
+      n = MODELS_STEP;
     }
     setStep(n);
   }
 
   function back() {
     let n = Math.max(0, step() - 1) as Step;
-    if (step() === 5 && stackChoice() === "local") {
+    if (step() === MODELS_STEP && stackChoice() === "local") {
       n = 3 as Step;
     }
     setStep(n);
@@ -131,7 +176,7 @@ export default function OnboardingView() {
         <Show when={step() === 4}>
           <KeysStep s={s()} patch={patch} />
         </Show>
-        <Show when={step() === 5}>
+        <Show when={step() === MODELS_STEP}>
           <Show
             when={stackChoice() === "local"}
             fallback={<TryStep />}
@@ -143,16 +188,24 @@ export default function OnboardingView() {
             />
           </Show>
         </Show>
+        <Show when={step() === LAST_STEP}>
+          <HowToUseStep s={s()} />
+        </Show>
       </main>
 
       <footer class="flex items-center justify-between border-t border-[var(--color-border)] px-6 py-4">
-        <button
-          type="button"
-          class="text-[12px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
-          onClick={step() === 5 ? handleFinish : next}
+        <Show
+          when={step() !== LAST_STEP}
+          fallback={<span aria-hidden="true" />}
         >
-          {step() === 0 ? "" : step() === 5 ? "Skip for now" : "Skip"}
-        </button>
+          <button
+            type="button"
+            class="text-[12px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+            onClick={next}
+          >
+            {step() === 0 ? "" : step() === MODELS_STEP ? "Skip for now" : "Skip"}
+          </button>
+        </Show>
         <PrimaryButton
           step={step()}
           perms={perms()}
@@ -169,7 +222,7 @@ export default function OnboardingView() {
 function Progress(props: { step: Step }) {
   return (
     <div class="flex items-center gap-2" aria-hidden="true">
-      <For each={[0, 1, 2, 3, 4, 5]}>
+      <For each={Array.from({ length: STEP_COUNT }, (_, i) => i)}>
         {(i) => (
           <span
             class="h-1.5 w-1.5 rounded-full transition-colors"
@@ -198,21 +251,34 @@ function PrimaryButton(props: {
   };
   const label = () => {
     if (props.step === 0) return "Get started";
-    if (props.step === 5) return "Finish";
+    if (props.step === LAST_STEP) return "Finish";
     return "Continue";
   };
+  const isFinish = () => props.step === LAST_STEP;
   return (
     <button
       type="button"
       disabled={disabled()}
-      onClick={props.step === 5 ? props.onFinish : props.onNext}
+      onClick={isFinish() ? props.onFinish : props.onNext}
       class="inline-flex h-9 items-center gap-2 rounded-[8px] bg-[var(--color-accent)] px-4 text-[13px] font-medium text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
     >
-      <span>{label()}</span>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-        <line x1="5" y1="12" x2="19" y2="12" />
-        <polyline points="12 5 19 12 12 19" />
-      </svg>
+      <Show
+        when={isFinish()}
+        fallback={
+          <>
+            <span>{label()}</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <line x1="5" y1="12" x2="19" y2="12" />
+              <polyline points="12 5 19 12 12 19" />
+            </svg>
+          </>
+        }
+      >
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="20 6 9 17 4 12" />
+        </svg>
+        <span>{label()}</span>
+      </Show>
     </button>
   );
 }
@@ -661,5 +727,61 @@ function TryStep() {
         If nothing happens, check the tray icon for errors.
       </p>
     </div>
+  );
+}
+
+function HowToUseStep(props: { s: Settings | null }) {
+  const pttGlyph = () => formatHotkey(props.s?.hotkey) || "⌥";
+  const cycleGlyph = () => formatHotkey(props.s?.mode_cycle_hotkey) || "⌥M";
+  const pasteGlyph = () =>
+    formatHotkey(props.s?.paste_last_hotkey) || "⌥⇧V";
+  return (
+    <div class="flex w-full max-w-[420px] flex-col gap-5">
+      <div class="flex flex-col gap-2">
+        <h2 class="text-[24px] font-semibold leading-tight">
+          You're ready.
+        </h2>
+        <p class="text-[13px] text-[var(--color-ink-mute)]">
+          Vox lives in your menu bar. Click the icon any time to see status,
+          switch modes, or open settings.
+        </p>
+      </div>
+
+      <ul class="flex flex-col gap-3">
+        <TipRow
+          label={<>Hold <span class="keycap">{pttGlyph()}</span></>}
+          description="to start dictating in any text field. Release when done."
+        />
+        <TipRow
+          label={<span class="keycap">{cycleGlyph()}</span>}
+          description="to cycle Voice Modes. Match your tone to the app you're in."
+        />
+        <TipRow
+          label={<span class="keycap">{pasteGlyph()}</span>}
+          description="to paste your last transcript again."
+        />
+      </ul>
+
+      <p class="text-[11px] text-[var(--color-ink-faint)]">
+        Need to change anything? Open Settings from the menu bar icon.
+        Welcome to Vox.
+      </p>
+    </div>
+  );
+}
+
+function TipRow(props: {
+  label: JSX.Element;
+  description: string;
+}) {
+  return (
+    <li class="flex items-baseline gap-2 rounded-[10px] bg-white/4 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+      <span class="text-[13px] font-medium text-[var(--color-ink)]">
+        {props.label}
+      </span>
+      <span class="text-[13px] text-[var(--color-ink-mute)]">
+        {props.description}
+      </span>
+    </li>
   );
 }
