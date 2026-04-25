@@ -66,7 +66,11 @@ pub fn register<R: Runtime>(
         .map_err(|e| e.to_string())?;
     }
 
-    // Cancel (only has an effect while recording).
+    // Cancel (PRD §4.2: must abort the *entire* operation — recording,
+    // transcribing, or polishing — not just the recording phase). The
+    // gating is delegated to `session::cancel`, which races the in-flight
+    // pipeline via `wait_for_cancel`. Gating here would re-introduce the
+    // exact bug the staff review C2 was meant to fix.
     if let Some(cancel_sc) = shortcut_from_key(cancel_preferred) {
         // Don't double-register if the user set cancel == PTT.
         if cancel_sc != shortcut {
@@ -74,9 +78,7 @@ pub fn register<R: Runtime>(
             let ctx_clone = ctx.clone();
             if let Err(e) = gs.on_shortcut(cancel_sc, move |_app, _sc, event: ShortcutEvent| {
                 if let ShortcutState::Pressed = event.state() {
-                    if ctx_clone.is_recording() {
-                        session::cancel(app_handle.clone(), ctx_clone.clone());
-                    }
+                    session::cancel(app_handle.clone(), ctx_clone.clone());
                 }
             }) {
                 log::warn!("could not register cancel hotkey '{cancel_preferred}': {e}");

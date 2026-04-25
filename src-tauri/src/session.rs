@@ -38,6 +38,11 @@ pub struct SessionCtx {
     /// is in flight. Reset to false at the start of every new session so a
     /// stale cancel from a previous session can't bleed into a fresh one.
     canceled: Arc<AtomicBool>,
+    /// True from begin_recording until the post-release pipeline has either
+    /// pasted, errored, or been canceled. Lets `cancel()` distinguish "Esc
+    /// during a real session" from "Esc with nothing in flight" so we don't
+    /// flash a Canceled pill when there's nothing to cancel.
+    pipeline_active: Arc<AtomicBool>,
 }
 
 impl SessionCtx {
@@ -48,15 +53,21 @@ impl SessionCtx {
             session_id: Arc::new(AtomicU64::new(0)),
             started_at: Arc::new(Mutex::new(None)),
             canceled: Arc::new(AtomicBool::new(false)),
+            pipeline_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_recording(&self) -> bool {
         self.recording.load(Ordering::SeqCst)
     }
 
     pub fn is_canceled(&self) -> bool {
         self.canceled.load(Ordering::SeqCst)
+    }
+
+    pub fn is_pipeline_active(&self) -> bool {
+        self.pipeline_active.load(Ordering::SeqCst)
     }
 }
 
@@ -95,6 +106,7 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
 
     let new_sid = ctx.session_id.fetch_add(1, Ordering::SeqCst) + 1;
     ctx.canceled.store(false, Ordering::SeqCst);
+    ctx.pipeline_active.store(true, Ordering::SeqCst);
     *ctx.started_at.lock() = Some(Instant::now());
 
     log::info!("▶ begin recording (sid={new_sid})");
@@ -104,6 +116,7 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
     if let Err(e) = ctx.audio.start() {
         log::error!("failed to start audio: {e}");
         ctx.recording.store(false, Ordering::SeqCst);
+        ctx.pipeline_active.store(false, Ordering::SeqCst);
         *ctx.started_at.lock() = None;
         pill::emit_state(
             &app,
@@ -140,6 +153,13 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 
     // Move stop + upload + paste off the hotkey callback thread.
     tauri::async_runtime::spawn(async move {
+        // Drop guard clears `pipeline_active` no matter which return path
+        // the task takes (cancel, stale, error, or success). This lets
+        // `cancel()` distinguish "Esc with a real session in flight" from
+        // "Esc with nothing happening" so we don't flash a Canceled pill
+        // when the user presses Esc with no session running.
+        let _pipeline_guard = PipelineGuard::new(&ctx, my_sid);
+
         // Always fetch audio to flush it, even if we'll discard it.
         let wav_result = ctx.audio.stop_and_encode();
 
@@ -329,6 +349,14 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 /// User triggered the cancel hotkey. Aborts whatever phase we're in:
 /// recording, transcribing, polishing, or just-before-paste.
 pub fn cancel<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
+    // No-op if there's nothing in flight. Without this guard, pressing the
+    // cancel hotkey with no session running would flash a stray "Canceled"
+    // pill, since the global hotkey listener fires unconditionally.
+    if !ctx.is_pipeline_active() {
+        log::debug!("cancel: no active pipeline; ignoring");
+        return;
+    }
+
     // Flip the flag — any in-flight pipeline observes it within one cancel
     // tick (50 ms) via `wait_for_cancel`.
     ctx.canceled.store(true, Ordering::SeqCst);
@@ -344,6 +372,34 @@ pub fn cancel<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
         pill::emit_state(&app, PillState::Canceled, None);
         let app_arc = Arc::new(app.clone());
         pill::hide_after(&app_arc, 600);
+    }
+}
+
+/// RAII guard that clears `pipeline_active` when the post-release pipeline
+/// task ends, however it ends — but only if our session id is still the
+/// active one. A re-press supersedes the old session and starts a new
+/// pipeline; the *old* task's guard must not clobber the new task's flag.
+struct PipelineGuard {
+    flag: Arc<AtomicBool>,
+    session_id: Arc<AtomicU64>,
+    sid: u64,
+}
+
+impl PipelineGuard {
+    fn new(ctx: &SessionCtx, sid: u64) -> Self {
+        Self {
+            flag: ctx.pipeline_active.clone(),
+            session_id: ctx.session_id.clone(),
+            sid,
+        }
+    }
+}
+
+impl Drop for PipelineGuard {
+    fn drop(&mut self) {
+        if self.session_id.load(Ordering::SeqCst) == self.sid {
+            self.flag.store(false, Ordering::SeqCst);
+        }
     }
 }
 
