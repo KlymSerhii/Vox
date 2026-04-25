@@ -81,6 +81,8 @@ pub fn run() {
             commands::reset_default_modes,
             commands::cycle_active_mode,
             commands::suggest_active_mode,
+            commands::get_active_hotkey,
+            commands::diagnose_hotkeys,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -94,6 +96,11 @@ pub fn run() {
             let audio = AudioHandle::spawn();
             let ctx = SessionCtx::new(audio);
             app.manage(ctx.clone());
+
+            // Hotkey-binding state. We register this BEFORE
+            // `hotkey::register` so the per-purpose snapshots are
+            // ready for the IPC handlers from the very first call.
+            app.manage(crate::hotkey::ActiveHotkeyState::default());
 
             // Engine registry — lazy-built, kept warm.
             app.manage(crate::engines::Registry::new());

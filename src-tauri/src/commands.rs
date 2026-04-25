@@ -3,7 +3,9 @@ use tauri::{AppHandle, Manager, Runtime, Webview, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::engines::{anthropic, groq};
+use crate::hotkey::{ActiveHotkey, ActiveHotkeyState};
 use crate::modes::{self, VoiceMode};
+use crate::settings::HotkeyPurpose;
 use crate::{frontmost, models, onboarding, pill, session, settings, transcripts};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -627,4 +629,79 @@ pub fn cycle_active_mode<R: Runtime>(app: AppHandle<R>) -> Result<VoiceMode, Str
 pub fn suggest_active_mode<R: Runtime>(app: AppHandle<R>) -> Option<String> {
     let (bundle_id, title) = frontmost::detect()?;
     modes::suggest_mode_for(&app, Some(&bundle_id), title.as_deref())
+}
+
+// -------- Hotkey diagnostics ------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct HotkeyDiagnostic {
+    pub purpose: String,
+    pub configured: String,
+    pub bound: String,
+    pub fell_back: bool,
+    pub error: Option<String>,
+    pub error_chain: Vec<String>,
+}
+
+impl HotkeyDiagnostic {
+    fn from_active(purpose: &str, a: ActiveHotkey) -> Self {
+        Self {
+            purpose: purpose.to_string(),
+            configured: a.configured,
+            bound: a.bound,
+            fell_back: a.fell_back,
+            error: a.error,
+            error_chain: a.error_chain,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct DiagnoseHotkeys {
+    pub entries: Vec<HotkeyDiagnostic>,
+}
+
+/// Snapshot of the push-to-talk binding for the UI to render. The
+/// frontend uses this in onboarding and Settings to show the user the
+/// truth about what's actually bound versus what was configured.
+#[tauri::command]
+pub fn get_active_hotkey<R: Runtime>(app: AppHandle<R>) -> ActiveHotkey {
+    match app.try_state::<ActiveHotkeyState>() {
+        Some(state) => state.snapshot(HotkeyPurpose::PushToTalk),
+        None => ActiveHotkey {
+            configured: settings::load(&app).hotkey,
+            bound: String::new(),
+            fell_back: false,
+            error: Some("hotkey state not initialised".into()),
+            error_chain: vec!["hotkey state not initialised".into()],
+        },
+    }
+}
+
+/// Snapshot of every hotkey binding. Used by the Settings → About
+/// "Diagnostics" button to render a full picture in a `<pre>` block.
+#[tauri::command]
+pub fn diagnose_hotkeys<R: Runtime>(app: AppHandle<R>) -> DiagnoseHotkeys {
+    let entries = match app.try_state::<ActiveHotkeyState>() {
+        Some(state) => vec![
+            HotkeyDiagnostic::from_active(
+                "push-to-talk",
+                state.snapshot(HotkeyPurpose::PushToTalk),
+            ),
+            HotkeyDiagnostic::from_active(
+                "cancel",
+                state.snapshot(HotkeyPurpose::Cancel),
+            ),
+            HotkeyDiagnostic::from_active(
+                "paste-last",
+                state.snapshot(HotkeyPurpose::PasteLast),
+            ),
+            HotkeyDiagnostic::from_active(
+                "mode-cycle",
+                state.snapshot(HotkeyPurpose::ModeCycle),
+            ),
+        ],
+        None => Vec::new(),
+    };
+    DiagnoseHotkeys { entries }
 }

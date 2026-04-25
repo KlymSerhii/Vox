@@ -54,7 +54,17 @@ const KEYRING_ACCOUNT_GROQ: &str = "groq";
 const KEYRING_ACCOUNT_ANTHROPIC: &str = "anthropic";
 
 fn default_hotkey() -> String {
-    "AltRight".to_string()
+    // PRD §4.1 + post-mortem 2026-04-25: `AltRight` is unreliable on
+    // macOS through `tauri-plugin-global-shortcut` because the Carbon-era
+    // scancode table the plugin walks doesn't always have an entry for
+    // bare Right-Option. F13 is reliably scancode-mapped on macOS,
+    // doesn't conflict with any default macOS shortcut, and is reachable
+    // on full-size keyboards (and easy to remap to the current
+    // Right-Option via Karabiner-Elements for users who prefer it). New
+    // installs default to F13; existing installs whose stored hotkey is
+    // the literal string "AltRight" are migrated to F13 lazily inside
+    // `load`.
+    "F13".to_string()
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
@@ -290,10 +300,30 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         }
     };
 
-    let hotkey = store
-        .get(KEY_HOTKEY)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_hotkey);
+    let hotkey = {
+        let stored = store
+            .get(KEY_HOTKEY)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(default_hotkey);
+        // One-shot migration: existing installs whose stored push-to-talk
+        // hotkey is the legacy `"AltRight"` string get rewritten to F13,
+        // because the bare Right-Option keysym is not reliably bindable
+        // through `tauri-plugin-global-shortcut` on macOS. We persist the
+        // change immediately so the next boot doesn't pay the migration
+        // cost again.
+        if stored == "AltRight" {
+            log::info!(
+                "settings: migrating legacy push-to-talk hotkey \
+                 'AltRight' -> 'F13' (Right-Option is unreliable through \
+                 tauri-plugin-global-shortcut on macOS)"
+            );
+            store.set(KEY_HOTKEY, serde_json::Value::String("F13".to_string()));
+            let _ = store.save();
+            "F13".to_string()
+        } else {
+            stored
+        }
+    };
     let cancel_hotkey = store
         .get(KEY_CANCEL_HOTKEY)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -610,4 +640,38 @@ pub fn set_active_mode_id<R: Runtime>(app: &AppHandle<R>, id: &str) -> anyhow::R
     let mut s = load(app);
     s.active_mode_id = id.to_string();
     save(app, &s)
+}
+
+/// Persist a single hotkey field by name, without rewriting the rest of
+/// the settings document. Used by `hotkey::register` when a configured
+/// shortcut couldn't be bound and we resolved a fallback — we mirror the
+/// truth back to disk so the picker shows what is actually active.
+pub fn set_hotkey_field<R: Runtime>(
+    app: &AppHandle<R>,
+    purpose: HotkeyPurpose,
+    value: &str,
+) -> anyhow::Result<()> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
+    let key = match purpose {
+        HotkeyPurpose::PushToTalk => KEY_HOTKEY,
+        HotkeyPurpose::Cancel => KEY_CANCEL_HOTKEY,
+        HotkeyPurpose::PasteLast => KEY_PASTE_LAST_HOTKEY,
+        HotkeyPurpose::ModeCycle => KEY_MODE_CYCLE_HOTKEY,
+    };
+    store.set(key, serde_json::Value::String(value.to_string()));
+    store
+        .save()
+        .map_err(|e| anyhow::anyhow!("save store: {e}"))?;
+    Ok(())
+}
+
+/// Identifies which hotkey field a `set_hotkey_field` call refers to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyPurpose {
+    PushToTalk,
+    Cancel,
+    PasteLast,
+    ModeCycle,
 }
