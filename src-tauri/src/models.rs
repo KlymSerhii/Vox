@@ -234,10 +234,18 @@ struct DownloadRegistry {
 }
 
 impl DownloadRegistry {
-    fn insert(&self, id: &str) -> CancellationToken {
+    /// Reserve a slot for `id`. Returns the new cancel token, or `None`
+    /// if a download is already in flight for the same id — callers
+    /// should refuse rather than racing two writers on the same
+    /// `.partial` file.
+    fn try_insert(&self, id: &str) -> Option<CancellationToken> {
+        let mut guard = self.inner.lock();
+        if guard.contains_key(id) {
+            return None;
+        }
         let tok = CancellationToken::new();
-        self.inner.lock().insert(id.to_string(), tok.clone());
-        tok
+        guard.insert(id.to_string(), tok.clone());
+        Some(tok)
     }
     fn cancel(&self, id: &str) -> bool {
         if let Some(tok) = self.inner.lock().remove(id) {
@@ -302,7 +310,17 @@ pub async fn download_model(
 
     let resume_from = partial_path.metadata().map(|m| m.len()).unwrap_or(0);
 
-    let cancel = REGISTRY.insert(&id);
+    // Refuse to start a second downloader for the same id while one is
+    // already running. Without this, two writers race on the same
+    // `.partial` file and the result is a corrupt model that survives
+    // the atomic rename to `model.bin`.
+    let Some(cancel) = REGISTRY.try_insert(&id) else {
+        let _ = app.emit(
+            "model:error",
+            serde_json::json!({"id": id, "error": "already downloading"}),
+        );
+        return Err(anyhow::anyhow!("already downloading: {id}"));
+    };
 
     let result = do_download(&app, &descriptor, &partial_path, resume_from, cancel.clone()).await;
 
@@ -529,4 +547,23 @@ pub fn recommended_stt_model_id() -> &'static str {
 
 pub fn recommended_llm_model_id() -> &'static str {
     "gemma-4-e2b-q4_k_m"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_registry_dedupes_by_id() {
+        let reg = DownloadRegistry::default();
+        let first = reg.try_insert("model-x");
+        assert!(first.is_some(), "first insert should succeed");
+        let second = reg.try_insert("model-x");
+        assert!(second.is_none(), "second insert for same id must refuse");
+
+        // After finish, a fresh download for the same id is allowed again.
+        reg.finish("model-x");
+        let third = reg.try_insert("model-x");
+        assert!(third.is_some(), "post-finish reinsert should succeed");
+    }
 }
