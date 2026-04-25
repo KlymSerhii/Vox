@@ -3,13 +3,18 @@
 @theme {
   --color-accent: #7c9cff;
   --color-accent-soft: rgb(124 156 255 / 0.16);
+  --color-violet: #b49bff;
   --color-danger: #ff6b6b;
   --color-success: #4ade80;
   --color-warning: #fbbf24;
   --color-ink: #f4f4f5;
   --color-ink-mute: #a1a1aa;
+  --color-ink-faint: #71717a;
   --color-bg: #0b0b0d;
   --color-surface: rgb(39 39 42 / 0.72);
+  --color-surface-raised: rgb(63 63 70 / 0.85);
+  --color-border: rgb(255 255 255 / 0.08);
+  --color-border-strong: rgb(255 255 255 / 0.14);
 }
 
 html,
@@ -19,16 +24,24 @@ body,
 }
 
 body {
-  background-color: var(--color-bg);
   color: var(--color-ink);
   font-family:
-    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
-    "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Inter",
+    "Helvetica Neue", Helvetica, Arial, sans-serif;
   font-feature-settings: "cv11", "ss01", "ss03";
   font-size: 13px;
   line-height: 18px;
   margin: 0;
   padding: 0;
+  -webkit-font-smoothing: antialiased;
+  background-color: var(--color-bg);
+}
+
+/* Windows that render translucent content on top of the desktop use an
+ * absolutely-positioned body with no background. The window transparency is
+ * set at the Tauri level. */
+body.translucent {
+  background: transparent !important;
 }
 
 input,
@@ -36,4 +49,102 @@ button,
 select,
 textarea {
   font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+/* ------- animations --------------------------------------------------- */
+
+@keyframes pulse-mic {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes spinner {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pill-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes flash-done {
+  0% {
+    background: rgba(74, 222, 128, 0.2);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+.animate-pulse-mic {
+  animation: pulse-mic 1.2s ease-in-out infinite;
+}
+
+.animate-spinner {
+  animation: spinner 900ms linear infinite;
+}
+
+.animate-pill-in {
+  animation: pill-in 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.animate-flash-done {
+  animation: flash-done 180ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-pulse-mic,
+  .animate-spinner,
+  .animate-pill-in,
+  .animate-flash-done {
+    animation: none !important;
+  }
+}
+
+/* ------- utility ------------------------------------------------------ */
+
+.keycap {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-ink);
+  background: rgb(255 255 255 / 0.06);
+  box-shadow: inset 0 0 0 1px var(--color-border);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgb(255 255 255 / 0.1);
+  border-radius: 3px;
 }

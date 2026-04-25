@@ -12,8 +12,11 @@ pub enum InjectError {
     Enigo(String),
 }
 
-/// Save the current clipboard, write `text`, simulate Cmd+V, restore the
-/// original clipboard after ~100 ms.
+/// Save the current clipboard, write `text`, simulate Cmd+V, then restore
+/// the original clipboard — but only if our text is still on the clipboard
+/// at restore time. If the user (or a clipboard manager) has written
+/// something else in the interim we leave it alone, per the tech-stack
+/// risk mitigation.
 pub fn paste_text(text: &str) -> Result<(), InjectError> {
     if text.is_empty() {
         return Ok(());
@@ -31,23 +34,36 @@ pub fn paste_text(text: &str) -> Result<(), InjectError> {
     let mut enigo =
         Enigo::new(&Settings::default()).map_err(|e| InjectError::Enigo(e.to_string()))?;
 
-    // Synthesize Cmd+V.
+    // Synthesize Cmd+V. Press the modifier first, click 'v', release the
+    // modifier — order matters so the target app sees a real ⌘V.
     enigo
         .key(Key::Meta, Direction::Press)
         .map_err(|e| InjectError::Enigo(e.to_string()))?;
-    enigo
-        .key(Key::Unicode('v'), Direction::Click)
-        .map_err(|e| InjectError::Enigo(e.to_string()))?;
-    enigo
-        .key(Key::Meta, Direction::Release)
-        .map_err(|e| InjectError::Enigo(e.to_string()))?;
+    let v_result = enigo.key(Key::Unicode('v'), Direction::Click);
+    // Always release the modifier even if the v keystroke errored, so we
+    // don't leave Cmd "stuck" from the user's perspective.
+    let release_result = enigo.key(Key::Meta, Direction::Release);
+    v_result.map_err(|e| InjectError::Enigo(e.to_string()))?;
+    release_result.map_err(|e| InjectError::Enigo(e.to_string()))?;
 
     // Give the target app time to consume the paste before we restore.
-    thread::sleep(Duration::from_millis(120));
+    // 150 ms matches the tech-stack restore window.
+    thread::sleep(Duration::from_millis(150));
 
     if let Some(prev) = previous {
-        if let Err(e) = clip.set_text(prev) {
-            log::warn!("clipboard restore failed: {e}");
+        // Verify the clipboard still holds *our* text before overwriting.
+        // If a clipboard manager or the user has written something else in
+        // the meantime, don't clobber it.
+        let still_ours = clip
+            .get_text()
+            .map(|cur| cur == text)
+            .unwrap_or(false);
+        if still_ours {
+            if let Err(e) = clip.set_text(prev) {
+                log::warn!("clipboard restore failed: {e}");
+            }
+        } else {
+            log::debug!("clipboard changed during paste; leaving user content alone");
         }
     }
 

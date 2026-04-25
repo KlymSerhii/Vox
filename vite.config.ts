@@ -1,6 +1,9 @@
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
 import tailwindcss from "@tailwindcss/vite";
+import { fileURLToPath, URL } from "node:url";
+
+const r = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 
 // https://vitejs.dev/config/
 export default defineConfig({
@@ -26,5 +29,13 @@ export default defineConfig({
     target: "es2022",
     minify: "esbuild",
     sourcemap: false,
+    rollupOptions: {
+      input: {
+        settings: r("./index.html"),
+        pill: r("./pill.html"),
+        onboarding: r("./onboarding.html"),
+        "tray-popover": r("./tray-popover.html"),
+      },
+    },
   },
 });

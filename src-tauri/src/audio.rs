@@ -5,6 +5,7 @@
 //! The public API (`AudioHandle`) is `Send + Sync`.
 
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
@@ -16,6 +17,12 @@ use parking_lot::Mutex;
 
 /// Target sample rate sent to Groq Whisper.
 const TARGET_SR: u32 = 16_000;
+
+/// Hard cap on how much audio we'll keep in memory at any time. Matches the
+/// session-layer 60 s safety net (PRD §3.1) with 5 s of headroom; if the
+/// guard fails, this clamps RAM usage and gracefully drops the *oldest*
+/// samples so the latest audio is still recoverable.
+const MAX_BUFFER_SECS: usize = 65;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
@@ -38,16 +45,21 @@ enum Command {
 #[derive(Clone)]
 pub struct AudioHandle {
     tx: Sender<Command>,
+    /// Shared live RMS level in 0..=1, updated by the capture thread.
+    /// Stored as f32 bits in an `AtomicU32` so we can read without a lock.
+    rms_bits: Arc<AtomicU32>,
 }
 
 impl AudioHandle {
     pub fn spawn() -> Self {
         let (tx, rx) = mpsc::channel::<Command>();
+        let rms_bits = Arc::new(AtomicU32::new(0));
+        let rms_for_thread = Arc::clone(&rms_bits);
         thread::Builder::new()
             .name("vox-audio".into())
-            .spawn(move || audio_thread(rx))
+            .spawn(move || audio_thread(rx, rms_for_thread))
             .expect("spawn audio thread");
-        Self { tx }
+        Self { tx, rms_bits }
     }
 
     pub fn start(&self) -> Result<(), AudioError> {
@@ -65,6 +77,11 @@ impl AudioHandle {
             .map_err(|_| AudioError::ThreadDied)?;
         reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
     }
+
+    /// Most-recent RMS level in [0, 1]. Returns 0.0 when not recording.
+    pub fn current_rms(&self) -> f32 {
+        f32::from_bits(self.rms_bits.load(Ordering::Relaxed))
+    }
 }
 
 struct ActiveCapture {
@@ -74,7 +91,7 @@ struct ActiveCapture {
     input_channels: u16,
 }
 
-fn audio_thread(rx: Receiver<Command>) {
+fn audio_thread(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
     let mut active: Option<ActiveCapture> = None;
 
     for cmd in rx {
@@ -84,12 +101,13 @@ fn audio_thread(rx: Receiver<Command>) {
                     let _ = reply.send(Ok(()));
                     continue;
                 }
-                match begin_capture() {
+                match begin_capture(Arc::clone(&rms_bits)) {
                     Ok(cap) => {
                         active = Some(cap);
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
+                        rms_bits.store(0, Ordering::Relaxed);
                         let _ = reply.send(Err(e));
                     }
                 }
@@ -98,12 +116,14 @@ fn audio_thread(rx: Receiver<Command>) {
                 let cap = match active.take() {
                     Some(c) => c,
                     None => {
+                        rms_bits.store(0, Ordering::Relaxed);
                         let _ = reply.send(Ok(Vec::new()));
                         continue;
                     }
                 };
                 // Stop + drop the stream.
                 drop(cap.stream);
+                rms_bits.store(0, Ordering::Relaxed);
                 let raw = {
                     let buf = cap.samples.lock();
                     buf.clone()
@@ -115,7 +135,7 @@ fn audio_thread(rx: Receiver<Command>) {
     }
 }
 
-fn begin_capture() -> Result<ActiveCapture, AudioError> {
+fn begin_capture(rms_bits: Arc<AtomicU32>) -> Result<ActiveCapture, AudioError> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -133,15 +153,23 @@ fn begin_capture() -> Result<ActiveCapture, AudioError> {
         (input_sr as usize) * (input_channels as usize) * 16,
     )));
 
+    let max_samples =
+        (input_sr as usize) * (input_channels as usize) * MAX_BUFFER_SECS;
+
     let err_fn = |err| log::error!("cpal stream error: {err}");
 
     let samples_cb = Arc::clone(&samples);
+    let rms_f32 = Arc::clone(&rms_bits);
+    let rms_i16 = Arc::clone(&rms_bits);
+    let rms_u16 = Arc::clone(&rms_bits);
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
             &config,
             move |data: &[f32], _| {
+                update_rms(&rms_f32, data.iter().copied());
                 let mut buf = samples_cb.lock();
                 buf.extend_from_slice(data);
+                trim_front(&mut buf, max_samples);
             },
             err_fn,
             None,
@@ -149,8 +177,12 @@ fn begin_capture() -> Result<ActiveCapture, AudioError> {
         SampleFormat::I16 => device.build_input_stream(
             &config,
             move |data: &[i16], _| {
+                let iter = data.iter().map(|&s| s as f32 / i16::MAX as f32);
+                let collected: Vec<f32> = iter.collect();
+                update_rms(&rms_i16, collected.iter().copied());
                 let mut buf = samples_cb.lock();
-                buf.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
+                buf.extend_from_slice(&collected);
+                trim_front(&mut buf, max_samples);
             },
             err_fn,
             None,
@@ -158,8 +190,12 @@ fn begin_capture() -> Result<ActiveCapture, AudioError> {
         SampleFormat::U16 => device.build_input_stream(
             &config,
             move |data: &[u16], _| {
+                let iter = data.iter().map(|&s| (s as f32 - 32_768.0) / 32_768.0);
+                let collected: Vec<f32> = iter.collect();
+                update_rms(&rms_u16, collected.iter().copied());
                 let mut buf = samples_cb.lock();
-                buf.extend(data.iter().map(|&s| (s as f32 - 32_768.0) / 32_768.0));
+                buf.extend_from_slice(&collected);
+                trim_front(&mut buf, max_samples);
             },
             err_fn,
             None,
@@ -238,6 +274,38 @@ fn linear_resample(input: &[f32], in_sr: u32, out_sr: u32) -> Vec<f32> {
         out.push(a + (b - a) * frac);
     }
     out
+}
+
+/// Drop the oldest samples if `buf` exceeds `max`. Cheap when nothing needs
+/// trimming (no allocation), drops in-place via `drain` otherwise.
+fn trim_front(buf: &mut Vec<f32>, max: usize) {
+    if max == 0 || buf.len() <= max {
+        return;
+    }
+    let excess = buf.len() - max;
+    buf.drain(0..excess);
+}
+
+/// Compute an exponentially-smoothed RMS from the incoming block and write
+/// it (clamped to [0, 1]) to the shared atomic.
+fn update_rms<I: IntoIterator<Item = f32>>(target: &Arc<AtomicU32>, samples: I) {
+    let mut n: u32 = 0;
+    let mut sum_sq: f32 = 0.0;
+    for s in samples {
+        sum_sq += s * s;
+        n += 1;
+    }
+    if n == 0 {
+        return;
+    }
+    let rms = (sum_sq / n as f32).sqrt();
+    // Roughly normalize: -30 dBFS → 0.1, -6 dBFS → ~0.9.
+    let scaled = (rms * 3.0).clamp(0.0, 1.0);
+
+    // Single-pole smoothing toward the new value.
+    let prev = f32::from_bits(target.load(Ordering::Relaxed));
+    let smoothed = prev * 0.5 + scaled * 0.5;
+    target.store(smoothed.to_bits(), Ordering::Relaxed);
 }
 
 fn encode_wav_pcm16(samples: &[f32], sr: u32) -> Result<Vec<u8>, AudioError> {
