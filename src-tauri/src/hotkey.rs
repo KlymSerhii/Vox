@@ -21,15 +21,30 @@
 //! we silently fail to bind the dictation hotkey and the entire feature
 //! looks broken.
 //!
-//! To make this self-healing each hotkey now ships with a fallback chain
-//! and the FIRST entry that successfully binds becomes the active key.
-//! We persist the resolved value back to settings so the picker UI shows
-//! the truth and the user isn't confused by the difference between the
-//! configured key and the bound key. We also expose the configured
-//! vs. bound pair through `hotkey::active_state` (read by the
-//! `get_active_hotkey` and `diagnose_hotkeys` IPCs) so the frontend can
-//! render an explanatory note like "Configured ⌥ wasn't available on
-//! your Mac — Vox is using F13."
+//! Behavior:
+//!
+//! 1. **Push-to-talk: chord configurations never auto-fall-back to a
+//!    key.** When the user has a modifier-only chord configured (e.g.
+//!    the default `Alt+Control`) and the chord install fails — typically
+//!    because Accessibility hasn't been granted — we return a clear
+//!    error to the UI. We do NOT silently substitute F13 or any other
+//!    key, because the user might not have F13 (recent Apple keyboards
+//!    don't), and "looks-like-it's-working but the wrong key" is a
+//!    worse failure than "nothing works and the UI tells you why".
+//! 2. **Push-to-talk: explicit-key configurations may fall back through
+//!    other key options.** If the user has manually picked F13 / F14 /
+//!    F15 / Cmd+Shift+Space etc. and that key fails to bind, we walk
+//!    `KEY_PTT_FALLBACKS` looking for the next bindable explicit-key
+//!    option. This is opt-in by virtue of the user choosing a key in
+//!    the picker.
+//! 3. **Cancel / paste-last / mode-cycle** keep the same behavior they
+//!    had before — they're discrete events, not press+release, and a
+//!    chord doesn't make sense for them.
+//!
+//! When push-to-talk binding fails we surface the error string through
+//! `ActiveHotkey.error` so the UI can render "Chord requires
+//! Accessibility permission. Open System Settings → Privacy & Security
+//! → Accessibility and add Vox." on the picker row.
 
 use std::sync::Mutex;
 
@@ -44,30 +59,32 @@ use crate::mac_chord::{self, ChordHandle};
 use crate::session::{self, SessionCtx};
 use crate::settings::{self, HotkeyPurpose};
 
-/// Default registration order when the configured push-to-talk hotkey
-/// can't be bound. Same order is used as the search space for the
-/// "first registerable" pass. The default chord (`Alt+Control`) is the
-/// first entry; the F13 chain is the standard fallback when the chord
-/// can't be installed (e.g. Accessibility revoked).
-const PTT_FALLBACKS: &[&str] = &[
-    "Alt+Control",
+/// Push-to-talk fallbacks that are ONLY consulted when the user has
+/// explicitly chosen a key-based shortcut (not a chord) AND that
+/// specific key fails to bind. Chord configurations never fall back to
+/// a key — see the file-level docs.
+///
+/// `F13`/`F14`/`F15` stay in the list because users with a full-size
+/// keyboard sometimes pick them deliberately, and if their chosen
+/// fn-row key fails to bind it's reasonable to try the next one. They
+/// are NEVER reached when the user has `Alt+Control` (or any chord)
+/// configured.
+const KEY_PTT_FALLBACKS: &[&str] = &[
+    "CommandOrControl+Shift+Space",
+    "CommandOrControl+Shift+Semicolon",
     "F13",
     "F14",
     "F15",
-    "CommandOrControl+Shift+Space",
 ];
 const CANCEL_FALLBACKS: &[&str] = &["Escape"];
 const PASTE_LAST_FALLBACKS: &[&str] = &[
     "Alt+Shift+V",
     "CommandOrControl+Shift+V",
-    "F14",
-    "F15",
 ];
 const MODE_CYCLE_FALLBACKS: &[&str] = &[
     "Alt+M",
     "Alt+Shift+M",
     "CommandOrControl+Shift+M",
-    "F15",
 ];
 
 /// Snapshot of what's actually bound for one hotkey purpose at runtime.
@@ -595,25 +612,77 @@ fn nonempty(s: &str) -> &str {
     }
 }
 
-/// Register the push-to-talk hotkey, walking the chord-or-shortcut
-/// preference chain and falling back through the `PTT_FALLBACKS` list.
+/// Register the push-to-talk hotkey.
 ///
-/// On macOS we try modifier-only chords first via `mac_chord::install`
-/// (a `CGEventTap` listener) before reaching for
-/// `tauri-plugin-global-shortcut`. On other platforms we go directly to
-/// the standard plugin path.
+/// Two distinct code paths, decided by whether the user's configured
+/// value parses as a modifier-only chord:
+///
+/// * **Chord configuration** (`Alt+Control`, `Alt+Shift`, ...): we try
+///   to install the `CGEventTap` listener via `mac_chord::install`. If
+///   that fails (most often because Accessibility hasn't been granted),
+///   we surface the error verbatim through `ActiveHotkey.error` and do
+///   NOT auto-fall-back to a key. The user has signalled — by picking
+///   a chord — that they want chord behaviour; substituting a key
+///   silently would be confusing and they may not even have the
+///   substitute key on their keyboard.
+/// * **Key configuration** (`F13`, `Cmd+Shift+Space`, ...): standard
+///   `tauri-plugin-global-shortcut` path with the `KEY_PTT_FALLBACKS`
+///   chain.
+///
+/// On non-macOS targets the chord path is unavailable; we always go
+/// straight to the shortcut plugin.
 fn register_push_to_talk<R: Runtime>(
     app: &AppHandle<R>,
     preferred: &str,
     gs: &tauri_plugin_global_shortcut::GlobalShortcut<R>,
     ctx: SessionCtx,
 ) -> ActiveHotkey {
-    // Build candidate list: configured first, then fallbacks.
-    let mut candidates: Vec<String> = Vec::with_capacity(1 + PTT_FALLBACKS.len());
-    if !preferred.is_empty() {
-        candidates.push(preferred.to_string());
+    if preferred.is_empty() {
+        return ActiveHotkey::empty("");
     }
-    for f in PTT_FALLBACKS {
+
+    // ---- Chord path (macOS only) -------------------------------------------
+    #[cfg(target_os = "macos")]
+    if let Some(spec) = mac_chord::try_parse_chord(preferred) {
+        match install_chord(app, spec, ctx) {
+            Ok(()) => {
+                log::error!(
+                    "push-to-talk: chord '{preferred}' installed via \
+                     CGEventTap. Hold the modifiers to dictate; release \
+                     to transcribe and paste."
+                );
+                return ActiveHotkey {
+                    configured: preferred.to_string(),
+                    bound: preferred.to_string(),
+                    fell_back: false,
+                    mechanism: "chord".to_string(),
+                    error: None,
+                    error_chain: Vec::new(),
+                };
+            }
+            Err(e) => {
+                let friendly = friendly_chord_error(&e);
+                log::error!(
+                    "push-to-talk: chord '{preferred}' could not be \
+                     installed: {e}. NOT falling back to a key shortcut \
+                     — the user explicitly chose a chord. Surface error: \
+                     {friendly}"
+                );
+                return ActiveHotkey {
+                    configured: preferred.to_string(),
+                    bound: String::new(),
+                    fell_back: false,
+                    mechanism: String::new(),
+                    error: Some(friendly.clone()),
+                    error_chain: vec![format!("'{preferred}' (chord): {e}"), friendly],
+                };
+            }
+        }
+    }
+
+    // ---- Key-shortcut path ------------------------------------------------
+    let mut candidates: Vec<String> = vec![preferred.to_string()];
+    for f in KEY_PTT_FALLBACKS {
         if !candidates.iter().any(|c| c == f) {
             candidates.push((*f).to_string());
         }
@@ -623,51 +692,7 @@ fn register_push_to_talk<R: Runtime>(
     let mut primary_error: Option<String> = None;
 
     for (idx, key) in candidates.iter().enumerate() {
-        let is_primary = idx == 0 && !preferred.is_empty();
-        // Try chord first (macOS only) — falls through to shortcut
-        // when the spec doesn't parse as a pure chord.
-        #[cfg(target_os = "macos")]
-        if let Some(spec) = mac_chord::try_parse_chord(key) {
-            match install_chord(app, spec, ctx.clone()) {
-                Ok(()) => {
-                    let fell_back = idx > 0;
-                    if fell_back {
-                        log::error!(
-                            "push-to-talk: configured '{preferred}' could not \
-                             be bound; using fallback chord '{key}'. Errors: {}",
-                            error_chain.join("; ")
-                        );
-                        if let Err(e) = settings::set_hotkey_field(
-                            app,
-                            HotkeyPurpose::PushToTalk,
-                            key,
-                        ) {
-                            log::warn!(
-                                "could not persist resolved push-to-talk hotkey: {e}"
-                            );
-                        }
-                    }
-                    return ActiveHotkey {
-                        configured: preferred.to_string(),
-                        bound: key.clone(),
-                        fell_back,
-                        mechanism: "chord".to_string(),
-                        error: primary_error,
-                        error_chain,
-                    };
-                }
-                Err(e) => {
-                    let msg = format!("'{key}' (chord): {e}");
-                    if is_primary {
-                        primary_error = Some(msg.clone());
-                    }
-                    error_chain.push(msg);
-                    continue;
-                }
-            }
-        }
-
-        // Standard `tauri-plugin-global-shortcut` path.
+        let is_primary = idx == 0;
         let Some(sc) = shortcut_from_key(key) else {
             let msg = format!("'{key}': unrecognised shortcut id");
             if is_primary {
@@ -705,8 +730,8 @@ fn register_push_to_talk<R: Runtime>(
                 let fell_back = idx > 0;
                 if fell_back {
                     log::error!(
-                        "push-to-talk: configured '{preferred}' could not be \
-                         bound; using fallback '{key}'. Errors: {}",
+                        "push-to-talk: configured key '{preferred}' could not \
+                         be bound; using fallback key '{key}'. Errors: {}",
                         error_chain.join("; ")
                     );
                     if let Err(e) = settings::set_hotkey_field(
@@ -739,7 +764,7 @@ fn register_push_to_talk<R: Runtime>(
     }
 
     log::error!(
-        "push-to-talk: NO hotkey could be bound. Tried: {}",
+        "push-to-talk: NO key shortcut could be bound. Tried: {}",
         error_chain.join("; ")
     );
     ActiveHotkey {
@@ -752,12 +777,39 @@ fn register_push_to_talk<R: Runtime>(
     }
 }
 
+/// Map a `mac_chord::ChordError` onto a single-sentence string the
+/// settings UI / pill / tray can show the user. The message must be
+/// actionable — assume the reader has never heard of "Accessibility
+/// permission" before.
+#[cfg(target_os = "macos")]
+fn friendly_chord_error(e: &mac_chord::ChordError) -> String {
+    match e {
+        mac_chord::ChordError::PermissionDenied
+        | mac_chord::ChordError::TapCreateFailed => {
+            "Vox can't listen for the chord because Accessibility \
+             permission isn't granted. Open System Settings → Privacy & \
+             Security → Accessibility and add Vox."
+                .into()
+        }
+        mac_chord::ChordError::RunLoopFailed => {
+            "Vox could not start the chord listener thread. Restart Vox; \
+             if this persists please report a bug."
+                .into()
+        }
+        mac_chord::ChordError::EmptySpec => {
+            "Configured push-to-talk chord has no modifiers. Pick a \
+             chord like Option+Control in Settings → Hotkeys."
+                .into()
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn install_chord<R: Runtime>(
     app: &AppHandle<R>,
     spec: mac_chord::ChordSpec,
     ctx: SessionCtx,
-) -> Result<(), String> {
+) -> Result<(), mac_chord::ChordError> {
     let app_press = app.clone();
     let ctx_press = ctx.clone();
     let app_release = app.clone();
@@ -783,8 +835,7 @@ fn install_chord<R: Runtime>(
                 session::end_recording(app_release.clone(), ctx_release.clone());
             }
         },
-    )
-    .map_err(|e| e.to_string())?;
+    )?;
 
     // Stash the handle on the active state so it stays alive for the
     // app's lifetime. We `manage` the state lazily if the host hasn't
