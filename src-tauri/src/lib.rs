@@ -5,6 +5,8 @@ mod frontmost;
 mod hotkey;
 mod inject;
 #[cfg(target_os = "macos")]
+mod mac_chord;
+#[cfg(target_os = "macos")]
 mod mac_perm;
 mod migration;
 mod models;

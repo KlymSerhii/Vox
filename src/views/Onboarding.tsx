@@ -741,11 +741,11 @@ function TryStep() {
     <div class="flex w-full max-w-[400px] flex-col items-center gap-4 text-center">
       <h2 class="text-[20px] font-semibold">Try it.</h2>
       <p class="text-[13px] text-[var(--color-ink-mute)]">
-        Hold <span class="keycap">⌥</span> and say something. Your words will
+        Hold <span class="keycap">⌥⌃</span> and say something. Your words will
         appear below.
       </p>
       <textarea
-        placeholder="Focus here, then hold ⌥ and speak."
+        placeholder="Focus here, then hold ⌥⌃ and speak."
         class="h-24 w-full resize-none rounded-[8px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
       />
       <p class="text-[11px] text-[var(--color-ink-faint)]">
@@ -783,7 +783,7 @@ function HowToUseStep(props: { s: Settings | null }) {
   const pttGlyph = () =>
     formatHotkey(ptt()?.bound) ||
     formatHotkey(props.s?.hotkey) ||
-    "F13";
+    "⌥⌃";
   const cycleGlyph = () =>
     formatHotkey(cycle()?.bound) ||
     formatHotkey(props.s?.mode_cycle_hotkey) ||

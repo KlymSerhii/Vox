@@ -54,17 +54,17 @@ const KEYRING_ACCOUNT_GROQ: &str = "groq";
 const KEYRING_ACCOUNT_ANTHROPIC: &str = "anthropic";
 
 fn default_hotkey() -> String {
-    // PRD §4.1 + post-mortem 2026-04-25: `AltRight` is unreliable on
-    // macOS through `tauri-plugin-global-shortcut` because the Carbon-era
-    // scancode table the plugin walks doesn't always have an entry for
-    // bare Right-Option. F13 is reliably scancode-mapped on macOS,
-    // doesn't conflict with any default macOS shortcut, and is reachable
-    // on full-size keyboards (and easy to remap to the current
-    // Right-Option via Karabiner-Elements for users who prefer it). New
-    // installs default to F13; existing installs whose stored hotkey is
-    // the literal string "AltRight" are migrated to F13 lazily inside
-    // `load`.
-    "F13".to_string()
+    // 2026-04-24: switched from `F13` to the `Alt+Control` modifier-only
+    // chord (the whispr-flow UX). Pure modifier chords cannot be
+    // registered through `tauri-plugin-global-shortcut` on macOS — they
+    // require a base key — so `hotkey.rs` recognises this string and
+    // installs a `CGEventTap` instead. If Accessibility is denied (or
+    // the tap fails for any other reason) we fall back through the
+    // `PTT_FALLBACKS` chain (F13 → F14 → F15 → ⌘⇧Space) so the dictation
+    // feature still works while the user grants permission. The token
+    // name is `Alt` (not `Option`) to stay consistent with the parser
+    // table we inherit from the global-shortcut plugin.
+    "Alt+Control".to_string()
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
@@ -305,21 +305,30 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
             .get(KEY_HOTKEY)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(default_hotkey);
-        // One-shot migration: existing installs whose stored push-to-talk
-        // hotkey is the legacy `"AltRight"` string get rewritten to F13,
-        // because the bare Right-Option keysym is not reliably bindable
-        // through `tauri-plugin-global-shortcut` on macOS. We persist the
-        // change immediately so the next boot doesn't pay the migration
-        // cost again.
-        if stored == "AltRight" {
-            log::info!(
+        // One-shot migration: legacy default values are upgraded to the
+        // current default chord (`Alt+Control`). Two cases:
+        //
+        // 1. `AltRight` — the original default; never reliably bindable
+        //    through `tauri-plugin-global-shortcut`.
+        // 2. `F13` — the previous default chosen as a workaround for
+        //    case 1; not every keyboard exposes it, and the modifier
+        //    chord is the better UX.
+        //
+        // Anything OTHER than these two is treated as an explicit user
+        // choice and left untouched. We log the migration at error
+        // level so it's visible in `tauri dev`'s terminal.
+        if stored == "AltRight" || stored == "F13" {
+            log::error!(
                 "settings: migrating legacy push-to-talk hotkey \
-                 'AltRight' -> 'F13' (Right-Option is unreliable through \
-                 tauri-plugin-global-shortcut on macOS)"
+                 '{stored}' -> 'Alt+Control'. Hold Option+Control to \
+                 dictate; release to transcribe and paste."
             );
-            store.set(KEY_HOTKEY, serde_json::Value::String("F13".to_string()));
+            store.set(
+                KEY_HOTKEY,
+                serde_json::Value::String("Alt+Control".to_string()),
+            );
             let _ = store.save();
-            "F13".to_string()
+            "Alt+Control".to_string()
         } else {
             stored
         }

@@ -639,6 +639,8 @@ pub struct HotkeyDiagnostic {
     pub configured: String,
     pub bound: String,
     pub fell_back: bool,
+    /// `"shortcut"`, `"chord"`, or `""` when nothing is bound.
+    pub mechanism: String,
     pub error: Option<String>,
     pub error_chain: Vec<String>,
 }
@@ -650,6 +652,7 @@ impl HotkeyDiagnostic {
             configured: a.configured,
             bound: a.bound,
             fell_back: a.fell_back,
+            mechanism: a.mechanism,
             error: a.error,
             error_chain: a.error_chain,
         }
@@ -672,6 +675,7 @@ pub fn get_active_hotkey<R: Runtime>(app: AppHandle<R>) -> ActiveHotkey {
             configured: settings::load(&app).hotkey,
             bound: String::new(),
             fell_back: false,
+            mechanism: String::new(),
             error: Some("hotkey state not initialised".into()),
             error_chain: vec!["hotkey state not initialised".into()],
         },

@@ -77,7 +77,14 @@ interface HotkeyOption {
 }
 
 const HOTKEY_OPTIONS: HotkeyOption[] = [
-  { value: "F13", label: "F13 (recommended)" },
+  // Modifier-only chords come first — these are bound via the
+  // CGEventTap path (mac_chord.rs), not tauri-plugin-global-shortcut,
+  // and they're the whispr-flow style hold-to-talk UX. Storage uses
+  // the canonical `Alt+...` token name; the label uses macOS naming
+  // ("Option" not "Alt") to match what's printed on the keys.
+  { value: "Alt+Control", label: "Option + Control (recommended)" },
+  { value: "Alt+Shift", label: "Option + Shift" },
+  { value: "F13", label: "F13" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
   { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
@@ -562,11 +569,7 @@ function HotkeysTab(props: {
       <Card>
         <HotkeyRow
           label="Push-to-talk"
-          hint={
-            props.s.hands_free_enabled
-              ? "Press once to start recording, press again to stop. (Hands-free is on.)"
-              : "Hold this key to record; release to transcribe."
-          }
+          hint={pttHint(props.s.hands_free_enabled, ptt())}
           configured={props.s.hotkey}
           diagnostic={ptt()}
           options={HOTKEY_OPTIONS}
@@ -720,6 +723,22 @@ function HotkeyRow(props: {
 function labelForValue(opts: HotkeyOption[], value: string): string | null {
   const m = opts.find((o) => o.value === value);
   return m?.label ?? null;
+}
+
+/** Subtext under the push-to-talk row. When the bound hotkey is a
+ * modifier-only chord we print "Hold both keys to dictate. Release
+ * either to stop." — otherwise the standard single-key copy. */
+function pttHint(
+  handsFree: boolean,
+  diag: HotkeyDiagnostic | null,
+): string {
+  if (handsFree) {
+    return "Press once to start recording, press again to stop. (Hands-free is on.)";
+  }
+  if (diag?.mechanism === "chord") {
+    return "Hold both keys to dictate. Release either to stop.";
+  }
+  return "Hold the key to dictate. Release to stop.";
 }
 
 // -------- Models --------
@@ -2115,8 +2134,9 @@ function formatDiagnostics(d: DiagnoseHotkeys): string {
   for (const e of d.entries) {
     const cfg = e.configured || "<off>";
     const bnd = e.bound || "<unbound>";
+    const mech = e.mechanism ? ` mechanism=${e.mechanism}` : "";
     lines.push(
-      `${e.purpose.padEnd(14)} configured=${cfg.padEnd(28)} bound=${bnd}` +
+      `${e.purpose.padEnd(14)} configured=${cfg.padEnd(28)} bound=${bnd}${mech}` +
         (e.fell_back ? "  [fallback]" : ""),
     );
     if (e.error_chain.length > 0) {

@@ -315,6 +315,10 @@ export interface HotkeyDiagnostic {
   configured: string;
   bound: string;
   fell_back: boolean;
+  /** "shortcut" | "chord" | "" — which mechanism the binding uses.
+   *  "chord" means a CGEventTap modifier-only listener; "shortcut" is
+   *  the standard `tauri-plugin-global-shortcut` (Carbon) path. */
+  mechanism: string;
   error: string | null;
   error_chain: string[];
 }

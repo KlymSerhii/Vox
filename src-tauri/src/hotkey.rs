@@ -39,13 +39,23 @@ use tauri_plugin_global_shortcut::{
     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
 };
 
+#[cfg(target_os = "macos")]
+use crate::mac_chord::{self, ChordHandle};
 use crate::session::{self, SessionCtx};
 use crate::settings::{self, HotkeyPurpose};
 
 /// Default registration order when the configured push-to-talk hotkey
 /// can't be bound. Same order is used as the search space for the
-/// "first registerable" pass.
-const PTT_FALLBACKS: &[&str] = &["F13", "F14", "F15", "CommandOrControl+Shift+Space"];
+/// "first registerable" pass. The default chord (`Alt+Control`) is the
+/// first entry; the F13 chain is the standard fallback when the chord
+/// can't be installed (e.g. Accessibility revoked).
+const PTT_FALLBACKS: &[&str] = &[
+    "Alt+Control",
+    "F13",
+    "F14",
+    "F15",
+    "CommandOrControl+Shift+Space",
+];
 const CANCEL_FALLBACKS: &[&str] = &["Escape"];
 const PASTE_LAST_FALLBACKS: &[&str] = &[
     "Alt+Shift+V",
@@ -72,6 +82,13 @@ pub struct ActiveHotkey {
     /// True when the configured value couldn't be bound and we fell
     /// through to a fallback. UIs use this to render an explanation.
     pub fell_back: bool,
+    /// Which underlying mechanism is providing the binding:
+    ///  - `"shortcut"` — `tauri-plugin-global-shortcut` (Carbon
+    ///    `RegisterEventHotKey` on macOS)
+    ///  - `"chord"` — modifier-only via our `CGEventTap` (whispr-flow
+    ///    UX)
+    ///  - `""` — nothing bound
+    pub mechanism: String,
     /// Last error from the configured key registration attempt, if any.
     /// `None` when registration succeeded outright.
     pub error: Option<String>,
@@ -86,6 +103,7 @@ impl ActiveHotkey {
             configured: configured.to_string(),
             bound: String::new(),
             fell_back: false,
+            mechanism: String::new(),
             error: None,
             error_chain: Vec::new(),
         }
@@ -94,12 +112,17 @@ impl ActiveHotkey {
 
 /// Mutable snapshot of the currently bound hotkeys. Stored in Tauri
 /// state so IPC handlers can expose it without re-running registration.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct ActiveHotkeyState {
     pub push_to_talk: Mutex<ActiveHotkey>,
     pub cancel: Mutex<ActiveHotkey>,
     pub paste_last: Mutex<ActiveHotkey>,
     pub mode_cycle: Mutex<ActiveHotkey>,
+    /// Owns the lifetime of the `CGEventTap`-backed chord listener (if
+    /// any). On re-`register()` we drop the prior handle BEFORE
+    /// installing the new one to avoid two taps competing.
+    #[cfg(target_os = "macos")]
+    pub chord: Mutex<Option<ChordHandle>>,
 }
 
 impl ActiveHotkeyState {
@@ -255,83 +278,38 @@ pub fn register<R: Runtime>(
     // Clear any existing registrations (safe if none).
     let _ = gs.unregister_all();
 
+    // Drop any existing chord listener BEFORE we try to install a new
+    // one, so two taps never run in parallel after a re-register.
+    #[cfg(target_os = "macos")]
+    if let Some(state) = app.try_state::<ActiveHotkeyState>() {
+        if let Ok(mut g) = state.chord.lock() {
+            *g = None;
+        }
+    }
+
     // ---- Push-to-talk -----------------------------------------------------
     //
-    // We intentionally pull the SessionCtx-owning closure into its own
-    // scope so the borrow checker is happy moving `ctx` into successive
-    // `register` attempts within `try_chain`.
-    let ptt_outcome = {
-        let ctx_outer = ctx.clone();
-        try_chain(preferred, PTT_FALLBACKS, |_id, sc| {
-            let app_handle = app.clone();
-            let ctx_clone = ctx_outer.clone();
-            gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
-                // Cheap read — never touches the Keychain.
-                let prefs = settings::prefs(&app_handle);
-                if prefs.hands_free_enabled {
-                    if let ShortcutState::Pressed = event.state() {
-                        if ctx_clone.is_recording() {
-                            session::end_recording(app_handle.clone(), ctx_clone.clone());
-                        } else {
-                            session::begin_recording(app_handle.clone(), &ctx_clone);
-                        }
-                    }
-                } else {
-                    match event.state() {
-                        ShortcutState::Pressed => {
-                            session::begin_recording(app_handle.clone(), &ctx_clone)
-                        }
-                        ShortcutState::Released => {
-                            session::end_recording(app_handle.clone(), ctx_clone.clone())
-                        }
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())
-        })
-    };
-
-    let ptt_active = match ptt_outcome {
-        Ok(out) => {
-            if out.fell_back {
-                log::error!(
-                    "push-to-talk: configured '{preferred}' could not be \
-                     bound; using fallback '{}'. Errors: {}",
-                    out.bound,
-                    out.error_chain.join("; ")
-                );
-                // Persist the migration so the picker shows the truth.
-                if let Err(e) = settings::set_hotkey_field(
-                    app,
-                    HotkeyPurpose::PushToTalk,
-                    &out.bound,
-                ) {
-                    log::warn!("could not persist resolved push-to-talk hotkey: {e}");
-                }
-            }
-            ActiveHotkey {
-                configured: preferred.to_string(),
-                bound: out.bound,
-                fell_back: out.fell_back,
-                error: out.primary_error,
-                error_chain: out.error_chain,
-            }
+    // For the push-to-talk slot we walk a preference chain that tries
+    // the chord listener (CGEventTap, whispr-flow UX) first, then falls
+    // back to the standard `tauri-plugin-global-shortcut` path. Cancel
+    // / paste-last / mode-cycle stay on the regular plugin — they're
+    // discrete events, not press+release, and modifier-only chords
+    // would conflict with normal typing there.
+    #[cfg(target_os = "macos")]
+    {
+        // Surface the current Accessibility status. We can't easily
+        // detect it being revoked while we're running, so logging on
+        // every call is the cheapest signal we can give a user staring
+        // at `tauri dev`'s terminal.
+        // SAFETY: AXIsProcessTrusted is a non-prompting check.
+        extern "C" {
+            fn AXIsProcessTrusted() -> bool;
         }
-        Err(chain) => {
-            log::error!(
-                "push-to-talk: NO hotkey could be bound. Tried: {}",
-                chain.join("; ")
-            );
-            ActiveHotkey {
-                configured: preferred.to_string(),
-                bound: String::new(),
-                fell_back: false,
-                error: chain.first().cloned(),
-                error_chain: chain,
-            }
-        }
-    };
+        let trusted = unsafe { AXIsProcessTrusted() };
+        log::info!("hotkey: AXIsProcessTrusted={trusted}");
+    }
 
+    let ptt_active: ActiveHotkey = register_push_to_talk(app, preferred, gs, ctx.clone());
     let ptt_bound_sc = shortcut_from_key(&ptt_active.bound);
 
     // ---- Cancel -----------------------------------------------------------
@@ -377,6 +355,7 @@ pub fn register<R: Runtime>(
                     configured: cancel_preferred.to_string(),
                     bound: out.bound,
                     fell_back: out.fell_back,
+                    mechanism: "shortcut".to_string(),
                     error: out.primary_error,
                     error_chain: out.error_chain,
                 }
@@ -390,6 +369,7 @@ pub fn register<R: Runtime>(
                     configured: cancel_preferred.to_string(),
                     bound: String::new(),
                     fell_back: false,
+                    mechanism: String::new(),
                     error: chain.first().cloned(),
                     error_chain: chain,
                 }
@@ -452,6 +432,7 @@ pub fn register<R: Runtime>(
                     configured: paste_last_preferred.to_string(),
                     bound: out.bound,
                     fell_back: out.fell_back,
+                    mechanism: "shortcut".to_string(),
                     error: out.primary_error,
                     error_chain: out.error_chain,
                 }
@@ -465,6 +446,7 @@ pub fn register<R: Runtime>(
                     configured: paste_last_preferred.to_string(),
                     bound: String::new(),
                     fell_back: false,
+                    mechanism: String::new(),
                     error: chain.first().cloned(),
                     error_chain: chain,
                 }
@@ -524,6 +506,7 @@ pub fn register<R: Runtime>(
                     configured: mode_cycle_preferred.to_string(),
                     bound: out.bound,
                     fell_back: out.fell_back,
+                    mechanism: "shortcut".to_string(),
                     error: out.primary_error,
                     error_chain: out.error_chain,
                 }
@@ -537,6 +520,7 @@ pub fn register<R: Runtime>(
                     configured: mode_cycle_preferred.to_string(),
                     bound: String::new(),
                     fell_back: false,
+                    mechanism: String::new(),
                     error: chain.first().cloned(),
                     error_chain: chain,
                 }
@@ -560,11 +544,18 @@ pub fn register<R: Runtime>(
     }
 
     // Single info-level summary so the user can see what's actually
-    // bound at startup without grep'ing through warnings.
+    // bound at startup without grep'ing through warnings. Includes the
+    // mechanism (chord vs shortcut) for the push-to-talk binding.
     log::info!(
-        "hotkey: push-to-talk={} (configured {}), cancel={} (configured {}), \
-         paste-last={} (configured {}), mode-cycle={} (configured {})",
+        "hotkey: push-to-talk={} mechanism={} (configured {}), \
+         cancel={} (configured {}), paste-last={} (configured {}), \
+         mode-cycle={} (configured {})",
         display_bound(&ptt_active),
+        if ptt_active.mechanism.is_empty() {
+            "<none>"
+        } else {
+            ptt_active.mechanism.as_str()
+        },
         nonempty(&ptt_active.configured),
         display_bound(&cancel_active),
         nonempty(&cancel_active.configured),
@@ -602,6 +593,214 @@ fn nonempty(s: &str) -> &str {
     } else {
         s
     }
+}
+
+/// Register the push-to-talk hotkey, walking the chord-or-shortcut
+/// preference chain and falling back through the `PTT_FALLBACKS` list.
+///
+/// On macOS we try modifier-only chords first via `mac_chord::install`
+/// (a `CGEventTap` listener) before reaching for
+/// `tauri-plugin-global-shortcut`. On other platforms we go directly to
+/// the standard plugin path.
+fn register_push_to_talk<R: Runtime>(
+    app: &AppHandle<R>,
+    preferred: &str,
+    gs: &tauri_plugin_global_shortcut::GlobalShortcut<R>,
+    ctx: SessionCtx,
+) -> ActiveHotkey {
+    // Build candidate list: configured first, then fallbacks.
+    let mut candidates: Vec<String> = Vec::with_capacity(1 + PTT_FALLBACKS.len());
+    if !preferred.is_empty() {
+        candidates.push(preferred.to_string());
+    }
+    for f in PTT_FALLBACKS {
+        if !candidates.iter().any(|c| c == f) {
+            candidates.push((*f).to_string());
+        }
+    }
+
+    let mut error_chain: Vec<String> = Vec::new();
+    let mut primary_error: Option<String> = None;
+
+    for (idx, key) in candidates.iter().enumerate() {
+        let is_primary = idx == 0 && !preferred.is_empty();
+        // Try chord first (macOS only) — falls through to shortcut
+        // when the spec doesn't parse as a pure chord.
+        #[cfg(target_os = "macos")]
+        if let Some(spec) = mac_chord::try_parse_chord(key) {
+            match install_chord(app, spec, ctx.clone()) {
+                Ok(()) => {
+                    let fell_back = idx > 0;
+                    if fell_back {
+                        log::error!(
+                            "push-to-talk: configured '{preferred}' could not \
+                             be bound; using fallback chord '{key}'. Errors: {}",
+                            error_chain.join("; ")
+                        );
+                        if let Err(e) = settings::set_hotkey_field(
+                            app,
+                            HotkeyPurpose::PushToTalk,
+                            key,
+                        ) {
+                            log::warn!(
+                                "could not persist resolved push-to-talk hotkey: {e}"
+                            );
+                        }
+                    }
+                    return ActiveHotkey {
+                        configured: preferred.to_string(),
+                        bound: key.clone(),
+                        fell_back,
+                        mechanism: "chord".to_string(),
+                        error: primary_error,
+                        error_chain,
+                    };
+                }
+                Err(e) => {
+                    let msg = format!("'{key}' (chord): {e}");
+                    if is_primary {
+                        primary_error = Some(msg.clone());
+                    }
+                    error_chain.push(msg);
+                    continue;
+                }
+            }
+        }
+
+        // Standard `tauri-plugin-global-shortcut` path.
+        let Some(sc) = shortcut_from_key(key) else {
+            let msg = format!("'{key}': unrecognised shortcut id");
+            if is_primary {
+                primary_error = Some(msg.clone());
+            }
+            error_chain.push(msg);
+            continue;
+        };
+        let app_handle = app.clone();
+        let ctx_clone = ctx.clone();
+        let r = gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
+            // Cheap read — never touches the Keychain.
+            let prefs = settings::prefs(&app_handle);
+            if prefs.hands_free_enabled {
+                if let ShortcutState::Pressed = event.state() {
+                    if ctx_clone.is_recording() {
+                        session::end_recording(app_handle.clone(), ctx_clone.clone());
+                    } else {
+                        session::begin_recording(app_handle.clone(), &ctx_clone);
+                    }
+                }
+            } else {
+                match event.state() {
+                    ShortcutState::Pressed => {
+                        session::begin_recording(app_handle.clone(), &ctx_clone)
+                    }
+                    ShortcutState::Released => {
+                        session::end_recording(app_handle.clone(), ctx_clone.clone())
+                    }
+                }
+            }
+        });
+        match r {
+            Ok(()) => {
+                let fell_back = idx > 0;
+                if fell_back {
+                    log::error!(
+                        "push-to-talk: configured '{preferred}' could not be \
+                         bound; using fallback '{key}'. Errors: {}",
+                        error_chain.join("; ")
+                    );
+                    if let Err(e) = settings::set_hotkey_field(
+                        app,
+                        HotkeyPurpose::PushToTalk,
+                        key,
+                    ) {
+                        log::warn!(
+                            "could not persist resolved push-to-talk hotkey: {e}"
+                        );
+                    }
+                }
+                return ActiveHotkey {
+                    configured: preferred.to_string(),
+                    bound: key.clone(),
+                    fell_back,
+                    mechanism: "shortcut".to_string(),
+                    error: primary_error,
+                    error_chain,
+                };
+            }
+            Err(e) => {
+                let msg = format!("'{key}': {e}");
+                if is_primary {
+                    primary_error = Some(msg.clone());
+                }
+                error_chain.push(msg);
+            }
+        }
+    }
+
+    log::error!(
+        "push-to-talk: NO hotkey could be bound. Tried: {}",
+        error_chain.join("; ")
+    );
+    ActiveHotkey {
+        configured: preferred.to_string(),
+        bound: String::new(),
+        fell_back: false,
+        mechanism: String::new(),
+        error: primary_error.or_else(|| error_chain.first().cloned()),
+        error_chain,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn install_chord<R: Runtime>(
+    app: &AppHandle<R>,
+    spec: mac_chord::ChordSpec,
+    ctx: SessionCtx,
+) -> Result<(), String> {
+    let app_press = app.clone();
+    let ctx_press = ctx.clone();
+    let app_release = app.clone();
+    let ctx_release = ctx.clone();
+    let handle = mac_chord::install(
+        spec,
+        move || {
+            let prefs = settings::prefs(&app_press);
+            if prefs.hands_free_enabled {
+                // Hands-free: chord-press toggles record state.
+                if ctx_press.is_recording() {
+                    session::end_recording(app_press.clone(), ctx_press.clone());
+                } else {
+                    session::begin_recording(app_press.clone(), &ctx_press);
+                }
+            } else {
+                session::begin_recording(app_press.clone(), &ctx_press);
+            }
+        },
+        move || {
+            let prefs = settings::prefs(&app_release);
+            if !prefs.hands_free_enabled {
+                session::end_recording(app_release.clone(), ctx_release.clone());
+            }
+        },
+    )
+    .map_err(|e| e.to_string())?;
+
+    // Stash the handle on the active state so it stays alive for the
+    // app's lifetime. We `manage` the state lazily if the host hasn't
+    // installed it yet (matches `register()`'s symmetric path).
+    if let Some(state) = app.try_state::<ActiveHotkeyState>() {
+        if let Ok(mut g) = state.chord.lock() {
+            *g = Some(handle);
+        }
+    } else {
+        let new_state = ActiveHotkeyState::default();
+        if let Ok(mut g) = new_state.chord.lock() {
+            *g = Some(handle);
+        }
+        app.manage(new_state);
+    }
+    Ok(())
 }
 
 fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
