@@ -138,6 +138,45 @@ pub fn emit_audio_level<R: Runtime>(app: &AppHandle<R>, level: f32) {
     let _ = app.emit_to(LABEL, "pill:audio_level", AudioLevelPayload { level });
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ActiveModePayload {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModeSuggestionPayload {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+}
+
+/// Tell the listening pill which Voice Mode is active. Read-only on the
+/// pill — switching is done via the tray popover or the cycle hotkey.
+pub fn emit_active_mode<R: Runtime>(app: &AppHandle<R>, mode: &crate::modes::VoiceMode) {
+    let payload = ActiveModePayload {
+        id: mode.id.clone(),
+        name: mode.name.clone(),
+        icon: mode.icon.clone(),
+    };
+    let _ = app.emit_to(LABEL, "pill:active_mode", payload);
+}
+
+/// Render a "Switch to <name>?" hint at the right edge of the pill.
+/// Pure suggestion — never auto-switches per the CEO decision.
+pub fn emit_mode_suggestion<R: Runtime>(
+    app: &AppHandle<R>,
+    suggestion: Option<crate::modes::VoiceMode>,
+) {
+    let payload = suggestion.map(|m| ModeSuggestionPayload {
+        id: m.id,
+        name: m.name,
+        icon: m.icon,
+    });
+    let _ = app.emit_to(LABEL, "pill:mode_suggestion", payload);
+}
+
 /// Schedule a hide after `ms` (used for Done / Error auto-dismiss).
 pub fn hide_after<R: Runtime>(app: &Arc<AppHandle<R>>, ms: u64) {
     let app_clone = Arc::clone(app);

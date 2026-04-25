@@ -2,24 +2,34 @@ import { createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-j
 import {
   cancelDownload,
   checkForUpdates,
+  deleteMode,
   deleteModel,
   downloadModel,
+  duplicateMode,
+  exportMode,
   getLaunchAtLogin,
   getSettings,
+  importModeJson,
   listModels,
+  listModes,
   onModelCanceled,
   onModelDone,
   onModelError,
   onModelProgress,
   replayOnboarding,
+  resetDefaultModes,
+  saveMode,
   setLaunchAtLogin,
   setSettings,
   testAnthropicConnection,
   testGroqConnection,
+  type CaseStyle,
   type ModelStatus,
+  type PunctuationStyle,
   type Settings,
   type TestConnectionResult,
   type UpdateCheckResult,
+  type VoiceMode,
 } from "../lib/ipc";
 
 type Tab =
@@ -27,6 +37,7 @@ type Tab =
   | "hotkeys"
   | "models"
   | "keys"
+  | "modes"
   | "dictionary"
   | "privacy"
   | "about";
@@ -36,6 +47,7 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "hotkeys", label: "Hotkeys", icon: "keyboard" },
   { id: "models", label: "Models", icon: "cube" },
   { id: "keys", label: "API Keys", icon: "key" },
+  { id: "modes", label: "Modes", icon: "modes" },
   { id: "dictionary", label: "Dictionary", icon: "book" },
   { id: "privacy", label: "Privacy", icon: "lock" },
   { id: "about", label: "About", icon: "info" },
@@ -62,6 +74,30 @@ const PASTE_LAST_HOTKEY_OPTIONS: { value: string; label: string }[] = [
   { value: "F13", label: "F13" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
+];
+
+const MODE_CYCLE_HOTKEY_OPTIONS: { value: string; label: string }[] = [
+  { value: "Alt+M", label: "⌥M" },
+  { value: "Alt+Shift+M", label: "⌥⇧M" },
+  { value: "CommandOrControl+Shift+M", label: "⌘⇧M" },
+  { value: "F13", label: "F13" },
+  { value: "F14", label: "F14" },
+  { value: "F15", label: "F15" },
+  { value: "", label: "Off" },
+];
+
+const PUNCTUATION_OPTIONS: { value: PunctuationStyle; label: string }[] = [
+  { value: "Aggressive", label: "Aggressive" },
+  { value: "Standard", label: "Standard" },
+  { value: "Minimal", label: "Minimal" },
+  { value: "None", label: "None (strip)" },
+];
+
+const CASE_OPTIONS: { value: CaseStyle; label: string }[] = [
+  { value: "Sentence", label: "Sentence" },
+  { value: "Title", label: "Title" },
+  { value: "Lower", label: "Lowercase" },
+  { value: "AsSpoken", label: "As spoken" },
 ];
 
 const LANGUAGE_OPTIONS: { value: string; label: string }[] = [
@@ -134,6 +170,9 @@ export default function SettingsView() {
               </Show>
               <Show when={tab() === "keys"}>
                 <KeysTab s={s()} update={update} />
+              </Show>
+              <Show when={tab() === "modes"}>
+                <ModesTab s={s()} update={update} />
               </Show>
               <Show when={tab() === "dictionary"}>
                 <DictionaryTab s={s()} update={update} />
@@ -264,6 +303,13 @@ function TabIcon(props: { name: string; active: boolean }) {
           <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
           <polyline points="3.27 6.96 12 12.01 20.73 6.96" />
           <line x1="12" y1="22.08" x2="12" y2="12" />
+        </>
+      )}
+      {props.name === "modes" && (
+        <>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 3v18" />
+          <path d="M3 12h18" />
         </>
       )}
     </svg>
@@ -479,7 +525,6 @@ function HotkeysTab(props: {
         <Row
           label="Paste last transcript"
           hint="Re-paste the most recent dictation at the cursor."
-          last
         >
           <select
             class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
@@ -489,6 +534,23 @@ function HotkeysTab(props: {
             }
           >
             <For each={PASTE_LAST_HOTKEY_OPTIONS}>
+              {(o) => <option value={o.value}>{o.label}</option>}
+            </For>
+          </select>
+        </Row>
+        <Row
+          label="Cycle voice mode"
+          hint="Press to advance through Voice Modes in display order."
+          last
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.mode_cycle_hotkey}
+            onChange={(e) =>
+              props.update({ mode_cycle_hotkey: e.currentTarget.value })
+            }
+          >
+            <For each={MODE_CYCLE_HOTKEY_OPTIONS}>
               {(o) => <option value={o.value}>{o.label}</option>}
             </For>
           </select>
@@ -846,6 +908,639 @@ function ModelRow(props: {
           </div>
         )}
       </Show>
+    </div>
+  );
+}
+
+// -------- Modes --------
+
+function ModesTab(props: {
+  s: Settings;
+  update: (p: Partial<Settings>) => void;
+}) {
+  const [modes, setModes] = createSignal<VoiceMode[]>([]);
+  const [editing, setEditing] = createSignal<VoiceMode | null>(null);
+  const [importErr, setImportErr] = createSignal<string | null>(null);
+  let fileInput: HTMLInputElement | undefined;
+
+  async function refresh() {
+    try {
+      setModes(await listModes());
+    } catch (e) {
+      console.error("listModes:", e);
+    }
+  }
+
+  onMount(async () => {
+    await refresh();
+  });
+
+  // Drag-drop file import on the whole modes tab.
+  function onDragOver(e: DragEvent) {
+    e.preventDefault();
+  }
+  async function onDrop(e: DragEvent) {
+    e.preventDefault();
+    const file = e.dataTransfer?.files?.[0];
+    if (!file) return;
+    if (!file.name.endsWith(".voxmode") && !file.name.endsWith(".json")) {
+      setImportErr("Only .voxmode or .json files are supported.");
+      return;
+    }
+    const text = await file.text();
+    await doImport(text);
+  }
+
+  async function doImport(text: string) {
+    setImportErr(null);
+    try {
+      await importModeJson(text);
+      await refresh();
+    } catch (e) {
+      setImportErr(String(e));
+    }
+  }
+
+  async function onFilePick(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    input.value = "";
+    await doImport(text);
+  }
+
+  async function onActivate(id: string) {
+    props.update({ active_mode_id: id });
+  }
+
+  async function onDuplicate(id: string) {
+    try {
+      const m = await duplicateMode(id);
+      await refresh();
+      setEditing(m);
+    } catch (e) {
+      console.error("duplicate:", e);
+    }
+  }
+
+  async function onDelete(id: string) {
+    if (!confirm("Delete this mode? This cannot be undone.")) return;
+    try {
+      await deleteMode(id);
+      await refresh();
+      if (editing()?.id === id) setEditing(null);
+    } catch (e) {
+      console.error("delete:", e);
+    }
+  }
+
+  async function onExport(m: VoiceMode) {
+    try {
+      const json = await exportMode(m.id);
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${m.id}.voxmode`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (e) {
+      console.error("export:", e);
+    }
+  }
+
+  async function onReset() {
+    try {
+      const n = await resetDefaultModes();
+      await refresh();
+      if (n === 0) alert("All defaults are already present.");
+    } catch (e) {
+      console.error("reset:", e);
+    }
+  }
+
+  function onNew() {
+    const draft: VoiceMode = {
+      id: "",
+      name: "New Mode",
+      icon: "🌟",
+      description: "",
+      system_prompt:
+        "You clean up dictated text. Return plain text only — no preface.",
+      dictionary: [],
+      punctuation: "Standard",
+      case: "Sentence",
+      max_length_chars: null,
+      auto_triggers: [],
+      built_in: false,
+      created_at: 0,
+      updated_at: 0,
+    };
+    setEditing(draft);
+  }
+
+  async function onSaveDraft(mode: VoiceMode) {
+    let id = mode.id;
+    if (!id) {
+      // Generate a slug client-side; the backend will dedup if it
+      // collides with an existing mode.
+      id = mode.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/(^-|-$)/g, "");
+      if (!id) id = `mode-${Date.now()}`;
+    }
+    const toSave: VoiceMode = { ...mode, id };
+    try {
+      await saveMode(toSave);
+      await refresh();
+      setEditing(null);
+    } catch (e) {
+      console.error("save mode:", e);
+      alert(`Save failed: ${e}`);
+    }
+  }
+
+  return (
+    <div onDragOver={onDragOver} onDrop={onDrop}>
+      <Card>
+        <Row
+          label="Active mode"
+          hint="Used for the next utterance unless you cycle or pick a different mode."
+        >
+          <select
+            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.active_mode_id}
+            onChange={(e) => onActivate(e.currentTarget.value)}
+          >
+            <For each={modes()}>
+              {(m) => (
+                <option value={m.id}>
+                  {m.icon} {m.name}
+                </option>
+              )}
+            </For>
+          </select>
+        </Row>
+        <Row
+          label="Show suggestion HUD"
+          hint="Hint a mode based on the focused app. Vox never auto-switches."
+          last
+        >
+          <Toggle
+            checked={props.s.auto_suggest_modes}
+            onChange={(v) => props.update({ auto_suggest_modes: v })}
+          />
+        </Row>
+      </Card>
+
+      <Show when={importErr()}>
+        <div class="mb-3 rounded-[10px] bg-[var(--color-danger)]/10 p-3 text-[12px] text-[var(--color-danger)] ring-1 ring-[var(--color-danger)]/40">
+          Import failed: {importErr()}
+        </div>
+      </Show>
+
+      <For each={modes()}>
+        {(m) => (
+          <ModeRow
+            m={m}
+            isActive={m.id === props.s.active_mode_id}
+            onActivate={() => onActivate(m.id)}
+            onEdit={() => setEditing(m)}
+            onDuplicate={() => onDuplicate(m.id)}
+            onDelete={() => onDelete(m.id)}
+            onExport={() => onExport(m)}
+          />
+        )}
+      </For>
+
+      <div class="mt-2 flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={onNew}
+          class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-black hover:brightness-110"
+        >
+          + New mode
+        </button>
+        <button
+          type="button"
+          onClick={() => fileInput?.click()}
+          class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+        >
+          Import .voxmode
+        </button>
+        <button
+          type="button"
+          onClick={onReset}
+          class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+        >
+          Reset to defaults
+        </button>
+        <input
+          ref={fileInput}
+          type="file"
+          accept=".voxmode,.json,application/json"
+          class="hidden"
+          onChange={onFilePick}
+        />
+      </div>
+      <p class="mt-3 text-[11px] text-[var(--color-ink-mute)]">
+        Drag a <code class="text-[var(--color-ink)]">.voxmode</code> file
+        anywhere on this tab to import. Built-in modes can't be edited
+        directly — duplicate one to make changes.
+      </p>
+
+      <Show when={editing()}>
+        {(m) => (
+          <ModeEditor
+            mode={m()}
+            onCancel={() => setEditing(null)}
+            onSave={onSaveDraft}
+          />
+        )}
+      </Show>
+    </div>
+  );
+}
+
+function ModeRow(props: {
+  m: VoiceMode;
+  isActive: boolean;
+  onActivate: () => void;
+  onEdit: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+  onExport: () => void;
+}) {
+  return (
+    <div class="mb-3 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1">
+          <div class="flex items-center gap-2">
+            <span class="text-[16px]" aria-hidden="true">
+              {props.m.icon}
+            </span>
+            <span class="text-[13px] font-medium">{props.m.name}</span>
+            <Show when={props.m.built_in}>
+              <span class="rounded-full bg-white/8 px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
+                Default
+              </span>
+            </Show>
+            <Show when={!props.m.built_in}>
+              <span class="rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">
+                Custom
+              </span>
+            </Show>
+            <Show when={props.isActive}>
+              <span class="rounded-full bg-[var(--color-success)]/20 px-2 py-0.5 text-[10px] text-[var(--color-success)]">
+                Active
+              </span>
+            </Show>
+          </div>
+          <div class="mt-0.5 text-[11px] text-[var(--color-ink-mute)]">
+            {props.m.description || "No description."}
+          </div>
+        </div>
+        <div class="flex shrink-0 flex-wrap items-center gap-1.5">
+          <Show when={!props.isActive}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-black hover:bg-[var(--color-accent)]"
+              onClick={props.onActivate}
+            >
+              Use
+            </button>
+          </Show>
+          <Show when={props.m.built_in}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+              onClick={props.onDuplicate}
+            >
+              Duplicate to edit
+            </button>
+          </Show>
+          <Show when={!props.m.built_in}>
+            <button
+              type="button"
+              class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+              onClick={props.onEdit}
+            >
+              Edit
+            </button>
+            <button
+              type="button"
+              class="rounded-[6px] bg-white/6 px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-white/10"
+              onClick={props.onExport}
+              title="Export as .voxmode"
+            >
+              Export
+            </button>
+            <button
+              type="button"
+              class="rounded-[6px] bg-white/6 px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+              onClick={props.onDelete}
+            >
+              Delete
+            </button>
+          </Show>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ModeEditor(props: {
+  mode: VoiceMode;
+  onCancel: () => void;
+  onSave: (m: VoiceMode) => void;
+}) {
+  const [draft, setDraft] = createSignal<VoiceMode>({ ...props.mode });
+  const [dictDraft, setDictDraft] = createSignal("");
+
+  function patch(partial: Partial<VoiceMode>) {
+    setDraft({ ...draft(), ...partial });
+  }
+
+  function addDictTerm() {
+    const v = dictDraft().trim();
+    if (!v) return;
+    if (draft().dictionary.includes(v)) {
+      setDictDraft("");
+      return;
+    }
+    patch({ dictionary: [...draft().dictionary, v] });
+    setDictDraft("");
+  }
+
+  function removeDictTerm(t: string) {
+    patch({ dictionary: draft().dictionary.filter((d) => d !== t) });
+  }
+
+  function addTrigger() {
+    patch({
+      auto_triggers: [
+        ...draft().auto_triggers,
+        { bundle_id_glob: "", window_title_substring: null },
+      ],
+    });
+  }
+
+  function updateTrigger(idx: number, field: "bundle_id_glob" | "window_title_substring", value: string) {
+    const triggers = draft().auto_triggers.map((t, i) => {
+      if (i !== idx) return t;
+      const next = { ...t };
+      next[field] = value || null;
+      return next;
+    });
+    patch({ auto_triggers: triggers });
+  }
+
+  function removeTrigger(idx: number) {
+    patch({
+      auto_triggers: draft().auto_triggers.filter((_, i) => i !== idx),
+    });
+  }
+
+  return (
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-6 py-8">
+      <div class="flex h-full w-full max-w-2xl flex-col overflow-hidden rounded-[12px] bg-[var(--color-bg)] ring-1 ring-[var(--color-border)]">
+        <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+          <h2 class="text-[14px] font-semibold">
+            {props.mode.id ? "Edit mode" : "New mode"}
+          </h2>
+          <button
+            type="button"
+            class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-white/8 hover:text-[var(--color-ink)]"
+            onClick={props.onCancel}
+            aria-label="Cancel"
+          >
+            ×
+          </button>
+        </header>
+        <div class="flex-1 overflow-y-auto scrollbar-thin px-4 py-4">
+          <Card>
+            <Row label="Name">
+              <input
+                type="text"
+                class="w-48 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().name}
+                onInput={(e) => patch({ name: e.currentTarget.value })}
+              />
+            </Row>
+            <Row label="Icon (emoji or text)">
+              <input
+                type="text"
+                class="w-24 rounded-[6px] bg-black/30 px-2 py-1 text-center text-[14px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().icon}
+                onInput={(e) => patch({ icon: e.currentTarget.value })}
+              />
+            </Row>
+            <Row label="Description" last>
+              <input
+                type="text"
+                class="w-64 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().description}
+                onInput={(e) => patch({ description: e.currentTarget.value })}
+              />
+            </Row>
+          </Card>
+
+          <Card>
+            <div class="px-4 py-3">
+              <div class="mb-1 text-[12px] font-medium">System prompt</div>
+              <textarea
+                class="h-48 w-full rounded-[6px] bg-black/30 px-2 py-2 font-mono text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().system_prompt}
+                onInput={(e) => patch({ system_prompt: e.currentTarget.value })}
+              />
+              <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
+                {draft().system_prompt.length} chars. Tip: keep it tight
+                (~150–250 tokens) and end with explicit "Output only the
+                cleaned text."
+              </p>
+            </div>
+          </Card>
+
+          <Card>
+            <Row label="Punctuation">
+              <select
+                class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().punctuation}
+                onChange={(e) =>
+                  patch({
+                    punctuation: e.currentTarget.value as PunctuationStyle,
+                  })
+                }
+              >
+                <For each={PUNCTUATION_OPTIONS}>
+                  {(o) => <option value={o.value}>{o.label}</option>}
+                </For>
+              </select>
+            </Row>
+            <Row label="Case">
+              <select
+                class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().case}
+                onChange={(e) =>
+                  patch({ case: e.currentTarget.value as CaseStyle })
+                }
+              >
+                <For each={CASE_OPTIONS}>
+                  {(o) => <option value={o.value}>{o.label}</option>}
+                </For>
+              </select>
+            </Row>
+            <Row
+              label="Max length"
+              hint="0 or empty = no cap. Truncates at the last sentence boundary that fits."
+              last
+            >
+              <input
+                type="number"
+                min="0"
+                class="w-20 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                value={draft().max_length_chars ?? ""}
+                onInput={(e) => {
+                  const v = e.currentTarget.value.trim();
+                  patch({ max_length_chars: v === "" ? null : Number(v) });
+                }}
+              />
+            </Row>
+          </Card>
+
+          <Card>
+            <div class="px-4 py-3">
+              <div class="mb-2 text-[12px] font-medium">
+                Mode dictionary
+              </div>
+              <p class="mb-2 text-[11px] text-[var(--color-ink-mute)]">
+                Appended to the global dictionary at runtime.
+              </p>
+              <div class="mb-2 flex gap-2">
+                <input
+                  type="text"
+                  class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                  placeholder="e.g. SwiftUI, ESLint"
+                  value={dictDraft()}
+                  onInput={(e) => setDictDraft(e.currentTarget.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      addDictTerm();
+                    }
+                  }}
+                />
+                <button
+                  type="button"
+                  class="rounded-[6px] bg-white/8 px-3 py-1 text-[12px] hover:bg-white/12"
+                  onClick={addDictTerm}
+                >
+                  Add
+                </button>
+              </div>
+              <Show when={draft().dictionary.length > 0}>
+                <div class="flex flex-wrap gap-2">
+                  <For each={draft().dictionary}>
+                    {(term) => (
+                      <button
+                        type="button"
+                        onClick={() => removeDictTerm(term)}
+                        class="group inline-flex items-center gap-1 rounded-[6px] bg-white/6 px-2 py-1 text-[12px] hover:bg-white/10"
+                      >
+                        <span>{term}</span>
+                        <span class="text-[var(--color-ink-mute)] group-hover:text-[var(--color-danger)]">
+                          ×
+                        </span>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+          </Card>
+
+          <Card>
+            <div class="px-4 py-3">
+              <div class="mb-2 flex items-center justify-between">
+                <span class="text-[12px] font-medium">
+                  Auto-triggers (suggest only)
+                </span>
+                <button
+                  type="button"
+                  class="rounded-[6px] bg-white/8 px-2 py-1 text-[11px] hover:bg-white/12"
+                  onClick={addTrigger}
+                >
+                  + Trigger
+                </button>
+              </div>
+              <p class="mb-2 text-[11px] text-[var(--color-ink-mute)]">
+                Vox never auto-switches. These rules feed the suggestion
+                HUD on the listening pill. Trailing wildcards allowed
+                (e.g. <code>com.jetbrains.*</code>).
+              </p>
+              <For each={draft().auto_triggers}>
+                {(t, i) => (
+                  <div class="mb-2 flex items-center gap-2">
+                    <input
+                      type="text"
+                      class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[11px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                      placeholder="bundle id (e.g. com.apple.Notes)"
+                      value={t.bundle_id_glob ?? ""}
+                      onInput={(e) =>
+                        updateTrigger(
+                          i(),
+                          "bundle_id_glob",
+                          e.currentTarget.value,
+                        )
+                      }
+                    />
+                    <input
+                      type="text"
+                      class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[11px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                      placeholder="window title contains (optional)"
+                      value={t.window_title_substring ?? ""}
+                      onInput={(e) =>
+                        updateTrigger(
+                          i(),
+                          "window_title_substring",
+                          e.currentTarget.value,
+                        )
+                      }
+                    />
+                    <button
+                      type="button"
+                      class="rounded-[6px] bg-white/6 px-2 py-1 text-[11px] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+                      onClick={() => removeTrigger(i())}
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
+              </For>
+            </div>
+          </Card>
+        </div>
+        <footer class="flex items-center justify-end gap-2 border-t border-[var(--color-border)] px-4 py-3">
+          <button
+            type="button"
+            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+            onClick={props.onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            class="rounded-[6px] bg-[var(--color-accent)] px-4 py-1.5 text-[12px] font-medium text-black hover:brightness-110"
+            onClick={() => props.onSave(draft())}
+          >
+            Save
+          </button>
+        </footer>
+      </div>
     </div>
   );
 }

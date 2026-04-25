@@ -21,6 +21,34 @@ export interface Settings {
   llm_model_id: string;
   migration_seen: boolean;
   gemma_tos_accepted: boolean;
+  // Voice Modes.
+  active_mode_id: string;
+  mode_cycle_hotkey: string;
+  auto_suggest_modes: boolean;
+}
+
+export type PunctuationStyle = "Aggressive" | "Standard" | "Minimal" | "None";
+export type CaseStyle = "Sentence" | "Title" | "Lower" | "AsSpoken";
+
+export interface AutoTrigger {
+  bundle_id_glob?: string | null;
+  window_title_substring?: string | null;
+}
+
+export interface VoiceMode {
+  id: string;
+  name: string;
+  icon: string;
+  description: string;
+  system_prompt: string;
+  dictionary: string[];
+  punctuation: PunctuationStyle;
+  case: CaseStyle;
+  max_length_chars?: number | null;
+  auto_triggers: AutoTrigger[];
+  built_in: boolean;
+  created_at: number;
+  updated_at: number;
 }
 
 export interface UpdateCheckResult {
@@ -224,4 +252,76 @@ export async function onModelCanceled(
   cb: (p: { id: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ id: string }>("model:canceled", (e) => cb(e.payload));
+}
+
+// ---- Voice Modes ----
+
+export async function listModes(): Promise<VoiceMode[]> {
+  return invoke<VoiceMode[]>("list_modes");
+}
+
+export async function getMode(id: string): Promise<VoiceMode | null> {
+  return invoke<VoiceMode | null>("get_mode", { id });
+}
+
+export async function saveMode(mode: VoiceMode): Promise<void> {
+  await invoke("save_mode", { mode });
+}
+
+export async function deleteMode(id: string): Promise<void> {
+  await invoke("delete_mode", { id });
+}
+
+export async function duplicateMode(id: string): Promise<VoiceMode> {
+  return invoke<VoiceMode>("duplicate_mode", { id });
+}
+
+export async function setActiveMode(id: string): Promise<VoiceMode> {
+  return invoke<VoiceMode>("set_active_mode", { id });
+}
+
+export async function exportMode(id: string): Promise<string> {
+  return invoke<string>("export_mode", { id });
+}
+
+export async function importModeJson(json: string): Promise<VoiceMode> {
+  return invoke<VoiceMode>("import_mode_json", { json });
+}
+
+export async function resetDefaultModes(): Promise<number> {
+  return invoke<number>("reset_default_modes");
+}
+
+export async function cycleActiveMode(): Promise<VoiceMode> {
+  return invoke<VoiceMode>("cycle_active_mode");
+}
+
+export async function suggestActiveMode(): Promise<string | null> {
+  return invoke<string | null>("suggest_active_mode");
+}
+
+export interface ActiveModePayload {
+  id: string;
+  name: string;
+  icon: string;
+}
+
+export interface ModeSuggestionPayload {
+  id: string;
+  name: string;
+  icon: string;
+}
+
+export async function onPillActiveMode(
+  cb: (p: ActiveModePayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ActiveModePayload>("pill:active_mode", (e) => cb(e.payload));
+}
+
+export async function onPillModeSuggestion(
+  cb: (p: ModeSuggestionPayload | null) => void,
+): Promise<UnlistenFn> {
+  return listen<ModeSuggestionPayload | null>("pill:mode_suggestion", (e) =>
+    cb(e.payload),
+  );
 }

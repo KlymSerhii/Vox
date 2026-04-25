@@ -40,6 +40,11 @@ const KEY_LLM_MODEL_ID: &str = "llm_model_id";
 const KEY_MIGRATION_SEEN: &str = "migration_seen";
 const KEY_GEMMA_TOS_ACCEPTED: &str = "gemma_tos_accepted";
 
+// Voice Modes keys.
+const KEY_ACTIVE_MODE_ID: &str = "active_mode_id";
+const KEY_MODE_CYCLE_HOTKEY: &str = "mode_cycle_hotkey";
+const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
+
 // Legacy keys we still read for migration but no longer write.
 const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
 const KEY_LEGACY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
@@ -74,6 +79,15 @@ fn default_stt_model_id() -> String {
 }
 fn default_llm_model_id() -> String {
     models::recommended_llm_model_id().to_string()
+}
+fn default_active_mode_id() -> String {
+    "general".into()
+}
+fn default_mode_cycle_hotkey() -> String {
+    "Alt+M".into()
+}
+fn default_auto_suggest_modes() -> bool {
+    true
 }
 
 /// User-visible settings. API keys live in `Settings` so the UI can edit
@@ -123,6 +137,14 @@ pub struct Settings {
     pub migration_seen: bool,
     #[serde(default)]
     pub gemma_tos_accepted: bool,
+
+    // ---- Voice Modes ----
+    #[serde(default = "default_active_mode_id")]
+    pub active_mode_id: String,
+    #[serde(default = "default_mode_cycle_hotkey")]
+    pub mode_cycle_hotkey: String,
+    #[serde(default = "default_auto_suggest_modes")]
+    pub auto_suggest_modes: bool,
 }
 
 impl Default for Settings {
@@ -146,6 +168,9 @@ impl Default for Settings {
             llm_model_id: default_llm_model_id(),
             migration_seen: false,
             gemma_tos_accepted: false,
+            active_mode_id: default_active_mode_id(),
+            mode_cycle_hotkey: default_mode_cycle_hotkey(),
+            auto_suggest_modes: default_auto_suggest_modes(),
         }
     }
 }
@@ -346,6 +371,16 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(default_llm_model_id);
 
+    let active_mode_id = store
+        .get(KEY_ACTIVE_MODE_ID)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_active_mode_id);
+    let mode_cycle_hotkey = store
+        .get(KEY_MODE_CYCLE_HOTKEY)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_else(default_mode_cycle_hotkey);
+    let auto_suggest_modes = get_bool(KEY_AUTO_SUGGEST_MODES, default_auto_suggest_modes());
+
     // Migrate plaintext keys → Keychain once.
     migrate_key_from_store(app, &store, KEY_GROQ, KEYRING_ACCOUNT_GROQ);
     migrate_key_from_store(app, &store, KEY_ANTHROPIC, KEYRING_ACCOUNT_ANTHROPIC);
@@ -372,6 +407,9 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         llm_model_id,
         migration_seen,
         gemma_tos_accepted,
+        active_mode_id,
+        mode_cycle_hotkey,
+        auto_suggest_modes,
     }
 }
 
@@ -480,6 +518,19 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         serde_json::Value::Bool(settings.gemma_tos_accepted),
     );
 
+    store.set(
+        KEY_ACTIVE_MODE_ID,
+        serde_json::Value::String(settings.active_mode_id.clone()),
+    );
+    store.set(
+        KEY_MODE_CYCLE_HOTKEY,
+        serde_json::Value::String(settings.mode_cycle_hotkey.clone()),
+    );
+    store.set(
+        KEY_AUTO_SUGGEST_MODES,
+        serde_json::Value::Bool(settings.auto_suggest_modes),
+    );
+
     // Drop the deprecated keys on save — they're superseded.
     store.delete(KEY_LEGACY_CLEANUP_ENABLED);
     store.delete(KEY_LEGACY_SEND_AUDIO_CLOUD);
@@ -534,6 +585,9 @@ pub struct Prefs {
     pub stt_model_id: String,
     pub llm_engine: String,
     pub llm_model_id: String,
+
+    pub active_mode_id: String,
+    pub auto_suggest_modes: bool,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
@@ -547,5 +601,13 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         stt_model_id: s.stt_model_id,
         llm_engine: s.llm_engine,
         llm_model_id: s.llm_model_id,
+        active_mode_id: s.active_mode_id,
+        auto_suggest_modes: s.auto_suggest_modes,
     }
+}
+
+pub fn set_active_mode_id<R: Runtime>(app: &AppHandle<R>, id: &str) -> anyhow::Result<()> {
+    let mut s = load(app);
+    s.active_mode_id = id.to_string();
+    save(app, &s)
 }

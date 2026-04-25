@@ -17,6 +17,7 @@ use tauri::{AppHandle, Manager, Runtime, Wry};
 
 use crate::audio::AudioHandle;
 use crate::engines::Registry;
+use crate::modes::{self, ModeStore, VoiceMode};
 use crate::pill::{self, PillState};
 use crate::{inject, settings, transcripts};
 
@@ -79,6 +80,23 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
     log::info!("▶ begin recording (sid={new_sid})");
     pill::show(&app);
     pill::emit_state(&app, PillState::Listening, None);
+
+    // Push the active mode chip to the pill immediately so the user
+    // sees which mode is going to handle this utterance.
+    if let Some(mode) = app
+        .try_state::<Arc<ModeStore>>()
+        .map(|s| s.inner().clone())
+        .and_then(|s| s.get(&prefs.active_mode_id).or_else(|| s.get("general")))
+    {
+        pill::emit_active_mode(&app, &mode);
+    }
+    // Clear any stale suggestion from a previous session.
+    pill::emit_mode_suggestion(&app, None);
+
+    // Suggest-mode HUD (per CEO §1: suggest only, never auto-switch).
+    if prefs.auto_suggest_modes {
+        spawn_suggestion_probe(app.clone(), prefs.active_mode_id.clone());
+    }
 
     if let Err(e) = ctx.audio.start() {
         log::error!("failed to start audio: {e}");
@@ -219,6 +237,14 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 
         let llm_engine = registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id);
 
+        // Resolve the active Voice Mode (default `general`). The mode
+        // contributes its system prompt + dictionary to the cleanup
+        // call, and its post-processing rules to the final text.
+        let active_mode = resolve_active_mode(&app_wry, &prefs.active_mode_id);
+        if let Some(m) = active_mode.as_ref() {
+            pill::emit_active_mode(&app_for_pill, m);
+        }
+
         pill::emit_state(&app_for_pill, PillState::Transcribing, None);
 
         let language = if prefs.language == "auto" {
@@ -269,10 +295,22 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
+        // Build the merged dictionary (global + mode-specific) and the
+        // mode's system prompt for the cleanup call. If no mode is
+        // resolved we fall back to the engine's built-in prompt.
+        let (mode_system_prompt, merged_dictionary) = match active_mode.as_ref() {
+            Some(m) => (m.system_prompt.clone(), merge_dictionaries(&prefs.dictionary, &m.dictionary)),
+            None => (String::new(), prefs.dictionary.clone()),
+        };
+
         let cleaned = match llm_engine {
             Some(engine) if engine.id() != "none" => {
                 pill::emit_state(&app_for_pill, PillState::Polishing, None);
-                let llm_fut = engine.cleanup(&transcript, "", &prefs.dictionary);
+                let llm_fut = engine.cleanup(
+                    &transcript,
+                    &mode_system_prompt,
+                    &merged_dictionary,
+                );
                 tokio::select! {
                     biased;
                     () = wait_for_cancel(&ctx, my_sid) => {
@@ -294,6 +332,13 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                 }
             }
             _ => transcript.clone(),
+        };
+
+        // Apply mode post-processing (case rules, punctuation strip,
+        // length cap). When no mode is resolved this is a no-op.
+        let cleaned = match active_mode.as_ref() {
+            Some(m) => m.apply_post_processing(&cleaned),
+            None => cleaned,
         };
 
         if ctx.is_canceled() || stale() {
@@ -488,4 +533,48 @@ fn try_into_wry<R: Runtime>(app: &AppHandle<R>) -> Option<AppHandle<Wry>> {
     // 'static guarantees Any-eligibility; AppHandle<R> is 'static.
     let any: &dyn Any = app as &dyn Any;
     any.downcast_ref::<AppHandle<Wry>>().cloned()
+}
+
+fn resolve_active_mode<R: Runtime>(app: &AppHandle<R>, id: &str) -> Option<VoiceMode> {
+    let store = app.try_state::<Arc<ModeStore>>()?;
+    let store = store.inner().clone();
+    store
+        .get(id)
+        .or_else(|| store.get("general"))
+        .or_else(|| modes::builtins().into_iter().next())
+}
+
+fn spawn_suggestion_probe<R: Runtime>(app: AppHandle<R>, active_mode_id: String) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let detected = crate::frontmost::detect();
+        let Some((bundle_id, title)) = detected else {
+            return;
+        };
+        let store = match app.try_state::<Arc<ModeStore>>() {
+            Some(s) => s.inner().clone(),
+            None => return,
+        };
+        let suggestion_id =
+            store.suggest_for(Some(&bundle_id), title.as_deref());
+        let suggestion = match suggestion_id {
+            Some(id) if id != active_mode_id => store.get(&id),
+            _ => None,
+        };
+        pill::emit_mode_suggestion(&app, suggestion);
+    });
+}
+
+fn merge_dictionaries(global: &[String], mode: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(global.len() + mode.len());
+    let mut seen = std::collections::HashSet::new();
+    for term in global.iter().chain(mode.iter()) {
+        let trimmed = term.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_lowercase()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
 }

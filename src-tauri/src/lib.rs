@@ -1,10 +1,12 @@
 mod audio;
 mod commands;
 mod engines;
+mod frontmost;
 mod hotkey;
 mod inject;
 mod migration;
 mod models;
+mod modes;
 mod onboarding;
 mod pill;
 mod session;
@@ -66,6 +68,17 @@ pub fn run() {
             commands::recommend_tier,
             commands::accept_gemma_tos,
             commands::dismiss_migration,
+            commands::list_modes,
+            commands::get_mode,
+            commands::save_mode,
+            commands::delete_mode,
+            commands::duplicate_mode,
+            commands::set_active_mode,
+            commands::export_mode,
+            commands::import_mode_json,
+            commands::reset_default_modes,
+            commands::cycle_active_mode,
+            commands::suggest_active_mode,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -83,6 +96,16 @@ pub fn run() {
             // Engine registry — lazy-built, kept warm.
             app.manage(crate::engines::Registry::new());
 
+            // Voice Modes store. First-launch seed is gated inside
+            // `init_with_root` (only writes built-ins when the dir is
+            // empty), so it's safe to call on every boot.
+            let mode_store = std::sync::Arc::new(crate::modes::ModeStore::new());
+            let modes_root = crate::modes::modes_dir(app_handle);
+            if let Err(e) = mode_store.init_with_root(modes_root) {
+                log::warn!("voice modes init failed: {e}");
+            }
+            app.manage(mode_store);
+
             // Load settings (also migrates plaintext keys into the Keychain).
             let s = settings::load(app_handle);
 
@@ -92,6 +115,7 @@ pub fn run() {
                 &s.hotkey,
                 &s.cancel_hotkey,
                 &s.paste_last_hotkey,
+                &s.mode_cycle_hotkey,
                 ctx.clone(),
             ) {
                 Ok(resolved) => log::info!("push-to-talk bound to {resolved}"),

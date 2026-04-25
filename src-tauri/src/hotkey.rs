@@ -11,7 +11,7 @@
 //! press-and-hold. We dispatch from the same shortcut by reading the
 //! current pref at press time.
 
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_global_shortcut::{
     Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutEvent, ShortcutState,
 };
@@ -50,6 +50,15 @@ fn shortcut_from_key(id: &str) -> Option<Shortcut> {
             Some(Modifiers::META | Modifiers::SHIFT),
             Code::KeyV,
         )),
+        "Alt+M" => Some(Shortcut::new(Some(Modifiers::ALT), Code::KeyM)),
+        "Alt+Shift+M" => Some(Shortcut::new(
+            Some(Modifiers::ALT | Modifiers::SHIFT),
+            Code::KeyM,
+        )),
+        "CommandOrControl+Shift+M" | "Cmd+Shift+M" => Some(Shortcut::new(
+            Some(Modifiers::META | Modifiers::SHIFT),
+            Code::KeyM,
+        )),
         _ => None,
     }
 }
@@ -59,6 +68,7 @@ pub fn register<R: Runtime>(
     preferred: &str,
     cancel_preferred: &str,
     paste_last_preferred: &str,
+    mode_cycle_preferred: &str,
     ctx: SessionCtx,
 ) -> Result<String, String> {
     let (shortcut, resolved) = resolve_shortcut(preferred);
@@ -154,6 +164,70 @@ pub fn register<R: Runtime>(
         }
     }
 
+    // Voice Modes cycle hotkey (default Alt+M). Cycles through modes in
+    // display order; updates `prefs.active_mode_id` and shows a brief HUD
+    // on the listening pill.
+    if !mode_cycle_preferred.is_empty() {
+        if let Some(cycle_sc) = shortcut_from_key(mode_cycle_preferred) {
+            let collides = cycle_sc == shortcut
+                || shortcut_from_key(cancel_preferred)
+                    .map(|s| s == cycle_sc)
+                    .unwrap_or(false)
+                || shortcut_from_key(paste_last_preferred)
+                    .map(|s| s == cycle_sc)
+                    .unwrap_or(false);
+            if collides {
+                log::warn!(
+                    "mode cycle hotkey '{mode_cycle_preferred}' conflicts with another binding; not registering"
+                );
+            } else {
+                let app_handle = app.clone();
+                if let Err(e) = gs.on_shortcut(
+                    cycle_sc,
+                    move |_app, _sc, event: ShortcutEvent| {
+                        if let ShortcutState::Pressed = event.state() {
+                            spawn_cycle_active_mode(app_handle.clone());
+                        }
+                    },
+                ) {
+                    log::warn!(
+                        "could not register mode cycle hotkey '{mode_cycle_preferred}': {e}"
+                    );
+                }
+            }
+        } else {
+            log::warn!("mode cycle hotkey '{mode_cycle_preferred}' not recognized");
+        }
+    }
+
     log::info!("global hotkey registered: {}", resolved);
     Ok(resolved)
+}
+
+fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let prefs = settings::prefs(&app);
+        let next = match crate::modes::cycle_active(&app, &prefs.active_mode_id) {
+            Some(m) => m,
+            None => return,
+        };
+        if let Err(e) = settings::set_active_mode_id(&app, &next.id) {
+            log::warn!("failed to persist mode cycle: {e}");
+            return;
+        }
+        // 800 ms HUD on the pill so the user sees the new mode.
+        crate::pill::show(&app);
+        crate::pill::emit_active_mode(&app, &next);
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            // Only auto-hide if no recording started in the meantime.
+            if let Some(ctx) = app_clone.try_state::<SessionCtx>() {
+                if ctx.is_recording() || ctx.is_pipeline_active() {
+                    return;
+                }
+            }
+            crate::pill::hide(&app_clone);
+        });
+    });
 }

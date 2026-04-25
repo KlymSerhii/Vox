@@ -3,11 +3,14 @@ import {
   closeTrayPopover,
   getPublicSettings,
   getRecentTranscripts,
+  listModes,
   openSettingsWindow,
   quitApp,
+  setActiveMode,
   setDictationEnabled,
   type RecentTranscript,
   type Settings,
+  type VoiceMode,
 } from "../lib/ipc";
 
 export default function TrayPopoverView() {
@@ -15,16 +18,20 @@ export default function TrayPopoverView() {
   const [s, setS] = createSignal<Settings | null>(null);
   const [recents, setRecents] = createSignal<RecentTranscript[]>([]);
   const [copyFlash, setCopyFlash] = createSignal<number | null>(null);
+  const [modes, setModes] = createSignal<VoiceMode[]>([]);
+  const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
 
   onMount(async () => {
     document.body.classList.add("translucent");
     try {
-      const [settings, rec] = await Promise.all([
+      const [settings, rec, list] = await Promise.all([
         getPublicSettings(),
         getRecentTranscripts(),
+        listModes(),
       ]);
       setS(settings);
       setRecents(rec);
+      setModes(list);
     } finally {
       setLoaded(true);
     }
@@ -33,6 +40,24 @@ export default function TrayPopoverView() {
       if (e.key === "Escape") closeTrayPopover();
     });
   });
+
+  async function pickMode(id: string) {
+    const cur = s();
+    if (!cur) return;
+    setModeMenuOpen(false);
+    try {
+      await setActiveMode(id);
+      setS({ ...cur, active_mode_id: id });
+    } catch (err) {
+      console.error("setActiveMode failed:", err);
+    }
+  }
+
+  function activeMode(): VoiceMode | undefined {
+    const id = s()?.active_mode_id;
+    if (!id) return undefined;
+    return modes().find((m) => m.id === id) ?? modes()[0];
+  }
 
   async function toggleDictation(v: boolean) {
     const cur = s();
@@ -128,6 +153,77 @@ export default function TrayPopoverView() {
                   onChange={toggleDictation}
                 />
               </div>
+            </div>
+
+            <div class="relative border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between">
+                <div class="flex flex-col">
+                  <span class="text-[13px] font-medium">Voice mode</span>
+                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+                    Cycle with{" "}
+                    <span class="keycap">
+                      {hotkeyLabel(st().mode_cycle_hotkey || "Alt+M")}
+                    </span>
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  class="inline-flex items-center gap-1.5 rounded-full bg-zinc-800/70 px-2 py-1 text-[12px] ring-1 ring-white/10 hover:bg-zinc-700/70"
+                  onClick={() => setModeMenuOpen(!modeMenuOpen())}
+                  aria-haspopup="listbox"
+                  aria-expanded={modeMenuOpen()}
+                >
+                  <Show when={activeMode()} fallback={<span>—</span>}>
+                    {(m) => (
+                      <>
+                        <span aria-hidden="true">{m().icon}</span>
+                        <span class="max-w-[120px] truncate">{m().name}</span>
+                      </>
+                    )}
+                  </Show>
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+              </div>
+              <Show when={modeMenuOpen()}>
+                <div
+                  class="absolute right-4 top-full z-10 mt-1 max-h-60 w-56 overflow-y-auto rounded-[10px] bg-[rgba(24,24,27,0.96)] py-1 shadow-lg ring-1 ring-white/10 scrollbar-thin"
+                  role="listbox"
+                >
+                  <For each={modes()}>
+                    {(m) => (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={m.id === st().active_mode_id}
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-white/6"
+                        classList={{
+                          "text-[var(--color-accent)]":
+                            m.id === st().active_mode_id,
+                          "text-[var(--color-ink)]":
+                            m.id !== st().active_mode_id,
+                        }}
+                        onClick={() => pickMode(m.id)}
+                      >
+                        <span aria-hidden="true">{m.icon}</span>
+                        <span class="flex-1 truncate">{m.name}</span>
+                        <Show when={m.id === st().active_mode_id}>
+                          <span class="text-[10px]">●</span>
+                        </Show>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
             </div>
 
             <div class="flex-1 overflow-y-auto scrollbar-thin px-2 py-2">
@@ -278,6 +374,13 @@ function hotkeyLabel(k: string): string {
     case "CommandOrControl+Shift+Space":
     case "Cmd+Shift+Space":
       return "⌘⇧Space";
+    case "Alt+M":
+      return "⌥M";
+    case "Alt+Shift+M":
+      return "⌥⇧M";
+    case "CommandOrControl+Shift+M":
+    case "Cmd+Shift+M":
+      return "⌘⇧M";
     default:
       return k;
   }

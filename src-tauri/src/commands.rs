@@ -3,7 +3,8 @@ use tauri::{AppHandle, Manager, Runtime, Webview, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::engines::{anthropic, groq};
-use crate::{models, onboarding, pill, session, settings, transcripts};
+use crate::modes::{self, VoiceMode};
+use crate::{frontmost, models, onboarding, pill, session, settings, transcripts};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TestConnectionResult {
@@ -473,4 +474,92 @@ pub fn dismiss_migration<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
         let _ = win.hide();
     }
     Ok(())
+}
+
+// -------- Voice Modes --------------------------------------------------------
+
+#[tauri::command]
+pub fn list_modes<R: Runtime>(app: AppHandle<R>) -> Vec<VoiceMode> {
+    modes::list_modes(&app)
+}
+
+#[tauri::command]
+pub fn get_mode<R: Runtime>(app: AppHandle<R>, id: String) -> Option<VoiceMode> {
+    modes::get_mode(&app, &id)
+}
+
+#[tauri::command]
+pub fn save_mode<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    mode: VoiceMode,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    modes::save_mode(&app, &mode).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_mode<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    id: String,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    modes::delete_mode(&app, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn duplicate_mode<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    id: String,
+) -> Result<VoiceMode, String> {
+    assert_secret_window(&webview)?;
+    modes::duplicate_mode(&app, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn set_active_mode<R: Runtime>(app: AppHandle<R>, id: String) -> Result<VoiceMode, String> {
+    let mode = modes::get_mode(&app, &id).ok_or_else(|| "unknown mode id".to_string())?;
+    settings::set_active_mode_id(&app, &mode.id).map_err(|e| e.to_string())?;
+    Ok(mode)
+}
+
+#[tauri::command]
+pub fn export_mode<R: Runtime>(app: AppHandle<R>, id: String) -> Result<String, String> {
+    modes::export_mode(&app, &id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn import_mode_json<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    json: String,
+) -> Result<VoiceMode, String> {
+    assert_secret_window(&webview)?;
+    modes::import_mode_json(&app, &json).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn reset_default_modes<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+) -> Result<usize, String> {
+    assert_secret_window(&webview)?;
+    modes::reset_defaults(&app).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cycle_active_mode<R: Runtime>(app: AppHandle<R>) -> Result<VoiceMode, String> {
+    let s = settings::load(&app);
+    let next = modes::cycle_active(&app, &s.active_mode_id)
+        .ok_or_else(|| "no modes available".to_string())?;
+    settings::set_active_mode_id(&app, &next.id).map_err(|e| e.to_string())?;
+    Ok(next)
+}
+
+#[tauri::command]
+pub fn suggest_active_mode<R: Runtime>(app: AppHandle<R>) -> Option<String> {
+    let (bundle_id, title) = frontmost::detect()?;
+    modes::suggest_mode_for(&app, Some(&bundle_id), title.as_deref())
 }

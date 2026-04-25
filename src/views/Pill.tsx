@@ -18,12 +18,30 @@ interface AudioLevelPayload {
   level: number;
 }
 
+interface ActiveModePayload {
+  id: string;
+  name: string;
+  icon: string;
+}
+
+interface ModeSuggestionPayload {
+  id: string;
+  name: string;
+  icon: string;
+}
+
 const BARS = 24;
 
 export default function PillView() {
   const [state, setState] = createSignal<PillState>("listening");
   const [message, setMessage] = createSignal<string | null>(null);
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
+  const [activeMode, setActiveMode] = createSignal<ActiveModePayload | null>(
+    null,
+  );
+  const [suggestion, setSuggestion] = createSignal<ModeSuggestionPayload | null>(
+    null,
+  );
 
   let unlisten: UnlistenFn[] = [];
 
@@ -50,6 +68,17 @@ export default function PillView() {
       await listen("pill:show", () => {
         // Reset bars when a new session starts.
         setLevels(new Array(BARS).fill(0));
+        setSuggestion(null);
+      }),
+    );
+    unlisten.push(
+      await listen<ActiveModePayload>("pill:active_mode", (e) => {
+        setActiveMode(e.payload);
+      }),
+    );
+    unlisten.push(
+      await listen<ModeSuggestionPayload | null>("pill:mode_suggestion", (e) => {
+        setSuggestion(e.payload ?? null);
       }),
     );
   });
@@ -85,6 +114,9 @@ export default function PillView() {
             <Waveform levels={levels()} />
           </Show>
         </div>
+        <Show when={activeMode()}>
+          {(m) => <ModeChip name={m().name} icon={m().icon} />}
+        </Show>
         <span
           class="shrink-0 text-[12px] font-medium"
           classList={{
@@ -98,6 +130,55 @@ export default function PillView() {
           }}
         >
           {rightLabel(state())}
+        </span>
+      </div>
+      <Show when={state() === "listening" ? suggestion() : null}>
+        {(sg) => <SuggestionHud name={sg().name} icon={sg().icon} />}
+      </Show>
+    </div>
+  );
+}
+
+function ModeChip(props: { name: string; icon: string }) {
+  // Small read-only chip on the listening pill. Switching is done via
+  // the tray popover or the cycle hotkey — never on the pill itself.
+  return (
+    <span
+      class="inline-flex shrink-0 items-center gap-1 rounded-full bg-zinc-800/70 px-2 py-0.5 text-[11px] font-medium text-[var(--color-ink)] ring-1 ring-white/10"
+      title={`Voice mode: ${props.name}`}
+    >
+      <span class="leading-none" aria-hidden="true">
+        {props.icon}
+      </span>
+      <span class="max-w-[80px] truncate">{props.name}</span>
+    </span>
+  );
+}
+
+function SuggestionHud(props: { name: string; icon: string }) {
+  // Floats just to the right of the pill — non-intrusive, never blocks
+  // the user's flow. Tells them how to switch with the cycle hotkey.
+  return (
+    <div
+      class="pointer-events-none absolute"
+      style={{
+        bottom: "12px",
+        right: "12px",
+        display: "flex",
+        "align-items": "center",
+      }}
+    >
+      <div
+        class="flex items-center gap-1.5 rounded-full bg-zinc-800/80 px-2.5 py-1 text-[11px] text-[var(--color-ink)] ring-1 ring-white/10"
+        style={{
+          "backdrop-filter": "blur(16px) saturate(180%)",
+          "-webkit-backdrop-filter": "blur(16px) saturate(180%)",
+        }}
+      >
+        <span aria-hidden="true">{props.icon}</span>
+        <span>Switch to {props.name}?</span>
+        <span class="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
+          ⌥M
         </span>
       </div>
     </div>
