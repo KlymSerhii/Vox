@@ -47,8 +47,6 @@
     }
   },
   "plugins": {
-    "globalShortcut": {},
-    "store": {},
     "updater": {
       "endpoints": [
         "https://updates.vox.local/{{target}}/{{arch}}/{{current_version}}"
