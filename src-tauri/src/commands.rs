@@ -184,48 +184,50 @@ fn probe_accessibility() -> bool {
     true
 }
 
+/// Non-prompting microphone status probe. Used by the onboarding poller
+/// (every 2 s) and by the tray icon at startup, so it MUST be safe to
+/// call repeatedly without re-prompting and must never escalate from a
+/// "check" into a "request".
+///
+/// On macOS we use AVFoundation's
+/// `AVCaptureDevice.authorizationStatusForMediaType:`, which returns the
+/// cached TCC state without showing the consent dialog. Crucially we do
+/// NOT touch cpal here: opening (or sometimes even configuring) a CPAL
+/// input device on macOS 14+ implicitly trips the TCC microphone gate
+/// and shows the prompt — exactly what callers of this function must
+/// avoid.
 fn probe_microphone() -> bool {
-    use cpal::traits::{DeviceTrait, HostTrait};
-    match cpal::default_host().default_input_device() {
-        Some(device) => device.default_input_config().is_ok(),
-        None => false,
+    #[cfg(target_os = "macos")]
+    {
+        crate::mac_perm::authorization_status().is_granted()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No TCC on Linux/Windows; treat as always granted at the
+        // permissions layer. Real device errors surface during capture.
+        true
     }
 }
 
+/// Explicitly request microphone access. This is the ONLY entry point
+/// allowed to show the macOS TCC dialog; it is wired up to the
+/// "Allow microphone" button on the onboarding mic step.
+///
+/// Returns `true` if access ends up granted (either freshly granted by
+/// the user, or already granted from a prior decision).
 #[tauri::command]
 pub fn request_microphone() -> bool {
-    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let host = cpal::default_host();
-    let Some(device) = host.default_input_device() else {
-        return false;
-    };
-    let Ok(cfg) = device.default_input_config() else {
-        return false;
-    };
-    let sample_format = cfg.sample_format();
-    let config: cpal::StreamConfig = cfg.into();
-    let err_fn = |err| log::warn!("mic probe stream error: {err}");
-    let stream = match sample_format {
-        cpal::SampleFormat::F32 => {
-            device.build_input_stream(&config, move |_: &[f32], _| {}, err_fn, None)
-        }
-        cpal::SampleFormat::I16 => {
-            device.build_input_stream(&config, move |_: &[i16], _| {}, err_fn, None)
-        }
-        cpal::SampleFormat::U16 => {
-            device.build_input_stream(&config, move |_: &[u16], _| {}, err_fn, None)
-        }
-        _ => return false,
-    };
-    match stream {
-        Ok(s) => {
-            let _ = s.play();
-            true
-        }
-        Err(e) => {
-            log::warn!("mic probe failed: {e}");
-            false
-        }
+    #[cfg(target_os = "macos")]
+    {
+        log::info!(
+            "commands::request_microphone invoked — about to call \
+             AVCaptureDevice requestAccessForMediaType:"
+        );
+        crate::mac_perm::request_access_blocking()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        true
     }
 }
 

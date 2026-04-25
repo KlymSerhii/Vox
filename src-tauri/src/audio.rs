@@ -136,6 +136,12 @@ fn audio_thread(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
 }
 
 fn begin_capture(rms_bits: Arc<AtomicU32>) -> Result<ActiveCapture, AudioError> {
+    log::info!(
+        "audio::begin_capture: about to call cpal default_input_config + \
+         build_input_stream (this WILL implicitly prompt for mic TCC if \
+         status is NotDetermined — caller must have already obtained mic \
+         authorization first)"
+    );
     let host = cpal::default_host();
     let device = host
         .default_input_device()

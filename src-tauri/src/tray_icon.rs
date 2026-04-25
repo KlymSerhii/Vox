@@ -208,15 +208,13 @@ fn missing_permissions() -> bool {
     if !accessibility {
         return true;
     }
-    // Microphone — same probe as `commands::probe_microphone`. Don't
-    // trigger the OS prompt: just check whether we can open a default
-    // input config (which works only after the user has granted mic TCC
-    // at least once).
-    use cpal::traits::{DeviceTrait, HostTrait};
-    match cpal::default_host().default_input_device() {
-        Some(device) => device.default_input_config().is_err(),
-        None => true,
-    }
+    // Microphone — non-prompting status check via AVFoundation. Critically,
+    // we MUST NOT call `cpal::default_input_config()` here at startup: on
+    // macOS 14+ that opens the audio device far enough to trigger the TCC
+    // microphone prompt before the user has reached the onboarding mic
+    // step. `mac_perm::authorization_status()` reads the cached TCC state
+    // without escalating it.
+    !crate::mac_perm::authorization_status().is_granted()
 }
 
 #[cfg(not(target_os = "macos"))]

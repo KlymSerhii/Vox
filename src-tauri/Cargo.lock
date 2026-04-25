@@ -5461,6 +5461,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "async-trait",
+ "block2 0.6.2",
  "chrono",
  "cpal",
  "dirs 5.0.1",
