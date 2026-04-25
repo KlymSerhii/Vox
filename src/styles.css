@@ -1,0 +1,39 @@
+@import "tailwindcss";
+
+@theme {
+  --color-accent: #7c9cff;
+  --color-accent-soft: rgb(124 156 255 / 0.16);
+  --color-danger: #ff6b6b;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  --color-ink: #f4f4f5;
+  --color-ink-mute: #a1a1aa;
+  --color-bg: #0b0b0d;
+  --color-surface: rgb(39 39 42 / 0.72);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--color-bg);
+  color: var(--color-ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-feature-settings: "cv11", "ss01", "ss03";
+  font-size: 13px;
+  line-height: 18px;
+  margin: 0;
+  padding: 0;
+}
+
+input,
+button,
+select,
+textarea {
+  font: inherit;
+}
