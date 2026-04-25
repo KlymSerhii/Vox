@@ -424,6 +424,13 @@ impl ModeStore {
     /// Save a mode. Built-ins reject (the UI surfaces "Duplicate to edit"
     /// for built-ins, and a fork is a non-built-in clone).
     pub fn save(&self, mode: &VoiceMode) -> Result<()> {
+        // Defense in depth: even though the webview-only commands gate
+        // this path, refuse any id that doesn't match our slug shape so
+        // a future plugin / IPC caller cannot path-traverse through the
+        // modes directory.
+        if !is_safe_mode_id(&mode.id) {
+            return Err(anyhow!("invalid mode id"));
+        }
         if let Some(existing) = self.get(&mode.id) {
             if existing.built_in {
                 return Err(anyhow!("is_builtin"));
@@ -440,6 +447,9 @@ impl ModeStore {
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
+        if !is_safe_mode_id(id) {
+            return Err(anyhow!("invalid mode id"));
+        }
         let mode = self.get(id).ok_or_else(|| anyhow!("not_found"))?;
         if mode.built_in {
             return Err(anyhow!("is_builtin"));
@@ -455,6 +465,9 @@ impl ModeStore {
 
     /// Duplicate any mode (built-in or user) into a new editable mode.
     pub fn duplicate(&self, id: &str) -> Result<VoiceMode> {
+        if !is_safe_mode_id(id) {
+            return Err(anyhow!("invalid mode id"));
+        }
         let src = self.get(id).ok_or_else(|| anyhow!("not_found"))?;
         let mut copy = src.clone();
         copy.built_in = false;
@@ -463,6 +476,12 @@ impl ModeStore {
         let now = Utc::now().timestamp();
         copy.created_at = now;
         copy.updated_at = now;
+        // unique_id_from is built from slugify, which already produces a
+        // safe id, but assert one more time so a future change to the
+        // slugifier can't silently regress this.
+        if !is_safe_mode_id(&copy.id) {
+            return Err(anyhow!("invalid mode id"));
+        }
         let root = self.root_or_err()?;
         write_mode_file(&mode_path(&root, &copy.id), &copy)?;
         self.invalidate();
@@ -481,8 +500,17 @@ impl ModeStore {
             serde_json::from_str(json).context("invalid .voxmode JSON")?;
         validate(&mode)?;
         mode.built_in = false;
-        if mode.id.trim().is_empty() || self.get(&mode.id).is_some() {
+        // Re-slug any id that doesn't fit our safe-id shape, then dedup.
+        // This both prevents path traversal (`"../foo"` -> rejected and
+        // regenerated from the name) and mirrors the prior behavior of
+        // generating a fresh id when the source file's id is malformed.
+        if !is_safe_mode_id(&mode.id) || self.get(&mode.id).is_some() {
             mode.id = self.unique_id_from(&slugify(&mode.name));
+        }
+        // unique_id_from always produces a safe id; assert again so a
+        // future regression is caught early rather than at the fs::write.
+        if !is_safe_mode_id(&mode.id) {
+            return Err(anyhow!("could not derive a valid mode id"));
         }
         let now = Utc::now().timestamp();
         if mode.created_at == 0 {
@@ -655,6 +683,21 @@ fn validate(mode: &VoiceMode) -> Result<()> {
         return Err(anyhow!("mode system_prompt is empty"));
     }
     Ok(())
+}
+
+/// True if the given id is safe to use as the *filename component* of a
+/// mode JSON file. Allowed shape: `[a-z0-9-]{1,64}`, no leading or
+/// trailing dash. This is intentionally narrower than what `slugify`
+/// produces so a slugifier change can't widen the filesystem-write
+/// surface area.
+pub fn is_safe_mode_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 64 {
+        return false;
+    }
+    if id.starts_with('-') || id.ends_with('-') {
+        return false;
+    }
+    id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 pub fn slugify(input: &str) -> String {
@@ -1011,5 +1054,82 @@ mod tests {
         assert_eq!(slugify("Hello World"), "hello-world");
         assert_eq!(slugify("  Foo!! Bar  "), "foo-bar");
         assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn is_safe_mode_id_accepts_slug_shape() {
+        assert!(is_safe_mode_id("general"));
+        assert!(is_safe_mode_id("code-comment"));
+        assert!(is_safe_mode_id("mode-2"));
+        assert!(is_safe_mode_id("a"));
+        assert!(is_safe_mode_id("123"));
+    }
+
+    #[test]
+    fn is_safe_mode_id_rejects_unsafe_shapes() {
+        // empty / whitespace
+        assert!(!is_safe_mode_id(""));
+        assert!(!is_safe_mode_id(" "));
+        // path traversal
+        assert!(!is_safe_mode_id("../foo"));
+        assert!(!is_safe_mode_id("foo/bar"));
+        assert!(!is_safe_mode_id("/etc/passwd"));
+        assert!(!is_safe_mode_id(".."));
+        assert!(!is_safe_mode_id("."));
+        // dotfiles / hidden
+        assert!(!is_safe_mode_id(".hidden"));
+        // upper case
+        assert!(!is_safe_mode_id("General"));
+        // unicode
+        assert!(!is_safe_mode_id("café"));
+        // dashes at edges
+        assert!(!is_safe_mode_id("-foo"));
+        assert!(!is_safe_mode_id("foo-"));
+        // overly long
+        let long = "a".repeat(65);
+        assert!(!is_safe_mode_id(&long));
+    }
+
+    #[test]
+    fn import_rejects_traversal_id() {
+        let (store, tmp) = fresh_store();
+        // Crafted .voxmode that tries to write outside the modes dir.
+        let evil = serde_json::json!({
+            "id": "../../../../tmp/vox-pwned",
+            "name": "Pwned",
+            "icon": "",
+            "description": "",
+            "system_prompt": "x",
+            "punctuation": "Standard",
+            "case": "Sentence",
+            "created_at": 0,
+            "updated_at": 0
+        })
+        .to_string();
+        // Import succeeds, but the id is rewritten to a slug of the name.
+        let imported = store.import_json(&evil).unwrap();
+        assert!(is_safe_mode_id(&imported.id));
+        // The expected file lives under the modes dir only.
+        let expected = mode_path(tmp.path(), &imported.id);
+        assert!(expected.exists());
+        // The traversal target must NOT exist.
+        let traversal = std::env::temp_dir().join("vox-pwned.json");
+        assert!(!traversal.exists());
+    }
+
+    #[test]
+    fn save_rejects_traversal_id() {
+        let (store, _tmp) = fresh_store();
+        let mut bad = store.duplicate("email").unwrap();
+        bad.id = "../../etc/owned".into();
+        let err = store.save(&bad).unwrap_err();
+        assert!(err.to_string().contains("invalid mode id"));
+    }
+
+    #[test]
+    fn delete_rejects_traversal_id() {
+        let (store, _tmp) = fresh_store();
+        let err = store.delete("../../etc/passwd").unwrap_err();
+        assert!(err.to_string().contains("invalid mode id"));
     }
 }
