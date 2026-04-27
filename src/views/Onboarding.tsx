@@ -15,19 +15,20 @@ import {
   recommendTier,
   requestMicrophone,
   setSettings,
-  testAnthropicConnection,
-  testGroqConnection,
   type HotkeyDiagnostic,
   type PermissionStatus,
   type Settings,
   type TierRecommendation,
 } from "../lib/ipc";
 
-type Step = 0 | 1 | 2 | 3 | 4 | 5 | 6;
+// 2026-04-26: cloud onboarding (StackStep + KeysStep) was removed when
+// Vox went fully on-device. The flow is now linear: Welcome → Mic →
+// Accessibility → Local model download → Try it / How to use.
+type Step = 0 | 1 | 2 | 3 | 4;
 
-const STEP_COUNT = 7;
-const LAST_STEP: Step = 6;
-const MODELS_STEP: Step = 5;
+const STEP_COUNT = 5;
+const LAST_STEP: Step = 4;
+const MODELS_STEP: Step = 3;
 
 /**
  * Render a Tauri global-shortcut spec like "Alt+Shift+V" or "F13" as a
@@ -74,7 +75,6 @@ export default function OnboardingView() {
   const [step, setStep] = createSignal<Step>(0);
   const [s, setS] = createSignal<Settings | null>(null);
   const [tier, setTier] = createSignal<TierRecommendation | null>(null);
-  const [stackChoice, setStackChoice] = createSignal<"local" | "cloud">("local");
   const [perms, setPerms] = createSignal<PermissionStatus>({
     microphone: false,
     accessibility: false,
@@ -133,20 +133,11 @@ export default function OnboardingView() {
   }
 
   function next() {
-    let n = Math.min(LAST_STEP, step() + 1) as Step;
-    // Skip the API-keys step (step 4) when the user picks local.
-    if (step() === 3 && stackChoice() === "local") {
-      n = MODELS_STEP;
-    }
-    setStep(n);
+    setStep(Math.min(LAST_STEP, step() + 1) as Step);
   }
 
   function back() {
-    let n = Math.max(0, step() - 1) as Step;
-    if (step() === MODELS_STEP && stackChoice() === "local") {
-      n = 3 as Step;
-    }
-    setStep(n);
+    setStep(Math.max(0, step() - 1) as Step);
   }
 
   return (
@@ -184,27 +175,8 @@ export default function OnboardingView() {
         <Show when={step() === 2}>
           <AccessibilityStep granted={perms().accessibility} />
         </Show>
-        <Show when={step() === 3}>
-          <StackStep
-            tier={tier()}
-            choice={stackChoice()}
-            onChoice={setStackChoice}
-          />
-        </Show>
-        <Show when={step() === 4}>
-          <KeysStep s={s()} patch={patch} />
-        </Show>
         <Show when={step() === MODELS_STEP}>
-          <Show
-            when={stackChoice() === "local"}
-            fallback={<TryStep />}
-          >
-            <DownloadStep
-              s={s()}
-              tier={tier()}
-              patch={patch}
-            />
-          </Show>
+          <DownloadStep s={s()} tier={tier()} patch={patch} />
         </Show>
         <Show when={step() === LAST_STEP}>
           <HowToUseStep s={s()} />
@@ -228,7 +200,6 @@ export default function OnboardingView() {
           step={step()}
           perms={perms()}
           s={s()}
-          stackChoice={stackChoice()}
           onNext={next}
           onFinish={handleFinish}
         />
@@ -259,7 +230,6 @@ function PrimaryButton(props: {
   step: Step;
   perms: PermissionStatus;
   s: Settings | null;
-  stackChoice: "local" | "cloud";
   onNext: () => void;
   onFinish: () => void;
 }) {
@@ -338,8 +308,7 @@ function Welcome() {
       <div>
         <h1 class="text-[24px] font-semibold">Talk to any app.</h1>
         <p class="mt-2 max-w-[360px] text-[13px] text-[var(--color-ink-mute)]">
-          Vox runs offline on your Mac. Press{" "}
-          <span class="keycap">⌥</span> to start.
+          Vox runs offline on your Mac.
         </p>
       </div>
     </div>
@@ -409,61 +378,9 @@ function PermStatus(props: {
   );
 }
 
-function StackStep(props: {
-  tier: TierRecommendation | null;
-  choice: "local" | "cloud";
-  onChoice: (c: "local" | "cloud") => void;
-}) {
-  return (
-    <div class="flex w-full max-w-[420px] flex-col gap-4">
-      <h2 class="text-[20px] font-semibold">Choose your stack.</h2>
-      <p class="text-[13px] text-[var(--color-ink-mute)]">
-        Local is the default — your audio never leaves this Mac. Cloud is
-        faster to set up and slightly faster per dictation.
-      </p>
-      <div
-        class="cursor-pointer rounded-[10px] p-4 ring-1 transition-colors"
-        classList={{
-          "ring-[var(--color-accent)] bg-[rgba(124,156,255,0.08)]":
-            props.choice === "local",
-          "ring-[var(--color-border)] hover:ring-white/20":
-            props.choice !== "local",
-        }}
-        onClick={() => props.onChoice("local")}
-      >
-        <div class="flex items-center justify-between">
-          <span class="text-[14px] font-medium">Run offline (recommended)</span>
-          <Show when={props.tier}>
-            {(t) => (
-              <span class="text-[11px] text-[var(--color-ink-mute)]">
-                {t().tier} tier
-              </span>
-            )}
-          </Show>
-        </div>
-        <p class="mt-1 text-[12px] text-[var(--color-ink-mute)]">
-          Whisper + Gemma 4 on-device. ~1.9 GB download up front, then
-          fully offline forever.
-        </p>
-      </div>
-      <div
-        class="cursor-pointer rounded-[10px] p-4 ring-1 transition-colors"
-        classList={{
-          "ring-[var(--color-accent)] bg-[rgba(124,156,255,0.08)]":
-            props.choice === "cloud",
-          "ring-[var(--color-border)] hover:ring-white/20":
-            props.choice !== "cloud",
-        }}
-        onClick={() => props.onChoice("cloud")}
-      >
-        <span class="text-[14px] font-medium">Use cloud (BYO API keys)</span>
-        <p class="mt-1 text-[12px] text-[var(--color-ink-mute)]">
-          Groq + Anthropic. Faster setup; sends audio off-device.
-        </p>
-      </div>
-    </div>
-  );
-}
+// 2026-04-26: StackStep + KeysStep were removed when cloud engines went
+// away. Onboarding is now a fixed local flow: Welcome → Mic →
+// Accessibility → DownloadStep → HowToUseStep.
 
 function DownloadStep(props: {
   s: Settings | null;
@@ -611,149 +528,8 @@ function DownloadBar(props: {
   );
 }
 
-function KeysStep(props: {
-  s: Settings | null;
-  patch: (p: Partial<Settings>) => void;
-}) {
-  const [groqMsg, setGroqMsg] = createSignal<string | null>(null);
-  const [groqOk, setGroqOk] = createSignal<boolean | null>(null);
-  const [anthroMsg, setAnthroMsg] = createSignal<string | null>(null);
-  const [anthroOk, setAnthroOk] = createSignal<boolean | null>(null);
-
-  async function testGroq() {
-    const key = props.s?.groq_api_key.trim() ?? "";
-    setGroqMsg("Testing…");
-    setGroqOk(null);
-    try {
-      const r = await testGroqConnection(key);
-      setGroqMsg(r.message);
-      setGroqOk(r.ok);
-    } catch (e) {
-      setGroqMsg(String(e));
-      setGroqOk(false);
-    }
-  }
-
-  async function testAnthro() {
-    const key = props.s?.anthropic_api_key.trim() ?? "";
-    setAnthroMsg("Testing…");
-    setAnthroOk(null);
-    try {
-      const r = await testAnthropicConnection(key);
-      setAnthroMsg(r.message);
-      setAnthroOk(r.ok);
-    } catch (e) {
-      setAnthroMsg(String(e));
-      setAnthroOk(false);
-    }
-  }
-
-  return (
-    <div class="flex w-full max-w-[400px] flex-col gap-4">
-      <h2 class="text-[20px] font-semibold">Bring your own keys.</h2>
-      <p class="text-[13px] text-[var(--color-ink-mute)]">
-        Vox runs on your accounts. Keys stay in your Keychain.
-      </p>
-
-      <div class="flex flex-col gap-1">
-        <label class="text-[12px] font-medium">Groq (required for cloud STT)</label>
-        <div class="flex gap-2">
-          <input
-            type="password"
-            placeholder="gsk_…"
-            class="flex-1 rounded-[6px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s?.groq_api_key ?? ""}
-            onInput={(e) =>
-              props.patch({
-                groq_api_key: e.currentTarget.value,
-                stt_engine: "groq",
-              })
-            }
-            autocomplete="off"
-            spellcheck={false}
-          />
-          <button
-            type="button"
-            onClick={testGroq}
-            class="rounded-[6px] bg-white/10 px-3 py-2 text-[12px] hover:bg-white/15"
-          >
-            Test
-          </button>
-        </div>
-        <Show when={groqMsg()}>
-          <span
-            class="text-[11px]"
-            classList={{
-              "text-[var(--color-success)]": groqOk() === true,
-              "text-[var(--color-danger)]": groqOk() === false,
-              "text-[var(--color-ink-mute)]": groqOk() === null,
-            }}
-          >
-            {groqMsg()}
-          </span>
-        </Show>
-      </div>
-
-      <div class="flex flex-col gap-1">
-        <label class="text-[12px] font-medium">Anthropic (optional cleanup)</label>
-        <div class="flex gap-2">
-          <input
-            type="password"
-            placeholder="sk-ant-…"
-            class="flex-1 rounded-[6px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s?.anthropic_api_key ?? ""}
-            onInput={(e) =>
-              props.patch({
-                anthropic_api_key: e.currentTarget.value,
-                llm_engine: "anthropic",
-              })
-            }
-            autocomplete="off"
-            spellcheck={false}
-          />
-          <button
-            type="button"
-            onClick={testAnthro}
-            class="rounded-[6px] bg-white/10 px-3 py-2 text-[12px] hover:bg-white/15"
-          >
-            Test
-          </button>
-        </div>
-        <Show when={anthroMsg()}>
-          <span
-            class="text-[11px]"
-            classList={{
-              "text-[var(--color-success)]": anthroOk() === true,
-              "text-[var(--color-danger)]": anthroOk() === false,
-              "text-[var(--color-ink-mute)]": anthroOk() === null,
-            }}
-          >
-            {anthroMsg()}
-          </span>
-        </Show>
-      </div>
-    </div>
-  );
-}
-
-function TryStep() {
-  return (
-    <div class="flex w-full max-w-[400px] flex-col items-center gap-4 text-center">
-      <h2 class="text-[20px] font-semibold">Try it.</h2>
-      <p class="text-[13px] text-[var(--color-ink-mute)]">
-        Hold <span class="keycap">⌥⌃</span> and say something. Your words will
-        appear below.
-      </p>
-      <textarea
-        placeholder="Focus here, then hold ⌥⌃ and speak."
-        class="h-24 w-full resize-none rounded-[8px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-      />
-      <p class="text-[11px] text-[var(--color-ink-faint)]">
-        If nothing happens, check the tray icon for errors.
-      </p>
-    </div>
-  );
-}
+// 2026-04-26: KeysStep + TryStep deleted — no cloud secrets, and the
+// cloud path that rendered TryStep as a model-step fallback is gone.
 
 function HowToUseStep(props: { s: Settings | null }) {
   // Always render the BOUND hotkey (what the OS will actually fire),
@@ -783,7 +559,7 @@ function HowToUseStep(props: { s: Settings | null }) {
   const pttGlyph = () =>
     formatHotkey(ptt()?.bound) ||
     formatHotkey(props.s?.hotkey) ||
-    "⌥⌃";
+    "⌘⌥L";
   const cycleGlyph = () =>
     formatHotkey(cycle()?.bound) ||
     formatHotkey(props.s?.mode_cycle_hotkey) ||
@@ -792,6 +568,13 @@ function HowToUseStep(props: { s: Settings | null }) {
     formatHotkey(paste()?.bound) ||
     formatHotkey(props.s?.paste_last_hotkey) ||
     "⌥⇧V";
+
+  const handsFree = () => props.s?.hands_free_enabled ?? true;
+  const pttVerb = () => (handsFree() ? "Press" : "Hold");
+  const pttTail = () =>
+    handsFree()
+      ? "to start dictating in any text field. Press again to stop."
+      : "to start dictating in any text field. Release when done.";
 
   return (
     <div class="flex w-full max-w-[420px] flex-col gap-5">
@@ -807,11 +590,11 @@ function HowToUseStep(props: { s: Settings | null }) {
 
       <ul class="flex flex-col gap-3">
         <TipRow
-          label={<>Hold <span class="keycap">{pttGlyph()}</span></>}
+          label={<>{pttVerb()} <span class="keycap">{pttGlyph()}</span></>}
           description={
             pttFailed(ptt())
               ? "— Vox can't listen yet, grant Accessibility to enable."
-              : "to start dictating in any text field. Release when done."
+              : pttTail()
           }
           fellBackNote={fellBackNote(ptt())}
           errorAction={
@@ -828,7 +611,7 @@ function HowToUseStep(props: { s: Settings | null }) {
         />
         <TipRow
           label={<span class="keycap">{pasteGlyph()}</span>}
-          description="to paste your last transcript again."
+          description="to copy your last transcript to the clipboard again."
           fellBackNote={fellBackNote(paste())}
         />
       </ul>

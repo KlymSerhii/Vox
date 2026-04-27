@@ -1,15 +1,17 @@
-//! Settings — backed by `tauri-plugin-store` for non-secret fields,
-//! and the macOS Keychain (via the `keyring` crate) for API keys.
+//! Settings — backed by `tauri-plugin-store` for non-secret fields.
 //!
-//! On startup, [`load`] migrates any plaintext keys out of the JSON store
-//! into the Keychain and clears them from disk. If Keychain access fails,
-//! we transparently fall back to the plaintext store and log a warning —
-//! dictation should still work.
+//! 2026-04-26: Vox went fully on-device. Cloud engines (Groq STT,
+//! Anthropic LLM cleanup) and their API keys were removed. Settings now
+//! persists only local-first preferences. Any historical cloud values
+//! are scrubbed at load time:
 //!
-//! Local-first migration: existing users who already have a `groq_api_key`
-//! keep their cloud engine assignments; new installs get
-//! `stt_engine = "whisper-local"`, `llm_engine = "gemma-local"`. Either
-//! group sees the migration dialog at most once.
+//! - `stt_engine = "groq"`            → `"whisper-local"`
+//! - `llm_engine = "anthropic"`       → `"none"` (raw transcript)
+//! - `groq_api_key` / `anthropic_api_key` (plaintext) → deleted
+//! - Keychain entries `groq` / `anthropic` → deleted
+//!
+//! API keys never leave the user's machine in any form afterward — the
+//! HTTP code paths that used them are gone from the binary.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
@@ -19,8 +21,6 @@ use crate::models;
 
 pub const STORE_FILE: &str = "vox-settings.json";
 
-const KEY_GROQ: &str = "groq_api_key";
-const KEY_ANTHROPIC: &str = "anthropic_api_key";
 const KEY_HOTKEY: &str = "hotkey";
 const KEY_CANCEL_HOTKEY: &str = "cancel_hotkey";
 const KEY_PASTE_LAST_HOTKEY: &str = "paste_last_hotkey";
@@ -37,34 +37,42 @@ const KEY_STT_ENGINE: &str = "stt_engine";
 const KEY_STT_MODEL_ID: &str = "stt_model_id";
 const KEY_LLM_ENGINE: &str = "llm_engine";
 const KEY_LLM_MODEL_ID: &str = "llm_model_id";
-const KEY_MIGRATION_SEEN: &str = "migration_seen";
 const KEY_GEMMA_TOS_ACCEPTED: &str = "gemma_tos_accepted";
+const KEY_POLISHING_ENABLED: &str = "polishing_enabled";
 
 // Voice Modes keys.
 const KEY_ACTIVE_MODE_ID: &str = "active_mode_id";
 const KEY_MODE_CYCLE_HOTKEY: &str = "mode_cycle_hotkey";
 const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
 
-// Legacy keys we still read for migration but no longer write.
+// Legacy keys we still read once for migration. Any time we touch the
+// store we delete these so they never come back.
 const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
 const KEY_LEGACY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
+const KEY_LEGACY_GROQ: &str = "groq_api_key";
+const KEY_LEGACY_ANTHROPIC: &str = "anthropic_api_key";
+const KEY_LEGACY_MIGRATION_SEEN: &str = "migration_seen";
 
 const KEYRING_SERVICE: &str = "app.vox.vox";
-const KEYRING_ACCOUNT_GROQ: &str = "groq";
-const KEYRING_ACCOUNT_ANTHROPIC: &str = "anthropic";
+const KEYRING_ACCOUNT_LEGACY_GROQ: &str = "groq";
+const KEYRING_ACCOUNT_LEGACY_ANTHROPIC: &str = "anthropic";
 
 fn default_hotkey() -> String {
-    // 2026-04-24: switched from `F13` to the `Alt+Control` modifier-only
-    // chord (the whispr-flow UX). Pure modifier chords cannot be
-    // registered through `tauri-plugin-global-shortcut` on macOS — they
-    // require a base key — so `hotkey.rs` recognises this string and
-    // installs a `CGEventTap` instead. If Accessibility is denied (or
-    // the tap fails for any other reason) we fall back through the
-    // `PTT_FALLBACKS` chain (F13 → F14 → F15 → ⌘⇧Space) so the dictation
-    // feature still works while the user grants permission. The token
-    // name is `Alt` (not `Option`) to stay consistent with the parser
-    // table we inherit from the global-shortcut plugin.
-    "Alt+Control".to_string()
+    // 2026-04-26: switched from the modifier-only `Alt+Control` chord to
+    // the standard `Cmd+Alt+L` shortcut. Two reasons:
+    //
+    // 1. The chord path (CGEventTap) requires Accessibility, which many
+    //    users could not grant from a `tauri dev` binary because TCC
+    //    keys permissions to a binary signature that changes on each
+    //    rebuild. The shortcut path goes through Carbon
+    //    `RegisterEventHotKey` and does NOT require Accessibility.
+    // 2. Pairing this with `hands_free_enabled = true` (the new default)
+    //    gives a press-once-to-toggle UX where users don't have to hold
+    //    a key while dictating.
+    //
+    // The token name is `Alt` (not `Option`) to stay consistent with the
+    // parser table we inherit from the global-shortcut plugin.
+    "Cmd+Alt+L".to_string()
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
@@ -82,7 +90,19 @@ fn default_stt_engine() -> String {
     "whisper-local".into()
 }
 fn default_llm_engine() -> String {
-    "gemma-local".into()
+    // Vox is now fully local: cloud cleanup is gone, and the only local
+    // option (`gemma-local`) currently aborts inside `llama-cpp-2`
+    // 0.1.145 (upstream llama.cpp PR 17869). Default new installs to
+    // `none` — raw whisper transcripts. The polishing toggle in
+    // Settings is the user-facing knob; it persists separately so the
+    // user's preference comes back the moment Gemma stabilises.
+    "none".into()
+}
+fn default_polishing_enabled() -> bool {
+    // Off by default while local Gemma cleanup is unavailable. Setting
+    // is preserved across sessions so flipping it back on is one click
+    // once the upstream fix lands.
+    false
 }
 fn default_stt_model_id() -> String {
     models::recommended_stt_model_id().to_string()
@@ -100,15 +120,9 @@ fn default_auto_suggest_modes() -> bool {
     true
 }
 
-/// User-visible settings. API keys live in `Settings` so the UI can edit
-/// them, but they are not persisted to disk — only to the Keychain.
+/// User-visible settings. Local-only — no API keys, no cloud secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    #[serde(default)]
-    pub groq_api_key: String,
-    #[serde(default)]
-    pub anthropic_api_key: String,
-
     #[serde(default = "default_hotkey")]
     pub hotkey: String,
     #[serde(default = "default_cancel_hotkey")]
@@ -143,8 +157,13 @@ pub struct Settings {
     pub llm_engine: String,
     #[serde(default = "default_llm_model_id")]
     pub llm_model_id: String,
-    #[serde(default)]
-    pub migration_seen: bool,
+    /// User-facing on/off switch for transcript polishing. Independent of
+    /// `llm_engine` so the user's preference survives across periods
+    /// when no working local LLM is available — when the engine is
+    /// fixed, flipping this back on flips `llm_engine` to `gemma-local`
+    /// without needing to remember the model id.
+    #[serde(default = "default_polishing_enabled")]
+    pub polishing_enabled: bool,
     #[serde(default)]
     pub gemma_tos_accepted: bool,
 
@@ -160,15 +179,18 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            groq_api_key: String::new(),
-            anthropic_api_key: String::new(),
             hotkey: default_hotkey(),
             cancel_hotkey: default_cancel_hotkey(),
             paste_last_hotkey: default_paste_last_hotkey(),
             launch_at_login: false,
             play_sound: false,
             dictation_enabled: true,
-            hands_free_enabled: false,
+            // 2026-04-26: toggle is the new default — press the hotkey
+            // once to start dictating, press again to stop. Holding the
+            // key is still supported (it just acts as a no-op down/up
+            // toggle pair), but discoverability of "press once" is much
+            // better than "hold for the whole sentence".
+            hands_free_enabled: true,
             language: default_language(),
             onboarded: false,
             dictionary: Vec::new(),
@@ -176,7 +198,7 @@ impl Default for Settings {
             stt_model_id: default_stt_model_id(),
             llm_engine: default_llm_engine(),
             llm_model_id: default_llm_model_id(),
-            migration_seen: false,
+            polishing_enabled: default_polishing_enabled(),
             gemma_tos_accepted: false,
             active_mode_id: default_active_mode_id(),
             mode_cycle_hotkey: default_mode_cycle_hotkey(),
@@ -185,107 +207,20 @@ impl Default for Settings {
     }
 }
 
-// ---------- Keyring wrappers ------------------------------------------------
+// ---------- Legacy cloud key scrubbing -------------------------------------
 
-fn keyring_entry(account: &str) -> Option<keyring::Entry> {
+/// Best-effort delete of a Keychain entry. Used only to scrub legacy
+/// cloud API keys when an old install upgrades to the local-only build;
+/// any error is logged and ignored — the keys are useless to a binary
+/// that doesn't ship the cloud HTTP client.
+fn keyring_delete(account: &str) {
     match keyring::Entry::new(KEYRING_SERVICE, account) {
-        Ok(e) => Some(e),
-        Err(e) => {
-            log::warn!("keyring entry create failed ({account}): {e}");
-            None
-        }
-    }
-}
-
-fn keyring_get(account: &str) -> Option<String> {
-    let entry = keyring_entry(account)?;
-    match entry.get_password() {
-        Ok(s) => Some(s),
-        Err(keyring::Error::NoEntry) => None,
-        Err(e) => {
-            log::warn!("keyring get failed ({account}): {e}");
-            None
-        }
-    }
-}
-
-fn keyring_set(account: &str, value: &str) -> bool {
-    let Some(entry) = keyring_entry(account) else {
-        return false;
-    };
-    if value.is_empty() {
-        match entry.delete_credential() {
-            Ok(_) => true,
-            Err(keyring::Error::NoEntry) => true,
-            Err(e) => {
-                log::warn!("keyring delete failed ({account}): {e}");
-                false
-            }
-        }
-    } else {
-        match entry.set_password(value) {
-            Ok(_) => true,
-            Err(e) => {
-                log::warn!("keyring set failed ({account}): {e}");
-                false
-            }
-        }
-    }
-}
-
-// ---------- Public single-key helpers --------------------------------------
-
-pub fn get_groq_key<R: Runtime>(app: &AppHandle<R>) -> String {
-    if let Some(s) = keyring_get(KEYRING_ACCOUNT_GROQ) {
-        return s;
-    }
-    read_string(app, KEY_GROQ)
-}
-
-pub fn set_groq_key<R: Runtime>(app: &AppHandle<R>, value: &str) {
-    if keyring_set(KEYRING_ACCOUNT_GROQ, value) {
-        clear_string(app, KEY_GROQ);
-    } else {
-        write_string(app, KEY_GROQ, value);
-    }
-}
-
-pub fn get_anthropic_key<R: Runtime>(app: &AppHandle<R>) -> String {
-    if let Some(s) = keyring_get(KEYRING_ACCOUNT_ANTHROPIC) {
-        return s;
-    }
-    read_string(app, KEY_ANTHROPIC)
-}
-
-pub fn set_anthropic_key<R: Runtime>(app: &AppHandle<R>, value: &str) {
-    if keyring_set(KEYRING_ACCOUNT_ANTHROPIC, value) {
-        clear_string(app, KEY_ANTHROPIC);
-    } else {
-        write_string(app, KEY_ANTHROPIC, value);
-    }
-}
-
-// ---------- Primitive store helpers ----------------------------------------
-
-fn read_string<R: Runtime>(app: &AppHandle<R>, key: &str) -> String {
-    app.store(STORE_FILE)
-        .ok()
-        .and_then(|s| s.get(key))
-        .and_then(|v| v.as_str().map(|x| x.to_string()))
-        .unwrap_or_default()
-}
-
-fn write_string<R: Runtime>(app: &AppHandle<R>, key: &str, value: &str) {
-    if let Ok(store) = app.store(STORE_FILE) {
-        store.set(key, serde_json::Value::String(value.to_string()));
-        let _ = store.save();
-    }
-}
-
-fn clear_string<R: Runtime>(app: &AppHandle<R>, key: &str) {
-    if let Ok(store) = app.store(STORE_FILE) {
-        store.delete(key);
-        let _ = store.save();
+        Ok(entry) => match entry.delete_credential() {
+            Ok(_) => log::info!("scrubbed legacy keychain entry: {account}"),
+            Err(keyring::Error::NoEntry) => {}
+            Err(e) => log::warn!("keychain delete failed ({account}): {e}"),
+        },
+        Err(e) => log::warn!("keychain entry open failed ({account}): {e}"),
     }
 }
 
@@ -306,29 +241,44 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(default_hotkey);
         // One-shot migration: legacy default values are upgraded to the
-        // current default chord (`Alt+Control`). Two cases:
+        // current default `Cmd+Alt+L`. Cases:
         //
         // 1. `AltRight` — the original default; never reliably bindable
         //    through `tauri-plugin-global-shortcut`.
-        // 2. `F13` — the previous default chosen as a workaround for
-        //    case 1; not every keyboard exposes it, and the modifier
-        //    chord is the better UX.
+        // 2. `F13` — workaround for case 1; not every keyboard has it.
+        // 3. `Alt+Control` / `Alt+Shift` — modifier-only chords that
+        //    require Accessibility, which many users could not grant
+        //    from a dev binary. `Cmd+Alt+L` works without Accessibility.
         //
-        // Anything OTHER than these two is treated as an explicit user
+        // Anything OTHER than these is treated as an explicit user
         // choice and left untouched. We log the migration at error
         // level so it's visible in `tauri dev`'s terminal.
-        if stored == "AltRight" || stored == "F13" {
+        const LEGACY: &[&str] =
+            &["AltRight", "F13", "Alt+Control", "Alt+Shift"];
+        if LEGACY.contains(&stored.as_str()) {
             log::error!(
                 "settings: migrating legacy push-to-talk hotkey \
-                 '{stored}' -> 'Alt+Control'. Hold Option+Control to \
-                 dictate; release to transcribe and paste."
+                 '{stored}' -> 'Cmd+Alt+L'. Press Cmd+Option+L to start \
+                 dictating; press again to stop (hands-free toggle is \
+                 on by default)."
             );
             store.set(
                 KEY_HOTKEY,
-                serde_json::Value::String("Alt+Control".to_string()),
+                serde_json::Value::String("Cmd+Alt+L".to_string()),
             );
+            // Also flip hands_free_enabled on if it's still at the old
+            // press-and-hold default. Users who explicitly turned it on
+            // already keep their setting; users who never touched it
+            // get the new toggle behaviour.
+            if store
+                .get(KEY_HANDS_FREE)
+                .and_then(|v| v.as_bool())
+                .is_none()
+            {
+                store.set(KEY_HANDS_FREE, serde_json::Value::Bool(true));
+            }
             let _ = store.save();
-            "Alt+Control".to_string()
+            "Cmd+Alt+L".to_string()
         } else {
             stored
         }
@@ -351,9 +301,9 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let launch_at_login = get_bool(KEY_LAUNCH_AT_LOGIN, false);
     let play_sound = get_bool(KEY_PLAY_SOUND, false);
     let dictation_enabled = get_bool(KEY_DICTATION_ENABLED, true);
-    let hands_free_enabled = get_bool(KEY_HANDS_FREE, false);
+    // Defaults to true: see `Settings::default` and the file-level docs.
+    let hands_free_enabled = get_bool(KEY_HANDS_FREE, true);
     let onboarded = get_bool(KEY_ONBOARDED, false);
-    let migration_seen = get_bool(KEY_MIGRATION_SEEN, false);
     let gemma_tos_accepted = get_bool(KEY_GEMMA_TOS_ACCEPTED, false);
 
     let dictionary = store
@@ -366,49 +316,113 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         })
         .unwrap_or_default();
 
-    // Engine selection. New keys override; if absent, fall back to a
-    // migration of the legacy `cleanup_enabled` / `send_audio_to_cloud`
-    // pair.
-    let legacy_cleanup_enabled =
-        store.get(KEY_LEGACY_CLEANUP_ENABLED).and_then(|v| v.as_bool());
-    let legacy_send_audio_cloud =
-        store.get(KEY_LEGACY_SEND_AUDIO_CLOUD).and_then(|v| v.as_bool());
+    // -------- Local-only engine selection ---------------------------------
+    //
+    // Any historical cloud value coming back from disk is rewritten to
+    // its local equivalent before we even hand it to the rest of the
+    // app. The store is updated in-place so the migration only logs once.
+    let mut store_dirty = false;
 
-    let stt_engine = store
-        .get(KEY_STT_ENGINE)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| {
-            // Existing user: had cloud STT. Brand-new: default local.
-            if legacy_send_audio_cloud.is_some() && !get_groq_key(app).is_empty() {
-                "groq".into()
-            } else {
-                default_stt_engine()
-            }
-        });
+    let stt_engine = {
+        let stored = store
+            .get(KEY_STT_ENGINE)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(default_stt_engine);
+        if stored == "groq" || stored == "cloud" {
+            log::error!(
+                "settings: migrating stt_engine '{stored}' -> 'whisper-local' \
+                 (Vox is now fully local)."
+            );
+            store.set(
+                KEY_STT_ENGINE,
+                serde_json::Value::String("whisper-local".into()),
+            );
+            store_dirty = true;
+            "whisper-local".into()
+        } else {
+            stored
+        }
+    };
     let stt_model_id = store
         .get(KEY_STT_MODEL_ID)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(default_stt_model_id);
 
-    let llm_engine = store
-        .get(KEY_LLM_ENGINE)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(|| {
-            if legacy_cleanup_enabled == Some(false) {
-                "none".into()
-            } else if !get_anthropic_key(app).is_empty() {
-                "anthropic".into()
-            } else if legacy_send_audio_cloud.is_some() {
-                // Existing cloud user without an Anthropic key: cleanup off.
-                "none".into()
-            } else {
-                default_llm_engine()
+    let llm_engine = {
+        let stored = store
+            .get(KEY_LLM_ENGINE)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(default_llm_engine);
+        // Two migrations stack here:
+        // 1. `anthropic` — cloud cleanup, removed → `none` so the
+        //    transcript pipeline finishes successfully without ever
+        //    attempting a network call.
+        // 2. `gemma-local` — local cleanup, currently broken under
+        //    `llama-cpp-2` 0.1.145 (GGML_ASSERT abort, upstream
+        //    llama.cpp PR 17869) → `none`. The user's intent is
+        //    preserved separately via `polishing_enabled` so the moment
+        //    the upstream fix lands they can flip the toggle and get
+        //    Gemma back.
+        match stored.as_str() {
+            "anthropic" | "claude" | "cloud" => {
+                log::error!(
+                    "settings: migrating llm_engine '{stored}' -> 'none' \
+                     (cloud polishing was removed; Vox is fully local now)."
+                );
+                store.set(
+                    KEY_LLM_ENGINE,
+                    serde_json::Value::String("none".into()),
+                );
+                store_dirty = true;
+                "none".to_string()
             }
-        });
+            "gemma-local" => {
+                log::error!(
+                    "settings: migrating llm_engine 'gemma-local' -> 'none'. \
+                     Local Gemma cleanup is paused while llama-cpp-2 ships \
+                     the fix from llama.cpp PR 17869 — your polishing \
+                     preference is preserved separately."
+                );
+                store.set(
+                    KEY_LLM_ENGINE,
+                    serde_json::Value::String("none".into()),
+                );
+                store_dirty = true;
+                "none".to_string()
+            }
+            _ => stored,
+        }
+    };
     let llm_model_id = store
         .get(KEY_LLM_MODEL_ID)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(default_llm_model_id);
+
+    // The polishing on/off toggle. If the user has never seen the new
+    // toggle and previously had cloud cleanup configured, treat that as
+    // "polishing was on" so when Gemma comes back online we can restore
+    // their intent. Otherwise default to off.
+    let polishing_enabled = match store.get(KEY_POLISHING_ENABLED) {
+        Some(v) => v.as_bool().unwrap_or_else(default_polishing_enabled),
+        None => {
+            // First-run inference for upgraders.
+            let was_using_cloud_cleanup = store
+                .get(KEY_LEGACY_CLEANUP_ENABLED)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                || matches!(
+                    store
+                        .get(KEY_LLM_ENGINE)
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .as_deref(),
+                    Some("anthropic") | Some("gemma-local")
+                );
+            let inferred = was_using_cloud_cleanup;
+            store.set(KEY_POLISHING_ENABLED, serde_json::Value::Bool(inferred));
+            store_dirty = true;
+            inferred
+        }
+    };
 
     let active_mode_id = store
         .get(KEY_ACTIVE_MODE_ID)
@@ -420,16 +434,34 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .unwrap_or_else(default_mode_cycle_hotkey);
     let auto_suggest_modes = get_bool(KEY_AUTO_SUGGEST_MODES, default_auto_suggest_modes());
 
-    // Migrate plaintext keys → Keychain once.
-    migrate_key_from_store(app, &store, KEY_GROQ, KEYRING_ACCOUNT_GROQ);
-    migrate_key_from_store(app, &store, KEY_ANTHROPIC, KEYRING_ACCOUNT_ANTHROPIC);
+    // -------- Scrub legacy cloud secrets ----------------------------------
+    //
+    // Historic plaintext API keys and the old `migration_seen` /
+    // cleanup-enabled bools are deleted on the first local-only launch.
+    // These are best-effort: a failure here only means a stale, unusable
+    // key sits in the Keychain until the next save — there's no live
+    // code path that reads it.
+    for key in [
+        KEY_LEGACY_GROQ,
+        KEY_LEGACY_ANTHROPIC,
+        KEY_LEGACY_CLEANUP_ENABLED,
+        KEY_LEGACY_SEND_AUDIO_CLOUD,
+        KEY_LEGACY_MIGRATION_SEEN,
+    ] {
+        if store.get(key).is_some() {
+            store.delete(key);
+            store_dirty = true;
+            log::info!("scrubbed legacy settings key: {key}");
+        }
+    }
+    keyring_delete(KEYRING_ACCOUNT_LEGACY_GROQ);
+    keyring_delete(KEYRING_ACCOUNT_LEGACY_ANTHROPIC);
 
-    let groq_api_key = get_groq_key(app);
-    let anthropic_api_key = get_anthropic_key(app);
+    if store_dirty {
+        let _ = store.save();
+    }
 
     Settings {
-        groq_api_key,
-        anthropic_api_key,
         hotkey,
         cancel_hotkey,
         paste_last_hotkey,
@@ -444,35 +476,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         stt_model_id,
         llm_engine,
         llm_model_id,
-        migration_seen,
+        polishing_enabled,
         gemma_tos_accepted,
         active_mode_id,
         mode_cycle_hotkey,
         auto_suggest_modes,
-    }
-}
-
-fn migrate_key_from_store<R: Runtime>(
-    app: &AppHandle<R>,
-    store: &std::sync::Arc<tauri_plugin_store::Store<R>>,
-    store_key: &str,
-    account: &str,
-) {
-    let plaintext = store
-        .get(store_key)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
-
-    if plaintext.is_empty() {
-        return;
-    }
-    if keyring_set(account, &plaintext) {
-        log::info!("migrated {store_key} from plaintext store → Keychain");
-        clear_string(app, store_key);
-    } else {
-        log::warn!(
-            "could not migrate {store_key} to Keychain — staying on plaintext store"
-        );
     }
 }
 
@@ -481,15 +489,7 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         .store(STORE_FILE)
         .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
 
-    // Secrets → Keychain.
-    let groq = settings.groq_api_key.trim();
-    if !groq.is_empty() || get_groq_key(app).is_empty() {
-        set_groq_key(app, groq);
-    }
-    let anthropic = settings.anthropic_api_key.trim();
-    if !anthropic.is_empty() || get_anthropic_key(app).is_empty() {
-        set_anthropic_key(app, anthropic);
-    }
+    // Local-only build — no cloud secrets to persist anywhere.
 
     store.set(
         KEY_HOTKEY,
@@ -549,8 +549,8 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         serde_json::Value::String(settings.llm_model_id.clone()),
     );
     store.set(
-        KEY_MIGRATION_SEEN,
-        serde_json::Value::Bool(settings.migration_seen),
+        KEY_POLISHING_ENABLED,
+        serde_json::Value::Bool(settings.polishing_enabled),
     );
     store.set(
         KEY_GEMMA_TOS_ACCEPTED,
@@ -570,9 +570,18 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         serde_json::Value::Bool(settings.auto_suggest_modes),
     );
 
-    // Drop the deprecated keys on save — they're superseded.
-    store.delete(KEY_LEGACY_CLEANUP_ENABLED);
-    store.delete(KEY_LEGACY_SEND_AUDIO_CLOUD);
+    // Drop deprecated keys defensively on every save — these may have
+    // been re-introduced by a downgraded build, and any cloud-related
+    // value here is unreachable code in this binary.
+    for key in [
+        KEY_LEGACY_GROQ,
+        KEY_LEGACY_ANTHROPIC,
+        KEY_LEGACY_CLEANUP_ENABLED,
+        KEY_LEGACY_SEND_AUDIO_CLOUD,
+        KEY_LEGACY_MIGRATION_SEEN,
+    ] {
+        store.delete(key);
+    }
 
     store
         .save()
@@ -585,30 +594,6 @@ pub fn mark_onboarded<R: Runtime>(app: &AppHandle<R>) {
         store.set(KEY_ONBOARDED, serde_json::Value::Bool(true));
         let _ = store.save();
     }
-}
-
-pub fn mark_migration_seen<R: Runtime>(app: &AppHandle<R>) {
-    if let Ok(store) = app.store(STORE_FILE) {
-        store.set(KEY_MIGRATION_SEEN, serde_json::Value::Bool(true));
-        let _ = store.save();
-    }
-}
-
-/// True if a previous Vox install on this machine had cloud config. Used
-/// to decide whether to surface the soft migration dialog.
-pub fn is_legacy_cloud_user<R: Runtime>(app: &AppHandle<R>) -> bool {
-    if get_groq_key(app).trim().is_empty() {
-        return false;
-    }
-    let Ok(store) = app.store(STORE_FILE) else {
-        return false;
-    };
-    // If the user already has explicit local-first keys, we treat them as
-    // already-migrated regardless of the legacy bool.
-    if store.get(KEY_STT_ENGINE).is_some() {
-        return false;
-    }
-    true
 }
 
 /// Lightweight, secret-free view of the user's preferences. Cheap enough
@@ -624,6 +609,7 @@ pub struct Prefs {
     pub stt_model_id: String,
     pub llm_engine: String,
     pub llm_model_id: String,
+    pub polishing_enabled: bool,
 
     pub active_mode_id: String,
     pub auto_suggest_modes: bool,
@@ -640,6 +626,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         stt_model_id: s.stt_model_id,
         llm_engine: s.llm_engine,
         llm_model_id: s.llm_model_id,
+        polishing_enabled: s.polishing_enabled,
         active_mode_id: s.active_mode_id,
         auto_suggest_modes: s.auto_suggest_modes,
     }

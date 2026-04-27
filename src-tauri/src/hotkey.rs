@@ -415,13 +415,13 @@ pub fn register<R: Runtime>(
             gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
                 if let ShortcutState::Pressed = event.state() {
                     log::error!(
-                        "hotkey: paste-last fired; dispatching to \
-                         commands::paste_last_transcript"
+                        "hotkey: copy-last fired; dispatching to \
+                         commands::copy_last_transcript"
                     );
                     if let Err(e) =
-                        crate::commands::paste_last_transcript(app_handle.clone())
+                        crate::commands::copy_last_transcript(app_handle.clone())
                     {
-                        log::error!("paste_last_transcript dispatch failed: {e}");
+                        log::error!("copy_last_transcript dispatch failed: {e}");
                     }
                 }
             })

@@ -1,9 +1,10 @@
-import { createSignal, For, onMount, Show } from "solid-js";
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   closeTrayPopover,
   getPublicSettings,
   getRecentTranscripts,
   listModes,
+  onSettingsChanged,
   openSettingsWindow,
   quitApp,
   setActiveMode,
@@ -21,6 +22,8 @@ export default function TrayPopoverView() {
   const [modes, setModes] = createSignal<VoiceMode[]>([]);
   const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
 
+  let unlistenSettings: (() => void) | null = null;
+
   onMount(async () => {
     document.body.classList.add("translucent");
     try {
@@ -36,9 +39,20 @@ export default function TrayPopoverView() {
       setLoaded(true);
     }
 
+    // Live-update when the user saves changes from the Settings window
+    // — keeps the tray popover's hotkey labels and mode badge in sync
+    // without having to close/reopen.
+    unlistenSettings = await onSettingsChanged((next) => {
+      setS(next);
+    });
+
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") closeTrayPopover();
     });
+  });
+
+  onCleanup(() => {
+    unlistenSettings?.();
   });
 
   async function pickMode(id: string) {
@@ -83,13 +97,7 @@ export default function TrayPopoverView() {
     const cur = s();
     if (!cur) return { label: "Loading…", tone: "ok" };
     if (!cur.dictation_enabled) return { label: "Dictation off", tone: "off" };
-    if (cur.stt_engine === "groq" && !cur.groq_api_key) {
-      return { label: "Add your Groq key", tone: "off" };
-    }
-    if (cur.stt_engine === "whisper-local") {
-      return { label: "Local · ready", tone: "ok" };
-    }
-    return { label: "Listening ready", tone: "ok" };
+    return { label: "Local · ready", tone: "ok" };
   }
 
   return (

@@ -15,13 +15,15 @@ tauri-build = { version = "2", features = [] }
 png = "0.17"
 
 [features]
-# Heavy native engines (whisper-rs + llama-cpp-2). NOT on by default so
-# `cargo check` and clippy stay fast on CI; production builds (`tauri
-# build`) opt in via `--features local-engines` (or `--all-features`).
-# The engine traits + registry + downloader all compile either way; the
-# local engines fall back to a clear runtime error when the feature is
-# off, so the app still builds and runs in cloud-only mode.
-default = []
+# Heavy native engines (whisper-rs + llama-cpp-2). ON by default because
+# Vox is a local-first app — the cloud engines are opt-in fallbacks, and
+# shipping a binary that says "Local engines not enabled in this build"
+# at runtime is a worse UX than the longer first compile. CI / fast UI
+# iteration can still opt out via `--no-default-features`. The engine
+# traits + registry + downloader all compile either way; the local
+# engines fall back to a clear runtime error when the feature is off so
+# the app still builds and runs in cloud-only mode.
+default = ["local-engines"]
 local-engines = ["dep:whisper-rs", "dep:llama-cpp-2", "dep:encoding_rs"]
 
 [dependencies]
@@ -38,7 +40,6 @@ reqwest = { version = "0.12", default-features = false, features = ["multipart",
 futures-util = "0.3"
 cpal = "0.15"
 hound = "3.5"
-enigo = "0.2"
 arboard = "3"
 log = "0.4"
 env_logger = "0.11"

@@ -8,7 +8,6 @@ mod inject;
 mod mac_chord;
 #[cfg(target_os = "macos")]
 mod mac_perm;
-mod migration;
 mod models;
 mod modes;
 mod onboarding;
@@ -45,8 +44,6 @@ pub fn run() {
             commands::get_public_settings,
             commands::set_settings,
             commands::set_dictation_enabled,
-            commands::test_groq_connection,
-            commands::test_anthropic_connection,
             commands::get_recent_transcripts,
             commands::open_settings,
             commands::close_tray_popover,
@@ -62,7 +59,7 @@ pub fn run() {
             commands::show_tray_popover,
             commands::get_launch_at_login,
             commands::set_launch_at_login,
-            commands::paste_last_transcript,
+            commands::copy_last_transcript,
             commands::check_for_updates,
             commands::list_models,
             commands::download_model,
@@ -71,7 +68,6 @@ pub fn run() {
             commands::load_model_warm,
             commands::recommend_tier,
             commands::accept_gemma_tos,
-            commands::dismiss_migration,
             commands::list_modes,
             commands::get_mode,
             commands::save_mode,
@@ -152,15 +148,14 @@ pub fn run() {
                 let _ = win.hide();
             }
 
-            // Local-first soft migration: existing cloud users see a
-            // one-time dialog. New installs go to onboarding instead.
-            if !s.onboarded {
+            // First-launch onboarding. The previous "legacy cloud user"
+            // migration dialog was removed when cloud engines went away
+            // (2026-04-26) — the app is fully local now and there's
+            // nothing to migrate to.
+            let _ = s; // settings still loaded above for hotkey wiring
+            if !settings::load(app_handle).onboarded {
                 if let Err(e) = onboarding::show(app_handle) {
                     log::warn!("failed to show onboarding: {e}");
-                }
-            } else if !s.migration_seen && settings::is_legacy_cloud_user(app_handle) {
-                if let Err(e) = migration::show(app_handle) {
-                    log::warn!("failed to show migration dialog: {e}");
                 }
             }
 
@@ -169,16 +164,6 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 match window.label() {
-                    "migration" => {
-                        // Closing the title-bar X has the same dismissive
-                        // effect as the "Keep using cloud" button: we
-                        // flip `migration_seen = true` so the dialog
-                        // doesn't re-appear on every launch. Engine
-                        // settings are left untouched.
-                        crate::settings::mark_migration_seen(window.app_handle());
-                        let _ = window.hide();
-                        api.prevent_close();
-                    }
                     "settings" | "tray-popover" | "pill" => {
                         let _ = window.hide();
                         api.prevent_close();

@@ -205,7 +205,7 @@ function pillLabel(state: PillState, message: string | null): string {
     case "polishing":
       return "Polishing…";
     case "done":
-      return "Pasted";
+      return "Copied";
     case "canceled":
       return "Canceled";
     case "error":

@@ -2,10 +2,14 @@
 //!
 //! There are concrete engine implementations under this module:
 //! - [`whisper_local`] — `whisper-rs` 0.16 with Core ML + Metal.
-//! - [`groq`] — cloud opt-in fallback using the Groq Whisper Turbo API.
 //! - [`gemma_local`] — `llama-cpp-2` 0.1 with Metal (Gemma 4 / Phi-4-mini).
-//! - [`anthropic`] — cloud opt-in cleanup via Claude Haiku 4.5.
 //! - [`none`] — no-op cleanup engine that returns its input unchanged.
+//!
+//! 2026-04-26: cloud engines (Groq STT, Anthropic LLM) were removed so
+//! the app is fully on-device — no transcript or audio ever leaves the
+//! Mac. The registry only resolves local engine ids; any stale cloud id
+//! coming from settings is migrated to its local equivalent before it
+//! reaches this layer (see `settings::load`).
 //!
 //! The session orchestrator picks the active engine instances at runtime
 //! from the engine registry (see [`Registry`]). Engines are lazy-loaded
@@ -17,9 +21,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Wry};
 
-pub mod anthropic;
 pub mod gemma_local;
-pub mod groq;
 pub mod none;
 pub mod whisper_local;
 
@@ -37,7 +39,7 @@ pub trait SttEngine: Send + Sync {
         dictionary: &[String],
     ) -> anyhow::Result<String>;
 
-    /// Stable id used in settings (e.g. `"whisper-local"`, `"groq"`).
+    /// Stable id used in settings (currently always `"whisper-local"`).
     #[allow(dead_code)]
     fn id(&self) -> &'static str;
 
@@ -112,7 +114,6 @@ impl Registry {
                 app.clone(),
                 model_id.to_string(),
             )),
-            "groq" => Arc::new(groq::GroqEngine::new(app.clone())),
             _ => return None,
         };
 
@@ -140,7 +141,6 @@ impl Registry {
                 app.clone(),
                 model_id.to_string(),
             )),
-            "anthropic" => Arc::new(anthropic::AnthropicEngine::new(app.clone())),
             "none" => Arc::new(none::NoOpEngine),
             _ => return None,
         };

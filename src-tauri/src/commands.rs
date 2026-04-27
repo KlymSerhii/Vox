@@ -1,20 +1,24 @@
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, Runtime, Webview, Wry};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Webview, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 
-use crate::engines::{anthropic, groq};
 use crate::hotkey::{ActiveHotkey, ActiveHotkeyState};
 use crate::modes::{self, VoiceMode};
 use crate::settings::HotkeyPurpose;
 use crate::{frontmost, models, onboarding, pill, session, settings, transcripts};
 
+// `TestConnectionResult` previously fronted the cloud key-test commands.
+// Cloud engines have been removed (2026-04-26) — the type is no longer
+// referenced but kept here as a small comment so future cloud experiments
+// know where to plug back in.
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct TestConnectionResult {
     pub ok: bool,
     pub message: String,
 }
 
-const SECRET_WINDOWS: &[&str] = &["settings", "onboarding", "migration"];
+const SECRET_WINDOWS: &[&str] = &["settings", "onboarding"];
 
 fn caller_label<R: Runtime>(webview: &Webview<R>) -> String {
     webview.label().to_string()
@@ -26,7 +30,7 @@ fn assert_secret_window<R: Runtime>(webview: &Webview<R>) -> Result<(), String> 
         Ok(())
     } else {
         Err(format!(
-            "command not available from window '{label}' — secrets are scoped to settings/onboarding/migration"
+            "command not available from window '{label}' — restricted to settings/onboarding"
         ))
     }
 }
@@ -42,18 +46,8 @@ pub fn get_settings<R: Runtime>(
 
 #[tauri::command]
 pub fn get_public_settings<R: Runtime>(app: AppHandle<R>) -> settings::Settings {
-    let mut s = settings::load(&app);
-    s.groq_api_key = if s.groq_api_key.trim().is_empty() {
-        String::new()
-    } else {
-        "set".to_string()
-    };
-    s.anthropic_api_key = if s.anthropic_api_key.trim().is_empty() {
-        String::new()
-    } else {
-        "set".to_string()
-    };
-    s
+    // No cloud secrets to redact — local-only build.
+    settings::load(&app)
 }
 
 #[tauri::command]
@@ -63,7 +57,56 @@ pub fn set_settings<R: Runtime>(
     settings: settings::Settings,
 ) -> Result<(), String> {
     assert_secret_window(&webview)?;
-    settings::save(&app, &settings).map_err(|e| e.to_string())
+
+    // Snapshot the previous values so we know whether any of the
+    // hotkey-related fields actually changed. Re-binding global
+    // shortcuts is cheap but not free (and on macOS it briefly
+    // unregisters everything), so we only do it when necessary.
+    let before = settings::load(&app);
+    let hotkeys_changed = before.hotkey != settings.hotkey
+        || before.cancel_hotkey != settings.cancel_hotkey
+        || before.paste_last_hotkey != settings.paste_last_hotkey
+        || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
+
+    settings::save(&app, &settings).map_err(|e| e.to_string())?;
+
+    if hotkeys_changed {
+        if let Some(ctx) = app.try_state::<session::SessionCtx>() {
+            let ctx_clone = (*ctx).clone();
+            match crate::hotkey::register(
+                &app,
+                &settings.hotkey,
+                &settings.cancel_hotkey,
+                &settings.paste_last_hotkey,
+                &settings.mode_cycle_hotkey,
+                ctx_clone,
+            ) {
+                Ok(resolved) => {
+                    log::info!("hotkeys re-bound after settings save: {resolved}");
+                }
+                Err(e) => {
+                    log::error!(
+                        "hotkey re-bind failed after settings save: {e}. \
+                         The previous bindings are gone — settings still saved."
+                    );
+                }
+            }
+        } else {
+            log::warn!(
+                "hotkeys changed but SessionCtx is not in app state; \
+                 binding will pick up new values on next launch."
+            );
+        }
+    }
+
+    // Notify every other window so they can refresh anything cached
+    // off the settings (mainly the displayed hotkey glyphs in the pill,
+    // tray popover and onboarding).
+    if let Err(e) = app.emit("settings:changed", &settings) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -73,35 +116,13 @@ pub fn set_dictation_enabled<R: Runtime>(
 ) -> Result<(), String> {
     let mut s = settings::load(&app);
     s.dictation_enabled = enabled;
-    settings::save(&app, &s).map_err(|e| e.to_string())
-}
-
-#[tauri::command]
-pub async fn test_groq_connection(api_key: String) -> TestConnectionResult {
-    match groq::test_key(&api_key).await {
-        Ok(_) => TestConnectionResult {
-            ok: true,
-            message: "OK — key accepted.".into(),
-        },
-        Err(e) => TestConnectionResult {
-            ok: false,
-            message: format!("Failed: {e}"),
-        },
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    // Broadcast so the Settings window's General tab and the tray
+    // popover's status line update without a manual refresh.
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
     }
-}
-
-#[tauri::command]
-pub async fn test_anthropic_connection(api_key: String) -> TestConnectionResult {
-    match anthropic::test_key(&api_key).await {
-        Ok(_) => TestConnectionResult {
-            ok: true,
-            message: "OK — key accepted.".into(),
-        },
-        Err(e) => TestConnectionResult {
-            ok: false,
-            message: format!("Failed: {e}"),
-        },
-    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -339,10 +360,10 @@ pub fn set_launch_at_login<R: Runtime>(
     Ok(())
 }
 
-// -------- Paste-last-transcript ----------------------------------------------
+// -------- Copy-last-transcript -----------------------------------------------
 
 #[tauri::command]
-pub fn paste_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+pub fn copy_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     if let Some(ctx) = app.try_state::<session::SessionCtx>() {
         if ctx.is_pipeline_active() {
             return Err("Vox is busy with another dictation.".into());
@@ -365,30 +386,34 @@ pub fn paste_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String
     let text = latest.text.clone();
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || {
-            crate::inject::paste_text(&text)
+            crate::inject::copy_to_clipboard(&text)
         })
         .await;
 
         match result {
             Ok(Ok(())) => {
                 pill::show(&app);
-                pill::emit_state(&app, pill::PillState::Done, None);
+                pill::emit_state(
+                    &app,
+                    pill::PillState::Done,
+                    Some("Copied — press ⌘V to paste.".into()),
+                );
                 let app_arc = std::sync::Arc::new(app.clone());
-                pill::hide_after(&app_arc, 700);
+                pill::hide_after(&app_arc, 1800);
             }
             Ok(Err(e)) => {
-                log::error!("paste-last failed: {e}");
+                log::error!("copy-last failed: {e}");
                 pill::show(&app);
                 pill::emit_state(
                     &app,
                     pill::PillState::Error,
-                    Some("Copied — press Cmd+V to paste.".into()),
+                    Some("Copy failed.".into()),
                 );
                 let app_arc = std::sync::Arc::new(app.clone());
                 pill::hide_after(&app_arc, 3000);
             }
             Err(e) => {
-                log::error!("paste-last task panicked: {e}");
+                log::error!("copy-last task panicked: {e}");
             }
         }
     });
@@ -570,18 +595,6 @@ pub fn accept_gemma_tos<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let mut s = settings::load(&app);
     s.gemma_tos_accepted = true;
     settings::save(&app, &s).map_err(|e| e.to_string())
-}
-
-/// Persist the migration dialog dismissal. Frontend should patch
-/// `stt_engine` / `llm_engine` via `set_settings` *before* calling this
-/// — we just flip the seen flag here.
-#[tauri::command]
-pub fn dismiss_migration<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    settings::mark_migration_seen(&app);
-    if let Some(win) = app.get_webview_window(crate::migration::LABEL) {
-        let _ = win.hide();
-    }
-    Ok(())
 }
 
 // -------- Voice Modes --------------------------------------------------------

@@ -2,7 +2,9 @@
 //!
 //! Flow: hotkey down → show pill (Listening) → mic capture + emit levels.
 //! Hotkey up → stop mic → STT (engine of user's choice) → optional LLM
-//! cleanup (engine of user's choice) → paste → Done pill.
+//! cleanup (engine of user's choice) → copy to clipboard → Done pill.
+//!
+//! 2026-04-26: dropped the synthetic-Cmd+V path — see `inject.rs`.
 //!
 //! STT and cleanup engines are resolved from the per-app
 //! `engines::Registry` based on `prefs.stt_engine` / `prefs.llm_engine`.
@@ -245,7 +247,17 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             }
         };
 
-        let llm_engine = registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id);
+        // The polishing toggle is the user-facing knob. When off, we
+        // skip cleanup entirely (no engine resolution, no log noise) so
+        // raw whisper output goes straight to the paste step. When on,
+        // we resolve whichever local engine is configured — currently
+        // `gemma-local` once it stabilises, falling back to `none`
+        // (raw) while it doesn't.
+        let llm_engine = if prefs.polishing_enabled {
+            registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id)
+        } else {
+            registry.llm(&app_wry, "none", "")
+        };
 
         // Resolve the active Voice Mode (default `general`). The mode
         // contributes its system prompt + dictionary to the cleanup
@@ -278,7 +290,7 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                 result = stt_fut => match result {
                     Ok(text) if !text.trim().is_empty() => text,
                     Ok(_) => {
-                        log::info!("empty transcript, nothing to paste");
+                        log::info!("empty transcript, nothing to copy");
                         pill::hide(&app_for_pill);
                         return;
                     }
@@ -352,7 +364,7 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
         };
 
         if ctx.is_canceled() || stale() {
-            log::info!("post-LLM cancel/supersede; aborting before paste");
+            log::info!("post-LLM cancel/supersede; aborting before copy");
             if ctx.is_canceled() && !stale() {
                 pill::emit_state(&app_for_pill, PillState::Canceled, None);
                 hide_after_session(&app_for_pill, &ctx, my_sid, 600);
@@ -360,35 +372,39 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
-        log::info!("pasting {} chars (sid={my_sid})", cleaned.len());
+        log::info!("copying {} chars (sid={my_sid})", cleaned.len());
 
         transcripts::push(&cleaned);
 
         let t = cleaned.clone();
-        let paste_result =
-            tauri::async_runtime::spawn_blocking(move || inject::paste_text(&t)).await;
+        let copy_result =
+            tauri::async_runtime::spawn_blocking(move || inject::copy_to_clipboard(&t)).await;
 
         if ctx.is_canceled() || stale() {
             return;
         }
 
-        match paste_result {
+        match copy_result {
             Ok(Ok(())) => {
-                pill::emit_state(&app_for_pill, PillState::Done, None);
-                hide_after_session(&app_for_pill, &ctx, my_sid, 700);
+                pill::emit_state(
+                    &app_for_pill,
+                    PillState::Done,
+                    Some("Copied — press ⌘V to paste.".into()),
+                );
+                hide_after_session(&app_for_pill, &ctx, my_sid, 1800);
             }
             Ok(Err(e)) => {
-                log::error!("paste failed: {e}");
+                log::error!("copy failed: {e}");
                 pill::emit_state(
                     &app_for_pill,
                     PillState::Error,
-                    Some("Copied — press Cmd+V to paste.".into()),
+                    Some("Copy failed.".into()),
                 );
                 hide_after_session(&app_for_pill, &ctx, my_sid, 3000);
             }
             Err(e) => {
-                log::error!("paste task panicked: {e}");
-                pill::emit_state(&app_for_pill, PillState::Error, Some("Paste error.".into()));
+                log::error!("copy task panicked: {e}");
+                pill::emit_state(&app_for_pill, PillState::Error, Some("Copy failed.".into()));
                 hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
             }
         }
@@ -476,20 +492,8 @@ fn wav_peak_pcm16(wav: &[u8]) -> f32 {
     peak as f32 / i16::MAX as f32
 }
 
-fn friendly_stt_error(e: &anyhow::Error, engine_id: &str) -> String {
+fn friendly_stt_error(e: &anyhow::Error, _engine_id: &str) -> String {
     let s = format!("{e}");
-    if engine_id == "groq" {
-        if s.contains("401") {
-            return "Groq key rejected.".into();
-        }
-        if s.contains("API key missing") {
-            return "Add your Groq key in Settings.".into();
-        }
-        if s.contains("network") {
-            return "Offline — Vox needs internet.".into();
-        }
-        return "Transcription failed.".into();
-    }
     if s.contains("not downloaded") {
         return "Local model not downloaded — open Settings → Models.".into();
     }

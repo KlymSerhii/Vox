@@ -26,6 +26,7 @@ import {
   onModelDone,
   onModelError,
   onModelProgress,
+  onSettingsChanged,
   openAccessibilitySettings,
   replayOnboarding,
   resetDefaultModes,
@@ -33,8 +34,6 @@ import {
   saveMode,
   setLaunchAtLogin,
   setSettings,
-  testAnthropicConnection,
-  testGroqConnection,
   type CaseStyle,
   type DevBinaryInfo,
   type DiagnoseHotkeys,
@@ -42,7 +41,6 @@ import {
   type ModelStatus,
   type PunctuationStyle,
   type Settings,
-  type TestConnectionResult,
   type UpdateCheckResult,
   type VoiceMode,
 } from "../lib/ipc";
@@ -51,7 +49,6 @@ type Tab =
   | "general"
   | "hotkeys"
   | "models"
-  | "keys"
   | "modes"
   | "dictionary"
   | "privacy"
@@ -61,7 +58,6 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
   { id: "general", label: "General", icon: "sliders" },
   { id: "hotkeys", label: "Hotkeys", icon: "keyboard" },
   { id: "models", label: "Models", icon: "cube" },
-  { id: "keys", label: "API Keys", icon: "key" },
   { id: "modes", label: "Modes", icon: "modes" },
   { id: "dictionary", label: "Dictionary", icon: "book" },
   { id: "privacy", label: "Privacy", icon: "lock" },
@@ -80,26 +76,27 @@ interface HotkeyOption {
 }
 
 const HOTKEY_OPTIONS: HotkeyOption[] = [
-  // Modifier-only chords come first — these are bound via the
-  // CGEventTap path (mac_chord.rs), not tauri-plugin-global-shortcut,
-  // and they're the whispr-flow style hold-to-talk UX. Storage uses
-  // the canonical `Alt+...` token name; the label uses macOS naming
-  // ("Option" not "Alt") to match what's printed on the keys.
-  //
-  // Chord configurations require Accessibility permission and never
-  // auto-fall-back to a key. If the chord install fails the picker
-  // surfaces a clear "Not bound — Accessibility required" chip and a
-  // link into System Settings — see `HotkeyRow.failed`.
-  { value: "Alt+Control", label: "Option + Control (recommended)" },
-  { value: "Alt+Shift", label: "Option + Shift" },
-  // Explicit-key options. These users have full-size keyboards or
-  // prefer a press-and-release single key; we keep F13/F14/F15 here
-  // for them but they are NEVER auto-substituted in for a chord.
+  // The default — bound via tauri-plugin-global-shortcut (Carbon
+  // RegisterEventHotKey) so it does NOT require Accessibility. Pairs
+  // well with hands-free toggle: press once to start, press again to
+  // stop. The label uses macOS naming ("Option" not "Alt") to match
+  // what's printed on the keys.
+  { value: "Cmd+Alt+L", label: "⌘ + ⌥ + L (recommended)" },
+  // Other plain-shortcut options.
   { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
   { value: "CommandOrControl+Shift+Semicolon", label: "⌘⇧;" },
   { value: "F13", label: "F13" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
+  // Modifier-only chords — bound via the CGEventTap path
+  // (mac_chord.rs). These are the whispr-flow style hold-to-talk UX
+  // but require Accessibility permission to install. If the chord
+  // install fails the picker surfaces a clear "Not bound —
+  // Accessibility required" chip and a link into System Settings —
+  // see `HotkeyRow.failed`. Chord configurations never auto-fall-back
+  // to a key.
+  { value: "Alt+Control", label: "Option + Control (chord, requires Accessibility)" },
+  { value: "Alt+Shift", label: "Option + Shift (chord, requires Accessibility)" },
   {
     value: "AltRight",
     label: "Right Option (⌥)",
@@ -169,6 +166,11 @@ export default function SettingsView() {
   const [state, setState] = createSignal<Settings | null>(null);
   const [savedFlash, setSavedFlash] = createSignal(false);
 
+  let unlistenSettings: (() => void) | null = null;
+  // Bumped each time *we* save from inside this window, so the
+  // settings:changed event handler can ignore the echo it triggers.
+  let lastSelfSaveAt = 0;
+
   onMount(async () => {
     try {
       const s = await getSettings();
@@ -184,6 +186,21 @@ export default function SettingsView() {
     } finally {
       setLoaded(true);
     }
+
+    // Keep this window in sync when settings change elsewhere — for
+    // example when the user flips dictation on/off from the tray
+    // popover. The `lastSelfSaveAt` guard suppresses the echo from our
+    // own `update()` calls so we don't churn through a redundant
+    // setState (which would force every controlled input to re-render
+    // mid-typing).
+    unlistenSettings = await onSettingsChanged((next) => {
+      if (Date.now() - lastSelfSaveAt < 500) return;
+      setState(next);
+    });
+  });
+
+  onCleanup(() => {
+    unlistenSettings?.();
   });
 
   async function update(patch: Partial<Settings>) {
@@ -192,6 +209,7 @@ export default function SettingsView() {
     const next = { ...cur, ...patch } as Settings;
     setState(next);
     try {
+      lastSelfSaveAt = Date.now();
       await setSettings(next);
       setSavedFlash(true);
       setTimeout(() => setSavedFlash(false), 240);
@@ -216,9 +234,6 @@ export default function SettingsView() {
               </Show>
               <Show when={tab() === "models"}>
                 <ModelsTab s={s()} update={update} />
-              </Show>
-              <Show when={tab() === "keys"}>
-                <KeysTab s={s()} update={update} />
               </Show>
               <Show when={tab() === "modes"}>
                 <ModesTab s={s()} update={update} />
@@ -479,7 +494,7 @@ function GeneralTab(props: {
       <Card>
         <Row
           label="Hotkey behavior"
-          hint="Push-to-talk (hold) or hands-free toggle (press to start, press to stop)."
+          hint="Hands-free toggle (press once to start, press again to stop) or push-to-talk (hold)."
           last
         >
           <select
@@ -491,8 +506,8 @@ function GeneralTab(props: {
               })
             }
           >
+            <option value="toggle">Hands-free toggle (recommended)</option>
             <option value="ptt">Push-to-talk (hold)</option>
-            <option value="toggle">Hands-free toggle</option>
           </select>
         </Row>
       </Card>
@@ -550,8 +565,24 @@ function HotkeysTab(props: {
     }
   }
 
+  let unlistenSettings: (() => void) | null = null;
+
   onMount(() => {
     void refreshDiagnostics();
+    // The backend re-registers hotkeys whenever settings are saved
+    // (see `commands::set_settings`). Listen for that broadcast and
+    // refetch the diagnostic snapshot so the picker rows immediately
+    // reflect what the OS actually has bound — including any fallback
+    // that kicked in or any "Not bound" state if registration failed.
+    void (async () => {
+      unlistenSettings = await onSettingsChanged(() => {
+        void refreshDiagnostics();
+      });
+    })();
+  });
+
+  onCleanup(() => {
+    unlistenSettings?.();
   });
 
   async function onTest() {
@@ -615,15 +646,15 @@ function HotkeysTab(props: {
         />
         <HotkeyRow
           label="Cancel while recording"
-          hint="Abort the pipeline without pasting."
+          hint="Abort the pipeline without copying."
           configured={props.s.cancel_hotkey}
           diagnostic={cancel()}
           options={CANCEL_HOTKEY_OPTIONS}
           onChange={(v) => props.update({ cancel_hotkey: v })}
         />
         <HotkeyRow
-          label="Paste last transcript"
-          hint="Re-paste the most recent dictation at the cursor."
+          label="Copy last transcript"
+          hint="Re-copy the most recent dictation to the clipboard."
           configured={props.s.paste_last_hotkey}
           diagnostic={paste()}
           options={PASTE_LAST_HOTKEY_OPTIONS}
@@ -906,17 +937,19 @@ function ModelsTab(props: {
   }
 
   function setActiveStt(modelId: string) {
-    const desc = models().find((m) => m.descriptor.id === modelId)?.descriptor;
+    // Only one STT engine ships now (whisper-local). Keep the field in
+    // sync but never offer to flip it elsewhere.
     props.update({
-      stt_engine: desc?.engine === "whisper-local" ? "whisper-local" : "groq",
+      stt_engine: "whisper-local",
       stt_model_id: modelId,
     });
   }
 
   function setActiveLlm(modelId: string) {
-    const desc = models().find((m) => m.descriptor.id === modelId)?.descriptor;
+    // Local-only LLM cleanup. The model selector is purely for choosing
+    // which Gemma weights live on disk; the engine id is fixed.
     props.update({
-      llm_engine: desc?.engine === "gemma-local" ? "gemma-local" : props.s.llm_engine,
+      llm_engine: "gemma-local",
       llm_model_id: modelId,
     });
   }
@@ -928,74 +961,79 @@ function ModelsTab(props: {
     models().filter((m) => m.descriptor.kind === "llm"),
   );
 
+  // The on/off switch the user sees. Internally it picks between
+  // `gemma-local` (when on) and `none` (when off). The `llm_engine`
+  // field stays in lockstep so the rest of the app keeps a single
+  // source of truth, while `polishing_enabled` carries the user's
+  // *intent* across periods when the local LLM is unavailable (so we
+  // can restore Gemma the moment it stabilises).
+  function setPolishing(on: boolean) {
+    props.update({
+      polishing_enabled: on,
+      llm_engine: on ? "gemma-local" : "none",
+    });
+  }
+
   return (
     <>
       <Card>
         <Row
-          label="Speech-to-text engine"
-          hint="Local runs offline on your Mac. Cloud (Groq) is faster but sends audio off-device."
+          label="Transcription"
+          hint="Whisper runs entirely on this Mac. No audio ever leaves the device."
+          last
         >
-          <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.stt_engine}
-            onChange={(e) =>
-              props.update({ stt_engine: e.currentTarget.value })
-            }
-          >
-            <option value="whisper-local">Local (Whisper)</option>
-            <option value="groq">Cloud (Groq)</option>
-          </select>
+          <span class="text-[12px] text-[var(--color-ink-mute)]">
+            Local (Whisper)
+          </span>
         </Row>
       </Card>
-      <Show when={props.s.stt_engine === "whisper-local"}>
-        <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-          Whisper models
-        </div>
-        <For each={sttModels()}>
-          {(m) => (
-            <ModelRow
-              m={m}
-              isActive={props.s.stt_model_id === m.descriptor.id}
-              progress={progress()[m.descriptor.id]}
-              downloading={downloading().has(m.descriptor.id)}
-              onUse={() => setActiveStt(m.descriptor.id)}
-              onDownload={() => startDownload(m.descriptor.id)}
-              onCancel={() => cancel(m.descriptor.id)}
-              onDelete={() => remove(m.descriptor.id)}
-            />
-          )}
-        </For>
-      </Show>
-      <Show when={props.s.stt_engine === "groq"}>
-        <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)] text-[12px] text-[var(--color-ink-mute)]">
-          Cloud STT uses your Groq API key.{" "}
-          <Show when={!props.s.groq_api_key}>
-            <span class="text-[var(--color-danger)]">
-              Add one in API Keys.
-            </span>
-          </Show>
-        </div>
-      </Show>
+      <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+        Whisper models
+      </div>
+      <For each={sttModels()}>
+        {(m) => (
+          <ModelRow
+            m={m}
+            isActive={props.s.stt_model_id === m.descriptor.id}
+            progress={progress()[m.descriptor.id]}
+            downloading={downloading().has(m.descriptor.id)}
+            onUse={() => setActiveStt(m.descriptor.id)}
+            onDownload={() => startDownload(m.descriptor.id)}
+            onCancel={() => cancel(m.descriptor.id)}
+            onDelete={() => remove(m.descriptor.id)}
+          />
+        )}
+      </For>
 
       <Card>
         <Row
-          label="Cleanup engine"
-          hint="Polish punctuation, remove filler words. Set to Off to paste raw transcripts."
+          label="Polish transcripts"
+          hint="Run a local Gemma model on each transcript to fix punctuation, remove filler words, and apply your active Voice Mode. When off, raw Whisper output is copied verbatim."
+          last
         >
-          <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.llm_engine}
-            onChange={(e) =>
-              props.update({ llm_engine: e.currentTarget.value })
-            }
-          >
-            <option value="gemma-local">Local (Gemma 4)</option>
-            <option value="anthropic">Cloud (Claude Haiku)</option>
-            <option value="none">Off (raw transcript)</option>
-          </select>
+          <Toggle
+            checked={props.s.polishing_enabled}
+            onChange={(v) => setPolishing(v)}
+          />
         </Row>
       </Card>
-      <Show when={props.s.llm_engine === "gemma-local"}>
+      <Show when={props.s.polishing_enabled}>
+        <div class="mb-3 rounded-[10px] bg-[var(--color-danger)]/10 p-3 ring-1 ring-[var(--color-danger)]/40 text-[12px] text-[var(--color-ink)]">
+          <strong>Heads up:</strong> local Gemma cleanup is paused right
+          now because <code>llama-cpp-2</code> 0.1.145 aborts on context
+          init (<code>GGML_ASSERT</code>) — fix is in upstream{" "}
+          <a
+            class="underline"
+            href="https://github.com/ggml-org/llama.cpp/pull/17869"
+            target="_blank"
+          >
+            llama.cpp PR 17869
+          </a>
+          {" "}but not yet vendored. Until then Vox falls back to the raw
+          Whisper transcript even with this switch on. Your choice is
+          remembered so polishing kicks back in automatically once the
+          underlying fix lands.
+        </div>
         <Show when={!props.s.gemma_tos_accepted}>
           <div class="mb-3 rounded-[10px] bg-[rgba(124,156,255,0.08)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
             You'll be asked to accept the{" "}
@@ -1026,16 +1064,6 @@ function ModelsTab(props: {
             />
           )}
         </For>
-      </Show>
-      <Show when={props.s.llm_engine === "anthropic"}>
-        <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)] text-[12px] text-[var(--color-ink-mute)]">
-          Cloud cleanup uses your Anthropic API key.{" "}
-          <Show when={!props.s.anthropic_api_key}>
-            <span class="text-[var(--color-danger)]">
-              Add one in API Keys.
-            </span>
-          </Show>
-        </div>
       </Show>
     </>
   );
@@ -1777,116 +1805,12 @@ function ModeEditor(props: {
   );
 }
 
-// -------- Keys / Dictionary / Privacy / About --------
+// -------- Dictionary / Privacy / About --------
 
-function KeysTab(props: {
-  s: Settings;
-  update: (p: Partial<Settings>) => void;
-}) {
-  return (
-    <>
-      <ProviderKey
-        title="Groq"
-        description="Used for cloud STT. Only required when STT engine is set to Cloud (Groq)."
-        value={props.s.groq_api_key}
-        onChange={(v) => props.update({ groq_api_key: v })}
-        tester={testGroqConnection}
-      />
-      <ProviderKey
-        title="Anthropic"
-        description="Used for cloud cleanup (Claude Haiku 4.5). Only required when Cleanup engine is set to Cloud."
-        value={props.s.anthropic_api_key}
-        onChange={(v) => props.update({ anthropic_api_key: v })}
-        tester={testAnthropicConnection}
-      />
-      <p class="text-[11px] text-[var(--color-ink-mute)]">
-        Keys are stored in the macOS Keychain under{" "}
-        <code class="text-[var(--color-ink)]">app.vox.vox</code>. If Keychain
-        access is denied we fall back to an encrypted-at-rest plaintext store.
-      </p>
-    </>
-  );
-}
-
-function ProviderKey(props: {
-  title: string;
-  description: string;
-  value: string;
-  onChange: (v: string) => void;
-  tester: (key: string) => Promise<TestConnectionResult>;
-}) {
-  const [show, setShow] = createSignal(false);
-  const [testing, setTesting] = createSignal(false);
-  const [result, setResult] = createSignal<TestConnectionResult | null>(null);
-
-  async function runTest() {
-    setTesting(true);
-    setResult(null);
-    try {
-      const r = await props.tester(props.value.trim());
-      setResult(r);
-    } catch (e) {
-      setResult({ ok: false, message: String(e) });
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  return (
-    <Card>
-      <div class="px-4 py-3">
-        <div class="mb-2 flex items-center justify-between">
-          <span class="text-[13px] font-medium">{props.title}</span>
-          <span class="text-[11px] text-[var(--color-ink-mute)]">
-            {props.value ? "Stored" : "Not set"}
-          </span>
-        </div>
-        <p class="mb-3 text-[11px] text-[var(--color-ink-mute)]">
-          {props.description}
-        </p>
-        <div class="flex gap-2">
-          <input
-            type={show() ? "text" : "password"}
-            class="flex-1 rounded-[6px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            placeholder={props.title === "Groq" ? "gsk_…" : "sk-ant-…"}
-            value={props.value}
-            autocomplete="off"
-            spellcheck={false}
-            onInput={(e) => props.onChange(e.currentTarget.value)}
-          />
-          <button
-            type="button"
-            class="rounded-[6px] bg-white/6 px-3 py-2 text-[12px] text-[var(--color-ink-mute)] hover:bg-white/10"
-            onClick={() => setShow(!show())}
-          >
-            {show() ? "Hide" : "Show"}
-          </button>
-          <button
-            type="button"
-            class="rounded-[6px] bg-[var(--color-accent)] px-3 py-2 text-[12px] font-medium text-black hover:brightness-110 disabled:opacity-50"
-            disabled={testing() || !props.value.trim()}
-            onClick={runTest}
-          >
-            {testing() ? "Testing…" : "Test"}
-          </button>
-        </div>
-        <Show when={result()}>
-          {(r) => (
-            <div
-              class="mt-2 text-[12px]"
-              classList={{
-                "text-[var(--color-success)]": r().ok,
-                "text-[var(--color-danger)]": !r().ok,
-              }}
-            >
-              {r().message}
-            </div>
-          )}
-        </Show>
-      </div>
-    </Card>
-  );
-}
+// 2026-04-26: API Keys tab and ProviderKey component removed — Vox is
+// fully on-device, so there are no cloud secrets to enter. If a future
+// cloud engine is reintroduced, restore the tab in the `TABS` list and
+// rebuild the picker here.
 
 function DictionaryTab(props: {
   s: Settings;
@@ -1978,65 +1902,41 @@ function DictionaryTab(props: {
   );
 }
 
-function PrivacyTab(props: { s: Settings }) {
-  const audioGoes = () => {
-    if (props.s.stt_engine === "whisper-local") return "Stays on this Mac.";
-    return "Sent to Groq (cloud).";
-  };
-  const transcriptGoes = () => {
-    if (props.s.llm_engine === "none") return "Not sent anywhere.";
-    if (props.s.llm_engine === "gemma-local") return "Stays on this Mac.";
-    return "Sent to Anthropic (cloud).";
-  };
+function PrivacyTab(_props: { s: Settings }) {
   return (
     <>
       <Card>
-        <Row label="Audio" hint={audioGoes()} last>
-          <span
-            class="rounded-full px-2 py-0.5 text-[10px]"
-            classList={{
-              "bg-[var(--color-success)]/20 text-[var(--color-success)]":
-                props.s.stt_engine === "whisper-local",
-              "bg-[var(--color-accent)]/20 text-[var(--color-accent)]":
-                props.s.stt_engine !== "whisper-local",
-            }}
-          >
-            {props.s.stt_engine === "whisper-local" ? "LOCAL" : "CLOUD"}
+        <Row label="Audio" hint="Stays on this Mac." last>
+          <span class="rounded-full bg-[var(--color-success)]/20 px-2 py-0.5 text-[10px] text-[var(--color-success)]">
+            LOCAL
           </span>
         </Row>
       </Card>
       <Card>
-        <Row label="Transcript cleanup" hint={transcriptGoes()} last>
-          <span
-            class="rounded-full px-2 py-0.5 text-[10px]"
-            classList={{
-              "bg-[var(--color-success)]/20 text-[var(--color-success)]":
-                props.s.llm_engine === "gemma-local" ||
-                props.s.llm_engine === "none",
-              "bg-[var(--color-accent)]/20 text-[var(--color-accent)]":
-                props.s.llm_engine === "anthropic",
-            }}
-          >
-            {props.s.llm_engine === "anthropic" ? "CLOUD" : "LOCAL"}
+        <Row
+          label="Transcript polishing"
+          hint="Stays on this Mac (or skipped, if polishing is off)."
+          last
+        >
+          <span class="rounded-full bg-[var(--color-success)]/20 px-2 py-0.5 text-[10px] text-[var(--color-success)]">
+            LOCAL
           </span>
         </Row>
       </Card>
 
       <p class="mb-4 text-[11px] text-[var(--color-ink-mute)]">
-        Change these in the Models tab. Engine choice is the source of truth
-        for what leaves your device.
+        Vox is now fully on-device. There is no setting that sends your
+        audio or transcripts to any external service.
       </p>
 
       <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
         <h3 class="mb-2 text-[13px] font-medium">What never leaves</h3>
         <ul class="space-y-1 text-[12px] text-[var(--color-ink-mute)]">
           <li>• No audio is ever written to disk.</li>
+          <li>• No transcripts are sent over the network.</li>
           <li>• No transcript history is persisted across app quits.</li>
           <li>• No telemetry, no analytics, no crash uploads.</li>
-          <li>
-            • API keys live in the macOS Keychain under{" "}
-            <code class="text-[var(--color-ink)]">app.vox.vox</code>.
-          </li>
+          <li>• No API keys are stored — there is nothing to leak.</li>
         </ul>
       </div>
     </>

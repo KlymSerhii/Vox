@@ -2,8 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 export interface Settings {
-  groq_api_key: string;
-  anthropic_api_key: string;
   hotkey: string;
   cancel_hotkey: string;
   paste_last_hotkey: string;
@@ -14,12 +12,15 @@ export interface Settings {
   language: string;
   onboarded: boolean;
   dictionary: string[];
-  // Local-first.
-  stt_engine: string;        // "whisper-local" | "groq"
+  // Local-only engines (cloud paths removed 2026-04-26).
+  stt_engine: string;        // "whisper-local"
   stt_model_id: string;
-  llm_engine: string;        // "gemma-local" | "anthropic" | "none"
+  llm_engine: string;        // "gemma-local" | "none"
   llm_model_id: string;
-  migration_seen: boolean;
+  /// User-facing on/off toggle for transcript polishing. Survives across
+  /// engine outages so the user's intent isn't lost when the local LLM
+  /// is temporarily unavailable.
+  polishing_enabled: boolean;
   gemma_tos_accepted: boolean;
   // Voice Modes.
   active_mode_id: string;
@@ -56,11 +57,6 @@ export interface UpdateCheckResult {
   current_version?: string;
   available_version?: string;
   message?: string;
-}
-
-export interface TestConnectionResult {
-  ok: boolean;
-  message: string;
 }
 
 export interface RecentTranscript {
@@ -123,18 +119,6 @@ export async function setDictationEnabled(enabled: boolean): Promise<void> {
   await invoke("set_dictation_enabled", { enabled });
 }
 
-export async function testGroqConnection(
-  apiKey: string,
-): Promise<TestConnectionResult> {
-  return invoke<TestConnectionResult>("test_groq_connection", { apiKey });
-}
-
-export async function testAnthropicConnection(
-  apiKey: string,
-): Promise<TestConnectionResult> {
-  return invoke<TestConnectionResult>("test_anthropic_connection", { apiKey });
-}
-
 export async function getRecentTranscripts(): Promise<RecentTranscript[]> {
   return invoke<RecentTranscript[]>("get_recent_transcripts");
 }
@@ -183,8 +167,8 @@ export async function setLaunchAtLogin(enabled: boolean): Promise<void> {
   await invoke("set_launch_at_login", { enabled });
 }
 
-export async function pasteLastTranscript(): Promise<void> {
-  await invoke("paste_last_transcript");
+export async function copyLastTranscript(): Promise<void> {
+  await invoke("copy_last_transcript");
 }
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
@@ -221,10 +205,6 @@ export async function acceptGemmaTos(): Promise<void> {
   await invoke("accept_gemma_tos");
 }
 
-export async function dismissMigration(): Promise<void> {
-  await invoke("dismiss_migration");
-}
-
 export async function onModelProgress(
   cb: (p: ModelProgress) => void,
 ): Promise<UnlistenFn> {
@@ -252,6 +232,17 @@ export async function onModelCanceled(
   cb: (p: { id: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ id: string }>("model:canceled", (e) => cb(e.payload));
+}
+
+/// Subscribe to backend `settings:changed` events. Fired after every
+/// successful `set_settings` call, with the full new `Settings` payload.
+/// Use this in any window that displays settings-derived UI (hotkey
+/// glyphs, "polish transcripts" status, etc.) so they refresh
+/// immediately when the user saves changes from the Settings window.
+export async function onSettingsChanged(
+  cb: (s: Settings) => void,
+): Promise<UnlistenFn> {
+  return listen<Settings>("settings:changed", (e) => cb(e.payload));
 }
 
 // ---- Voice Modes ----
