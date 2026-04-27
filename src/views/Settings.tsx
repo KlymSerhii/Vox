@@ -2004,7 +2004,7 @@ function AboutTab() {
       <Card>
         <Row
           label="Check for updates"
-          hint="Auto-update requires a signed release (see docs/signing-and-notarization.md)."
+          hint="Auto-update requires a signed release."
         >
           <button
             type="button"

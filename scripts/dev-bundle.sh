@@ -15,7 +15,7 @@
 # correct `Info.plist` and bundle id `com.vox.app`, which TCC recognises.
 # Use this for any work that touches macOS permissions.
 #
-# See `docs/dev-permissions.md` for the full rationale and reset workflow.
+# See `CLAUDE.md` § Development for the full rationale and reset workflow.
 
 set -euo pipefail
 

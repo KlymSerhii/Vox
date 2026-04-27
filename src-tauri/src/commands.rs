@@ -441,9 +441,9 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
 
     // Stub-config short-circuit. The released bundles ship with the
     // placeholder endpoint `https://updates.vox.local/...` and an empty
-    // pubkey until signing is wired up (see
-    // `docs/signing-and-notarization.md`). In that state we MUST NOT
-    // make a real network request: the placeholder host won't resolve
+    // pubkey until signing + notarization are wired up. In that state
+    // we MUST NOT make a real network request: the placeholder host
+    // won't resolve
     // (5-15 s DNS timeout, leaks "Vox is running" to anyone watching
     // the resolver), and an empty pubkey + a real GET would have no
     // signature pin to fail-closed against if the endpoint config is

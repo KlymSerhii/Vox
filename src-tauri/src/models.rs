@@ -1,11 +1,10 @@
 //! Model catalog + on-disk cache + resumable HTTP downloader.
 //!
 //! Catalog = compile-time metadata (URL, size, sha256). The cache lives
-//! under `~/Library/Application Support/app.vox.vox/models/<kind>/<id>/`
-//! per `docs/local-first-stack.md` §C.4. Downloads are resumable via
-//! HTTP `Range`; sha256 is verified streaming. On completion the
-//! `.partial` file is renamed atomically to `model.bin` (or
-//! `model.gguf`).
+//! under `~/Library/Application Support/com.vox.app/models/<kind>/<id>/`.
+//! Downloads are resumable via HTTP `Range`; sha256 is verified
+//! streaming. On completion the `.partial` file is renamed atomically
+//! to `model.bin` (or `model.gguf`).
 //!
 //! sha256 sources:
 //! - whisper.cpp models: <https://huggingface.co/ggerganov/whisper.cpp/tree/main>
