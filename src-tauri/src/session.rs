@@ -250,9 +250,8 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
         // The polishing toggle is the user-facing knob. When off, we
         // skip cleanup entirely (no engine resolution, no log noise) so
         // raw whisper output goes straight to the paste step. When on,
-        // we resolve whichever local engine is configured — currently
-        // `gemma-local` once it stabilises, falling back to `none`
-        // (raw) while it doesn't.
+        // we resolve whichever local LLM is configured (currently
+        // always `gemma-local`).
         let llm_engine = if prefs.polishing_enabled {
             registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id)
         } else {

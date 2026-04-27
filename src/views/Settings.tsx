@@ -1018,22 +1018,6 @@ function ModelsTab(props: {
         </Row>
       </Card>
       <Show when={props.s.polishing_enabled}>
-        <div class="mb-3 rounded-[10px] bg-[var(--color-danger)]/10 p-3 ring-1 ring-[var(--color-danger)]/40 text-[12px] text-[var(--color-ink)]">
-          <strong>Heads up:</strong> local Gemma cleanup is paused right
-          now because <code>llama-cpp-2</code> 0.1.145 aborts on context
-          init (<code>GGML_ASSERT</code>) — fix is in upstream{" "}
-          <a
-            class="underline"
-            href="https://github.com/ggml-org/llama.cpp/pull/17869"
-            target="_blank"
-          >
-            llama.cpp PR 17869
-          </a>
-          {" "}but not yet vendored. Until then Vox falls back to the raw
-          Whisper transcript even with this switch on. Your choice is
-          remembered so polishing kicks back in automatically once the
-          underlying fix lands.
-        </div>
         <Show when={!props.s.gemma_tos_accepted}>
           <div class="mb-3 rounded-[10px] bg-[rgba(124,156,255,0.08)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
             You'll be asked to accept the{" "}

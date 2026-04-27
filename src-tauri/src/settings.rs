@@ -90,19 +90,14 @@ fn default_stt_engine() -> String {
     "whisper-local".into()
 }
 fn default_llm_engine() -> String {
-    // Vox is now fully local: cloud cleanup is gone, and the only local
-    // option (`gemma-local`) currently aborts inside `llama-cpp-2`
-    // 0.1.145 (upstream llama.cpp PR 17869). Default new installs to
-    // `none` — raw whisper transcripts. The polishing toggle in
-    // Settings is the user-facing knob; it persists separately so the
-    // user's preference comes back the moment Gemma stabilises.
-    "none".into()
+    // Local cleanup engine — runs Gemma on-device via llama-cpp-2.
+    "gemma-local".into()
 }
 fn default_polishing_enabled() -> bool {
-    // Off by default while local Gemma cleanup is unavailable. Setting
-    // is preserved across sessions so flipping it back on is one click
-    // once the upstream fix lands.
-    false
+    // Polishing is on by default: raw Whisper output is run through
+    // local Gemma to fix punctuation, drop filler words, and apply the
+    // active Voice Mode.
+    true
 }
 fn default_stt_model_id() -> String {
     models::recommended_stt_model_id().to_string()
@@ -353,35 +348,15 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
             .get(KEY_LLM_ENGINE)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(default_llm_engine);
-        // Two migrations stack here:
-        // 1. `anthropic` — cloud cleanup, removed → `none` so the
-        //    transcript pipeline finishes successfully without ever
-        //    attempting a network call.
-        // 2. `gemma-local` — local cleanup, currently broken under
-        //    `llama-cpp-2` 0.1.145 (GGML_ASSERT abort, upstream
-        //    llama.cpp PR 17869) → `none`. The user's intent is
-        //    preserved separately via `polishing_enabled` so the moment
-        //    the upstream fix lands they can flip the toggle and get
-        //    Gemma back.
+        // Cloud cleanup was removed — any historical `anthropic` /
+        // `claude` / `cloud` value gets rewritten to `none` so the
+        // transcript pipeline finishes successfully without ever
+        // attempting a network call. `gemma-local` is preserved as-is.
         match stored.as_str() {
             "anthropic" | "claude" | "cloud" => {
                 log::error!(
                     "settings: migrating llm_engine '{stored}' -> 'none' \
                      (cloud polishing was removed; Vox is fully local now)."
-                );
-                store.set(
-                    KEY_LLM_ENGINE,
-                    serde_json::Value::String("none".into()),
-                );
-                store_dirty = true;
-                "none".to_string()
-            }
-            "gemma-local" => {
-                log::error!(
-                    "settings: migrating llm_engine 'gemma-local' -> 'none'. \
-                     Local Gemma cleanup is paused while llama-cpp-2 ships \
-                     the fix from llama.cpp PR 17869 — your polishing \
-                     preference is preserved separately."
                 );
                 store.set(
                     KEY_LLM_ENGINE,

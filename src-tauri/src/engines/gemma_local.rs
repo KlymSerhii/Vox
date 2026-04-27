@@ -73,34 +73,6 @@ impl LlmEngine for GemmaLocalEngine {
             return Ok(trimmed.to_string());
         }
 
-        // 2026-04-26: hard circuit-breaker for the published
-        // `llama-cpp-2` 0.1.145 abort during `sched_reserve`. This is a
-        // C-side `GGML_ASSERT` (calls `abort()`) — we cannot
-        // catch_unwind it, so the only way to keep the app alive is
-        // never to invoke the call. Settings migration moves users off
-        // `gemma-local` automatically, but we add this defense so that
-        // anyone who manually re-selects it just gets the raw
-        // transcript instead of bringing the app down. Remove this
-        // block when a llama-cpp-2 release vendoring upstream PR 17869
-        // is published.
-        log::warn!(
-            "gemma-local cleanup is paused (llama-cpp-2 0.1.145 abort \
-             workaround); returning raw transcript. Toggle 'Polish \
-             transcripts' off in Settings → Models to silence this \
-             warning, or wait for the upstream fix from llama.cpp PR \
-             17869."
-        );
-        let _ = (system_prompt, dictionary);
-        return Ok(trimmed.to_string());
-
-        // The original implementation is preserved below the early
-        // return so we can simply remove the `return` above once the
-        // upstream fix lands. Keeping the code in-place (rather than
-        // commented out) means the dependency graph and feature gates
-        // continue to compile-check.
-        #[allow(unreachable_code)]
-        {
-
         let path = models::cached_model_path(&self.app, &self.model_id, ModelKind::Llm)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -168,7 +140,6 @@ impl LlmEngine for GemmaLocalEngine {
             );
             Ok(trimmed.to_string())
         }
-        } // close the unreachable_code block
     }
 
     fn id(&self) -> &'static str {
