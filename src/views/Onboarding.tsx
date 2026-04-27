@@ -320,7 +320,7 @@ function MicStep(props: { granted: boolean; onAllow: () => void }) {
     <div class="flex flex-col items-center gap-5 text-center">
       <h2 class="text-[20px] font-semibold">Let Vox hear you.</h2>
       <p class="max-w-[360px] text-[13px] text-[var(--color-ink-mute)]">
-        Vox only captures audio while you hold the hotkey. Nothing is saved
+        Vox only captures audio while you pressed the hotkey. Nothing is saved
         to disk.
       </p>
       <button
