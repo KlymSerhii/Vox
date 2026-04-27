@@ -6,7 +6,6 @@ export interface Settings {
   cancel_hotkey: string;
   paste_last_hotkey: string;
   launch_at_login: boolean;
-  play_sound: boolean;
   dictation_enabled: boolean;
   hands_free_enabled: boolean;
   language: string;

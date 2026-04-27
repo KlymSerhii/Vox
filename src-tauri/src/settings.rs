@@ -25,7 +25,6 @@ const KEY_HOTKEY: &str = "hotkey";
 const KEY_CANCEL_HOTKEY: &str = "cancel_hotkey";
 const KEY_PASTE_LAST_HOTKEY: &str = "paste_last_hotkey";
 const KEY_LAUNCH_AT_LOGIN: &str = "launch_at_login";
-const KEY_PLAY_SOUND: &str = "play_sound";
 const KEY_ONBOARDED: &str = "onboarded";
 const KEY_DICTATION_ENABLED: &str = "dictation_enabled";
 const KEY_DICTIONARY: &str = "dictionary";
@@ -113,8 +112,6 @@ pub struct Settings {
 
     #[serde(default)]
     pub launch_at_login: bool,
-    #[serde(default)]
-    pub play_sound: bool,
     #[serde(default = "default_true")]
     pub dictation_enabled: bool,
 
@@ -164,7 +161,6 @@ impl Default for Settings {
             cancel_hotkey: default_cancel_hotkey(),
             paste_last_hotkey: default_paste_last_hotkey(),
             launch_at_login: false,
-            play_sound: false,
             dictation_enabled: true,
             // 2026-04-26: toggle is the new default — press the hotkey
             // once to start dictating, press again to stop. Holding the
@@ -246,7 +242,6 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
     let launch_at_login = get_bool(KEY_LAUNCH_AT_LOGIN, false);
-    let play_sound = get_bool(KEY_PLAY_SOUND, false);
     let dictation_enabled = get_bool(KEY_DICTATION_ENABLED, true);
     // Defaults to true: see `Settings::default` and the file-level docs.
     let hands_free_enabled = get_bool(KEY_HANDS_FREE, true);
@@ -393,7 +388,6 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         cancel_hotkey,
         paste_last_hotkey,
         launch_at_login,
-        play_sound,
         dictation_enabled,
         hands_free_enabled,
         language,
@@ -442,7 +436,6 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         KEY_LAUNCH_AT_LOGIN,
         serde_json::Value::Bool(settings.launch_at_login),
     );
-    store.set(KEY_PLAY_SOUND, serde_json::Value::Bool(settings.play_sound));
     store.set(
         KEY_DICTATION_ENABLED,
         serde_json::Value::Bool(settings.dictation_enabled),

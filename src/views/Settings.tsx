@@ -441,20 +441,11 @@ function GeneralTab(props: {
         <Row
           label="Launch at login"
           hint="Vox will start quietly in your menu bar."
+          last
         >
           <Toggle
             checked={props.s.launch_at_login}
             onChange={(v) => void toggleLaunchAtLogin(v)}
-          />
-        </Row>
-        <Row
-          label="Play sound on start / stop"
-          hint="Subtle audio cues when recording begins and ends. (Stub.)"
-          last
-        >
-          <Toggle
-            checked={props.s.play_sound}
-            onChange={(v) => props.update({ play_sound: v })}
           />
         </Row>
       </Card>
