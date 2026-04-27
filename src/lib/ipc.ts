@@ -178,6 +178,10 @@ export async function copyLastTranscript(): Promise<void> {
   await invoke("copy_last_transcript");
 }
 
+export async function copyText(text: string): Promise<void> {
+  await invoke("copy_text", { text });
+}
+
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke<UpdateCheckResult>("check_for_updates");
 }
@@ -250,6 +254,12 @@ export async function onSettingsChanged(
   cb: (s: Settings) => void,
 ): Promise<UnlistenFn> {
   return listen<Settings>("settings:changed", (e) => cb(e.payload));
+}
+
+export async function onTranscriptsChanged(
+  cb: (rec: RecentTranscript[]) => void,
+): Promise<UnlistenFn> {
+  return listen<RecentTranscript[]>("transcripts:changed", (e) => cb(e.payload));
 }
 
 // ---- Voice Modes ----

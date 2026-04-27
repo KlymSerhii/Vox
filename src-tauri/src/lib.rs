@@ -46,6 +46,7 @@ pub fn run() {
             commands::set_dictation_enabled,
             commands::set_hands_free_enabled,
             commands::set_polishing_enabled,
+            commands::copy_text,
             commands::get_recent_transcripts,
             commands::open_settings,
             commands::close_tray_popover,

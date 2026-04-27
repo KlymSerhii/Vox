@@ -1,10 +1,12 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   closeTrayPopover,
+  copyText,
   getPublicSettings,
   getRecentTranscripts,
   listModes,
   onSettingsChanged,
+  onTranscriptsChanged,
   openSettingsWindow,
   quitApp,
   setActiveMode,
@@ -24,6 +26,7 @@ export default function TrayPopoverView() {
   const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
 
   let unlistenSettings: (() => void) | null = null;
+  let unlistenTranscripts: (() => void) | null = null;
 
   onMount(async () => {
     document.body.classList.add("translucent");
@@ -40,11 +43,20 @@ export default function TrayPopoverView() {
       setLoaded(true);
     }
 
-    // Live-update when the user saves changes from the Settings window
-    // — keeps the tray popover's hotkey labels and mode badge in sync
-    // without having to close/reopen.
+    // The popover webview is built once and reused on every tray click —
+    // `onMount` only runs the first time. Subscribe to backend events so
+    // the recents list and settings stay live across reopens.
     unlistenSettings = await onSettingsChanged((next) => {
       setS(next);
+    });
+    unlistenTranscripts = await onTranscriptsChanged((rec) => {
+      setRecents(rec);
+    });
+
+    // Backstop: refetch on focus, in case the popover was hidden when
+    // an event fired (e.g. earlier app launches that pre-date this code).
+    window.addEventListener("focus", () => {
+      void getRecentTranscripts().then(setRecents);
     });
 
     document.addEventListener("keydown", (e) => {
@@ -54,6 +66,7 @@ export default function TrayPopoverView() {
 
   onCleanup(() => {
     unlistenSettings?.();
+    unlistenTranscripts?.();
   });
 
   async function pickMode(id: string) {
@@ -96,7 +109,7 @@ export default function TrayPopoverView() {
 
   async function copyRecent(idx: number, text: string) {
     try {
-      await navigator.clipboard.writeText(text);
+      await copyText(text);
       setCopyFlash(idx);
       setTimeout(() => setCopyFlash(null), 900);
     } catch (e) {
@@ -289,9 +302,9 @@ export default function TrayPopoverView() {
                       </span>
                       <button
                         type="button"
-                        class="rounded p-1 text-[var(--color-ink-mute)] opacity-0 transition-opacity hover:bg-white/8 hover:text-[var(--color-ink)] group-hover:opacity-100"
+                        class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-white/8 hover:text-[var(--color-ink)]"
                         onClick={() => copyRecent(idx(), r.text)}
-                        title="Copy"
+                        title="Copy to clipboard (⌘V to paste)"
                       >
                         <Show
                           when={copyFlash() === idx()}

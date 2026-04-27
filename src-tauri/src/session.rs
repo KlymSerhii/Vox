@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tauri::{AppHandle, Manager, Runtime, Wry};
+use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
 
 use crate::audio::AudioHandle;
 use crate::engines::Registry;
@@ -374,6 +374,9 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
         log::info!("copying {} chars (sid={my_sid})", cleaned.len());
 
         transcripts::push(&cleaned);
+        if let Err(e) = app_for_pill.emit("transcripts:changed", transcripts::snapshot()) {
+            log::warn!("failed to emit transcripts:changed: {e}");
+        }
 
         let t = cleaned.clone();
         let copy_result =

@@ -140,6 +140,14 @@ pub fn set_hands_free_enabled<R: Runtime>(
 }
 
 #[tauri::command]
+pub async fn copy_text(text: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::inject::copy_to_clipboard(&text))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn set_polishing_enabled<R: Runtime>(
     app: AppHandle<R>,
     enabled: bool,
