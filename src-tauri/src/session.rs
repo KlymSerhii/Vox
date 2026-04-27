@@ -23,7 +23,7 @@ use crate::modes::{self, ModeStore, VoiceMode};
 use crate::pill::{self, PillState};
 use crate::{inject, settings, transcripts};
 
-const MAX_RECORD_SECS: u64 = 60;
+const MAX_RECORD_SECS: u64 = 30 * 60;
 const MIN_RECORD_MS: u128 = 300;
 const SILENCE_PEAK_THRESHOLD: f32 = 0.003;
 
@@ -516,7 +516,7 @@ fn spawn_max_record_guard<R: Runtime>(
         if ctx.session_id.load(Ordering::SeqCst) == sid
             && ctx.recording.load(Ordering::SeqCst)
         {
-            log::warn!("hotkey held >{max_secs}s — auto-stopping");
+            log::warn!("recording exceeded {max_secs}s safety cap — auto-stopping");
             end_recording(app, ctx);
         }
     });

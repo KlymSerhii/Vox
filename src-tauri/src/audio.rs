@@ -18,11 +18,11 @@ use parking_lot::Mutex;
 /// Target sample rate sent to Groq Whisper.
 const TARGET_SR: u32 = 16_000;
 
-/// Hard cap on how much audio we'll keep in memory at any time. Matches the
-/// session-layer 60 s safety net (PRD §3.1) with 5 s of headroom; if the
-/// guard fails, this clamps RAM usage and gracefully drops the *oldest*
-/// samples so the latest audio is still recoverable.
-const MAX_BUFFER_SECS: usize = 65;
+/// Hard cap on how much audio we'll keep in memory at any time. Sits a few
+/// seconds above the session-layer recording cap (`MAX_RECORD_SECS`); if that
+/// guard ever fails to fire, this clamps RAM usage and gracefully drops the
+/// *oldest* samples so the latest audio is still recoverable.
+const MAX_BUFFER_SECS: usize = 30 * 60 + 5;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
