@@ -1,4 +1,12 @@
-//! Local LLM cleanup — `llama-cpp-2` 0.1 with Metal.
+//! Local LLM cleanup — `llama-cpp-2` (git, Metal) running Gemma 4 / Phi-4-mini.
+//!
+//! `llama-cpp-2` is pinned to a specific commit on the upstream `main`
+//! branch in `Cargo.toml` rather than the latest crates.io release. The
+//! pinned rev bundles a `llama.cpp` submodule that includes Gemma 4
+//! tokenizer / chat-template support; older crates.io snapshots
+//! mis-tokenized Gemma 4 prompts and produced gibberish or aborted
+//! under `GGML_ASSERT`. Bumping the pinned rev is the single knob for
+//! tracking upstream llama.cpp going forward.
 //!
 //! Loads a GGUF model on first use, keeps it warm for repeat dictations.
 //! Hard 3 s wall-clock timeout per the existing fail-open pattern: if the
