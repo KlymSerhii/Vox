@@ -101,7 +101,7 @@ Each mode contributes:
 │       └── engines/
 │           ├── mod.rs                 ← Registry + SttEngine / LlmEngine traits
 │           ├── whisper_local.rs       ← whisper-rs 0.16 (CoreML+Metal)
-│           ├── gemma_local.rs         ← llama-cpp-2 0.1 (Metal)
+│           ├── gemma_local.rs         ← llama-cpp-2 (git pin, Metal)
 │           └── none.rs                ← no-op LLM (raw transcript)
 └── scripts/
     ├── dev-bundle.sh                  ← build + open a debug .app for TCC sanity
@@ -211,7 +211,7 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 
 - **Auto-update is stubbed.** `commands::check_for_updates` short-circuits to `unconfigured` until the placeholder endpoint and pubkey are replaced and the bundle is signed + notarized.
 - **No code signing yet.** Built `.app` is ad-hoc signed; macOS Gatekeeper will block it on first launch (control-click → Open once to trust).
-- **Gemma cleanup may regress under specific `llama-cpp-2` versions.** A previous llama.cpp `GGML_ASSERT` abort was patched upstream and we've re-enabled the path. If it crashes again, flip `Settings → Models → Polish transcripts` off and the pipeline goes Listening → Transcribing → Done with raw Whisper output.
+- **Gemma cleanup tracks upstream `llama.cpp` via a git-pinned `llama-cpp-2`.** `src-tauri/Cargo.toml` pins `llama-cpp-2` to a specific commit on the upstream `main` branch (not the latest crates.io release) so we get a `llama.cpp` snapshot with Gemma 4 tokenizer / chat-template support. Older crates.io snapshots produced gibberish or aborted under `GGML_ASSERT` for Gemma 4. Bump the `rev` field to track upstream; rebuild; verify polishing works against the current Gemma 4 GGUFs. If it ever crashes again, flip `Settings → Models → Polish transcripts` off and the pipeline goes Listening → Transcribing → Done with raw Whisper output.
 - **Pill always renders on the primary display.** Multi-display follow-the-focus is a future enhancement.
 
 ## Contact points for changes
