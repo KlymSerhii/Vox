@@ -2,6 +2,7 @@
 
 @theme {
   --color-accent: #7c9cff;
+  --color-accent-strong: #3d5bff;
   --color-accent-soft: rgb(124 156 255 / 0.16);
   --color-violet: #b49bff;
   --color-danger: #ff6b6b;
@@ -13,8 +14,91 @@
   --color-bg: #0b0b0d;
   --color-surface: rgb(39 39 42 / 0.72);
   --color-surface-raised: rgb(63 63 70 / 0.85);
+  --color-surface-glass: rgba(24, 24, 27, 0.88);
+  --color-sidebar: rgba(24, 24, 27, 0.6);
   --color-border: rgb(255 255 255 / 0.08);
   --color-border-strong: rgb(255 255 255 / 0.14);
+  --color-control: rgb(255 255 255 / 0.08);
+  --color-control-hover: rgb(255 255 255 / 0.12);
+  --color-input-bg: rgb(255 255 255 / 0.05);
+  --color-overlay: rgb(255 255 255 / 0.06);
+  --color-scrim: rgb(0 0 0 / 0.60);
+
+  /* Audio meter bars — defaults to accent in dark, swapped to neutral
+   * grey in light to read as Liquid Glass depth indicator. */
+  --color-meter: var(--color-accent);
+  --color-meter-shadow: rgba(0, 0, 0, 0.30);
+
+  /* Glass material tokens. The shadow stacks reference the per-theme
+   * shadow primitives so they auto-adapt across light/dark. */
+  --glass-highlight: rgb(255 255 255 / 0.08);
+  --glass-shadow: rgba(0, 0, 0, 0.45);
+  --glass-shadow-soft: rgba(0, 0, 0, 0.22);
+  --glass-shadow-contact: rgba(0, 0, 0, 0.18);
+  --glass-edge-bottom: rgba(0, 0, 0, 0.30);
+  --glass-rim: rgba(255, 255, 255, 0.10);
+  --glass-blur: blur(24px) saturate(180%);
+
+  --glass-shadow-stack: inset 0 1px 0 var(--glass-highlight),
+    inset 0 -1px 0 var(--glass-edge-bottom),
+    0 1px 2px var(--glass-shadow-contact), 0 8px 24px var(--glass-shadow-soft),
+    0 28px 64px var(--glass-shadow);
+  --glass-shadow-stack-sm: inset 0 1px 0 var(--glass-highlight),
+    0 1px 2px var(--glass-shadow-contact), 0 6px 16px var(--glass-shadow-soft);
+}
+
+/* Light theme overrides — applied when `<html data-theme="light">`. The
+ * inline early-paint script in each HTML entry sets this synchronously
+ * to avoid a flash. Kept outside `@theme` because Tailwind 4's `@theme`
+ * only accepts static defaults. */
+[data-theme="light"] {
+  --color-accent: #5b7bff;
+  --color-accent-strong: #3d5bff;
+  --color-accent-soft: rgb(91 123 255 / 0.12);
+  --color-violet: #8a6dff;
+  --color-danger: #e5484d;
+  --color-success: #22a06b;
+  --color-warning: #d9870f;
+  --color-ink: #1b1b1f;
+  --color-ink-mute: #54545a;
+  --color-ink-faint: #86868c;
+  /* Slightly cool-tinted near-white. The previous warm cream made the
+   * whole UI read as flat paper. This is closer to macOS Tahoe's system
+   * window background and gives glass surfaces a more believable
+   * "ambient light" to tint. */
+  --color-bg: #f3f4f7;
+  /* Translucent surfaces — alphas dropped from the 0.6-0.78 band into
+   * the authentic Liquid Glass band. Tints with a faint warm cream so
+   * the wallpaper bleed doesn't feel sterile. */
+  --color-surface: rgba(252, 250, 247, 0.45);
+  --color-surface-raised: rgba(252, 250, 247, 0.55);
+  --color-surface-glass: rgba(252, 250, 247, 0.22);
+  --color-sidebar: rgba(252, 250, 247, 0.3);
+  --color-border: rgb(15 15 20 / 0.08);
+  --color-border-strong: rgb(15 15 20 / 0.14);
+  --color-control: rgb(15 15 20 / 0.06);
+  --color-control-hover: rgb(15 15 20 / 0.10);
+  --color-input-bg: rgb(255 255 255 / 0.55);
+  --color-overlay: rgb(15 15 20 / 0.05);
+  --color-scrim: rgb(15 15 20 / 0.35);
+
+  /* Neutral grey meter bars in light mode — keep saturated accent in
+   * dark theme via the @theme default. Slight transparency + an inner
+   * shadow on each bar carries the "carved depth" cue. */
+  --color-meter: rgba(40, 44, 56, 0.5);
+  --color-meter-shadow: rgba(20, 24, 40, 0.25);
+
+  /* Liquid Glass primitives — cool blue-grey shadow hue + bumped alphas
+   * so floating panels carry visible weight against arbitrary
+   * wallpapers. The bright top inner highlight is the load-bearing
+   * "bevelled glass rim" cue. */
+  --glass-highlight: rgba(255, 255, 255, 0.75);
+  --glass-shadow: rgba(20, 24, 40, 0.22);
+  --glass-shadow-soft: rgba(20, 24, 40, 0.12);
+  --glass-shadow-contact: rgba(20, 24, 40, 0.06);
+  --glass-edge-bottom: rgba(20, 24, 40, 0.08);
+  --glass-rim: rgba(255, 255, 255, 0.45);
+  --glass-blur: blur(24px) saturate(180%) contrast(92%);
 }
 
 html,
@@ -35,6 +119,9 @@ body {
   padding: 0;
   -webkit-font-smoothing: antialiased;
   background-color: var(--color-bg);
+  /* Smooth the theme flip; restrict to bg/color so hover transitions
+   * elsewhere don't get an unintended 150ms lag. */
+  transition: background-color 150ms ease, color 150ms ease;
 }
 
 /* Windows that render translucent content on top of the desktop use an
@@ -136,7 +223,7 @@ button:disabled {
   font-size: 12px;
   font-weight: 500;
   color: var(--color-ink);
-  background: rgb(255 255 255 / 0.06);
+  background: var(--color-control);
   box-shadow: inset 0 0 0 1px var(--color-border);
 }
 
@@ -145,6 +232,9 @@ button:disabled {
   height: 6px;
 }
 .scrollbar-thin::-webkit-scrollbar-thumb {
-  background: rgb(255 255 255 / 0.1);
+  background: var(--color-border-strong);
   border-radius: 3px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-faint);
 }

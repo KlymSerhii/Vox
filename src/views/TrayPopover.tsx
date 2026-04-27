@@ -10,6 +10,7 @@ import {
   openSettingsWindow,
   quitApp,
   setActiveMode,
+  setAppearance,
   setHandsFreeEnabled,
   setPolishingEnabled,
   type RecentTranscript,
@@ -128,11 +129,11 @@ export default function TrayPopoverView() {
     <div
       class="flex h-screen w-screen flex-col overflow-hidden rounded-[14px] text-[13px] text-[var(--color-ink)]"
       style={{
-        background: "rgba(24, 24, 27, 0.88)",
-        "backdrop-filter": "blur(28px) saturate(180%)",
-        "-webkit-backdrop-filter": "blur(28px) saturate(180%)",
-        "box-shadow":
-          "0 12px 32px rgba(0,0,0,0.45), inset 0 0 0 1px rgba(255,255,255,0.06)",
+        background: "var(--color-surface-glass)",
+        "backdrop-filter": "var(--glass-blur)",
+        "-webkit-backdrop-filter": "var(--glass-blur)",
+        border: "1px solid var(--glass-rim)",
+        "box-shadow": "var(--glass-shadow-stack)",
       }}
     >
       <Show
@@ -154,7 +155,7 @@ export default function TrayPopoverView() {
               </div>
               <button
                 type="button"
-                class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-white/8 hover:text-[var(--color-ink)]"
+                class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
                 title="Open Settings"
                 onClick={() => openSettingsWindow()}
               >
@@ -221,7 +222,8 @@ export default function TrayPopoverView() {
                 </div>
                 <button
                   type="button"
-                  class="inline-flex items-center gap-1.5 rounded-full bg-zinc-800/70 px-2 py-1 text-[12px] ring-1 ring-white/10 hover:bg-zinc-700/70"
+                  class="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] hover:brightness-110"
+                  style={{ background: "var(--color-surface-raised)" }}
                   onClick={() => setModeMenuOpen(!modeMenuOpen())}
                   aria-haspopup="listbox"
                   aria-expanded={modeMenuOpen()}
@@ -249,7 +251,12 @@ export default function TrayPopoverView() {
               </div>
               <Show when={modeMenuOpen()}>
                 <div
-                  class="absolute right-4 top-full z-10 mt-1 max-h-60 w-56 overflow-y-auto rounded-[10px] bg-[rgba(24,24,27,0.96)] py-1 shadow-lg ring-1 ring-white/10 scrollbar-thin"
+                  class="absolute right-4 top-full z-10 mt-1 max-h-60 w-56 overflow-y-auto rounded-[10px] py-1 shadow-lg ring-1 ring-[var(--color-border-strong)] scrollbar-thin"
+                  style={{
+                    background: "var(--color-surface-raised)",
+                    "backdrop-filter": "blur(28px) saturate(180%)",
+                    "-webkit-backdrop-filter": "blur(28px) saturate(180%)",
+                  }}
                   role="listbox"
                 >
                   <For each={modes()}>
@@ -258,7 +265,7 @@ export default function TrayPopoverView() {
                         type="button"
                         role="option"
                         aria-selected={m.id === st().active_mode_id}
-                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-white/6"
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
                         classList={{
                           "text-[var(--color-accent)]":
                             m.id === st().active_mode_id,
@@ -293,7 +300,7 @@ export default function TrayPopoverView() {
               >
                 <For each={recents()}>
                   {(r, idx) => (
-                    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 hover:bg-white/4">
+                    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 hover:bg-[var(--color-overlay)]">
                       <span class="w-10 shrink-0 text-[11px] text-[var(--color-ink-faint)]">
                         {ago(r.ts)}
                       </span>
@@ -302,7 +309,7 @@ export default function TrayPopoverView() {
                       </span>
                       <button
                         type="button"
-                        class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-white/8 hover:text-[var(--color-ink)]"
+                        class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
                         onClick={() => copyRecent(idx(), r.text)}
                         title="Copy to clipboard (⌘V to paste)"
                       >
@@ -335,10 +342,25 @@ export default function TrayPopoverView() {
               </Show>
             </div>
 
+            <div class="border-t border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between">
+                <span class="text-[12px] text-[var(--color-ink-mute)]">
+                  Appearance
+                </span>
+                <AppearanceToggle
+                  value={st().appearance}
+                  onChange={(v) => {
+                    const cur = s();
+                    if (cur) setS({ ...cur, appearance: v });
+                    void setAppearance(v);
+                  }}
+                />
+              </div>
+            </div>
             <footer class="flex border-t border-[var(--color-border)]">
               <button
                 type="button"
-                class="flex-1 py-3 text-[12px] text-[var(--color-ink-mute)] hover:bg-white/4 hover:text-[var(--color-danger)]"
+                class="flex-1 py-3 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
                 onClick={() => quitApp()}
               >
                 Quit
@@ -372,7 +394,7 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
       class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
       classList={{
         "bg-[var(--color-accent)]": props.checked,
-        "bg-white/10": !props.checked,
+        "bg-[var(--color-control)]": !props.checked,
       }}
     >
       <span
@@ -383,6 +405,111 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
         }}
       />
     </button>
+  );
+}
+
+function AppearanceToggle(props: {
+  value: "light" | "dark";
+  onChange: (v: "light" | "dark") => void;
+}) {
+  return (
+    <div
+      class="inline-flex items-center rounded-[12px] p-0.5"
+      style={{ background: "var(--color-control)" }}
+      role="radiogroup"
+      aria-label="Appearance"
+    >
+      <AppearanceHalf
+        active={props.value === "light"}
+        label="Light"
+        onClick={() => props.onChange("light")}
+      >
+        <SunGlyph />
+      </AppearanceHalf>
+      <AppearanceHalf
+        active={props.value === "dark"}
+        label="Dark"
+        onClick={() => props.onChange("dark")}
+      >
+        <MoonGlyph />
+      </AppearanceHalf>
+    </div>
+  );
+}
+
+function AppearanceHalf(props: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+  children: any;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={props.active}
+      aria-label={props.label}
+      class="inline-flex h-6 w-8 items-center justify-center rounded-[10px] transition-colors"
+      classList={{
+        "hover:text-[var(--color-ink-mute)]": !props.active,
+      }}
+      style={{
+        background: props.active ? "var(--color-surface-raised)" : "transparent",
+        "box-shadow": props.active
+          ? "var(--glass-shadow-stack-sm)"
+          : "none",
+        color: props.active
+          ? "var(--color-ink)"
+          : "var(--color-ink-faint)",
+      }}
+      onClick={props.onClick}
+    >
+      {props.children}
+    </button>
+  );
+}
+
+function SunGlyph() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.5"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="12" cy="12" r="3.5" />
+      <line x1="12" y1="2" x2="12" y2="4" />
+      <line x1="12" y1="20" x2="12" y2="22" />
+      <line x1="2" y1="12" x2="4" y2="12" />
+      <line x1="20" y1="12" x2="22" y2="12" />
+      <line x1="4.9" y1="4.9" x2="6.3" y2="6.3" />
+      <line x1="17.7" y1="17.7" x2="19.1" y2="19.1" />
+      <line x1="4.9" y1="19.1" x2="6.3" y2="17.7" />
+      <line x1="17.7" y1="6.3" x2="19.1" y2="4.9" />
+    </svg>
+  );
+}
+
+function MoonGlyph() {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.5"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
+    </svg>
   );
 }
 

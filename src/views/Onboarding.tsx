@@ -147,7 +147,7 @@ export default function OnboardingView() {
           <button
             type="button"
             onClick={back}
-            class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-white/8 hover:text-[var(--color-ink)]"
+            class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
             aria-label="Back"
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -217,7 +217,7 @@ function Progress(props: { step: Step }) {
             class="h-1.5 w-1.5 rounded-full transition-colors"
             classList={{
               "bg-[var(--color-accent)]": props.step === i,
-              "bg-white/20": props.step !== i,
+              "bg-[var(--color-border-strong)]": props.step !== i,
             }}
           />
         )}
@@ -326,7 +326,7 @@ function MicStep(props: { granted: boolean; onAllow: () => void }) {
       <button
         type="button"
         onClick={props.onAllow}
-        class="rounded-[8px] bg-white/10 px-4 py-2 text-[13px] hover:bg-white/15"
+        class="rounded-[8px] bg-[var(--color-control)] px-4 py-2 text-[13px] hover:bg-[var(--color-control-hover)]"
       >
         Allow microphone
       </button>
@@ -346,7 +346,7 @@ function AccessibilityStep(props: { granted: boolean }) {
       <button
         type="button"
         onClick={() => openAccessibilitySettings()}
-        class="rounded-[8px] bg-white/10 px-4 py-2 text-[13px] hover:bg-white/15"
+        class="rounded-[8px] bg-[var(--color-control)] px-4 py-2 text-[13px] hover:bg-[var(--color-control-hover)]"
       >
         Open System Settings
       </button>
@@ -518,7 +518,7 @@ function DownloadBar(props: {
         <span>{props.label}</span>
         <span>{props.done ? "Done" : `${pct().toFixed(0)}%`}</span>
       </div>
-      <div class="h-1.5 w-full overflow-hidden rounded-full bg-white/8">
+      <div class="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-control)]">
         <div
           class="h-full rounded-full bg-[var(--color-accent)] transition-[width]"
           style={{ width: `${pct()}%` }}
@@ -638,7 +638,13 @@ function TipRow(props: {
   errorActionLabel?: string | undefined;
 }) {
   return (
-    <li class="flex flex-col gap-1 rounded-[10px] bg-white/4 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+    <li
+      class="flex flex-col gap-1 rounded-[14px] bg-[var(--color-surface-raised)] px-3 py-2.5 ring-1 ring-[var(--color-border)]"
+      style={{
+        "box-shadow":
+          "inset 0 1px 0 var(--glass-highlight), 0 1px 2px var(--glass-shadow-soft)",
+      }}
+    >
       <div class="flex items-baseline gap-2">
         <span class="text-[13px] font-medium text-[var(--color-ink)]">
           {props.label}

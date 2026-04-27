@@ -24,6 +24,8 @@ export interface Settings {
   active_mode_id: string;
   mode_cycle_hotkey: string;
   auto_suggest_modes: boolean;
+  // Appearance.
+  appearance: "light" | "dark";
 }
 
 export type PunctuationStyle = "Aggressive" | "Standard" | "Minimal" | "None";
@@ -123,6 +125,12 @@ export async function setHandsFreeEnabled(enabled: boolean): Promise<void> {
 
 export async function setPolishingEnabled(enabled: boolean): Promise<void> {
   await invoke("set_polishing_enabled", { enabled });
+}
+
+export async function setAppearance(
+  appearance: "light" | "dark",
+): Promise<void> {
+  await invoke("set_appearance", { appearance });
 }
 
 export async function getRecentTranscripts(): Promise<RecentTranscript[]> {

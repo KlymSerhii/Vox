@@ -225,7 +225,16 @@ function Loader() {
 
 function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
   return (
-    <aside class="flex h-full w-[200px] flex-col border-r border-[var(--color-border)] bg-[rgba(24,24,27,0.6)] px-3 py-4">
+    <aside
+      class="flex h-full w-[200px] flex-col border-r border-[var(--color-border)] px-3 py-4"
+      style={{
+        background: "var(--color-sidebar)",
+        "backdrop-filter": "var(--glass-blur)",
+        "-webkit-backdrop-filter": "var(--glass-blur)",
+        "box-shadow":
+          "inset 0 1px 0 var(--glass-highlight), 1px 0 0 var(--glass-edge-bottom)",
+      }}
+    >
       <div class="mb-4 px-2">
         <div class="text-[15px] font-semibold">Vox</div>
         <div class="text-[11px] text-[var(--color-ink-mute)]">
@@ -240,8 +249,9 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
               onClick={() => props.onTab(t.id)}
               class="flex items-center gap-2 rounded-[6px] px-3 py-1.5 text-left text-[13px] transition-colors"
               classList={{
-                "bg-white/6 text-[var(--color-ink)]": props.tab === t.id,
-                "text-[var(--color-ink-mute)] hover:bg-white/4":
+                "bg-[var(--color-control)] text-[var(--color-ink)]":
+                  props.tab === t.id,
+                "text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)]":
                   props.tab !== t.id,
               }}
             >
@@ -356,7 +366,10 @@ function Header(props: { tab: Tab; savedFlash: boolean }) {
 
 function Card(props: { children: any }) {
   return (
-    <div class="mb-5 overflow-hidden rounded-[10px] bg-[var(--color-surface-raised)] ring-1 ring-[var(--color-border)]">
+    <div
+      class="mb-5 overflow-hidden rounded-[14px] bg-[var(--color-surface-raised)] ring-1 ring-[var(--color-border)]"
+      style={{ "box-shadow": "var(--glass-shadow-stack-sm)" }}
+    >
       {props.children}
     </div>
   );
@@ -398,7 +411,7 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
       class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
       classList={{
         "bg-[var(--color-accent)]": props.checked,
-        "bg-white/10": !props.checked,
+        "bg-[var(--color-control)]": !props.checked,
       }}
     >
       <span
@@ -449,7 +462,7 @@ function GeneralTab(props: {
           last
         >
           <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
             value={props.s.hands_free_enabled ? "toggle" : "ptt"}
             onChange={(e) =>
               props.update({
@@ -470,7 +483,7 @@ function GeneralTab(props: {
           last
         >
           <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
             value={props.s.language}
             onChange={(e) => props.update({ language: e.currentTarget.value })}
           >
@@ -565,7 +578,7 @@ function HotkeysTab(props: {
               <span class="text-[13px] text-[var(--color-ink)]">
                 Push-to-talk
               </span>
-              <span class="rounded-full bg-white/8 px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
+              <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
                 ⌘ + ⌃ + Space
               </span>
             </div>
@@ -577,14 +590,14 @@ function HotkeysTab(props: {
             <button
               type="button"
               onClick={() => void onTest()}
-              class="rounded-[6px] bg-white/8 px-3 py-1 text-[11px] hover:bg-white/12"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
               title="Read the current binding from the runtime"
             >
               Test
             </button>
             <Show when={testStatus()}>
               <span
-                class="rounded-full bg-black/40 px-2 py-0.5 text-[10px]"
+                class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px]"
                 classList={{
                   "text-[var(--color-success)]":
                     testStatus()?.startsWith("Bound") ?? false,
@@ -712,7 +725,7 @@ function HotkeyRow(props: {
       </div>
       <div class="flex shrink-0 items-center gap-2">
         <select
-          class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
           value={props.configured}
           onChange={(e) => props.onChange(e.currentTarget.value)}
         >
@@ -966,7 +979,7 @@ function ModelsTab(props: {
       </Card>
       <Show when={props.s.polishing_enabled}>
         <Show when={!props.s.gemma_tos_accepted}>
-          <div class="mb-3 rounded-[10px] bg-[rgba(124,156,255,0.08)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
+          <div class="mb-3 rounded-[10px] bg-[var(--color-accent-soft)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
             You'll be asked to accept the{" "}
             <a
               class="underline"
@@ -1059,7 +1072,7 @@ function ModelRow(props: {
           <Show when={props.downloading}>
             <button
               type="button"
-              class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
               onClick={props.onCancel}
             >
               Cancel
@@ -1068,7 +1081,7 @@ function ModelRow(props: {
           <Show when={props.m.installed}>
             <button
               type="button"
-              class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
               onClick={props.onDelete}
               title="Delete cached model"
             >
@@ -1088,7 +1101,7 @@ function ModelRow(props: {
                 <span>ETA {p().eta}s</span>
               </Show>
             </div>
-            <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-white/8">
+            <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-control)]">
               <div
                 class="h-full rounded-full bg-[var(--color-accent)]"
                 style={{
@@ -1263,7 +1276,7 @@ function ModesTab(props: {
           hint="Used for the next utterance unless you cycle or pick a different mode."
         >
           <select
-            class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
             value={props.s.active_mode_id}
             onChange={(e) => onActivate(e.currentTarget.value)}
           >
@@ -1319,14 +1332,14 @@ function ModesTab(props: {
         <button
           type="button"
           onClick={() => fileInput?.click()}
-          class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+          class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
         >
           Import .voxmode
         </button>
         <button
           type="button"
           onClick={onReset}
-          class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+          class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
         >
           Reset to defaults
         </button>
@@ -1376,7 +1389,7 @@ function ModeRow(props: {
             </span>
             <span class="text-[13px] font-medium">{props.m.name}</span>
             <Show when={props.m.built_in}>
-              <span class="rounded-full bg-white/8 px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
+              <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
                 Default
               </span>
             </Show>
@@ -1408,7 +1421,7 @@ function ModeRow(props: {
           <Show when={props.m.built_in}>
             <button
               type="button"
-              class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
               onClick={props.onDuplicate}
             >
               Duplicate to edit
@@ -1417,14 +1430,14 @@ function ModeRow(props: {
           <Show when={!props.m.built_in}>
             <button
               type="button"
-              class="rounded-[6px] bg-white/8 px-3 py-1.5 text-[12px] hover:bg-white/12"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
               onClick={props.onEdit}
             >
               Edit
             </button>
             <button
               type="button"
-              class="rounded-[6px] bg-white/6 px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-white/10"
+              class="rounded-[6px] bg-[var(--color-control)] px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-control-hover)]"
               onClick={props.onExport}
               title="Export as .voxmode"
             >
@@ -1432,7 +1445,7 @@ function ModeRow(props: {
             </button>
             <button
               type="button"
-              class="rounded-[6px] bg-white/6 px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+              class="rounded-[6px] bg-[var(--color-control)] px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
               onClick={props.onDelete}
             >
               Delete
@@ -1497,7 +1510,7 @@ function ModeEditor(props: {
   }
 
   return (
-    <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-6 py-8">
+    <div class="fixed inset-0 z-50 flex items-center justify-center bg-[var(--color-scrim)] px-6 py-8">
       <div class="flex h-full w-full max-w-2xl flex-col overflow-hidden rounded-[12px] bg-[var(--color-bg)] ring-1 ring-[var(--color-border)]">
         <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
           <h2 class="text-[14px] font-semibold">
@@ -1505,7 +1518,7 @@ function ModeEditor(props: {
           </h2>
           <button
             type="button"
-            class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-white/8 hover:text-[var(--color-ink)]"
+            class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
             onClick={props.onCancel}
             aria-label="Cancel"
           >
@@ -1517,7 +1530,7 @@ function ModeEditor(props: {
             <Row label="Name">
               <input
                 type="text"
-                class="w-48 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="w-48 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().name}
                 onInput={(e) => patch({ name: e.currentTarget.value })}
               />
@@ -1525,7 +1538,7 @@ function ModeEditor(props: {
             <Row label="Icon (emoji or text)">
               <input
                 type="text"
-                class="w-24 rounded-[6px] bg-black/30 px-2 py-1 text-center text-[14px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="w-24 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-center text-[14px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().icon}
                 onInput={(e) => patch({ icon: e.currentTarget.value })}
               />
@@ -1533,7 +1546,7 @@ function ModeEditor(props: {
             <Row label="Description" last>
               <input
                 type="text"
-                class="w-64 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="w-64 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().description}
                 onInput={(e) => patch({ description: e.currentTarget.value })}
               />
@@ -1544,7 +1557,7 @@ function ModeEditor(props: {
             <div class="px-4 py-3">
               <div class="mb-1 text-[12px] font-medium">System prompt</div>
               <textarea
-                class="h-48 w-full rounded-[6px] bg-black/30 px-2 py-2 font-mono text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="h-48 w-full rounded-[6px] bg-[var(--color-input-bg)] px-2 py-2 font-mono text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().system_prompt}
                 onInput={(e) => patch({ system_prompt: e.currentTarget.value })}
               />
@@ -1559,7 +1572,7 @@ function ModeEditor(props: {
           <Card>
             <Row label="Punctuation">
               <select
-                class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().punctuation}
                 onChange={(e) =>
                   patch({
@@ -1574,7 +1587,7 @@ function ModeEditor(props: {
             </Row>
             <Row label="Case">
               <select
-                class="rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().case}
                 onChange={(e) =>
                   patch({ case: e.currentTarget.value as CaseStyle })
@@ -1593,7 +1606,7 @@ function ModeEditor(props: {
               <input
                 type="number"
                 min="0"
-                class="w-20 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                class="w-20 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                 value={draft().max_length_chars ?? ""}
                 onInput={(e) => {
                   const v = e.currentTarget.value.trim();
@@ -1614,7 +1627,7 @@ function ModeEditor(props: {
               <div class="mb-2 flex gap-2">
                 <input
                   type="text"
-                  class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                  class="flex-1 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                   placeholder="Add proper nouns, acronyms, or technical terms — one per line."
                   value={dictDraft()}
                   onInput={(e) => setDictDraft(e.currentTarget.value)}
@@ -1627,7 +1640,7 @@ function ModeEditor(props: {
                 />
                 <button
                   type="button"
-                  class="rounded-[6px] bg-white/8 px-3 py-1 text-[12px] hover:bg-white/12"
+                  class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[12px] hover:bg-[var(--color-control-hover)]"
                   onClick={addDictTerm}
                 >
                   Add
@@ -1640,7 +1653,7 @@ function ModeEditor(props: {
                       <button
                         type="button"
                         onClick={() => removeDictTerm(term)}
-                        class="group inline-flex items-center gap-1 rounded-[6px] bg-white/6 px-2 py-1 text-[12px] hover:bg-white/10"
+                        class="group inline-flex items-center gap-1 rounded-[6px] bg-[var(--color-control)] px-2 py-1 text-[12px] hover:bg-[var(--color-control-hover)]"
                       >
                         <span>{term}</span>
                         <span class="text-[var(--color-ink-mute)] group-hover:text-[var(--color-danger)]">
@@ -1662,7 +1675,7 @@ function ModeEditor(props: {
                 </span>
                 <button
                   type="button"
-                  class="rounded-[6px] bg-white/8 px-2 py-1 text-[11px] hover:bg-white/12"
+                  class="rounded-[6px] bg-[var(--color-control)] px-2 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
                   onClick={addTrigger}
                 >
                   + Trigger
@@ -1678,7 +1691,7 @@ function ModeEditor(props: {
                   <div class="mb-2 flex items-center gap-2">
                     <input
                       type="text"
-                      class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[11px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                      class="flex-1 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[11px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                       placeholder="bundle id (e.g. com.apple.Notes)"
                       value={t.bundle_id_glob ?? ""}
                       onInput={(e) =>
@@ -1691,7 +1704,7 @@ function ModeEditor(props: {
                     />
                     <input
                       type="text"
-                      class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[11px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                      class="flex-1 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[11px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
                       placeholder="window title contains (optional)"
                       value={t.window_title_substring ?? ""}
                       onInput={(e) =>
@@ -1704,7 +1717,7 @@ function ModeEditor(props: {
                     />
                     <button
                       type="button"
-                      class="rounded-[6px] bg-white/6 px-2 py-1 text-[11px] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+                      class="rounded-[6px] bg-[var(--color-control)] px-2 py-1 text-[11px] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
                       onClick={() => removeTrigger(i())}
                     >
                       ×
@@ -1718,7 +1731,7 @@ function ModeEditor(props: {
         <footer class="flex items-center justify-end gap-2 border-t border-[var(--color-border)] px-4 py-3">
           <button
             type="button"
-            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
             onClick={props.onCancel}
           >
             Cancel
@@ -1777,7 +1790,7 @@ function DictionaryTab(props: {
           <div class="mb-3 flex gap-2">
             <input
               type="text"
-              class="flex-1 rounded-[6px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+              class="flex-1 rounded-[6px] bg-[var(--color-input-bg)] px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
               placeholder="Add proper nouns, acronyms, or technical terms — one per line."
               value={draft()}
               onInput={(e) => setDraft(e.currentTarget.value)}
@@ -1811,7 +1824,7 @@ function DictionaryTab(props: {
                   <button
                     type="button"
                     onClick={() => remove(term)}
-                    class="group inline-flex items-center gap-1 rounded-[6px] bg-white/6 px-2 py-1 text-[12px] hover:bg-white/10"
+                    class="group inline-flex items-center gap-1 rounded-[6px] bg-[var(--color-control)] px-2 py-1 text-[12px] hover:bg-[var(--color-control-hover)]"
                     title="Click to remove"
                   >
                     <span>{term}</span>
@@ -1860,7 +1873,10 @@ function PrivacyTab(_props: { s: Settings }) {
         audio or transcripts to any external service.
       </p>
 
-      <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
+      <div
+        class="mb-5 rounded-[14px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]"
+        style={{ "box-shadow": "var(--glass-shadow-stack-sm)" }}
+      >
         <h3 class="mb-2 text-[13px] font-medium">What never leaves</h3>
         <ul class="space-y-1 text-[12px] text-[var(--color-ink-mute)]">
           <li>• No audio is ever written to disk.</li>
@@ -1939,7 +1955,10 @@ function AboutTab() {
 
   return (
     <>
-      <div class="mb-5 rounded-[10px] bg-[var(--color-surface-raised)] p-5 ring-1 ring-[var(--color-border)]">
+      <div
+        class="mb-5 rounded-[14px] bg-[var(--color-surface-raised)] p-5 ring-1 ring-[var(--color-border)]"
+        style={{ "box-shadow": "var(--glass-shadow-stack-sm)" }}
+      >
         <div class="mb-1 text-[20px] font-semibold">Vox</div>
         <div class="text-[13px] text-[var(--color-ink-mute)]">
           Talk to any app — now offline by default.
@@ -1957,7 +1976,7 @@ function AboutTab() {
             type="button"
             onClick={onCheckUpdates}
             disabled={checking()}
-            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10 disabled:opacity-40"
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)] disabled:opacity-40"
           >
             {checking() ? "Checking…" : "Check now"}
           </button>
@@ -1987,7 +2006,7 @@ function AboutTab() {
           <button
             type="button"
             onClick={onReplay}
-            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
           >
             Start
           </button>
@@ -1999,7 +2018,7 @@ function AboutTab() {
           <button
             type="button"
             onClick={() => void onDiagnostics()}
-            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
           >
             Run
           </button>
@@ -2011,7 +2030,7 @@ function AboutTab() {
           <button
             type="button"
             onClick={() => void onRevealDevPath()}
-            class="rounded-[6px] bg-white/6 px-3 py-1.5 text-[12px] hover:bg-white/10"
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
           >
             Open & copy path
           </button>
@@ -2047,7 +2066,7 @@ function AboutTab() {
         <Show when={diag()}>
           {(d) => (
             <div class="px-4 py-3 border-b border-[var(--color-border)]">
-              <pre class="overflow-x-auto rounded-[6px] bg-black/40 p-3 text-[11px] text-[var(--color-ink)]">
+              <pre class="overflow-x-auto rounded-[6px] bg-[var(--color-input-bg)] p-3 text-[11px] text-[var(--color-ink)]">
                 {formatDiagnostics(d())}
               </pre>
             </div>

@@ -93,6 +93,26 @@ fn show_settings<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
+/// Find the monitor whose physical rect contains `pos`. Used to anchor the
+/// popover to whichever display the user clicked the tray icon on, rather
+/// than always falling onto the primary display.
+fn monitor_for_position<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+    pos: PhysicalPosition<f64>,
+) -> Option<tauri::Monitor> {
+    let monitors = win.available_monitors().ok()?;
+    monitors.into_iter().find(|m| {
+        let mp = m.position();
+        let ms = m.size();
+        let mx = mp.x as f64;
+        let my = mp.y as f64;
+        pos.x >= mx
+            && pos.x < mx + ms.width as f64
+            && pos.y >= my
+            && pos.y < my + ms.height as f64
+    })
+}
+
 pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let win = match app.get_webview_window(POPOVER_LABEL) {
         Some(w) => w,
@@ -120,15 +140,23 @@ pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         return Ok(());
     }
 
-    // Position: anchor below the tray icon if we have its position; otherwise
-    // top-right of the primary display, 8px below the menu bar.
-    if let Some(monitor) = win.primary_monitor()? {
+    // Position: anchor below the tray icon on the display the icon is on.
+    // Pick the monitor under the icon (so multi-display setups land the
+    // popover on the correct screen, with the correct DPI scale). Fall back
+    // to the primary monitor if we don't have an icon position yet (e.g.
+    // programmatic show before any tray event).
+    let icon_pos = *rect_store().lock();
+    let monitor = icon_pos
+        .and_then(|p| monitor_for_position(&win, p))
+        .or_else(|| win.primary_monitor().ok().flatten());
+
+    if let Some(monitor) = monitor {
         let scale = monitor.scale_factor();
         let mw = monitor.size().width as f64 / scale;
         let mx = monitor.position().x as f64 / scale;
         let my = monitor.position().y as f64 / scale;
 
-        let (cx_logical, top_y) = match *rect_store().lock() {
+        let (cx_logical, top_y) = match icon_pos {
             Some(p) => {
                 let cx = p.x / scale;
                 let cy = p.y / scale;

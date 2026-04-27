@@ -103,12 +103,13 @@ export default function PillView() {
       <div
         class="animate-pill-in pointer-events-none flex h-14 w-[272px] items-center gap-3 rounded-full px-4 transition-shadow duration-300"
         style={{
-          background: "rgba(11, 11, 13, 0.82)",
-          "backdrop-filter": "blur(24px) saturate(180%)",
-          "-webkit-backdrop-filter": "blur(24px) saturate(180%)",
+          background: "var(--color-surface-glass)",
+          "backdrop-filter": "var(--glass-blur)",
+          "-webkit-backdrop-filter": "var(--glass-blur)",
+          border: "1px solid var(--glass-rim)",
           "box-shadow": isDone()
-            ? "0 8px 32px rgba(0,0,0,0.32), inset 0 0 0 2px var(--color-success), 0 0 24px rgba(74, 222, 128, 0.55)"
-            : "0 8px 32px rgba(0,0,0,0.32), inset 0 0 0 1px rgba(255,255,255,0.08)",
+            ? "inset 0 0 0 2px var(--color-success), 0 0 24px rgba(74, 222, 128, 0.55), var(--glass-shadow-stack)"
+            : "var(--glass-shadow-stack)",
         }}
         role="status"
         aria-live="polite"
@@ -154,9 +155,18 @@ export default function PillView() {
 function ModeChip(props: { name: string; icon: string }) {
   // Small read-only chip on the listening pill. Switching is done via
   // the tray popover or the cycle hotkey — never on the pill itself.
+  // Sits on top of the pill's glass backdrop, so a second backdrop-blur
+  // layer + the small shadow stack creates the "glass on glass" lift.
   return (
     <span
-      class="inline-flex shrink-0 items-center gap-1 rounded-full bg-zinc-800/70 px-2 py-0.5 text-[11px] font-medium text-[var(--color-ink)] ring-1 ring-white/10"
+      class="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium text-[var(--color-ink)]"
+      style={{
+        background: "var(--color-surface-glass)",
+        "backdrop-filter": "blur(18px) saturate(200%)",
+        "-webkit-backdrop-filter": "blur(18px) saturate(200%)",
+        border: "1px solid var(--glass-rim)",
+        "box-shadow": "var(--glass-shadow-stack-sm)",
+      }}
       title={`Voice mode: ${props.name}`}
     >
       <span class="leading-none" aria-hidden="true">
@@ -181,15 +191,21 @@ function SuggestionHud(props: { name: string; icon: string }) {
       }}
     >
       <div
-        class="flex items-center gap-1.5 rounded-full bg-zinc-800/80 px-2.5 py-1 text-[11px] text-[var(--color-ink)] ring-1 ring-white/10"
+        class="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] text-[var(--color-ink)]"
         style={{
-          "backdrop-filter": "blur(16px) saturate(180%)",
-          "-webkit-backdrop-filter": "blur(16px) saturate(180%)",
+          background: "var(--color-surface-glass)",
+          "backdrop-filter": "var(--glass-blur)",
+          "-webkit-backdrop-filter": "var(--glass-blur)",
+          border: "1px solid var(--glass-rim)",
+          "box-shadow": "var(--glass-shadow-stack-sm)",
         }}
       >
         <span aria-hidden="true">{props.icon}</span>
         <span>Switch to {props.name}?</span>
-        <span class="rounded bg-white/8 px-1.5 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
+        <span
+          class="rounded px-1.5 py-0.5 text-[10px] text-[var(--color-ink-mute)]"
+          style={{ background: "var(--color-control)" }}
+        >
           ⌥M
         </span>
       </div>
@@ -312,7 +328,8 @@ function MicLevelMeter(props: { bars: number[] }) {
               width: "3px",
               height: `${h}px`,
               "border-radius": "2px",
-              background: "var(--color-accent)",
+              background: "var(--color-meter)",
+              "box-shadow": "inset 0 -1px 0 var(--color-meter-shadow)",
               opacity: active ? 0.95 : 0.5,
               transition: "height 120ms ease-out, opacity 200ms ease-out",
             }}
@@ -419,7 +436,8 @@ function Waveform(props: { levels: number[] }) {
               width: "4px",
               height: `${h}px`,
               "border-radius": "2px",
-              background: "var(--color-accent)",
+              background: "var(--color-meter)",
+              "box-shadow": "inset 0 -1px 0 var(--color-meter-shadow)",
               opacity,
             }}
           />

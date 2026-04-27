@@ -66,8 +66,23 @@ pub fn set_settings<R: Runtime>(
     let hotkeys_changed = before.hotkey != settings.hotkey
         || before.cancel_hotkey != settings.cancel_hotkey
         || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
+    let appearance_changed = before.appearance != settings.appearance;
 
     settings::save(&app, &settings).map_err(|e| e.to_string())?;
+
+    if appearance_changed {
+        let theme = match settings.appearance.as_str() {
+            "light" => Some(tauri::Theme::Light),
+            _ => Some(tauri::Theme::Dark),
+        };
+        for label in ["settings", "onboarding"] {
+            if let Some(win) = app.get_webview_window(label) {
+                if let Err(e) = win.set_theme(theme) {
+                    log::warn!("set_theme failed on '{label}': {e}");
+                }
+            }
+        }
+    }
 
     if hotkeys_changed {
         if let Some(ctx) = app.try_state::<session::SessionCtx>() {
@@ -154,6 +169,37 @@ pub fn set_polishing_enabled<R: Runtime>(
     s.polishing_enabled = enabled;
     s.llm_engine = if enabled { "gemma-local".into() } else { "none".into() };
     settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_appearance<R: Runtime>(
+    app: AppHandle<R>,
+    appearance: String,
+) -> Result<(), String> {
+    let theme = match appearance.as_str() {
+        "light" => tauri::Theme::Light,
+        "dark" => tauri::Theme::Dark,
+        other => return Err(format!("invalid appearance: {other}")),
+    };
+
+    let mut s = settings::load(&app);
+    s.appearance = appearance;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+
+    // Flip the macOS title-bar chrome on labelled chrome'd windows. Pill
+    // and tray-popover are decorationless so this is a no-op for them.
+    for label in ["settings", "onboarding"] {
+        if let Some(win) = app.get_webview_window(label) {
+            if let Err(e) = win.set_theme(Some(theme)) {
+                log::warn!("set_theme failed on '{label}': {e}");
+            }
+        }
+    }
+
     if let Err(e) = app.emit("settings:changed", &s) {
         log::warn!("failed to emit settings:changed: {e}");
     }

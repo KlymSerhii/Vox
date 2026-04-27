@@ -3,8 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark" />
+    <meta name="color-scheme" content="dark light" />
     <title>Vox</title>
+    <script>
+      document.documentElement.dataset.theme = (() => { const v = localStorage.getItem('vox-theme'); return v === 'light' || v === 'dark' ? v : 'dark'; })();
+    </script>
     <style>
       html,
       body,

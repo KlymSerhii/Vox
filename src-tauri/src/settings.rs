@@ -43,6 +43,9 @@ const KEY_ACTIVE_MODE_ID: &str = "active_mode_id";
 const KEY_MODE_CYCLE_HOTKEY: &str = "mode_cycle_hotkey";
 const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
 
+// Appearance.
+const KEY_APPEARANCE: &str = "appearance";
+
 // Legacy keys we still read once for migration. Any time we touch the
 // store we delete these so they never come back.
 const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
@@ -95,6 +98,9 @@ fn default_mode_cycle_hotkey() -> String {
 fn default_auto_suggest_modes() -> bool {
     true
 }
+fn default_appearance() -> String {
+    "dark".into()
+}
 
 /// User-visible settings. Local-only — no API keys, no cloud secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,6 +152,10 @@ pub struct Settings {
     pub mode_cycle_hotkey: String,
     #[serde(default = "default_auto_suggest_modes")]
     pub auto_suggest_modes: bool,
+
+    // ---- Appearance ----
+    #[serde(default = "default_appearance")]
+    pub appearance: String,
 }
 
 impl Default for Settings {
@@ -173,6 +183,7 @@ impl Default for Settings {
             active_mode_id: default_active_mode_id(),
             mode_cycle_hotkey: default_mode_cycle_hotkey(),
             auto_suggest_modes: default_auto_suggest_modes(),
+            appearance: default_appearance(),
         }
     }
 }
@@ -345,6 +356,17 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .unwrap_or_else(default_mode_cycle_hotkey);
     let auto_suggest_modes = get_bool(KEY_AUTO_SUGGEST_MODES, default_auto_suggest_modes());
 
+    // Appearance: "light" | "dark"; coerce anything else to "dark".
+    let appearance = match store
+        .get(KEY_APPEARANCE)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .as_deref()
+    {
+        Some("light") => "light".to_string(),
+        Some("dark") => "dark".to_string(),
+        _ => default_appearance(),
+    };
+
     // -------- Scrub legacy cloud secrets ----------------------------------
     //
     // Historic plaintext API keys and the old `migration_seen` /
@@ -390,6 +412,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         active_mode_id,
         mode_cycle_hotkey,
         auto_suggest_modes,
+        appearance,
     }
 }
 
@@ -472,6 +495,16 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     store.set(
         KEY_AUTO_SUGGEST_MODES,
         serde_json::Value::Bool(settings.auto_suggest_modes),
+    );
+
+    // Appearance — store-side validation mirrors `load`.
+    let appearance = match settings.appearance.as_str() {
+        "light" => "light",
+        _ => "dark",
+    };
+    store.set(
+        KEY_APPEARANCE,
+        serde_json::Value::String(appearance.to_string()),
     );
 
     // Drop deprecated keys defensively on every save — these may have
