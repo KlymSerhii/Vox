@@ -4,7 +4,6 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export interface Settings {
   hotkey: string;
   cancel_hotkey: string;
-  paste_last_hotkey: string;
   launch_at_login: boolean;
   dictation_enabled: boolean;
   hands_free_enabled: boolean;
@@ -172,10 +171,6 @@ export async function getLaunchAtLogin(): Promise<boolean> {
 
 export async function setLaunchAtLogin(enabled: boolean): Promise<void> {
   await invoke("set_launch_at_login", { enabled });
-}
-
-export async function copyLastTranscript(): Promise<void> {
-  await invoke("copy_last_transcript");
 }
 
 export async function copyText(text: string): Promise<void> {

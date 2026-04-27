@@ -31,11 +31,15 @@ interface ModeSuggestionPayload {
 }
 
 const BARS = 24;
+const METER_BARS = 10;
 
 export default function PillView() {
   const [state, setState] = createSignal<PillState>("listening");
   const [message, setMessage] = createSignal<string | null>(null);
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
+  const [meter, setMeter] = createSignal<number[]>(
+    new Array(METER_BARS).fill(0),
+  );
   const [activeMode, setActiveMode] = createSignal<ActiveModePayload | null>(
     null,
   );
@@ -56,18 +60,19 @@ export default function PillView() {
     );
     unlisten.push(
       await listen<AudioLevelPayload>("pill:audio_level", (e) => {
-        // Shift bars left and push the new sample on the right.
+        const v = clamp(e.payload.level);
         setLevels((prev) => {
           const next = prev.slice(1);
-          next.push(clamp(e.payload.level));
+          next.push(v);
           return next;
         });
+        setMeter((prev) => nextMeter(prev, v));
       }),
     );
     unlisten.push(
       await listen("pill:show", () => {
-        // Reset bars when a new session starts.
         setLevels(new Array(BARS).fill(0));
+        setMeter(new Array(METER_BARS).fill(0));
         setSuggestion(null);
       }),
     );
@@ -108,7 +113,7 @@ export default function PillView() {
         role="status"
         aria-live="polite"
       >
-        <LeftIcon state={state()} />
+        <LeftIcon state={state()} meter={meter()} />
         <div class="min-w-0 flex-1">
           <Show
             when={state() === "listening"}
@@ -197,6 +202,24 @@ function clamp(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
+function nextMeter(prev: number[], sample: number): number[] {
+  // Each bar trails the next one by a frame so an incoming sample
+  // visibly "ripples" through the cluster instead of moving every bar
+  // in unison. Slower decay (0.85) keeps the leftmost bars in motion
+  // even with 10 bars — at 0.7 they'd damp to nothing before reaching
+  // the far edge.
+  const next = new Array(prev.length).fill(0);
+  next[next.length - 1] = sample;
+  for (let i = 0; i < next.length - 1; i++) {
+    const incoming = prev[i + 1] ?? 0;
+    const decayed = (prev[i] ?? 0) * 0.85;
+    next[i] = Math.max(decayed, incoming);
+  }
+  const tailDecayed = (prev[prev.length - 1] ?? 0) * 0.85;
+  next[next.length - 1] = Math.max(tailDecayed, sample);
+  return next;
+}
+
 function pillLabel(state: PillState, message: string | null): string {
   if (message) return message;
   switch (state) {
@@ -232,11 +255,17 @@ function rightLabel(state: PillState): string {
   }
 }
 
-function LeftIcon(props: { state: PillState }) {
+function LeftIcon(props: { state: PillState; meter: number[] }) {
   return (
-    <div class="flex h-7 w-7 shrink-0 items-center justify-center">
+    <div
+      class="flex h-8 shrink-0 items-center justify-center"
+      classList={{
+        "w-[52px]": props.state === "listening",
+        "w-7": props.state !== "listening",
+      }}
+    >
       <Show when={props.state === "listening"}>
-        <MicIcon pulse />
+        <MicLevelMeter bars={props.meter} />
       </Show>
       <Show
         when={
@@ -258,24 +287,39 @@ function LeftIcon(props: { state: PillState }) {
   );
 }
 
-function MicIcon(props: { pulse?: boolean }) {
+function MicLevelMeter(props: { bars: number[] }) {
+  // 10-bar level meter that replaces the static mic icon during
+  // Listening. Center-tall profile keeps the cluster cohesive.
+  // 1.8× gain (clamped) on raw level pushes speech peaks to the full
+  // 30px height so quiet vs speaking is dramatic at a glance.
+  const PROFILE = [0.7, 0.82, 0.92, 0.98, 1.0, 1.0, 0.98, 0.92, 0.82, 0.7];
+  const MAX_H = 30;
+  const MIN_H = 2;
+  const GAIN = 1.8;
   return (
-    <svg
-      class={props.pulse ? "animate-pulse-mic" : ""}
-      width="20"
-      height="20"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="var(--color-accent)"
-      stroke-width="1.75"
-      stroke-linecap="round"
-      stroke-linejoin="round"
+    <div
+      class="flex h-8 items-center justify-center gap-[2px]"
       aria-hidden="true"
     >
-      <rect x="9" y="2" width="6" height="12" rx="3" />
-      <path d="M5 10a7 7 0 0 0 14 0" />
-      <line x1="12" y1="17" x2="12" y2="22" />
-    </svg>
+      {props.bars.map((level, i) => {
+        const amped = Math.min(1.0, level * GAIN);
+        const shaped = amped * (PROFILE[i] ?? 1);
+        const h = MIN_H + Math.round(shaped * (MAX_H - MIN_H));
+        const active = level > 0.06;
+        return (
+          <div
+            style={{
+              width: "3px",
+              height: `${h}px`,
+              "border-radius": "2px",
+              background: "var(--color-accent)",
+              opacity: active ? 0.95 : 0.5,
+              transition: "height 120ms ease-out, opacity 200ms ease-out",
+            }}
+          />
+        );
+      })}
+    </div>
   );
 }
 
@@ -362,8 +406,13 @@ function Waveform(props: { levels: number[] }) {
       aria-hidden="true"
     >
       {props.levels.map((level) => {
-        const h = Math.max(2, Math.round(level * 24));
-        const opacity = 0.4 + level * 0.6;
+        // Soft gamma so the bottom half of the dynamic range opens up
+        // (Whisper-grade RMS spends most of its life in [0, 0.3]).
+        const shaped = Math.pow(level, 0.7);
+        // 1px floor when silent — clearly a flat line, not a wall of
+        // bars. Speech peaks to the full 24px height.
+        const h = Math.max(1, Math.round(shaped * 24));
+        const opacity = 0.25 + shaped * 0.75;
         return (
           <div
             style={{

@@ -65,7 +65,6 @@ pub fn set_settings<R: Runtime>(
     let before = settings::load(&app);
     let hotkeys_changed = before.hotkey != settings.hotkey
         || before.cancel_hotkey != settings.cancel_hotkey
-        || before.paste_last_hotkey != settings.paste_last_hotkey
         || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
 
     settings::save(&app, &settings).map_err(|e| e.to_string())?;
@@ -77,7 +76,6 @@ pub fn set_settings<R: Runtime>(
                 &app,
                 &settings.hotkey,
                 &settings.cancel_hotkey,
-                &settings.paste_last_hotkey,
                 &settings.mode_cycle_hotkey,
                 ctx_clone,
             ) {
@@ -394,66 +392,6 @@ pub fn set_launch_at_login<R: Runtime>(
     let mut s = settings::load(&app);
     s.launch_at_login = enabled;
     let _ = settings::save(&app, &s);
-    Ok(())
-}
-
-// -------- Copy-last-transcript -----------------------------------------------
-
-#[tauri::command]
-pub fn copy_last_transcript<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    if let Some(ctx) = app.try_state::<session::SessionCtx>() {
-        if ctx.is_pipeline_active() {
-            return Err("Vox is busy with another dictation.".into());
-        }
-    }
-
-    let snap = transcripts::snapshot();
-    let Some(latest) = snap.first() else {
-        pill::show(&app);
-        pill::emit_state(
-            &app,
-            pill::PillState::Error,
-            Some("No recent transcript yet.".into()),
-        );
-        let app_arc = std::sync::Arc::new(app.clone());
-        pill::hide_after(&app_arc, 2000);
-        return Err("No recent transcript.".into());
-    };
-
-    let text = latest.text.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            crate::inject::copy_to_clipboard(&text)
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                pill::show(&app);
-                pill::emit_state(
-                    &app,
-                    pill::PillState::Done,
-                    Some("Copied — press ⌘V to paste.".into()),
-                );
-                let app_arc = std::sync::Arc::new(app.clone());
-                pill::hide_after(&app_arc, 1800);
-            }
-            Ok(Err(e)) => {
-                log::error!("copy-last failed: {e}");
-                pill::show(&app);
-                pill::emit_state(
-                    &app,
-                    pill::PillState::Error,
-                    Some("Copy failed.".into()),
-                );
-                let app_arc = std::sync::Arc::new(app.clone());
-                pill::hide_after(&app_arc, 3000);
-            }
-            Err(e) => {
-                log::error!("copy-last task panicked: {e}");
-            }
-        }
-    });
     Ok(())
 }
 
@@ -786,10 +724,6 @@ pub fn diagnose_hotkeys<R: Runtime>(app: AppHandle<R>) -> DiagnoseHotkeys {
             HotkeyDiagnostic::from_active(
                 "cancel",
                 state.snapshot(HotkeyPurpose::Cancel),
-            ),
-            HotkeyDiagnostic::from_active(
-                "paste-last",
-                state.snapshot(HotkeyPurpose::PasteLast),
             ),
             HotkeyDiagnostic::from_active(
                 "mode-cycle",

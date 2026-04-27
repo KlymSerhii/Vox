@@ -23,7 +23,6 @@ pub const STORE_FILE: &str = "vox-settings.json";
 
 const KEY_HOTKEY: &str = "hotkey";
 const KEY_CANCEL_HOTKEY: &str = "cancel_hotkey";
-const KEY_PASTE_LAST_HOTKEY: &str = "paste_last_hotkey";
 const KEY_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const KEY_ONBOARDED: &str = "onboarded";
 const KEY_DICTATION_ENABLED: &str = "dictation_enabled";
@@ -61,9 +60,6 @@ fn default_hotkey() -> String {
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
-}
-fn default_paste_last_hotkey() -> String {
-    "Alt+Shift+V".to_string()
 }
 fn default_language() -> String {
     "auto".to_string()
@@ -107,8 +103,6 @@ pub struct Settings {
     pub hotkey: String,
     #[serde(default = "default_cancel_hotkey")]
     pub cancel_hotkey: String,
-    #[serde(default = "default_paste_last_hotkey")]
-    pub paste_last_hotkey: String,
 
     #[serde(default)]
     pub launch_at_login: bool,
@@ -159,7 +153,6 @@ impl Default for Settings {
         Self {
             hotkey: default_hotkey(),
             cancel_hotkey: default_cancel_hotkey(),
-            paste_last_hotkey: default_paste_last_hotkey(),
             launch_at_login: false,
             dictation_enabled: true,
             // 2026-04-26: toggle is the new default — press the hotkey
@@ -230,10 +223,6 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .get(KEY_CANCEL_HOTKEY)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .unwrap_or_else(default_cancel_hotkey);
-    let paste_last_hotkey = store
-        .get(KEY_PASTE_LAST_HOTKEY)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_paste_last_hotkey);
     let language = store
         .get(KEY_LANGUAGE)
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -386,7 +375,6 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     Settings {
         hotkey,
         cancel_hotkey,
-        paste_last_hotkey,
         launch_at_login,
         dictation_enabled,
         hands_free_enabled,
@@ -419,10 +407,6 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     store.set(
         KEY_CANCEL_HOTKEY,
         serde_json::Value::String(settings.cancel_hotkey.clone()),
-    );
-    store.set(
-        KEY_PASTE_LAST_HOTKEY,
-        serde_json::Value::String(settings.paste_last_hotkey.clone()),
     );
     store.set(
         KEY_LANGUAGE,
@@ -573,7 +557,6 @@ pub fn set_hotkey_field<R: Runtime>(
     let key = match purpose {
         HotkeyPurpose::PushToTalk => KEY_HOTKEY,
         HotkeyPurpose::Cancel => KEY_CANCEL_HOTKEY,
-        HotkeyPurpose::PasteLast => KEY_PASTE_LAST_HOTKEY,
         HotkeyPurpose::ModeCycle => KEY_MODE_CYCLE_HOTKEY,
     };
     store.set(key, serde_json::Value::String(value.to_string()));
@@ -588,6 +571,5 @@ pub fn set_hotkey_field<R: Runtime>(
 pub enum HotkeyPurpose {
     PushToTalk,
     Cancel,
-    PasteLast,
     ModeCycle,
 }

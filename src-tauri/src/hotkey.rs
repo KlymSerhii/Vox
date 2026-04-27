@@ -3,9 +3,7 @@
 //! Primary: push-to-talk on the user-selected key (default `F13`).
 //! Secondary: a cancel hotkey (default `Escape`) that aborts the in-flight
 //! session without pasting.
-//! Tertiary: a paste-last-transcript hotkey (default `Alt+Shift+V`) that
-//! re-pastes the most recent transcript at the cursor.
-//! Quaternary: a mode-cycle hotkey (default `Alt+M`).
+//! Tertiary: a mode-cycle hotkey (default `Alt+M`).
 //!
 //! When `hands_free_enabled` is true, the push-to-talk hotkey acts as a
 //! toggle (press to start, press again to stop) instead of as
@@ -37,9 +35,9 @@
 //!    `KEY_PTT_FALLBACKS` looking for the next bindable explicit-key
 //!    option. This is opt-in by virtue of the user choosing a key in
 //!    the picker.
-//! 3. **Cancel / paste-last / mode-cycle** keep the same behavior they
-//!    had before — they're discrete events, not press+release, and a
-//!    chord doesn't make sense for them.
+//! 3. **Cancel / mode-cycle** keep the same behavior they had before —
+//!    they're discrete events, not press+release, and a chord doesn't
+//!    make sense for them.
 //!
 //! When push-to-talk binding fails we surface the error string through
 //! `ActiveHotkey.error` so the UI can render "Chord requires
@@ -77,10 +75,6 @@ const KEY_PTT_FALLBACKS: &[&str] = &[
     "F15",
 ];
 const CANCEL_FALLBACKS: &[&str] = &["Escape"];
-const PASTE_LAST_FALLBACKS: &[&str] = &[
-    "Alt+Shift+V",
-    "CommandOrControl+Shift+V",
-];
 const MODE_CYCLE_FALLBACKS: &[&str] = &[
     "Alt+M",
     "Alt+Shift+M",
@@ -133,7 +127,6 @@ impl ActiveHotkey {
 pub struct ActiveHotkeyState {
     pub push_to_talk: Mutex<ActiveHotkey>,
     pub cancel: Mutex<ActiveHotkey>,
-    pub paste_last: Mutex<ActiveHotkey>,
     pub mode_cycle: Mutex<ActiveHotkey>,
     /// Owns the lifetime of the `CGEventTap`-backed chord listener (if
     /// any). On re-`register()` we drop the prior handle BEFORE
@@ -147,7 +140,6 @@ impl ActiveHotkeyState {
         let guard = match purpose {
             HotkeyPurpose::PushToTalk => self.push_to_talk.lock(),
             HotkeyPurpose::Cancel => self.cancel.lock(),
-            HotkeyPurpose::PasteLast => self.paste_last.lock(),
             HotkeyPurpose::ModeCycle => self.mode_cycle.lock(),
         };
         match guard {
@@ -160,7 +152,6 @@ impl ActiveHotkeyState {
         let cell = match purpose {
             HotkeyPurpose::PushToTalk => &self.push_to_talk,
             HotkeyPurpose::Cancel => &self.cancel,
-            HotkeyPurpose::PasteLast => &self.paste_last,
             HotkeyPurpose::ModeCycle => &self.mode_cycle,
         };
         match cell.lock() {
@@ -188,14 +179,6 @@ fn shortcut_from_key(id: &str) -> Option<Shortcut> {
         "CommandOrControl+Shift+Semicolon" | "Cmd+Shift+;" => Some(Shortcut::new(
             Some(Modifiers::META | Modifiers::SHIFT),
             Code::Semicolon,
-        )),
-        "Alt+Shift+V" => Some(Shortcut::new(
-            Some(Modifiers::ALT | Modifiers::SHIFT),
-            Code::KeyV,
-        )),
-        "Cmd+Shift+V" | "CommandOrControl+Shift+V" => Some(Shortcut::new(
-            Some(Modifiers::META | Modifiers::SHIFT),
-            Code::KeyV,
         )),
         "Alt+M" => Some(Shortcut::new(Some(Modifiers::ALT), Code::KeyM)),
         "Alt+Shift+M" => Some(Shortcut::new(
@@ -287,7 +270,6 @@ pub fn register<R: Runtime>(
     app: &AppHandle<R>,
     preferred: &str,
     cancel_preferred: &str,
-    paste_last_preferred: &str,
     mode_cycle_preferred: &str,
     ctx: SessionCtx,
 ) -> Result<String, String> {
@@ -309,9 +291,9 @@ pub fn register<R: Runtime>(
     // For the push-to-talk slot we walk a preference chain that tries
     // the chord listener (CGEventTap, whispr-flow UX) first, then falls
     // back to the standard `tauri-plugin-global-shortcut` path. Cancel
-    // / paste-last / mode-cycle stay on the regular plugin — they're
-    // discrete events, not press+release, and modifier-only chords
-    // would conflict with normal typing there.
+    // / mode-cycle stay on the regular plugin — they're discrete events,
+    // not press+release, and modifier-only chords would conflict with
+    // normal typing there.
     #[cfg(target_os = "macos")]
     {
         // Surface the current Accessibility status. We can't easily
@@ -396,83 +378,6 @@ pub fn register<R: Runtime>(
 
     let cancel_bound_sc = shortcut_from_key(&cancel_active.bound);
 
-    // ---- Paste last -------------------------------------------------------
-    let paste_active = if paste_last_preferred.is_empty() {
-        ActiveHotkey::empty("")
-    } else {
-        let outcome = try_chain(paste_last_preferred, PASTE_LAST_FALLBACKS, |key, sc| {
-            if Some(sc) == ptt_bound_sc {
-                return Err(format!(
-                    "'{key}' collides with push-to-talk; not registering"
-                ));
-            }
-            if Some(sc) == cancel_bound_sc {
-                return Err(format!(
-                    "'{key}' collides with cancel; not registering"
-                ));
-            }
-            let app_handle = app.clone();
-            gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
-                if let ShortcutState::Pressed = event.state() {
-                    log::error!(
-                        "hotkey: copy-last fired; dispatching to \
-                         commands::copy_last_transcript"
-                    );
-                    if let Err(e) =
-                        crate::commands::copy_last_transcript(app_handle.clone())
-                    {
-                        log::error!("copy_last_transcript dispatch failed: {e}");
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())
-        });
-        match outcome {
-            Ok(out) => {
-                if out.fell_back {
-                    log::error!(
-                        "paste-last: configured '{paste_last_preferred}' \
-                         could not be bound; using fallback '{}'. \
-                         Errors: {}",
-                        out.bound,
-                        out.error_chain.join("; ")
-                    );
-                    if let Err(e) = settings::set_hotkey_field(
-                        app,
-                        HotkeyPurpose::PasteLast,
-                        &out.bound,
-                    ) {
-                        log::warn!("could not persist resolved paste-last hotkey: {e}");
-                    }
-                }
-                ActiveHotkey {
-                    configured: paste_last_preferred.to_string(),
-                    bound: out.bound,
-                    fell_back: out.fell_back,
-                    mechanism: "shortcut".to_string(),
-                    error: out.primary_error,
-                    error_chain: out.error_chain,
-                }
-            }
-            Err(chain) => {
-                log::error!(
-                    "paste-last: NO hotkey could be bound. Tried: {}",
-                    chain.join("; ")
-                );
-                ActiveHotkey {
-                    configured: paste_last_preferred.to_string(),
-                    bound: String::new(),
-                    fell_back: false,
-                    mechanism: String::new(),
-                    error: chain.first().cloned(),
-                    error_chain: chain,
-                }
-            }
-        }
-    };
-
-    let paste_bound_sc = shortcut_from_key(&paste_active.bound);
-
     // ---- Mode cycle -------------------------------------------------------
     let mode_active = if mode_cycle_preferred.is_empty() {
         ActiveHotkey::empty("")
@@ -486,11 +391,6 @@ pub fn register<R: Runtime>(
             if Some(sc) == cancel_bound_sc {
                 return Err(format!(
                     "'{key}' collides with cancel; not registering"
-                ));
-            }
-            if Some(sc) == paste_bound_sc {
-                return Err(format!(
-                    "'{key}' collides with paste-last; not registering"
                 ));
             }
             let app_handle = app.clone();
@@ -549,13 +449,11 @@ pub fn register<R: Runtime>(
     if let Some(state) = app.try_state::<ActiveHotkeyState>() {
         state.store(HotkeyPurpose::PushToTalk, ptt_active.clone());
         state.store(HotkeyPurpose::Cancel, cancel_active.clone());
-        state.store(HotkeyPurpose::PasteLast, paste_active.clone());
         state.store(HotkeyPurpose::ModeCycle, mode_active.clone());
     } else {
         let new_state = ActiveHotkeyState::default();
         new_state.store(HotkeyPurpose::PushToTalk, ptt_active.clone());
         new_state.store(HotkeyPurpose::Cancel, cancel_active.clone());
-        new_state.store(HotkeyPurpose::PasteLast, paste_active.clone());
         new_state.store(HotkeyPurpose::ModeCycle, mode_active.clone());
         app.manage(new_state);
     }
@@ -565,8 +463,7 @@ pub fn register<R: Runtime>(
     // mechanism (chord vs shortcut) for the push-to-talk binding.
     log::info!(
         "hotkey: push-to-talk={} mechanism={} (configured {}), \
-         cancel={} (configured {}), paste-last={} (configured {}), \
-         mode-cycle={} (configured {})",
+         cancel={} (configured {}), mode-cycle={} (configured {})",
         display_bound(&ptt_active),
         if ptt_active.mechanism.is_empty() {
             "<none>"
@@ -576,8 +473,6 @@ pub fn register<R: Runtime>(
         nonempty(&ptt_active.configured),
         display_bound(&cancel_active),
         nonempty(&cancel_active.configured),
-        display_bound(&paste_active),
-        nonempty(&paste_active.configured),
         display_bound(&mode_active),
         nonempty(&mode_active.configured),
     );

@@ -554,7 +554,6 @@ function HowToUseStep(props: { s: Settings | null }) {
 
   const ptt = () => diags().get("push-to-talk");
   const cycle = () => diags().get("mode-cycle");
-  const paste = () => diags().get("paste-last");
 
   const pttGlyph = () =>
     formatHotkey(ptt()?.bound) ||
@@ -564,10 +563,6 @@ function HowToUseStep(props: { s: Settings | null }) {
     formatHotkey(cycle()?.bound) ||
     formatHotkey(props.s?.mode_cycle_hotkey) ||
     "⌥M";
-  const pasteGlyph = () =>
-    formatHotkey(paste()?.bound) ||
-    formatHotkey(props.s?.paste_last_hotkey) ||
-    "⌥⇧V";
 
   const handsFree = () => props.s?.hands_free_enabled ?? true;
   const pttVerb = () => (handsFree() ? "Press" : "Hold");
@@ -608,11 +603,6 @@ function HowToUseStep(props: { s: Settings | null }) {
           label={<span class="keycap">{cycleGlyph()}</span>}
           description="to cycle Voice Modes. Match your tone to the app you're in."
           fellBackNote={fellBackNote(cycle())}
-        />
-        <TipRow
-          label={<span class="keycap">{pasteGlyph()}</span>}
-          description="to copy your last transcript to the clipboard again."
-          fellBackNote={fellBackNote(paste())}
         />
       </ul>
 

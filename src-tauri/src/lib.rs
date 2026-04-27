@@ -62,7 +62,6 @@ pub fn run() {
             commands::show_tray_popover,
             commands::get_launch_at_login,
             commands::set_launch_at_login,
-            commands::copy_last_transcript,
             commands::check_for_updates,
             commands::list_models,
             commands::download_model,
@@ -125,7 +124,6 @@ pub fn run() {
                 app_handle,
                 &s.hotkey,
                 &s.cancel_hotkey,
-                &s.paste_last_hotkey,
                 &s.mode_cycle_hotkey,
                 ctx.clone(),
             ) {

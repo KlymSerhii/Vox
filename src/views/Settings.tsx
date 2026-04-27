@@ -82,14 +82,6 @@ const CANCEL_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "F15", label: "F15" },
 ];
 
-const PASTE_LAST_HOTKEY_OPTIONS: HotkeyOption[] = [
-  { value: "Alt+Shift+V", label: "⌥⇧V" },
-  { value: "CommandOrControl+Shift+V", label: "⌘⇧V" },
-  { value: "F13", label: "F13" },
-  { value: "F14", label: "F14" },
-  { value: "F15", label: "F15" },
-];
-
 const MODE_CYCLE_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "Alt+M", label: "⌥M" },
   { value: "Alt+Shift+M", label: "⌥⇧M" },
@@ -562,7 +554,6 @@ function HotkeysTab(props: {
 
   const ptt = () => diags().get("push-to-talk") ?? null;
   const cancel = () => diags().get("cancel") ?? null;
-  const paste = () => diags().get("paste-last") ?? null;
   const cycle = () => diags().get("mode-cycle") ?? null;
 
   return (
@@ -615,14 +606,6 @@ function HotkeysTab(props: {
           diagnostic={cancel()}
           options={CANCEL_HOTKEY_OPTIONS}
           onChange={(v) => props.update({ cancel_hotkey: v })}
-        />
-        <HotkeyRow
-          label="Copy last transcript"
-          hint="Re-copy the most recent dictation to the clipboard."
-          configured={props.s.paste_last_hotkey}
-          diagnostic={paste()}
-          options={PASTE_LAST_HOTKEY_OPTIONS}
-          onChange={(v) => props.update({ paste_last_hotkey: v })}
         />
         <HotkeyRow
           label="Cycle voice mode"
