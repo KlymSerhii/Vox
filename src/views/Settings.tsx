@@ -75,38 +75,6 @@ interface HotkeyOption {
   warn?: string;
 }
 
-const HOTKEY_OPTIONS: HotkeyOption[] = [
-  // The default — bound via tauri-plugin-global-shortcut (Carbon
-  // RegisterEventHotKey) so it does NOT require Accessibility. Pairs
-  // well with hands-free toggle: press once to start, press again to
-  // stop. The label uses macOS naming ("Option" not "Alt") to match
-  // what's printed on the keys.
-  { value: "Cmd+Alt+L", label: "⌘ + ⌥ + L (recommended)" },
-  // Other plain-shortcut options.
-  { value: "CommandOrControl+Shift+Space", label: "⌘⇧Space" },
-  { value: "CommandOrControl+Shift+Semicolon", label: "⌘⇧;" },
-  { value: "F13", label: "F13" },
-  { value: "F14", label: "F14" },
-  { value: "F15", label: "F15" },
-  // Modifier-only chords — bound via the CGEventTap path
-  // (mac_chord.rs). These are the whispr-flow style hold-to-talk UX
-  // but require Accessibility permission to install. If the chord
-  // install fails the picker surfaces a clear "Not bound —
-  // Accessibility required" chip and a link into System Settings —
-  // see `HotkeyRow.failed`. Chord configurations never auto-fall-back
-  // to a key.
-  { value: "Alt+Control", label: "Option + Control (chord, requires Accessibility)" },
-  { value: "Alt+Shift", label: "Option + Shift (chord, requires Accessibility)" },
-  {
-    value: "AltRight",
-    label: "Right Option (⌥)",
-    warn:
-      "Right-Option fails to bind on most Macs through " +
-      "tauri-plugin-global-shortcut. If it doesn't work the picker will " +
-      "show a 'Not bound' chip — choose another option from this list.",
-  },
-];
-
 const CANCEL_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "Escape", label: "Esc" },
   { value: "F13", label: "F13" },
@@ -292,7 +260,7 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
         </For>
       </nav>
       <div class="mt-auto px-3 text-center text-[11px] text-[var(--color-ink-faint)]">
-        Vox 0.1.0
+        Vox 1.0.0
       </div>
     </aside>
   );
@@ -609,41 +577,46 @@ function HotkeysTab(props: {
   return (
     <>
       <Card>
-        <HotkeyRow
-          label="Push-to-talk"
-          hint={pttHint(props.s.hands_free_enabled, ptt())}
-          configured={props.s.hotkey}
-          diagnostic={ptt()}
-          options={HOTKEY_OPTIONS}
-          onChange={(v) => props.update({ hotkey: v })}
-          extra={
-            <>
-              <button
-                type="button"
-                onClick={() => void onTest()}
-                class="rounded-[6px] bg-white/8 px-3 py-1 text-[11px] hover:bg-white/12"
-                title="Read the current binding from the runtime"
+        <div class="flex items-start justify-between gap-4 border-b border-[var(--color-border)] px-4 py-3">
+          <div class="flex flex-col">
+            <div class="flex items-center gap-2">
+              <span class="text-[13px] text-[var(--color-ink)]">
+                Push-to-talk
+              </span>
+              <span class="rounded-full bg-white/8 px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
+                ⌘ + ⌃ + Space
+              </span>
+            </div>
+            <span class="mt-0.5 text-[11px] text-[var(--color-ink-mute)]">
+              {pttHint(props.s.hands_free_enabled, ptt())}
+            </span>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void onTest()}
+              class="rounded-[6px] bg-white/8 px-3 py-1 text-[11px] hover:bg-white/12"
+              title="Read the current binding from the runtime"
+            >
+              Test
+            </button>
+            <Show when={testStatus()}>
+              <span
+                class="rounded-full bg-black/40 px-2 py-0.5 text-[10px]"
+                classList={{
+                  "text-[var(--color-success)]":
+                    testStatus()?.startsWith("Bound") ?? false,
+                  "text-[var(--color-danger)]":
+                    testStatus()?.startsWith("Failed") ?? false,
+                  "text-[var(--color-ink-mute)]":
+                    testStatus() === "Reading…",
+                }}
               >
-                Test
-              </button>
-              <Show when={testStatus()}>
-                <span
-                  class="rounded-full bg-black/40 px-2 py-0.5 text-[10px]"
-                  classList={{
-                    "text-[var(--color-success)]":
-                      testStatus()?.startsWith("Bound") ?? false,
-                    "text-[var(--color-danger)]":
-                      testStatus()?.startsWith("Failed") ?? false,
-                    "text-[var(--color-ink-mute)]":
-                      testStatus() === "Reading…",
-                  }}
-                >
-                  {testStatus()}
-                </span>
-              </Show>
-            </>
-          }
-        />
+                {testStatus()}
+              </span>
+            </Show>
+          </div>
+        </div>
         <HotkeyRow
           label="Cancel while recording"
           hint="Abort the pipeline without copying."
@@ -1008,7 +981,7 @@ function ModelsTab(props: {
       <Card>
         <Row
           label="Polish transcripts"
-          hint="Run a local Gemma model on each transcript to fix punctuation, remove filler words, and apply your active Voice Mode. When off, raw Whisper output is copied verbatim."
+          hint="Run a local Gemma model on each transcript to fix punctuation, remove filler words, and apply your active Voice Mode. When off, raw output is copied verbatim."
           last
         >
           <Toggle
@@ -1668,7 +1641,7 @@ function ModeEditor(props: {
                 <input
                   type="text"
                   class="flex-1 rounded-[6px] bg-black/30 px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-                  placeholder="e.g. SwiftUI, ESLint"
+                  placeholder="Add proper nouns, acronyms, or technical terms — one per line."
                   value={dictDraft()}
                   onInput={(e) => setDictDraft(e.currentTarget.value)}
                   onKeyDown={(e) => {
@@ -1831,7 +1804,7 @@ function DictionaryTab(props: {
             <input
               type="text"
               class="flex-1 rounded-[6px] bg-black/30 px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-              placeholder="e.g. Klymenko, Tauri, gpt-4o"
+              placeholder="Add proper nouns, acronyms, or technical terms — one per line."
               value={draft()}
               onInput={(e) => setDraft(e.currentTarget.value)}
               onKeyDown={(e) => {
@@ -1998,7 +1971,7 @@ function AboutTab() {
           Talk to any app — now offline by default.
         </div>
         <div class="mt-3 text-[11px] text-[var(--color-ink-faint)]">
-          Version 0.1.0 · Local-first · Built with Tauri
+          Version 1.0.0 · Local-first · Built with Tauri
         </div>
       </div>
       <Card>
@@ -2131,7 +2104,7 @@ function formatDiagnostics(d: DiagnoseHotkeys): string {
     const mech = e.mechanism ? ` mechanism=${e.mechanism}` : "";
     lines.push(
       `${e.purpose.padEnd(14)} configured=${cfg.padEnd(28)} bound=${bnd}${mech}` +
-        (e.fell_back ? "  [fallback]" : ""),
+      (e.fell_back ? "  [fallback]" : ""),
     );
     if (e.error_chain.length > 0) {
       for (const err of e.error_chain) {

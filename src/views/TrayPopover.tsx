@@ -8,7 +8,8 @@ import {
   openSettingsWindow,
   quitApp,
   setActiveMode,
-  setDictationEnabled,
+  setHandsFreeEnabled,
+  setPolishingEnabled,
   type RecentTranscript,
   type Settings,
   type VoiceMode,
@@ -73,14 +74,24 @@ export default function TrayPopoverView() {
     return modes().find((m) => m.id === id) ?? modes()[0];
   }
 
-  async function toggleDictation(v: boolean) {
+  async function toggleHandsFree(v: boolean) {
     const cur = s();
     if (!cur) return;
-    const next = { ...cur, dictation_enabled: v };
+    const next = { ...cur, hands_free_enabled: v };
     setS(next);
-    // Use the narrow command — the tray popover is not a secret-bearing
-    // window and must not call set_settings (which carries API keys).
-    await setDictationEnabled(v);
+    await setHandsFreeEnabled(v);
+  }
+
+  async function togglePolishing(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    const next = {
+      ...cur,
+      polishing_enabled: v,
+      llm_engine: v ? "gemma-local" : "none",
+    };
+    setS(next);
+    await setPolishingEnabled(v);
   }
 
   async function copyRecent(idx: number, text: string) {
@@ -151,14 +162,35 @@ export default function TrayPopoverView() {
             <div class="border-b border-[var(--color-border)] px-4 py-3">
               <div class="flex items-center justify-between">
                 <div class="flex flex-col">
-                  <span class="text-[13px] font-medium">Dictation</span>
+                  <span class="text-[13px] font-medium">
+                    {st().hands_free_enabled ? "Press to talk" : "Hold to talk"}
+                  </span>
                   <span class="text-[11px] text-[var(--color-ink-mute)]">
-                    Hold <span class="keycap">⌥</span> to speak
+                    {st().hands_free_enabled
+                      ? "Press the hotkey to start, press again to stop."
+                      : "Hold the hotkey while speaking, release to stop."}
                   </span>
                 </div>
                 <Toggle
-                  checked={st().dictation_enabled}
-                  onChange={toggleDictation}
+                  checked={st().hands_free_enabled}
+                  onChange={toggleHandsFree}
+                />
+              </div>
+            </div>
+
+            <div class="border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between">
+                <div class="flex flex-col">
+                  <span class="text-[13px] font-medium">Polish transcripts</span>
+                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+                    {st().polishing_enabled
+                      ? "Gemma cleans up the transcript before copying."
+                      : "Raw output is copied as-is."}
+                  </span>
+                </div>
+                <Toggle
+                  checked={st().polishing_enabled}
+                  onChange={togglePolishing}
                 />
               </div>
             </div>
@@ -290,24 +322,7 @@ export default function TrayPopoverView() {
               </Show>
             </div>
 
-            <div class="border-t border-[var(--color-border)] px-4 py-2 text-[11px] text-[var(--color-ink-mute)]">
-              <div class="flex items-center justify-between">
-                <span>Hotkey</span>
-                <span class="keycap">
-                  {hotkeyLabel(st().hotkey)}
-                </span>
-              </div>
-            </div>
-
             <footer class="flex border-t border-[var(--color-border)]">
-              <button
-                type="button"
-                class="flex-1 py-3 text-[12px] text-[var(--color-ink)] hover:bg-white/4"
-                onClick={() => openSettingsWindow()}
-              >
-                Settings…
-              </button>
-              <div class="w-px bg-[var(--color-border)]" />
               <button
                 type="button"
                 class="flex-1 py-3 text-[12px] text-[var(--color-ink-mute)] hover:bg-white/4 hover:text-[var(--color-danger)]"

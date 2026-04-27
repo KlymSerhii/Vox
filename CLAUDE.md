@@ -18,7 +18,7 @@ This file is the canonical project reference. It supersedes the historical `docs
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `hotkey` | `Cmd+Alt+L` | Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
+| `hotkey` | `Cmd+Ctrl+Space` | Hardcoded — not user-editable. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
 | `cancel_hotkey` | `Escape` | Aborts the in-flight session. |
 | `paste_last_hotkey` | `Alt+Shift+V` | Re-copies the most recent transcript. (Field name is historical — it copies, never auto-pastes.) |
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |

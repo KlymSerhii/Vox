@@ -58,21 +58,7 @@ const KEYRING_ACCOUNT_LEGACY_GROQ: &str = "groq";
 const KEYRING_ACCOUNT_LEGACY_ANTHROPIC: &str = "anthropic";
 
 fn default_hotkey() -> String {
-    // 2026-04-26: switched from the modifier-only `Alt+Control` chord to
-    // the standard `Cmd+Alt+L` shortcut. Two reasons:
-    //
-    // 1. The chord path (CGEventTap) requires Accessibility, which many
-    //    users could not grant from a `tauri dev` binary because TCC
-    //    keys permissions to a binary signature that changes on each
-    //    rebuild. The shortcut path goes through Carbon
-    //    `RegisterEventHotKey` and does NOT require Accessibility.
-    // 2. Pairing this with `hands_free_enabled = true` (the new default)
-    //    gives a press-once-to-toggle UX where users don't have to hold
-    //    a key while dictating.
-    //
-    // The token name is `Alt` (not `Option`) to stay consistent with the
-    // parser table we inherit from the global-shortcut plugin.
-    "Cmd+Alt+L".to_string()
+    "Cmd+Ctrl+Space".to_string()
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
@@ -233,50 +219,16 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let hotkey = {
         let stored = store
             .get(KEY_HOTKEY)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(default_hotkey);
-        // One-shot migration: legacy default values are upgraded to the
-        // current default `Cmd+Alt+L`. Cases:
-        //
-        // 1. `AltRight` — the original default; never reliably bindable
-        //    through `tauri-plugin-global-shortcut`.
-        // 2. `F13` — workaround for case 1; not every keyboard has it.
-        // 3. `Alt+Control` / `Alt+Shift` — modifier-only chords that
-        //    require Accessibility, which many users could not grant
-        //    from a dev binary. `Cmd+Alt+L` works without Accessibility.
-        //
-        // Anything OTHER than these is treated as an explicit user
-        // choice and left untouched. We log the migration at error
-        // level so it's visible in `tauri dev`'s terminal.
-        const LEGACY: &[&str] =
-            &["AltRight", "F13", "Alt+Control", "Alt+Shift"];
-        if LEGACY.contains(&stored.as_str()) {
-            log::error!(
-                "settings: migrating legacy push-to-talk hotkey \
-                 '{stored}' -> 'Cmd+Alt+L'. Press Cmd+Option+L to start \
-                 dictating; press again to stop (hands-free toggle is \
-                 on by default)."
-            );
+            .and_then(|v| v.as_str().map(|s| s.to_string()));
+        let forced = default_hotkey();
+        if stored.as_deref() != Some(forced.as_str()) {
             store.set(
                 KEY_HOTKEY,
-                serde_json::Value::String("Cmd+Alt+L".to_string()),
+                serde_json::Value::String(forced.clone()),
             );
-            // Also flip hands_free_enabled on if it's still at the old
-            // press-and-hold default. Users who explicitly turned it on
-            // already keep their setting; users who never touched it
-            // get the new toggle behaviour.
-            if store
-                .get(KEY_HANDS_FREE)
-                .and_then(|v| v.as_bool())
-                .is_none()
-            {
-                store.set(KEY_HANDS_FREE, serde_json::Value::Bool(true));
-            }
             let _ = store.save();
-            "Cmd+Alt+L".to_string()
-        } else {
-            stored
         }
+        forced
     };
     let cancel_hotkey = store
         .get(KEY_CANCEL_HOTKEY)

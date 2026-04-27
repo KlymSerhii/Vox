@@ -126,6 +126,35 @@ pub fn set_dictation_enabled<R: Runtime>(
 }
 
 #[tauri::command]
+pub fn set_hands_free_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    s.hands_free_enabled = enabled;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_polishing_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    s.polishing_enabled = enabled;
+    s.llm_engine = if enabled { "gemma-local".into() } else { "none".into() };
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn get_recent_transcripts() -> Vec<transcripts::RecentTranscript> {
     transcripts::snapshot()
 }

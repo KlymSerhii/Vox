@@ -119,6 +119,14 @@ export async function setDictationEnabled(enabled: boolean): Promise<void> {
   await invoke("set_dictation_enabled", { enabled });
 }
 
+export async function setHandsFreeEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_hands_free_enabled", { enabled });
+}
+
+export async function setPolishingEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_polishing_enabled", { enabled });
+}
+
 export async function getRecentTranscripts(): Promise<RecentTranscript[]> {
   return invoke<RecentTranscript[]>("get_recent_transcripts");
 }
