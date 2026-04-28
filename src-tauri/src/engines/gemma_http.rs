@@ -16,7 +16,14 @@ use crate::inference_proc;
 // margin at the measured ~52 tok/s on Apple Silicon.
 const HARD_TIMEOUT: Duration = Duration::from_secs(240);
 
-const MIN_NEW_TOKENS: u32 = 256;
+// Gemma 4 is a thinking model: llama.cpp's `peg-gemma4` chat handler
+// routes ~250-300 tokens of chain-of-thought into `reasoning_content`
+// before any answer tokens land in `content`. The floor must therefore
+// cover *thinking + answer*, not just answer. 256 was tight enough that
+// short inputs (e.g. 100 chars) had thinking eat the entire budget,
+// leaving content empty and finish_reason=length. 1024 leaves roughly
+// 3× headroom for the model's internal reasoning plus a short reply.
+const MIN_NEW_TOKENS: u32 = 1024;
 
 // ~160 s of generation at ~52 tok/s; past that we'd rather fail-open.
 const MAX_NEW_TOKENS_CAP: u32 = 8192;
@@ -100,16 +107,34 @@ struct ChatMessage<'a> {
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoice {
     message: ChatChoiceMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ChatChoiceMessage {
     content: String,
+    /// Some llama.cpp builds (and OpenAI-compatible reasoning models) split
+    /// chain-of-thought into a separate field. If `content` is empty but
+    /// this is non-empty, the model is in thinking mode and the answer is
+    /// being discarded.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Usage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
 }
 
 #[async_trait::async_trait]
@@ -153,12 +178,20 @@ impl LlmEngine for GemmaHttpEngine {
         };
 
         match &result {
-            Ok(out) => log::info!(
-                "gemma-http: polished {}→{} chars in {} ms",
-                trimmed.len(),
-                out.len(),
-                started.elapsed().as_millis()
-            ),
+            Ok(out) => {
+                log::info!(
+                    "gemma-http: polished {}→{} chars in {} ms",
+                    trimmed.len(),
+                    out.len(),
+                    started.elapsed().as_millis()
+                );
+                if out.trim().is_empty() && trimmed.len() > 20 {
+                    log::warn!(
+                        "gemma-http: polish returned EMPTY content for {}-char input; session will fail-open to raw transcript",
+                        trimmed.len()
+                    );
+                }
+            }
             Err(e) => log::warn!(
                 "gemma-http: polish FAILED in {} ms — session will fail-open to raw transcript: {e}",
                 started.elapsed().as_millis()
@@ -191,21 +224,29 @@ impl GemmaHttpEngine {
     ) -> anyhow::Result<String> {
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
         let max_tokens = dynamic_max_tokens(transcript.len());
-        log::debug!(
-            "gemma-http: dynamic max_tokens={max_tokens} for {} input chars",
-            transcript.len()
+
+        let system_msg = build_system_message(system_prompt, dictionary);
+        // Fenced block keeps content like "Hey Claude, …" from being
+        // parsed as an instruction directed at the model.
+        let user_msg = format!(
+            "Clean this transcript. Output only the cleaned text.\n\n```\n{transcript}\n```"
         );
+
+        log::debug!(
+            "gemma-http: request → model={}, max_tokens={}, temp=0.2, system_chars={}, user_chars={}",
+            server.model_id,
+            max_tokens,
+            system_msg.len(),
+            user_msg.len(),
+        );
+        log::debug!("gemma-http: system prompt:\n{system_msg}");
+        log::debug!("gemma-http: user message:\n{user_msg}");
+
         let body = ChatRequest {
             model: &server.model_id,
             messages: vec![
-                ChatMessage {
-                    role: "system",
-                    content: build_system_message(system_prompt, dictionary),
-                },
-                ChatMessage {
-                    role: "user",
-                    content: format!("Clean this transcript:\n{transcript}"),
-                },
+                ChatMessage { role: "system", content: system_msg },
+                ChatMessage { role: "user", content: user_msg },
             ],
             max_tokens,
             // Cleanup is editing, not generation — keep it deterministic.
@@ -223,23 +264,65 @@ impl GemmaHttpEngine {
             .map_err(|e| anyhow::anyhow!("llama-server POST: {e}"))?;
 
         let status = resp.status();
+        // Read the raw body once so we can log it on parse failure or
+        // empty-content cases.
+        let body_text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::anyhow!("read response body: {e}"))?;
+
         if !status.is_success() {
-            let snippet: String =
-                resp.text().await.unwrap_or_default().chars().take(200).collect();
+            let snippet: String = body_text.chars().take(200).collect();
             return Err(anyhow::anyhow!("llama-server HTTP {status}: {snippet}"));
         }
 
-        let parsed: ChatResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("parse chat response: {e}"))?;
-        let content = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| anyhow::anyhow!("empty choices in chat response"))?;
-        Ok(content.trim().to_string())
+        let parsed: ChatResponse = serde_json::from_str(&body_text).map_err(|e| {
+            let snippet: String = body_text.chars().take(500).collect();
+            anyhow::anyhow!("parse chat response: {e}; body={snippet}")
+        })?;
+
+        let choice = parsed.choices.into_iter().next().ok_or_else(|| {
+            let snippet: String = body_text.chars().take(500).collect();
+            anyhow::anyhow!("empty choices in chat response; body={snippet}")
+        })?;
+
+        let finish_reason = choice.finish_reason.unwrap_or_else(|| "(none)".into());
+        let content = choice.message.content;
+        let reasoning = choice.message.reasoning_content.unwrap_or_default();
+        let usage = parsed.usage.unwrap_or_default();
+
+        log::info!(
+            "gemma-http: response — finish_reason={}, prompt_tokens={}, completion_tokens={}, content_chars={}, reasoning_chars={}",
+            finish_reason,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            content.len(),
+            reasoning.len(),
+        );
+
+        let trimmed_content = content.trim().to_string();
+        if trimmed_content.is_empty() {
+            // Single most useful diagnostic: what did llama-server
+            // actually send back? Dump the whole JSON body unredacted —
+            // this only happens on the failure path, and the body is
+            // small (just envelope + empty content).
+            log::warn!(
+                "gemma-http: empty content (input={} chars, finish_reason={}, completion_tokens={}). Raw response body:\n{}",
+                transcript.len(),
+                finish_reason,
+                usage.completion_tokens,
+                body_text,
+            );
+            if !reasoning.trim().is_empty() {
+                log::warn!(
+                    "gemma-http: reasoning_content was non-empty ({} chars) while content was empty — model is in thinking mode and the answer is being discarded. First 300 chars of reasoning:\n{}",
+                    reasoning.len(),
+                    reasoning.chars().take(300).collect::<String>(),
+                );
+            }
+        }
+
+        Ok(trimmed_content)
     }
 }
 

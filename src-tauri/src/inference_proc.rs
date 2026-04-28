@@ -261,6 +261,15 @@ async fn spawn<R: Runtime>(
         // `--jinja` enables the Gemma `<start_of_turn>` chat template
         // baked into the GGUF metadata, so we can speak the OpenAI
         // chat-completions shape without hand-rolling the wrapper.
+        // Gemma 4 is a thinking model: llama.cpp's `peg-gemma4` chat
+        // handler routes chain-of-thought into `reasoning_content` and
+        // the cleaned text into `content`. We read only `content` (see
+        // gemma_http::post_cleanup), and `gemma_http::dynamic_max_tokens`
+        // keeps the per-request budget large enough that the answer
+        // lands before max_tokens trips. We deliberately do NOT pass
+        // `--reasoning-budget 0`: it sounds like "skip thinking" but
+        // actually only collapses the reasoning/content split, leaving
+        // a verbose mid-thought dump in `content`.
         .arg("--jinja")
         // Web UI is dead weight for a desktop sidecar.
         .arg("--no-webui")

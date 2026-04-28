@@ -306,7 +306,12 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                     }
                     result = llm_fut => match result {
                         Ok(t) if !t.trim().is_empty() => t,
-                        Ok(_) => transcript.clone(),
+                        Ok(_) => {
+                            log::info!(
+                                "LLM polish returned empty content; falling back to raw transcript"
+                            );
+                            transcript.clone()
+                        }
                         Err(e) => {
                             log::warn!("LLM cleanup failed: {e}; falling back to raw transcript");
                             transcript.clone()
