@@ -15,16 +15,20 @@ tauri-build = { version = "2", features = [] }
 png = "0.17"
 
 [features]
-# Heavy native engines (whisper-rs + llama-cpp-2). ON by default because
-# Vox is a local-first app — the cloud engines are opt-in fallbacks, and
-# shipping a binary that says "Local engines not enabled in this build"
-# at runtime is a worse UX than the longer first compile. CI / fast UI
-# iteration can still opt out via `--no-default-features`. The engine
-# traits + registry + downloader all compile either way; the local
-# engines fall back to a clear runtime error when the feature is off so
-# the app still builds and runs in cloud-only mode.
+# Heavy native STT engine (whisper-rs). ON by default because Vox is a
+# local-first app and shipping a binary that says "Local engines not
+# enabled" at runtime is worse UX than the longer first compile. CI /
+# fast UI iteration can still opt out via `--no-default-features`. The
+# engine traits + registry + downloader all compile either way; the
+# whisper engine falls back to a clear runtime error when the feature
+# is off so the app still builds and runs in stub mode.
+#
+# Gemma 4 polishing is OUT-OF-PROCESS (a downloaded `llama-server`
+# subprocess we talk to over HTTP — see `inference_proc.rs`), so it
+# does not participate in this feature gate. Crash isolation, not a
+# compile-time toggle, was the whole point of moving it out.
 default = ["local-engines"]
-local-engines = ["dep:whisper-rs", "dep:llama-cpp-2", "dep:encoding_rs"]
+local-engines = ["dep:whisper-rs"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
@@ -51,22 +55,30 @@ keyring = { version = "3", features = ["apple-native"] }
 once_cell = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 sha2 = "0.10"
+# `system` covers `System::processes()` (used by
+# `inference_proc::reap_orphans_at_startup` to find leftover
+# `llama-server` instances whose `--api-key` matches our persisted
+# token, after a parent SIGKILL — macOS has no
+# `prctl(PR_SET_PDEATHSIG)`) and `total_memory()` (used by
+# `physical_ram_gb`).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 dirs = "5"
 num_cpus = "1"
-# Heavy native engines — see `local-engines` feature above.
+# Heavy native STT engine — see `local-engines` feature above.
 whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
-# Pin llama-cpp-2 to a specific git commit on the upstream `main` branch
-# rather than the latest crates.io release (0.1.145). The git pin gives
-# us a `llama.cpp` snapshot post-Gemma-4-launch with the
-# `<start_of_turn>` chat-template tooling Gemma needs; older crates.io
-# snapshots mis-tokenized that template and produced gibberish or
-# aborted under `GGML_ASSERT`. Cargo materializes the git submodule for
-# us, so the build is fully reproducible: bumping `rev` is the only
-# knob for tracking upstream llama.cpp going forward, and it's far less
-# work than maintaining a fork.
-llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "7d1b2f69777b588c70f35a69c6125d6b626713e5", default-features = false, features = ["metal"], optional = true }
-encoding_rs = { version = "0.8", optional = true }
+# Out-of-process Gemma polishing dependencies.
+# `command-group` gives us cross-platform "kill-on-parent-exit" semantics:
+# `setpgid(0,0)` on Unix and Windows Job Objects with
+# `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Tokio's `kill_on_drop` only
+# handles graceful Drop — it doesn't kill the child if the parent itself
+# crashes.
+command-group = { version = "5", features = ["with-tokio"] }
+# Archive extraction for the downloaded `llama-server` artifacts.
+# macOS releases ship as .tar.gz, Windows as .zip.
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
@@ -97,6 +109,14 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
   "std",
   "CFCGTypes",
 ] }
+
+# Unix-only: `xattr` strips `com.apple.quarantine` from the extracted
+# llama-server binary so Gatekeeper doesn't block first launch with a
+# silent "killed: 9". `tar -xzf` does not propagate the quarantine bit
+# in our testing, but Apple keeps tightening Gatekeeper's heuristics —
+# the strip is defensive insurance.
+[target.'cfg(unix)'.dependencies]
+xattr = "1"
 
 [profile.release]
 panic = "abort"

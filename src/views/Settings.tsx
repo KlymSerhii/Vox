@@ -9,10 +9,13 @@ import {
 } from "solid-js";
 import {
   cancelDownload,
+  cancelInferenceServerDownload,
   checkForUpdates,
+  deleteInferenceServer,
   deleteMode,
   deleteModel,
   diagnoseHotkeys,
+  downloadInferenceServer,
   downloadModel,
   duplicateMode,
   exportMode,
@@ -20,8 +23,13 @@ import {
   getLaunchAtLogin,
   getSettings,
   importModeJson,
+  inferenceServerStatus,
   listModels,
   listModes,
+  onBinaryCanceled,
+  onBinaryDone,
+  onBinaryError,
+  onBinaryProgress,
   onModelCanceled,
   onModelDone,
   onModelError,
@@ -30,6 +38,7 @@ import {
   openAccessibilitySettings,
   replayOnboarding,
   resetDefaultModes,
+  restartInferenceServer,
   revealDevBinaryPath,
   saveMode,
   setLaunchAtLogin,
@@ -38,6 +47,7 @@ import {
   type DevBinaryInfo,
   type DiagnoseHotkeys,
   type HotkeyDiagnostic,
+  type InferenceServerStatus,
   type ModelStatus,
   type PunctuationStyle,
   type Settings,
@@ -991,6 +1001,7 @@ function ModelsTab(props: {
             on first download.
           </div>
         </Show>
+        <InferenceServerSection />
         <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
           Cleanup models
         </div>
@@ -1013,6 +1024,200 @@ function ModelsTab(props: {
   );
 }
 
+function formatBytes(b: number) {
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
+  if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
+  return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+// Diagnostic + maintenance row for the out-of-process `llama-server`
+// binary. Sits above the cleanup-models list because the binary is
+// the prerequisite — without it, the GGUF on disk does nothing.
+//
+// Polish requests fail-open in the orchestrator (`session.rs`) when
+// the binary is missing, so the user still gets the raw Whisper
+// transcript. This row is for the user who opens Settings to figure
+// out *why* polish stopped working.
+function InferenceServerSection() {
+  const [status, setStatus] = createSignal<InferenceServerStatus | null>(null);
+  const [progress, setProgress] = createSignal<{
+    downloaded: number;
+    total: number;
+    eta: number | null;
+  } | null>(null);
+  const [downloading, setDownloading] = createSignal(false);
+  const [err, setErr] = createSignal<string | null>(null);
+
+  let unlistens: (() => void)[] = [];
+
+  async function refresh() {
+    try {
+      setStatus(await inferenceServerStatus());
+    } catch (e) {
+      console.error("inferenceServerStatus:", e);
+    }
+  }
+
+  onMount(async () => {
+    await refresh();
+    unlistens.push(
+      await onBinaryProgress((p) => {
+        setProgress({
+          downloaded: p.bytes_downloaded,
+          total: p.total_bytes,
+          eta: p.eta_secs,
+        });
+      }),
+    );
+    unlistens.push(
+      await onBinaryDone(async () => {
+        setDownloading(false);
+        setProgress(null);
+        setErr(null);
+        await refresh();
+      }),
+    );
+    unlistens.push(
+      await onBinaryError((p) => {
+        setErr(p.error);
+        setDownloading(false);
+      }),
+    );
+    unlistens.push(
+      await onBinaryCanceled(() => {
+        setDownloading(false);
+        setProgress(null);
+      }),
+    );
+  });
+
+  onCleanup(() => {
+    unlistens.forEach((u) => u());
+  });
+
+  async function install() {
+    setDownloading(true);
+    setErr(null);
+    try {
+      await downloadInferenceServer();
+    } catch (e) {
+      setErr(String(e));
+      setDownloading(false);
+    }
+  }
+
+  async function reinstall() {
+    if (!confirm("Reinstall the inference engine? This stops the running server and re-downloads the binary.")) {
+      return;
+    }
+    try {
+      await deleteInferenceServer();
+      await refresh();
+      await install();
+    } catch (e) {
+      console.error("reinstall:", e);
+      setErr(String(e));
+    }
+  }
+
+  async function restart() {
+    try {
+      await restartInferenceServer();
+    } catch (e) {
+      console.error("restart inference:", e);
+    }
+  }
+
+  const supported = () => status()?.supported_host ?? false;
+  const installed = () => status()?.installed ?? false;
+  const version = () => status()?.version ?? "";
+
+  return (
+    <Show when={supported()}>
+      <div class="mb-2 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
+        Inference engine
+      </div>
+      <Card>
+        <Row
+          label={`llama-server ${version()}`}
+          hint={
+            installed()
+              ? "Pre-built, sandboxed inference subprocess. Crashes here can't take down Vox."
+              : "Pre-built inference subprocess. Required for transcript polishing."
+          }
+          last
+        >
+          <div class="flex items-center gap-2">
+            <Show when={!installed() && !downloading()}>
+              <button
+                type="button"
+                class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-black hover:brightness-110"
+                onClick={install}
+              >
+                Install
+              </button>
+            </Show>
+            <Show when={installed() && !downloading()}>
+              <button
+                type="button"
+                class="rounded-[6px] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+                onClick={restart}
+                title="Stop the running server. The next polish will spawn a fresh one."
+              >
+                Restart
+              </button>
+              <button
+                type="button"
+                class="rounded-[6px] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+                onClick={reinstall}
+              >
+                Reinstall
+              </button>
+            </Show>
+            <Show when={downloading()}>
+              <button
+                type="button"
+                class="rounded-[6px] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+                onClick={() => cancelInferenceServerDownload()}
+              >
+                Cancel
+              </button>
+            </Show>
+          </div>
+        </Row>
+        <Show when={progress()}>
+          {(p) => (
+            <div class="px-3 pb-3">
+              <div class="flex justify-between text-[11px] text-[var(--color-ink-mute)]">
+                <span>
+                  {formatBytes(p().downloaded)} / {formatBytes(p().total)}
+                </span>
+                <Show when={p().eta != null}>
+                  <span>ETA {p().eta}s</span>
+                </Show>
+              </div>
+              <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-control)]">
+                <div
+                  class="h-full rounded-full bg-[var(--color-accent)]"
+                  style={{
+                    width: `${p().total > 0 ? Math.min(100, (p().downloaded / p().total) * 100) : 0}%`,
+                  }}
+                />
+              </div>
+            </div>
+          )}
+        </Show>
+        <Show when={err()}>
+          <p class="px-3 pb-3 text-[11px] text-[var(--color-danger)]">
+            {err()}
+          </p>
+        </Show>
+      </Card>
+    </Show>
+  );
+}
+
 function ModelRow(props: {
   m: ModelStatus;
   isActive: boolean;
@@ -1025,13 +1230,6 @@ function ModelRow(props: {
 }) {
   const sizeMb = () => Math.round(props.m.descriptor.size_bytes / 1_000_000);
   const ramMb = () => props.m.descriptor.ram_peak_mb;
-
-  function formatBytes(b: number) {
-    if (b < 1024) return `${b} B`;
-    if (b < 1024 * 1024) return `${(b / 1024).toFixed(0)} KB`;
-    if (b < 1024 * 1024 * 1024) return `${(b / 1024 / 1024).toFixed(1)} MB`;
-    return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  }
 
   return (
     <div class="liquid-card mb-3 rounded-[10px] p-4 ring-1 ring-[var(--color-border)]">

@@ -12,11 +12,16 @@ import {
   acceptGemmaTos,
   checkPermissions,
   diagnoseHotkeys,
+  downloadInferenceServer,
   downloadModel,
   finishOnboarding,
   getSettings,
+  inferenceServerStatus,
   listModels,
   loadModelWarm,
+  onBinaryDone,
+  onBinaryError,
+  onBinaryProgress,
   onModelDone,
   onModelError,
   onModelProgress,
@@ -25,6 +30,7 @@ import {
   requestMicrophone,
   setSettings,
   type HotkeyDiagnostic,
+  type InferenceServerStatus,
   type ModelStatus,
   type PermissionStatus,
   type Settings,
@@ -89,6 +95,12 @@ export default function OnboardingView() {
     microphone: false,
     accessibility: false,
   });
+  // True from the moment the user clicks "Accept and download" until
+  // every chosen download finishes. Used to gate the Continue button
+  // so the user can't skip ahead while bytes are still moving — but
+  // the "Skip for now" exit stays open at all times so a user with a
+  // dead network can still bail.
+  const [downloadInFlight, setDownloadInFlight] = createSignal(false);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -186,7 +198,12 @@ export default function OnboardingView() {
           <AccessibilityStep granted={perms().accessibility} />
         </Show>
         <Show when={step() === MODELS_STEP}>
-          <DownloadStep s={s()} tier={tier()} patch={patch} />
+          <DownloadStep
+            s={s()}
+            tier={tier()}
+            patch={patch}
+            onInFlightChange={setDownloadInFlight}
+          />
         </Show>
         <Show when={step() === LAST_STEP}>
           <HowToUseStep s={s()} />
@@ -210,6 +227,7 @@ export default function OnboardingView() {
           step={step()}
           perms={perms()}
           s={s()}
+          downloadInFlight={downloadInFlight()}
           onNext={next}
           onFinish={handleFinish}
         />
@@ -240,11 +258,18 @@ function PrimaryButton(props: {
   step: Step;
   perms: PermissionStatus;
   s: Settings | null;
+  downloadInFlight: boolean;
   onNext: () => void;
   onFinish: () => void;
 }) {
   const disabled = () => {
     if (props.step === 1) return !props.perms.microphone;
+    // While downloads are in flight, force the user to either wait
+    // (so the next step's pre-warm finds the assets) or click "Skip
+    // for now" to bail explicitly. This keeps the menu-bar app from
+    // flipping into a broken-on-first-use state if the user races
+    // ahead while a multi-GB GGUF is still streaming.
+    if (props.step === MODELS_STEP && props.downloadInFlight) return true;
     return false;
   };
   const label = () => {
@@ -396,6 +421,10 @@ function DownloadStep(props: {
   s: Settings | null;
   tier: TierRecommendation | null;
   patch: (p: Partial<Settings>) => void;
+  /// Notify the parent so it can gate the "Continue" button while
+  /// large downloads are still streaming. The parent owns the gate;
+  /// this step owns the truth about which IDs are expected.
+  onInFlightChange: (v: boolean) => void;
 }) {
   const [progress, setProgress] = createSignal<
     Record<string, { downloaded: number; total: number }>
@@ -405,36 +434,61 @@ function DownloadStep(props: {
   const [err, setErr] = createSignal<string | null>(null);
   const [llmModels, setLlmModels] = createSignal<ModelStatus[]>([]);
   const [selectedLlmId, setSelectedLlmId] = createSignal<string | null>(null);
+  // Out-of-process inference server (`llama-server`). Treated as a
+  // first-class download alongside the two model downloads — the
+  // user can't polish without it.
+  const [binaryStatus, setBinaryStatus] =
+    createSignal<InferenceServerStatus | null>(null);
   const unlistens: (() => void)[] = [];
 
   onMount(async () => {
-    unlistens.push(
-      await onModelProgress((p) => {
-        setProgress((prev) => ({
-          ...prev,
-          [p.id]: { downloaded: p.bytes_downloaded, total: p.total_bytes },
-        }));
-      }),
-    );
-    unlistens.push(
-      await onModelDone((p) => {
+    // The binary download emits the same shape on `binary:*` events as
+    // models do on `model:*`, so we share the progress/completed maps.
+    // The per-id key keeps them disambiguated in the UI.
+    const handleProgress = (p: {
+      id: string;
+      bytes_downloaded: number;
+      total_bytes: number;
+    }) => {
+      setProgress((prev) => ({
+        ...prev,
+        [p.id]: { downloaded: p.bytes_downloaded, total: p.total_bytes },
+      }));
+    };
+    const handleDone = (p: { id: string }) => {
+      setCompleted((prev) => {
+        const n = new Set(prev);
+        n.add(p.id);
+        return n;
+      });
+    };
+    const handleError = (p: { id: string; error: string }) => {
+      setErr(p.error);
+    };
+
+    unlistens.push(await onModelProgress(handleProgress));
+    unlistens.push(await onModelDone(handleDone));
+    unlistens.push(await onModelError(handleError));
+    unlistens.push(await onBinaryProgress(handleProgress));
+    unlistens.push(await onBinaryDone(handleDone));
+    unlistens.push(await onBinaryError(handleError));
+
+    try {
+      const [all, bin] = await Promise.all([listModels(), inferenceServerStatus()]);
+      setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
+      setBinaryStatus(bin);
+      // If the binary is already installed (e.g. the user re-runs
+      // onboarding from Settings), pre-mark it as completed so the
+      // gate doesn't block forever.
+      if (bin.installed) {
         setCompleted((prev) => {
           const n = new Set(prev);
-          n.add(p.id);
+          n.add(bin.id);
           return n;
         });
-      }),
-    );
-    unlistens.push(
-      await onModelError((p) => {
-        setErr(p.error);
-      }),
-    );
-    try {
-      const all = await listModels();
-      setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
+      }
     } catch (e) {
-      console.warn("listModels failed", e);
+      console.warn("listModels/inferenceServerStatus failed", e);
     }
   });
 
@@ -475,17 +529,27 @@ function DownloadStep(props: {
       gemma_tos_accepted: true,
     });
     try {
+      props.onInFlightChange(true);
       await Promise.all([
         downloadModel(t.stt_model_id),
         downloadModel(llmId),
+        // Pull the `llama-server` binary alongside the GGUFs — the
+        // three downloads run concurrently so total wall-clock is
+        // dominated by the largest (Gemma) rather than the sum.
+        downloadInferenceServer(),
       ]);
       // Pre-warm so first dictation doesn't pay the cold-load tax.
+      // We don't pre-warm the inference server here — that would
+      // start `llama-server` immediately, but the user might not
+      // dictate for a while, so we defer until the first polish.
       await Promise.allSettled([
         loadModelWarm(t.stt_model_id),
         loadModelWarm(llmId),
       ]);
     } catch (e) {
       setErr(String(e));
+    } finally {
+      props.onInFlightChange(false);
     }
   }
 
@@ -557,6 +621,15 @@ function DownloadStep(props: {
                   label={shortLlmName(d().name)}
                   done={completed().has(d().id)}
                   prog={progress()[d().id]}
+                />
+              )}
+            </Show>
+            <Show when={binaryStatus()}>
+              {(b) => (
+                <DownloadBar
+                  label="Inference engine"
+                  done={completed().has(b().id)}
+                  prog={progress()[b().id]}
                 />
               )}
             </Show>

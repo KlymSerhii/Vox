@@ -46,6 +46,14 @@ const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
 // Appearance.
 const KEY_APPEARANCE: &str = "appearance";
 
+// Out-of-process Gemma — see `inference_proc.rs`. The api_key is
+// generated on first spawn and reused across sessions so the
+// startup-time orphan reaper can identify stale `llama-server`
+// instances by their `--api-key` argument. Not a secret in the
+// security sense (the server only listens on 127.0.0.1) — it's a
+// process-identification token.
+const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
+
 // Legacy keys we still read once for migration. Any time we touch the
 // store we delete these so they never come back.
 const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
@@ -156,6 +164,15 @@ pub struct Settings {
     // ---- Appearance ----
     #[serde(default = "default_appearance")]
     pub appearance: String,
+
+    /// Random alphanumeric token passed to `llama-server` as
+    /// `--api-key`. Generated lazily on first spawn (see
+    /// `inference_proc::persistent_api_key`) and reused thereafter so
+    /// the startup-time orphan reaper can identify stale child
+    /// processes from a force-killed previous session. Empty string
+    /// means "not yet generated".
+    #[serde(default)]
+    pub inference_api_key: String,
 }
 
 impl Default for Settings {
@@ -184,6 +201,8 @@ impl Default for Settings {
             mode_cycle_hotkey: default_mode_cycle_hotkey(),
             auto_suggest_modes: default_auto_suggest_modes(),
             appearance: default_appearance(),
+            // Generated on first spawn (see `inference_proc`).
+            inference_api_key: String::new(),
         }
     }
 }
@@ -389,6 +408,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         _ => default_appearance(),
     };
 
+    let inference_api_key = store
+        .get(KEY_INFERENCE_API_KEY)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
     // -------- Scrub legacy cloud secrets ----------------------------------
     //
     // Historic plaintext API keys and the old `migration_seen` /
@@ -435,6 +459,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         mode_cycle_hotkey,
         auto_suggest_modes,
         appearance,
+        inference_api_key,
     }
 }
 
@@ -527,6 +552,11 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     store.set(
         KEY_APPEARANCE,
         serde_json::Value::String(appearance.to_string()),
+    );
+
+    store.set(
+        KEY_INFERENCE_API_KEY,
+        serde_json::Value::String(settings.inference_api_key.clone()),
     );
 
     // Drop deprecated keys defensively on every save — these may have

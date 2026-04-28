@@ -392,6 +392,78 @@ async fn do_download(
     resume_from: u64,
     cancel: CancellationToken,
 ) -> anyhow::Result<bool> {
+    let lock_path = partial_path
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.join("models.lock"));
+
+    stream_to_file(
+        app,
+        StreamArgs {
+            id: descriptor.id,
+            url: descriptor.url,
+            partial_path,
+            expected_size: descriptor.size_bytes,
+            expected_sha256: descriptor.sha256,
+            event_prefix: "model",
+            lock_file: lock_path.as_deref(),
+        },
+        resume_from,
+        cancel,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Args for the generic streaming downloader. Reused by both the model
+/// catalog path (`models::download_model`) and the inference-server
+/// binary catalog path (`inference_server::download_and_extract`).
+#[derive(Debug, Clone, Copy)]
+pub struct StreamArgs<'a> {
+    /// Stable id surfaced on every progress / done / error event so the
+    /// frontend can route a single event stream to the right
+    /// per-asset progress bar.
+    pub id: &'a str,
+    /// Source URL. Must be HTTPS.
+    pub url: &'a str,
+    /// On-disk destination for the partial bytes. The caller owns
+    /// the rename to a final filename — keeping the partial separate
+    /// means an interrupted download can resume cleanly the next
+    /// session via the HTTP `Range:` header.
+    pub partial_path: &'a Path,
+    /// Hint for total-bytes fallback when the server omits
+    /// `Content-Length`.
+    pub expected_size: u64,
+    /// Optional pin: when set, the streamed bytes' sha256 must match.
+    /// When `None`, the computed digest is appended to `lock_file` (if
+    /// set) on first download as a soft canary.
+    pub expected_sha256: Option<&'a str>,
+    /// Tauri event family name. This downloader emits
+    /// `<event_prefix>:progress` events (the caller is responsible for
+    /// `:done`, `:error`, `:canceled` — they belong to the higher-level
+    /// orchestration around rename/extract/etc.).
+    pub event_prefix: &'a str,
+    /// Optional lockfile to append the computed sha256 to when no
+    /// `expected_sha256` was pinned at compile time.
+    pub lock_file: Option<&'a Path>,
+}
+
+/// Streaming, resumable, sha256-verified download into `partial_path`.
+///
+/// Memory residency is bounded by reqwest's chunk size (16 KiB by
+/// default) regardless of total file size — verified safe for 17 GB
+/// downloads on 8 GB Macs. Cancellation is checked on every chunk so
+/// the worst-case latency between `cancel.cancel()` and the function
+/// returning is one chunk's transfer time.
+///
+/// Atomic rename on success is the **caller's** responsibility — this
+/// function only writes to `partial_path`.
+pub async fn stream_to_file<R: Runtime>(
+    app: &AppHandle<R>,
+    args: StreamArgs<'_>,
+    resume_from: u64,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
@@ -400,7 +472,7 @@ async fn do_download(
         .build()
         .map_err(|e| anyhow::anyhow!("reqwest build: {e}"))?;
 
-    let mut req = client.get(descriptor.url);
+    let mut req = client.get(args.url);
     if resume_from > 0 {
         req = req.header("Range", format!("bytes={resume_from}-"));
     }
@@ -415,28 +487,28 @@ async fn do_download(
         return Err(anyhow::anyhow!(
             "download HTTP {} for {}",
             status,
-            descriptor.url
+            args.url
         ));
     }
 
     let total_bytes = resp
         .content_length()
         .map(|c| c + resume_from)
-        .unwrap_or(descriptor.size_bytes);
+        .unwrap_or(args.expected_size);
 
     let mut file = OpenOptions::new()
         .create(true)
         .append(resume_from > 0)
         .write(true)
         .truncate(resume_from == 0)
-        .open(partial_path)
+        .open(args.partial_path)
         .map_err(|e| anyhow::anyhow!("open partial: {e}"))?;
 
     let mut hasher = Sha256::new();
     if resume_from > 0 {
         // Re-hash the existing prefix so the final digest is correct.
         use std::io::Read;
-        let mut existing = std::fs::File::open(partial_path)
+        let mut existing = std::fs::File::open(args.partial_path)
             .map_err(|e| anyhow::anyhow!("rehash open: {e}"))?;
         let mut buf = vec![0u8; 1 << 20];
         let mut left = resume_from;
@@ -458,6 +530,8 @@ async fn do_download(
         .checked_sub(Duration::from_secs(1))
         .unwrap_or_else(Instant::now);
 
+    let progress_event = format!("{}:progress", args.event_prefix);
+
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         if cancel.is_cancelled() {
@@ -476,9 +550,9 @@ async fn do_download(
             let remaining = total_bytes.saturating_sub(downloaded) as f64;
             let eta = if bps > 1.0 { Some((remaining / bps) as u64) } else { None };
             let _ = app.emit(
-                "model:progress",
+                &progress_event,
                 ProgressPayload {
-                    id: descriptor.id,
+                    id: args.id,
                     bytes_downloaded: downloaded,
                     total_bytes,
                     eta_secs: eta,
@@ -488,11 +562,11 @@ async fn do_download(
         }
     }
 
-    // Final progress emit.
+    // Final progress emit so the UI snaps to 100%.
     let _ = app.emit(
-        "model:progress",
+        &progress_event,
         ProgressPayload {
-            id: descriptor.id,
+            id: args.id,
             bytes_downloaded: downloaded,
             total_bytes,
             eta_secs: Some(0),
@@ -509,27 +583,25 @@ async fn do_download(
         .map(|b| format!("{b:02x}"))
         .collect();
 
-    if let Some(expected) = descriptor.sha256 {
+    if let Some(expected) = args.expected_sha256 {
         if !computed.eq_ignore_ascii_case(expected) {
-            // Clean up the corrupted partial.
-            let _ = std::fs::remove_file(partial_path);
+            // Clean up the corrupted partial so a retry starts fresh
+            // — resuming a corrupted prefix would re-fail at every
+            // attempt forever.
+            let _ = std::fs::remove_file(args.partial_path);
             return Err(anyhow::anyhow!(
                 "sha256 mismatch for {}: got {computed}, expected {expected}",
-                descriptor.id
+                args.id
             ));
         }
-    } else {
-        // First-time pinning: write to models.lock so we have a reference.
-        let lock_path = partial_path
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("models.lock"));
-        if let Some(lp) = lock_path {
-            let _ = append_to_lock(&lp, descriptor.id, &computed);
-        }
+    } else if let Some(lp) = args.lock_file {
+        // First-time pinning: write the computed digest to the
+        // sibling lockfile so a future build can pin against it. Soft
+        // canary — useful for diagnosing HF asset rotation.
+        let _ = append_to_lock(lp, args.id, &computed);
     }
 
-    Ok(true)
+    Ok(())
 }
 
 fn append_to_lock(lock_path: &Path, id: &str, sha: &str) -> std::io::Result<()> {

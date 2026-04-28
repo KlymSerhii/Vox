@@ -26,6 +26,10 @@ export interface Settings {
   auto_suggest_modes: boolean;
   // Appearance.
   appearance: "light" | "dark";
+  // Out-of-process Gemma — see `inference_proc.rs`. Token used to
+  // identify our `llama-server` children for orphan reaping. Not a
+  // secret in the security sense (server is loopback-only).
+  inference_api_key: string;
 }
 
 export type PunctuationStyle = "Aggressive" | "Standard" | "Minimal" | "None";
@@ -246,6 +250,73 @@ export async function onModelCanceled(
   cb: (p: { id: string }) => void,
 ): Promise<UnlistenFn> {
   return listen<{ id: string }>("model:canceled", (e) => cb(e.payload));
+}
+
+// ---- Inference server (out-of-process llama-server) ----
+//
+// Mirrors the model:* event family on the wire so the existing
+// progress-bar component can be reused 1:1 in onboarding. The
+// `id` field on every event matches `InferenceServerStatus.id`.
+
+export interface InferenceServerStatus {
+  id: string;
+  version: string;
+  installed: boolean;
+  /** False on platforms where we don't ship a llama.cpp binary (e.g.
+   *  Linux today). The frontend should hide the polish path entirely
+   *  when this is false. */
+  supported_host: boolean;
+  binary_path: string | null;
+  size_bytes: number;
+}
+
+export async function downloadInferenceServer(): Promise<void> {
+  await invoke("download_inference_server");
+}
+
+export async function cancelInferenceServerDownload(): Promise<boolean> {
+  return invoke<boolean>("cancel_inference_server_download");
+}
+
+export async function inferenceServerStatus(): Promise<InferenceServerStatus> {
+  return invoke<InferenceServerStatus>("inference_server_status");
+}
+
+export async function restartInferenceServer(): Promise<void> {
+  await invoke("restart_inference_server");
+}
+
+export async function deleteInferenceServer(): Promise<void> {
+  await invoke("delete_inference_server");
+}
+
+export async function onBinaryProgress(
+  cb: (p: ModelProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<ModelProgress>("binary:progress", (e) => cb(e.payload));
+}
+
+export async function onBinaryDone(
+  cb: (p: { id: string; already_installed?: boolean }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string; already_installed?: boolean }>(
+    "binary:done",
+    (e) => cb(e.payload),
+  );
+}
+
+export async function onBinaryError(
+  cb: (p: { id: string; error: string }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string; error: string }>("binary:error", (e) =>
+    cb(e.payload),
+  );
+}
+
+export async function onBinaryCanceled(
+  cb: (p: { id: string }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ id: string }>("binary:canceled", (e) => cb(e.payload));
 }
 
 /// Subscribe to backend `settings:changed` events. Fired after every

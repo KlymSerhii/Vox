@@ -1,8 +1,15 @@
 //! Engine trait surfaces for STT and LLM cleanup.
 //!
-//! There are concrete engine implementations under this module:
-//! - [`whisper_local`] — `whisper-rs` 0.16 with Core ML + Metal.
-//! - [`gemma_local`] — `llama-cpp-2` (git pin, Metal) for Gemma 4.
+//! Concrete engine implementations:
+//! - [`whisper_local`] — `whisper-rs` 0.16 with Core ML + Metal,
+//!   in-process. Stable, hasn't been the source of Vox crashes.
+//! - [`gemma_http`] — talks to an out-of-process `llama-server`
+//!   subprocess over loopback HTTP. Replaced the old in-process
+//!   `gemma_local` (`llama-cpp-2`) on 2026-04-27 so a C++ assert in
+//!   llama.cpp can no longer crash the menu-bar app — the assert
+//!   exits the child, the supervisor respawns, and the user keeps
+//!   working. Engine ID is unchanged (`"gemma-local"`) because the
+//!   user's *intent* (polish locally) is unchanged.
 //! - [`none`] — no-op cleanup engine that returns its input unchanged.
 //!
 //! 2026-04-26: cloud engines (Groq STT, Anthropic LLM) were removed so
@@ -21,7 +28,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Wry};
 
-pub mod gemma_local;
+pub mod gemma_http;
 pub mod none;
 pub mod whisper_local;
 
@@ -137,7 +144,7 @@ impl Registry {
         }
 
         let engine: Arc<dyn LlmEngine> = match engine_id {
-            "gemma-local" => Arc::new(gemma_local::GemmaLocalEngine::new(
+            "gemma-local" => Arc::new(gemma_http::GemmaHttpEngine::new(
                 app.clone(),
                 model_id.to_string(),
             )),

@@ -5,7 +5,10 @@ use tauri_plugin_autostart::ManagerExt as _;
 use crate::hotkey::{ActiveHotkey, ActiveHotkeyState};
 use crate::modes::{self, VoiceMode};
 use crate::settings::HotkeyPurpose;
-use crate::{frontmost, models, onboarding, pill, session, settings, transcripts};
+use crate::{
+    frontmost, inference_proc, inference_server, models, onboarding, pill, session, settings,
+    transcripts,
+};
 
 // `TestConnectionResult` previously fronted the cloud key-test commands.
 // Cloud engines have been removed (2026-04-26) — the type is no longer
@@ -617,6 +620,51 @@ pub fn accept_gemma_tos<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     let mut s = settings::load(&app);
     s.gemma_tos_accepted = true;
     settings::save(&app, &s).map_err(|e| e.to_string())
+}
+
+// -------- Inference server (llama-server) -----------------------------------
+//
+// This pipeline downloads + extracts a pre-built `llama-server` binary
+// at first launch and supervises it as a subprocess. See
+// `inference_server.rs` (download/extract) and `inference_proc.rs`
+// (spawn/health/shutdown) for the implementation. The IPC surface
+// mirrors the model-catalog commands so the frontend can reuse its
+// download UI: `binary:progress`, `binary:done`, `binary:error`,
+// `binary:canceled`.
+
+#[tauri::command]
+pub async fn download_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
+    inference_server::download_and_extract(&app)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn cancel_inference_server_download() -> bool {
+    inference_server::cancel_download()
+}
+
+#[tauri::command]
+pub fn inference_server_status(app: AppHandle<Wry>) -> inference_server::InferenceServerStatus {
+    inference_server::status(&app)
+}
+
+#[tauri::command]
+pub fn restart_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
+    // The supervisor lazily respawns on the next polish call, so
+    // dropping the cached handle is enough — no need to spawn here.
+    inference_proc::drop_managed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn delete_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
+    // Kill the running child first so we're not deleting files out
+    // from under it on Windows (where holding files open prevents
+    // unlinks) — also frees up the version directory for the next
+    // install.
+    inference_proc::drop_managed(&app);
+    inference_server::delete(&app).map_err(|e| e.to_string())
 }
 
 // -------- Voice Modes --------------------------------------------------------

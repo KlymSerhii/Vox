@@ -261,15 +261,27 @@ pub fn builtins() -> Vec<VoiceMode> {
     ]
 }
 
-const GENERAL_PROMPT: &str = "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no explanations.
+const GENERAL_PROMPT: &str = "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.
 
 Rules:
-- Remove filler words (um, uh, like as filler, you know, sort of, kind of as filler).
-- Apply standard punctuation and capitalization (commas, periods, question marks).
-- Fix obvious mid-sentence self-corrections (\"go to the — I mean, the store\" → \"go to the store\").
-- Preserve the speaker's register and word choice. Do not formalize casual speech.
-- Never add facts, names, links, or content the user did not say.
-- Output only the cleaned text.";
+1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler). Keep them when meaningful.
+2. Apply standard English punctuation and capitalization. For longer passages, group related ideas into paragraphs separated by blank lines.
+3. Fix mid-sentence self-corrections.
+   - \"go to the — I mean, the store\" → \"go to the store\"
+   - \"we ship Friday, no Thursday\" → \"we ship Thursday\"
+4. Drop content the speaker explicitly retracts — including everything before the retraction marker.
+   - \"X. Actually no, disregard that. Y.\" → \"Y.\"
+   - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"
+   - \"Forget what I just said. Z.\" → \"Z.\"
+5. When the speaker enumerates items or steps, format them as a numbered list. Only do this when the enumeration is explicit (\"first… second… third…\", \"the three things are…\", \"step one… step two…\"). Leave flowing narrative as prose.
+6. Preserve the speaker's register and word choice. Do not formalize casual speech.
+7. Never add facts, names, links, or content the speaker did not say.
+
+Examples:
+- \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"
+- \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"
+- \"first we ship the build then we run tests and finally we deploy\" →
+   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"";
 
 const EMAIL_PROMPT: &str = "You are formatting a dictated message as the BODY of a professional email. Return plain text only.
 
@@ -343,6 +355,22 @@ impl ModeStore {
                 }
             }
         }
+        // Refresh stale built-in prompts. Existing installs already
+        // wrote per-mode JSON files at first launch with whatever
+        // the prompt constants were at the time. When we improve a
+        // built-in prompt (e.g. teaching General to handle
+        // retractions and structuring), users on an upgraded build
+        // would otherwise stay on the old prompt forever because
+        // `reset_defaults` only fills in MISSING files.
+        //
+        // The migration is conservative: it only overwrites when
+        // the on-disk `system_prompt` field exactly matches a known
+        // legacy version. If the user has customised the prompt at
+        // all, the on-disk prompt won't match the legacy fingerprint
+        // and we leave it alone. Other fields (dictionary,
+        // auto_triggers, punctuation/case overrides) are always
+        // preserved — only the prompt text changes.
+        let _ = migrate_legacy_builtin_prompts(&root);
         // Force a refresh on next read.
         *self.inner.write() = None;
         Ok(())
@@ -655,6 +683,69 @@ fn dir_is_empty(dir: &Path) -> Result<bool> {
         return Ok(true);
     }
     Ok(fs::read_dir(dir)?.next().is_none())
+}
+
+/// Past `GENERAL_PROMPT` revisions. When an existing install has any
+/// of these *byte-for-byte* on disk, it means the user never edited
+/// the General mode and is just running an older default — so we
+/// safely refresh it to the current `GENERAL_PROMPT`.
+///
+/// Append a new entry every time we revise `GENERAL_PROMPT`.
+const LEGACY_GENERAL_PROMPTS: &[&str] = &[
+    // Pre-2026-04-28 default: filler removal + mid-sentence
+    // self-corrections only. Did not handle retractions
+    // (\"X. Disregard that. Y.\") or list-style structuring.
+    "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no explanations.\n\nRules:\n- Remove filler words (um, uh, like as filler, you know, sort of, kind of as filler).\n- Apply standard punctuation and capitalization (commas, periods, question marks).\n- Fix obvious mid-sentence self-corrections (\"go to the — I mean, the store\" → \"go to the store\").\n- Preserve the speaker's register and word choice. Do not formalize casual speech.\n- Never add facts, names, links, or content the user did not say.\n- Output only the cleaned text.",
+];
+
+/// Walk every built-in's stored JSON; when its `system_prompt`
+/// matches a known legacy fingerprint, replace just the prompt
+/// field with the current default. Other fields (dictionary,
+/// auto-triggers, punctuation/case overrides) are preserved.
+fn migrate_legacy_builtin_prompts(root: &Path) -> Result<()> {
+    for current in builtins() {
+        let path = mode_path(root, &current.id);
+        if !path.exists() {
+            continue;
+        }
+        let mut on_disk = match read_mode_file(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!(
+                    "modes: skipping legacy-prompt migration for {} — read failed: {e}",
+                    current.id
+                );
+                continue;
+            }
+        };
+
+        let is_legacy = match current.id.as_str() {
+            "general" => LEGACY_GENERAL_PROMPTS
+                .iter()
+                .any(|p| *p == on_disk.system_prompt),
+            // Other built-ins have no past revisions worth
+            // migrating yet. Add similar arms as they evolve.
+            _ => false,
+        };
+
+        if !is_legacy {
+            continue;
+        }
+
+        log::info!(
+            "modes: refreshing built-in '{}' system_prompt from a legacy revision to current default",
+            current.id
+        );
+        on_disk.system_prompt = current.system_prompt.clone();
+        on_disk.updated_at = current.updated_at;
+        if let Err(e) = write_mode_file(&path, &on_disk) {
+            log::warn!(
+                "modes: legacy-prompt migration failed to write {}: {e}",
+                current.id
+            );
+        }
+    }
+    Ok(())
 }
 
 fn mode_path(root: &Path, id: &str) -> PathBuf {

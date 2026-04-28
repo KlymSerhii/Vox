@@ -3,6 +3,8 @@ mod commands;
 mod engines;
 mod frontmost;
 mod hotkey;
+mod inference_proc;
+mod inference_server;
 mod inject;
 #[cfg(target_os = "macos")]
 mod mac_chord;
@@ -71,6 +73,11 @@ pub fn run() {
             commands::load_model_warm,
             commands::recommend_tier,
             commands::accept_gemma_tos,
+            commands::download_inference_server,
+            commands::cancel_inference_server_download,
+            commands::inference_server_status,
+            commands::restart_inference_server,
+            commands::delete_inference_server,
             commands::list_modes,
             commands::get_mode,
             commands::save_mode,
@@ -106,6 +113,20 @@ pub fn run() {
 
             // Engine registry — lazy-built, kept warm.
             app.manage(crate::engines::Registry::new());
+
+            // Out-of-process Gemma supervisor state. Stored as
+            // `Arc<Mutex<Option<ServerHandle>>>` so the engine layer
+            // can lazily spawn (or respawn after a crash) without
+            // serializing every polish call.
+            crate::inference_proc::install_state(app_handle);
+
+            // Best-effort cleanup of any `llama-server` left behind by
+            // a previous force-killed parent (macOS has no
+            // PR_SET_PDEATHSIG, so we can't rely on the kernel).
+            // Followed immediately by a stale-version sweep so old
+            // tag directories don't pile up after a llama.cpp bump.
+            crate::inference_proc::reap_orphans_at_startup(app_handle);
+            crate::inference_server::cleanup_stale_versions(app_handle);
 
             // Voice Modes store. First-launch seed is gated inside
             // `init_with_root` (only writes built-ins when the dir is
@@ -182,6 +203,16 @@ pub fn run() {
                 }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| {
+            // Tear down the out-of-process `llama-server` on app
+            // shutdown. `Exit` is the last event Tauri emits — by
+            // the time we get here all windows are closed and the
+            // event loop is unwinding. Doing it on `ExitRequested`
+            // would race with a Cmd+Q the user might cancel.
+            if let tauri::RunEvent::Exit = event {
+                crate::inference_proc::shutdown_managed(app_handle);
+            }
+        });
 }
