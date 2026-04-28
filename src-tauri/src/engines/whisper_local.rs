@@ -8,7 +8,7 @@
 //! the session orchestrator surfaces "Model not downloaded. Open
 //! Settings → Models." in that case.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "local-engines")]
 use std::sync::Arc;
 
@@ -51,6 +51,24 @@ impl WhisperLocalEngine {
     }
 }
 
+/// Construct a `WhisperContext` from a GGML file on disk. Pulled out of
+/// `transcribe()` so the pre-warm path can use the same loader without
+/// duplicating the param/log/wrap incantation.
+#[cfg(feature = "local-engines")]
+fn load_context_blocking(
+    model_id: &str,
+    path: &Path,
+) -> anyhow::Result<Arc<Mutex<whisper_rs::WhisperContext>>> {
+    let params = whisper_rs::WhisperContextParameters::default();
+    let path_str = path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("model path is not UTF-8"))?;
+    log::info!("[whisper-local] loading model id={model_id} path={path_str}");
+    let ctx = whisper_rs::WhisperContext::new_with_params(path_str, params)
+        .map_err(|e| anyhow::anyhow!("whisper load: {e}"))?;
+    Ok(Arc::new(Mutex::new(ctx)))
+}
+
 #[async_trait::async_trait]
 impl SttEngine for WhisperLocalEngine {
     async fn transcribe(
@@ -76,14 +94,7 @@ impl SttEngine for WhisperLocalEngine {
             let ctx_cell = self.ctx.clone();
             tauri::async_runtime::spawn_blocking(move || {
                 let ctx = ctx_cell.get_or_try_init::<_, anyhow::Error>(|| {
-                    let params = whisper_rs::WhisperContextParameters::default();
-                    let path_str = path
-                        .to_str()
-                        .ok_or_else(|| anyhow::anyhow!("model path is not UTF-8"))?;
-                    log::info!("[whisper-local] loading model id={model_id} path={path_str}");
-                    let ctx = whisper_rs::WhisperContext::new_with_params(path_str, params)
-                        .map_err(|e| anyhow::anyhow!("whisper load: {e}"))?;
-                    Ok(Arc::new(Mutex::new(ctx)))
+                    load_context_blocking(&model_id, &path)
                 })?;
 
                 let pcm = decode_wav_to_f32_mono_16k(&wav_owned)?;
@@ -159,6 +170,41 @@ impl SttEngine for WhisperLocalEngine {
 
     fn requires_network(&self) -> bool {
         false
+    }
+
+    /// Force the heavy `WhisperContext` load so the first dictation
+    /// pays only the spawn-state + inference cost, not the ~1-2 s
+    /// model-from-disk cost. Idempotent: a second call is a no-op
+    /// because `OnceCell::get_or_try_init` short-circuits.
+    ///
+    /// If the model file isn't downloaded yet we silently return
+    /// `Ok(())` — the user hasn't finished onboarding, and the real
+    /// `transcribe()` path will surface the missing-model error with
+    /// the proper "open Settings → Models" hint.
+    async fn prewarm(&self) -> anyhow::Result<()> {
+        let Some(path) = self.cache_path() else {
+            return Ok(());
+        };
+
+        #[cfg(feature = "local-engines")]
+        {
+            let ctx_cell = self.ctx.clone();
+            let model_id = self.model_id.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                ctx_cell.get_or_try_init::<_, anyhow::Error>(|| {
+                    load_context_blocking(&model_id, &path)
+                })?;
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("whisper prewarm task panicked: {e}"))?
+        }
+
+        #[cfg(not(feature = "local-engines"))]
+        {
+            let _ = path;
+            Ok(())
+        }
     }
 }
 

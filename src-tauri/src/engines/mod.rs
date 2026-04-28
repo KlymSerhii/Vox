@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tauri::{AppHandle, Wry};
+use tauri::{AppHandle, Manager, Wry};
 
 pub mod gemma_http;
 pub mod none;
@@ -57,6 +57,14 @@ pub trait SttEngine: Send + Sync {
     /// True if this engine sends data over the network.
     #[allow(dead_code)]
     fn requires_network(&self) -> bool;
+
+    /// Optional pre-warm hook. Loads any heavy state (model weights,
+    /// subprocess handles) into RAM so the first transcription doesn't
+    /// pay the cold-load cost. Default impl is a no-op for engines
+    /// that don't need it.
+    async fn prewarm(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// LLM cleanup engine. The optional `system_prompt` is reserved for the
@@ -156,4 +164,49 @@ impl Registry {
         guard.llm.insert(key, engine.clone());
         Some(engine)
     }
+}
+
+/// Conditionally pre-warm the active STT engine in the background.
+/// No-op when:
+/// - the user hasn't finished onboarding, or
+/// - dictation is disabled, or
+/// - no model id is configured, or
+/// - the engine id isn't recognised, or
+/// - the engine's own prewarm returns a benign error (e.g. model not
+///   downloaded — the real `transcribe()` path will surface it later).
+///
+/// Idempotent: spawning more than once is safe because
+/// `WhisperLocalEngine::prewarm` is itself idempotent (the
+/// `OnceCell::get_or_try_init` short-circuits on the second pass).
+///
+/// Fire-and-forget: the actual model load runs on a Tokio task so it
+/// never delays the caller (UI startup, settings save, toggle flip).
+pub fn prewarm_stt_in_background(app: &AppHandle<Wry>) {
+    let s = crate::settings::load(app);
+    if !s.onboarded || !s.dictation_enabled || s.stt_model_id.is_empty() {
+        return;
+    }
+    let registry = match app.try_state::<Registry>() {
+        Some(r) => r,
+        None => return,
+    };
+    let engine = match registry.stt(app, &s.stt_engine, &s.stt_model_id) {
+        Some(e) => e,
+        None => return,
+    };
+    let model_id = s.stt_model_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
+        log::info!("stt: pre-warming (model={model_id})");
+        match engine.prewarm().await {
+            Ok(_) => log::info!(
+                "stt: pre-warm complete in {} ms",
+                started.elapsed().as_millis()
+            ),
+            Err(e) => log::info!(
+                "stt: pre-warm skipped after {} ms: {e}",
+                started.elapsed().as_millis()
+            ),
+        }
+    });
 }

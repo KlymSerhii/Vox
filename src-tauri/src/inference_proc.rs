@@ -472,6 +472,48 @@ pub fn shutdown_managed<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
+/// Conditionally pre-warm the inference server in the background so the
+/// first polish doesn't pay the ~5-10 s cold spawn + GGUF-load cost on
+/// top of the actual roundtrip. No-op when:
+/// - the user hasn't finished onboarding,
+/// - polishing is disabled,
+/// - the LLM engine isn't `gemma-local`, or
+/// - the `llama-server` binary isn't installed yet.
+///
+/// Idempotent: a concurrent `ensure_running` call serialises against
+/// the spawn lock so a fast user dictating during the warmup window
+/// won't double-spawn. Errors log at info level (not warn) because
+/// "binary not installed yet" is a normal pre-onboarding state.
+pub fn prewarm_in_background<R: Runtime>(app: &AppHandle<R>) {
+    let s = settings::load(app);
+    if !(s.onboarded
+        && s.polishing_enabled
+        && s.llm_engine == "gemma-local"
+        && !s.llm_model_id.is_empty()
+        && inference_server::is_installed(app))
+    {
+        return;
+    }
+
+    let warm_handle = app.clone();
+    let warm_model_id = s.llm_model_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let started = std::time::Instant::now();
+        log::info!("inference: pre-warming (model={warm_model_id})");
+        match ensure_running(&warm_handle, &warm_model_id).await {
+            Ok(server) => log::info!(
+                "inference: pre-warm complete on port {} in {} ms",
+                server.port,
+                started.elapsed().as_millis()
+            ),
+            Err(e) => log::info!(
+                "inference: pre-warm skipped after {} ms: {e}",
+                started.elapsed().as_millis()
+            ),
+        }
+    });
+}
+
 /// Force a respawn on the next polish call. Used by the
 /// `restart_inference_server` IPC command exposed in the Settings →
 /// Models tab.

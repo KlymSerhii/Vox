@@ -54,9 +54,9 @@ pub fn get_public_settings<R: Runtime>(app: AppHandle<R>) -> settings::Settings 
 }
 
 #[tauri::command]
-pub fn set_settings<R: Runtime>(
-    app: AppHandle<R>,
-    webview: Webview<R>,
+pub fn set_settings(
+    app: AppHandle<Wry>,
+    webview: Webview<Wry>,
     settings: settings::Settings,
 ) -> Result<(), String> {
     assert_secret_window(&webview)?;
@@ -70,6 +70,27 @@ pub fn set_settings<R: Runtime>(
         || before.cancel_hotkey != settings.cancel_hotkey
         || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
     let appearance_changed = before.appearance != settings.appearance;
+    // Engine lifecycle diff. We act on these AFTER the save so the
+    // on-disk state matches what the supervisors see.
+    //
+    // - `polish_off`: user turned polishing off. Kill the live
+    //   `llama-server` so the ~5 GB GGUF stops sitting in RAM right
+    //   now, not lazily.
+    // - `stt_changed`: user switched Whisper model or engine. We
+    //   pre-warm the new selection so the next dictation doesn't
+    //   pay the GGML load.
+    //
+    // Note: we don't need a separate "polish_on" branch — the
+    // unconditional `prewarm_in_background` below is a no-op when
+    // polishing is off, so flipping polish on (or changing the LLM
+    // model while it stays on) both go through the same code path
+    // and ensure_running's spawn-lock + model-id check handles the
+    // model swap atomically.
+    let polish_off = before.polishing_enabled && !settings.polishing_enabled;
+    let llm_left_gemma =
+        before.llm_engine == "gemma-local" && settings.llm_engine != "gemma-local";
+    let stt_changed = before.stt_engine != settings.stt_engine
+        || before.stt_model_id != settings.stt_model_id;
 
     settings::save(&app, &settings).map_err(|e| e.to_string())?;
 
@@ -115,6 +136,19 @@ pub fn set_settings<R: Runtime>(
         }
     }
 
+    // ---- Engine lifecycle ----
+    if polish_off || llm_left_gemma {
+        inference_proc::drop_managed(&app);
+    }
+    // Always-attempt pre-warm. Both helpers no-op when the relevant
+    // toggles are off (`polishing_enabled` for inference, `dictation_
+    // enabled` for STT), so the conditions for "is this worth doing"
+    // live in one place.
+    inference_proc::prewarm_in_background(&app);
+    if stt_changed {
+        crate::engines::prewarm_stt_in_background(&app);
+    }
+
     // Notify every other window so they can refresh anything cached
     // off the settings (mainly the displayed hotkey glyphs in the pill,
     // tray popover and onboarding).
@@ -126,13 +160,20 @@ pub fn set_settings<R: Runtime>(
 }
 
 #[tauri::command]
-pub fn set_dictation_enabled<R: Runtime>(
-    app: AppHandle<R>,
+pub fn set_dictation_enabled(
+    app: AppHandle<Wry>,
     enabled: bool,
 ) -> Result<(), String> {
     let mut s = settings::load(&app);
     s.dictation_enabled = enabled;
     settings::save(&app, &s).map_err(|e| e.to_string())?;
+    // Pre-warm Whisper when dictation is freshly turned on so the
+    // first hotkey press doesn't pay the model-load tax. The helper
+    // is a no-op if the model isn't downloaded yet, which keeps the
+    // path safe for users who toggle this before completing onboarding.
+    if enabled {
+        crate::engines::prewarm_stt_in_background(&app);
+    }
     // Broadcast so the Settings window's General tab and the tray
     // popover's status line update without a manual refresh.
     if let Err(e) = app.emit("settings:changed", &s) {
@@ -172,6 +213,19 @@ pub fn set_polishing_enabled<R: Runtime>(
     s.polishing_enabled = enabled;
     s.llm_engine = if enabled { "gemma-local".into() } else { "none".into() };
     settings::save(&app, &s).map_err(|e| e.to_string())?;
+
+    // Drive the inference subprocess in lockstep with the toggle so
+    // the user sees the RAM/CPU change immediately, not lazily on the
+    // next dictation: spawn `llama-server` when polishing is turned
+    // on, kill it when turned off. Both helpers are sync fire-and-
+    // forget — `prewarm_in_background` spawns its own Tokio task and
+    // `drop_managed` issues a SIGKILL via command-group's Drop.
+    if enabled {
+        inference_proc::prewarm_in_background(&app);
+    } else {
+        inference_proc::drop_managed(&app);
+    }
+
     if let Err(e) = app.emit("settings:changed", &s) {
         log::warn!("failed to emit settings:changed: {e}");
     }
@@ -575,6 +629,14 @@ pub fn delete_model(app: AppHandle<Wry>, id: String) -> Result<(), String> {
 
 /// Pre-warm an engine into RAM. Used by onboarding's "Set up local
 /// models" step so the first dictation doesn't pay the cold-load tax.
+///
+/// STT engines actually load the model file here (via the engine's
+/// `prewarm()` hook). LLM cleanup is left to `inference_proc::
+/// prewarm_in_background`, which the rest of the lifecycle plumbing
+/// already drives — onboarding intentionally does NOT spawn
+/// `llama-server` at this point because the user might not dictate
+/// for a while and we don't want a 5 GB GGUF sitting hot for an
+/// audience that may never need it.
 #[tauri::command]
 pub async fn load_model_warm(app: AppHandle<Wry>, id: String) -> Result<(), String> {
     let descriptor = models::descriptor_for(&id)
@@ -584,7 +646,11 @@ pub async fn load_model_warm(app: AppHandle<Wry>, id: String) -> Result<(), Stri
         .ok_or_else(|| "engine registry missing".to_string())?;
     match descriptor.kind {
         models::ModelKind::Stt => {
-            let _ = registry.stt(&app, descriptor.engine, descriptor.id);
+            if let Some(engine) = registry.stt(&app, descriptor.engine, descriptor.id) {
+                if let Err(e) = engine.prewarm().await {
+                    log::warn!("stt prewarm '{}' failed: {e}", descriptor.id);
+                }
+            }
         }
         models::ModelKind::Llm => {
             let _ = registry.llm(&app, descriptor.engine, descriptor.id);
