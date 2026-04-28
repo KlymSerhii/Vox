@@ -1,4 +1,12 @@
-import { createSignal, For, type JSX, onCleanup, onMount, Show } from "solid-js";
+import {
+  createEffect,
+  createSignal,
+  For,
+  type JSX,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   acceptGemmaTos,
@@ -7,6 +15,7 @@ import {
   downloadModel,
   finishOnboarding,
   getSettings,
+  listModels,
   loadModelWarm,
   onModelDone,
   onModelError,
@@ -16,6 +25,7 @@ import {
   requestMicrophone,
   setSettings,
   type HotkeyDiagnostic,
+  type ModelStatus,
   type PermissionStatus,
   type Settings,
   type TierRecommendation,
@@ -393,6 +403,8 @@ function DownloadStep(props: {
   const [completed, setCompleted] = createSignal<Set<string>>(new Set());
   const [started, setStarted] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
+  const [llmModels, setLlmModels] = createSignal<ModelStatus[]>([]);
+  const [selectedLlmId, setSelectedLlmId] = createSignal<string | null>(null);
   const unlistens: (() => void)[] = [];
 
   onMount(async () => {
@@ -418,16 +430,39 @@ function DownloadStep(props: {
         setErr(p.error);
       }),
     );
+    try {
+      const all = await listModels();
+      setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
+    } catch (e) {
+      console.warn("listModels failed", e);
+    }
+  });
+
+  // Default the radio selection to the recommender's preferred LLM id once
+  // both inputs are available. Effect re-runs if either changes.
+  createEffect(() => {
+    const t = props.tier;
+    const llms = llmModels();
+    if (t && llms.length > 0 && !selectedLlmId()) {
+      setSelectedLlmId(t.llm_model_id);
+    }
   });
 
   onCleanup(() => {
     unlistens.forEach((u) => u());
   });
 
+  const selectedDescriptor = () => {
+    const id = selectedLlmId();
+    if (!id) return null;
+    return llmModels().find((m) => m.descriptor.id === id)?.descriptor ?? null;
+  };
+
   async function start() {
     const t = props.tier;
     const cur = props.s;
-    if (!t || !cur) return;
+    const llmId = selectedLlmId();
+    if (!t || !cur || !llmId) return;
     setStarted(true);
     if (!cur.gemma_tos_accepted) {
       await acceptGemmaTos();
@@ -436,18 +471,18 @@ function DownloadStep(props: {
       stt_engine: "whisper-local",
       stt_model_id: t.stt_model_id,
       llm_engine: "gemma-local",
-      llm_model_id: t.llm_model_id,
+      llm_model_id: llmId,
       gemma_tos_accepted: true,
     });
     try {
       await Promise.all([
         downloadModel(t.stt_model_id),
-        downloadModel(t.llm_model_id),
+        downloadModel(llmId),
       ]);
       // Pre-warm so first dictation doesn't pay the cold-load tax.
       await Promise.allSettled([
         loadModelWarm(t.stt_model_id),
-        loadModelWarm(t.llm_model_id),
+        loadModelWarm(llmId),
       ]);
     } catch (e) {
       setErr(String(e));
@@ -470,9 +505,39 @@ function DownloadStep(props: {
           </a>
           .
         </p>
+        <Show when={llmModels().length > 0 && props.tier}>
+          {(t) => (
+            <div class="flex flex-col gap-2" role="radiogroup" aria-label="Gemma 4 model">
+              <div class="flex items-baseline justify-between">
+                <span class="text-[13px] font-medium">Choose your Gemma 4 model</span>
+                <Show when={t().physical_ram_gb > 0}>
+                  <span class="text-[11px] text-[var(--color-ink-faint)]">
+                    Your Mac has {t().physical_ram_gb} GB RAM
+                  </span>
+                </Show>
+              </div>
+              <For each={llmModels()}>
+                {(m) => (
+                  <LlmCard
+                    model={m}
+                    selected={selectedLlmId() === m.descriptor.id}
+                    recommended={m.descriptor.tier === t().tier}
+                    swapWarn={
+                      t().physical_ram_gb > 0 &&
+                      m.descriptor.ram_peak_mb >
+                        t().physical_ram_gb * 1024 * 0.85
+                    }
+                    onSelect={() => setSelectedLlmId(m.descriptor.id)}
+                  />
+                )}
+              </For>
+            </div>
+          )}
+        </Show>
         <button
           type="button"
-          class="self-start rounded-[8px] bg-[var(--color-accent)] px-4 py-2 text-[13px] font-medium text-black hover:brightness-110"
+          class="self-start rounded-[8px] bg-[var(--color-accent)] px-4 py-2 text-[13px] font-medium text-black hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={!selectedLlmId() || !props.tier}
           onClick={start}
         >
           Accept and download
@@ -486,11 +551,15 @@ function DownloadStep(props: {
               done={completed().has(t().stt_model_id)}
               prog={progress()[t().stt_model_id]}
             />
-            <DownloadBar
-              label="Gemma"
-              done={completed().has(t().llm_model_id)}
-              prog={progress()[t().llm_model_id]}
-            />
+            <Show when={selectedDescriptor()} fallback={null}>
+              {(d) => (
+                <DownloadBar
+                  label={shortLlmName(d().name)}
+                  done={completed().has(d().id)}
+                  prog={progress()[d().id]}
+                />
+              )}
+            </Show>
           </div>
         )}
       </Show>
@@ -499,6 +568,71 @@ function DownloadStep(props: {
       </Show>
     </div>
   );
+}
+
+function LlmCard(props: {
+  model: ModelStatus;
+  selected: boolean;
+  recommended: boolean;
+  swapWarn: boolean;
+  onSelect: () => void;
+}) {
+  const d = () => props.model.descriptor;
+  const displayName = () => d().name.replace(/\s*\([^)]*\)/g, "");
+  const sizeGb = () => (d().size_bytes / 1e9).toFixed(1);
+  const ramGb = () => (d().ram_peak_mb / 1024).toFixed(0);
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={props.selected}
+      onClick={props.onSelect}
+      class="flex flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color]"
+      classList={{
+        "ring-1 ring-[var(--color-border)]": !props.selected,
+        "ring-2 ring-[var(--color-accent)]": props.selected,
+      }}
+    >
+      <div class="flex items-center justify-between gap-2">
+        <span class="text-[13px] font-medium text-[var(--color-ink)]">
+          {displayName()}
+        </span>
+        <span
+          class="flex h-3.5 w-3.5 items-center justify-center rounded-full"
+          classList={{
+            "ring-1 ring-[var(--color-border-strong)]": !props.selected,
+            "bg-[var(--color-accent)]": props.selected,
+          }}
+          aria-hidden="true"
+        >
+          <Show when={props.selected}>
+            <span class="h-1.5 w-1.5 rounded-full bg-black" />
+          </Show>
+        </span>
+      </div>
+      <span class="text-[11px] text-[var(--color-ink-mute)]">
+        ~{sizeGb()} GB on disk · ~{ramGb()} GB peak RAM
+      </span>
+      <Show when={props.recommended || props.swapWarn}>
+        <div class="mt-1 flex flex-wrap gap-1">
+          <Show when={props.recommended}>
+            <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+              Recommended
+            </span>
+          </Show>
+          <Show when={props.swapWarn}>
+            <span class="rounded-full bg-[var(--color-danger)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-danger)]">
+              May swap on this Mac
+            </span>
+          </Show>
+        </div>
+      </Show>
+    </button>
+  );
+}
+
+function shortLlmName(name: string): string {
+  return name.replace(/\s*\([^)]*\)/g, "").replace(/ —.*$/, "");
 }
 
 function DownloadBar(props: {
