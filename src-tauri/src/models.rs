@@ -12,23 +12,37 @@
 //!   "TBD" in the catalog and pin the computed hash to a per-machine
 //!   `models.lock` file on first successful download. Treat the lock
 //!   as a warning canary, not a hard gate, because HF can rotate.)
-//! - Gemma 3 GGUF: <https://huggingface.co/unsloth/gemma-3-1b-it-GGUF>
-//!   and <https://huggingface.co/unsloth/gemma-3-4b-it-GGUF>.
+//! - Gemma 4 E4B GGUF: <https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF>.
+//! - Gemma 4 26B-A4B (MoE) GGUF:
+//!   <https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF>.
 //!
-//! NB: Gemma 4 was the original LLM, but the bundled `llama.cpp` snapshot
-//! (revision `e21cdc1`, the latest available through `llama-cpp-2`) hits a
-//! `GGML_ASSERT` in `llama-context.cpp::sched_reserve` when constructing a
-//! context for Gemma 4 E2B/E4B GGUFs. The graph contains
+//! NB: Gemma 4 E2B (the smaller MatFormer "elastic" variant — `n_layer=35`,
+//! `shared_kv_layers=20`, `embedding_length_per_layer_input=256`) hits a
+//! `GGML_ASSERT` in `llama-context.cpp::sched_reserve` when the bundled
+//! `llama.cpp` (rev `e21cdc1`, the latest available through
+//! `llama-cpp-2`) runs its FGDN auto-detect: that graph contains
 //! `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the
-//! `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the FGDN auto-detect block
-//! expects, and the assertion `abort()`s the process from C++ — bypassing
-//! Rust's fail-open guard. There is no Rust-side switch to disable that
-//! block (`fused_gdn_*` and `auto_fgdn` live in the internal cparams
-//! struct, not in the public `llama_context_params`), and the bug is
-//! unfixed at upstream HEAD. We sidestep it by shipping Gemma 3 instead:
-//! same `<start_of_turn>` chat template (so `gemma_local.rs` is unchanged)
-//! and a standard transformer architecture (no Gated Delta Net, so no
-//! crash). When `llama.cpp` ships a fix we can re-add the Gemma 4 entries.
+//! `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the check expects, so a
+//! `GGML_ASSERT` fires from C++ — bypassing Rust's fail-open guard.
+//! There is no Rust-side switch to disable that block (`fused_gdn_*` and
+//! `auto_fgdn` live in the internal cparams struct, not in the public
+//! `llama_context_params`), and the bug is unfixed at upstream HEAD.
+//! E2B is therefore in `is_known_broken_llm_id` and any stored selection
+//! pointing at it gets migrated to the current default on settings load.
+//!
+//! E4B is the bigger MatFormer variant (`n_layer=42`, same family as
+//! E2B). Source-level analysis predicts it crashes the same way, but it
+//! is shipped here at the user's explicit request — without empirical
+//! verification we can't be 100% sure, and the failure (if any) is
+//! recoverable: the user picks a different model in Settings.
+//!
+//! Gemma 4 26B-A4B (the MoE variant — 26 B params total, 4 B active,
+//! `shared_kv_layers=0`, no PLE) does NOT hit this code path: it
+//! dispatches through the same `llm_build_gemma4_iswa` builder but uses
+//! standard `build_attn` exclusively, so its graph emits zero
+//! `GGML_OP_GATED_DELTA_NET` ops. It is the recommended fallback if E4B
+//! crashes; it needs ~19 GB RAM at runtime so it isn't the default for
+//! sub-quality tiers.
 //! - Phi-4-mini GGUF: <https://huggingface.co/microsoft/Phi-4-mini-instruct-onnx>
 //!   (mirrored in `bartowski/microsoft_Phi-4-mini-instruct-GGUF`).
 
@@ -131,26 +145,39 @@ pub const CATALOG: &[ModelDescriptor] = &[
     },
     // ---- LLM ----
     ModelDescriptor {
-        id: "gemma-3-1b-q4_k_m",
+        // Gemma 4 E4B (MatFormer): 4 B effective params, n_layer=42,
+        // shared_kv_layers > 0, PLE. **WARNING:** in this build's
+        // bundled `llama.cpp` (rev `e21cdc1`), MatFormer Gemma 4 hits a
+        // `GGML_ASSERT` in the FGDN auto-detect path of
+        // `llama-context.cpp::sched_reserve` — see file-level docs and
+        // `is_known_broken_llm_id`. Shipped here at the user's explicit
+        // request; if Polish is enabled with this selected and the
+        // assertion still fires, fall back to 26B-A4B or wait for an
+        // upstream `llama.cpp` fix.
+        id: "gemma-4-e4b-q4_k_m",
         kind: ModelKind::Llm,
-        name: "Gemma 3 1B (Q4_K_M) — Small",
-        size_bytes: 806_058_272,
+        name: "Gemma 4 E4B (Q4_K_M) — Balanced",
+        size_bytes: 4_977_169_088,
         sha256: None,
-        url: "https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
         engine: "gemma-local",
-        ram_peak_mb: 1500,
-        tier: "small",
+        ram_peak_mb: 6000,
+        tier: "balanced",
     },
     ModelDescriptor {
-        id: "gemma-3-4b-q4_k_m",
+        // Gemma 4 26B-A4B (MoE: 26 B total, 4 B active). Avoids the FGDN
+        // crash that affects E2B/E4B because its graph has no Gated
+        // Delta Net ops — see file-level docs. ~17 GB on disk, ~19 GB
+        // RAM peak with KV cache; comfortable on 24 GB+ Apple Silicon.
+        id: "gemma-4-26b-a4b-q4_k_m",
         kind: ModelKind::Llm,
-        name: "Gemma 3 4B (Q4_K_M) — Balanced",
-        size_bytes: 2_489_894_016,
+        name: "Gemma 4 26B-A4B MoE (Q4_K_M) — Quality",
+        size_bytes: 16_868_240_704,
         sha256: None,
-        url: "https://huggingface.co/unsloth/gemma-3-4b-it-GGUF/resolve/main/gemma-3-4b-it-Q4_K_M.gguf",
+        url: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
         engine: "gemma-local",
-        ram_peak_mb: 3500,
-        tier: "balanced",
+        ram_peak_mb: 19000,
+        tier: "quality",
     },
     ModelDescriptor {
         id: "phi-4-mini-q4_k_m",
@@ -561,8 +588,8 @@ pub fn recommended_stt_model_id() -> &'static str {
 
 pub fn recommended_llm_model_id() -> &'static str {
     match recommend_tier() {
-        "small" => "gemma-3-1b-q4_k_m",
-        _ => "gemma-3-4b-q4_k_m",
+        "quality" => "gemma-4-26b-a4b-q4_k_m",
+        _ => "gemma-4-e4b-q4_k_m",
     }
 }
 
@@ -570,9 +597,11 @@ pub fn recommended_llm_model_id() -> &'static str {
 /// `llama.cpp` (see file-level docs). On settings load we rewrite any
 /// stored selection that names one of these to the current default so
 /// the user doesn't get an `abort()` the next time they hit the polish
-/// hotkey.
+/// hotkey. Only E2B is migrated automatically — E4B has the same
+/// MatFormer architecture and is expected to crash too, but it is shipped
+/// at the user's explicit request, so leave it selectable.
 pub fn is_known_broken_llm_id(id: &str) -> bool {
-    matches!(id, "gemma-4-e2b-q4_k_m" | "gemma-4-e4b-q4_k_m")
+    matches!(id, "gemma-4-e2b-q4_k_m")
 }
 
 #[cfg(test)]

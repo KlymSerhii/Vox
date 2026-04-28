@@ -1,4 +1,7 @@
-//! Local LLM cleanup — `llama-cpp-2` (git, Metal) running Gemma 3 GGUFs.
+//! Local LLM cleanup — `llama-cpp-2` (git, Metal) running Gemma 4 GGUFs
+//! (E4B MatFormer or 26B-A4B MoE). All Gemma releases share the same
+//! `<start_of_turn>` chat template, so this engine is shape-agnostic
+//! across the catalog.
 //!
 //! `llama-cpp-2` is pinned to a specific commit on the upstream `main`
 //! branch in `Cargo.toml` rather than the latest crates.io release. The
@@ -6,16 +9,13 @@
 //! `<start_of_turn>` chat-template tooling Gemma needs; older crates.io
 //! snapshots mis-tokenized Gemma prompts.
 //!
-//! Gemma 4 (E2B / E4B) GGUFs are NOT supported on this build: the
-//! bundled `llama.cpp` aborts in `llama-context.cpp::sched_reserve` when
-//! it tries to auto-detect Fused Gated Delta Net support on Gemma 4's
-//! graph (the GDN tensors don't carry the FGDN_AR name prefix the check
-//! requires, so a `GGML_ASSERT` fires from C++ and the process exits,
-//! bypassing fail-open). The catalog ships Gemma 3 instead because it
-//! uses the same chat template (so this engine is unchanged) but a
-//! standard transformer architecture (no GDN, so no crash). See
-//! `models.rs` doc comment for details. `settings.rs::load` migrates
-//! any stored `gemma-4-*` selection back to the working default.
+//! Gemma 4 E2B (the smaller MatFormer variant) crashes this build in
+//! `llama-context.cpp::sched_reserve` (FGDN auto-detect — see
+//! `models.rs` for the full analysis); `settings.rs::load` migrates any
+//! stored `gemma-4-e2b-*` selection back to the working default.
+//! Gemma 4 E4B is shipped at the user's request even though source
+//! analysis predicts it crashes the same way; 26B-A4B is the proven
+//! Gemma 4 path on this build because its graph emits zero GDN ops.
 //!
 //! Loads a GGUF model on first use, keeps it warm for repeat dictations.
 //! A wall-clock timeout plus a pre-flight token-count gate protect the
