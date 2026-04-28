@@ -1,17 +1,28 @@
-//! Local LLM cleanup — `llama-cpp-2` (git, Metal) running Gemma 4 / Phi-4-mini.
+//! Local LLM cleanup — `llama-cpp-2` (git, Metal) running Gemma 3 GGUFs.
 //!
 //! `llama-cpp-2` is pinned to a specific commit on the upstream `main`
 //! branch in `Cargo.toml` rather than the latest crates.io release. The
-//! pinned rev bundles a `llama.cpp` submodule that includes Gemma 4
-//! tokenizer / chat-template support; older crates.io snapshots
-//! mis-tokenized Gemma 4 prompts and produced gibberish or aborted
-//! under `GGML_ASSERT`. Bumping the pinned rev is the single knob for
-//! tracking upstream llama.cpp going forward.
+//! pinned rev bundles a `llama.cpp` submodule that includes the
+//! `<start_of_turn>` chat-template tooling Gemma needs; older crates.io
+//! snapshots mis-tokenized Gemma prompts.
+//!
+//! Gemma 4 (E2B / E4B) GGUFs are NOT supported on this build: the
+//! bundled `llama.cpp` aborts in `llama-context.cpp::sched_reserve` when
+//! it tries to auto-detect Fused Gated Delta Net support on Gemma 4's
+//! graph (the GDN tensors don't carry the FGDN_AR name prefix the check
+//! requires, so a `GGML_ASSERT` fires from C++ and the process exits,
+//! bypassing fail-open). The catalog ships Gemma 3 instead because it
+//! uses the same chat template (so this engine is unchanged) but a
+//! standard transformer architecture (no GDN, so no crash). See
+//! `models.rs` doc comment for details. `settings.rs::load` migrates
+//! any stored `gemma-4-*` selection back to the working default.
 //!
 //! Loads a GGUF model on first use, keeps it warm for repeat dictations.
-//! Hard 3 s wall-clock timeout per the existing fail-open pattern: if the
-//! model takes longer than that, the session falls back to the raw
-//! transcript.
+//! A wall-clock timeout plus a pre-flight token-count gate protect the
+//! existing fail-open pattern: if the prompt is too long for a 2 B local
+//! model to handle usefully, or if generation stalls, the session falls
+//! back to the raw transcript instead of crashing the C++ inference layer
+//! with a `GGML_ASSERT` abort (which Rust cannot catch).
 //!
 //! NB: the actual inference path is gated behind the `local-engines`
 //! Cargo feature. Without that feature this engine compiles into a stub
@@ -33,8 +44,30 @@ use crate::models::{self, ModelKind};
 #[cfg(feature = "local-engines")]
 use once_cell::sync::OnceCell;
 
+// Wall-clock ceiling for the whole cleanup call. Cold model load
+// (~3–8 s) + prompt eval at MAX_PROMPT_TOKENS (~5–10 s) + up to
+// MAX_NEW_TOKENS at 30–60 tok/s on M-series Metal (~17–34 s) ≈ ~52 s
+// worst case; 60 s leaves slack. On overrun, fail-open in `session.rs`
+// uses the raw transcript.
 #[cfg(feature = "local-engines")]
-const HARD_TIMEOUT: Duration = Duration::from_secs(3);
+const HARD_TIMEOUT: Duration = Duration::from_secs(60);
+
+// Largest tokenized prompt we hand to llama.cpp. Above this we return
+// `Err` and the pipeline falls open. 6144 BPE tokens is well past a
+// 30-min dictation while keeping KV-cache RAM bounded on the E2B model,
+// and matters because Gemma's non-causal attention requires the full
+// input batch in a single ubatch — exceeding `n_ubatch` on the C++ side
+// triggers a `GGML_ASSERT` `abort()` that bypasses Rust error handling.
+#[cfg(feature = "local-engines")]
+const MAX_PROMPT_TOKENS: usize = 6144;
+
+// Generation cap derived from prompt length. Cleanup output is bounded
+// by input (we strip filler, never invent), so we cap at ~1.25× input
+// with a floor for short utterances and an absolute ceiling.
+#[cfg(feature = "local-engines")]
+const MIN_NEW_TOKENS: i32 = 128;
+#[cfg(feature = "local-engines")]
+const MAX_NEW_TOKENS: i32 = 1024;
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a transcript cleaner. Output ONLY the cleaned text. Do not add commentary, prefaces, or quotes.
 
@@ -203,18 +236,59 @@ fn run_completion(
 
     let model = model_lock.lock();
 
-    let n_ctx = NonZeroU32::new(2048).unwrap();
-    let cparams = LlamaContextParams::default().with_n_ctx(Some(n_ctx));
+    // Tokenize first so we can size the context to the actual prompt.
+    // `AddBos::Never`: the hand-rolled chat template above starts with
+    // `<start_of_turn>user\n…` and does not include an explicit `<bos>`.
+    // Gemma GGUF metadata sets `add_bos = true`, and on this pinned rev
+    // passing `Always` here causes a duplicated BOS that throws off
+    // `n_ubatch` sizing and biases first-token logits.
+    let tokens = model
+        .str_to_token(prompt, AddBos::Never)
+        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+
+    // Pre-flight gate: this is the load-bearing guard that prevents the
+    // C++ `GGML_ASSERT` `abort()`. By returning `Err` before creating
+    // the context we let `session.rs` fail open to the raw transcript.
+    if tokens.len() > MAX_PROMPT_TOKENS {
+        return Err(anyhow::anyhow!(
+            "transcript too long for local polish ({} tokens > {})",
+            tokens.len(),
+            MAX_PROMPT_TOKENS
+        ));
+    }
+    let prompt_len = tokens.len() as i32;
+    if prompt_len == 0 {
+        return Err(anyhow::anyhow!("empty prompt after tokenization"));
+    }
+
+    // Round up to the natural llama.cpp ubatch grid so prompts that
+    // differ by a few tokens reuse the same allocation pattern.
+    fn round_up_512(x: u32) -> u32 {
+        x.div_ceil(512) * 512
+    }
+
+    // Output is bounded by input (cleanup ≈ subset of input) so 1.25×
+    // is a generous ceiling; the floor lets a one-sentence input still
+    // emit a complete polished sentence + eog.
+    let n_new = (prompt_len + prompt_len / 4).clamp(MIN_NEW_TOKENS, MAX_NEW_TOKENS);
+
+    let needed_ctx = (prompt_len as u32) + (n_new as u32) + 64;
+    let n_ctx_val = round_up_512(needed_ctx).max(2048);
+    let n_batch_val = round_up_512(prompt_len as u32).max(512).min(n_ctx_val);
+
+    let n_ctx = NonZeroU32::new(n_ctx_val).unwrap();
+    // `n_ubatch == n_batch >= prompt_len` is the precondition that
+    // dodges Gemma's non-causal-attention assertion in C++.
+    let cparams = LlamaContextParams::default()
+        .with_n_ctx(Some(n_ctx))
+        .with_n_batch(n_batch_val)
+        .with_n_ubatch(n_batch_val);
     let mut ctx = model
         .new_context(backend, cparams)
         .map_err(|e| anyhow::anyhow!("llama context: {e}"))?;
 
-    let tokens = model
-        .str_to_token(prompt, AddBos::Always)
-        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-
-    let mut batch = LlamaBatch::new(2048, 1);
-    let last_idx = tokens.len() as i32 - 1;
+    let mut batch = LlamaBatch::new(n_batch_val as usize, 1);
+    let last_idx = prompt_len - 1;
     for (i, tok) in tokens.iter().enumerate() {
         batch
             .add(*tok, i as i32, &[0], i as i32 == last_idx)
@@ -226,7 +300,6 @@ fn run_completion(
 
     let mut out = String::new();
     let mut n_cur = batch.n_tokens();
-    let max_new = 1024i32;
     let mut decoder = encoding_rs::UTF_8.new_decoder();
 
     // Simple greedy decoder. We pull the post-decode candidate
@@ -235,7 +308,7 @@ fn run_completion(
     // batch. Sampling sophistication (temperature, top-p) can come in a
     // follow-up — for the cleanup task greedy + the tightly scoped
     // system prompt is competitive.
-    for _ in 0..max_new {
+    for _ in 0..n_new {
         let mut best_tok: Option<llama_cpp_2::token::LlamaToken> = None;
         let mut best_logit: f32 = f32::NEG_INFINITY;
         for c in ctx.candidates() {

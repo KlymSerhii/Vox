@@ -179,7 +179,7 @@ export default function SettingsView() {
   }
 
   return (
-    <div class="flex h-screen w-screen bg-[var(--color-bg)] text-[var(--color-ink)]">
+    <div class="liquid-canvas flex h-screen w-screen text-[var(--color-ink)]">
       <Show when={loaded() && state()} fallback={<Loader />}>
         {(s) => (
           <>
@@ -226,7 +226,7 @@ function Loader() {
 function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
   return (
     <aside
-      class="flex h-full w-[200px] flex-col border-r border-[var(--color-border)] px-3 py-4"
+      class="flex h-full w-[210px] flex-col border-r border-[var(--color-border)] px-3 py-5"
       style={{
         background: "var(--color-sidebar)",
         "backdrop-filter": "var(--glass-blur)",
@@ -235,8 +235,10 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
           "inset 0 1px 0 var(--glass-highlight), 1px 0 0 var(--glass-edge-bottom)",
       }}
     >
-      <div class="mb-4 px-2">
-        <div class="text-[15px] font-semibold">Vox</div>
+      <div class="mb-5 px-2">
+        <div class="text-[15px] font-semibold tracking-[-0.01em] text-[var(--color-ink)]">
+          Vox
+        </div>
         <div class="text-[11px] text-[var(--color-ink-mute)]">
           Talk to any app.
         </div>
@@ -247,13 +249,23 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
             <button
               type="button"
               onClick={() => props.onTab(t.id)}
-              class="flex items-center gap-2 rounded-[6px] px-3 py-1.5 text-left text-[13px] transition-colors"
+              class="flex items-center gap-2.5 rounded-[8px] px-3 py-1.5 text-left text-[13px] font-medium transition-all"
               classList={{
-                "bg-[var(--color-control)] text-[var(--color-ink)]":
+                "text-[var(--color-ink)] ring-1 ring-[var(--color-border)]":
                   props.tab === t.id,
-                "text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)]":
+                "text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]":
                   props.tab !== t.id,
               }}
+              style={
+                props.tab === t.id
+                  ? {
+                      background: "var(--color-surface-raised)",
+                      "backdrop-filter": "var(--glass-blur)",
+                      "-webkit-backdrop-filter": "var(--glass-blur)",
+                      "box-shadow": "var(--glass-shadow-stack-sm)",
+                    }
+                  : {}
+              }
             >
               <TabIcon name={t.icon} active={props.tab === t.id} />
               <span>{t.label}</span>
@@ -355,10 +367,14 @@ function Header(props: { tab: Tab; savedFlash: boolean }) {
     () => TABS.find((t) => t.id === props.tab)?.label ?? "",
   );
   return (
-    <header class="mb-5 flex items-center justify-between border-b border-[var(--color-border)] pb-3">
-      <h1 class="text-[17px] font-semibold">{title()}</h1>
+    <header class="mb-6 flex items-center justify-between border-b border-[var(--color-border)] pb-4">
+      <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[var(--color-ink)]">
+        {title()}
+      </h1>
       <Show when={props.savedFlash}>
-        <span class="text-[11px] text-[var(--color-success)]">✓ Saved</span>
+        <span class="text-[11px] font-medium text-[var(--color-success)]">
+          ✓ Saved
+        </span>
       </Show>
     </header>
   );
@@ -366,10 +382,7 @@ function Header(props: { tab: Tab; savedFlash: boolean }) {
 
 function Card(props: { children: any }) {
   return (
-    <div
-      class="mb-5 overflow-hidden rounded-[14px] bg-[var(--color-surface-raised)] ring-1 ring-[var(--color-border)]"
-      style={{ "box-shadow": "var(--glass-shadow-stack-sm)" }}
-    >
+    <div class="liquid-card mb-5 overflow-hidden rounded-[14px] ring-1 ring-[var(--color-border)]">
       {props.children}
     </div>
   );
@@ -408,17 +421,18 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
       role="switch"
       aria-checked={props.checked}
       onClick={() => props.onChange(!props.checked)}
-      class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
+      class="relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full ring-1 ring-inset transition-colors"
       classList={{
-        "bg-[var(--color-accent)]": props.checked,
-        "bg-[var(--color-control)]": !props.checked,
+        "bg-[var(--color-accent)] ring-transparent": props.checked,
+        "bg-[var(--color-control)] ring-[var(--color-border-strong)]":
+          !props.checked,
       }}
     >
       <span
-        class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+        class="toggle-knob inline-block h-[18px] w-[18px] transform rounded-full transition-transform"
         classList={{
-          "translate-x-4": props.checked,
-          "translate-x-0.5": !props.checked,
+          "translate-x-[18px]": props.checked,
+          "translate-x-[2px]": !props.checked,
         }}
       />
     </button>
@@ -441,71 +455,57 @@ function GeneralTab(props: {
   }
 
   return (
-    <>
-      <Card>
-        <Row
-          label="Launch at login"
-          hint="Vox will start quietly in your menu bar."
-          last
+    <Card>
+      <Row
+        label="Launch at login"
+        hint="Vox will start quietly in your menu bar."
+      >
+        <Toggle
+          checked={props.s.launch_at_login}
+          onChange={(v) => void toggleLaunchAtLogin(v)}
+        />
+      </Row>
+      <Row
+        label="Hotkey behavior"
+        hint="Hands-free toggle (press once to start, press again to stop) or push-to-talk (hold)."
+      >
+        <select
+          class="rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          value={props.s.hands_free_enabled ? "toggle" : "ptt"}
+          onChange={(e) =>
+            props.update({
+              hands_free_enabled: e.currentTarget.value === "toggle",
+            })
+          }
         >
-          <Toggle
-            checked={props.s.launch_at_login}
-            onChange={(v) => void toggleLaunchAtLogin(v)}
-          />
-        </Row>
-      </Card>
-
-      <Card>
-        <Row
-          label="Hotkey behavior"
-          hint="Hands-free toggle (press once to start, press again to stop) or push-to-talk (hold)."
-          last
+          <option value="toggle">Hands-free toggle (recommended)</option>
+          <option value="ptt">Push-to-talk (hold)</option>
+        </select>
+      </Row>
+      <Row
+        label="Language"
+        hint="Whisper language hint. Auto detects from speech."
+      >
+        <select
+          class="rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          value={props.s.language}
+          onChange={(e) => props.update({ language: e.currentTarget.value })}
         >
-          <select
-            class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.hands_free_enabled ? "toggle" : "ptt"}
-            onChange={(e) =>
-              props.update({
-                hands_free_enabled: e.currentTarget.value === "toggle",
-              })
-            }
-          >
-            <option value="toggle">Hands-free toggle (recommended)</option>
-            <option value="ptt">Push-to-talk (hold)</option>
-          </select>
-        </Row>
-      </Card>
-
-      <Card>
-        <Row
-          label="Language"
-          hint="Whisper language hint. Auto detects from speech."
-          last
-        >
-          <select
-            class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-            value={props.s.language}
-            onChange={(e) => props.update({ language: e.currentTarget.value })}
-          >
-            <For each={LANGUAGE_OPTIONS}>
-              {(o) => <option value={o.value}>{o.label}</option>}
-            </For>
-          </select>
-        </Row>
-      </Card>
-
-      <Card>
-        <Row
-          label="Default microphone"
-          hint="Vox uses the current system default input device."
-          last
-        >
-          <span class="text-[12px] text-[var(--color-ink-mute)]">
-            System default
-          </span>
-        </Row>
-      </Card>
-    </>
+          <For each={LANGUAGE_OPTIONS}>
+            {(o) => <option value={o.value}>{o.label}</option>}
+          </For>
+        </select>
+      </Row>
+      <Row
+        label="Default microphone"
+        hint="Vox uses the current system default input device."
+        last
+      >
+        <span class="text-[12px] text-[var(--color-ink-mute)]">
+          System default
+        </span>
+      </Row>
+    </Card>
   );
 }
 
@@ -1034,7 +1034,7 @@ function ModelRow(props: {
   }
 
   return (
-    <div class="mb-3 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
+    <div class="liquid-card mb-3 rounded-[10px] p-4 ring-1 ring-[var(--color-border)]">
       <div class="flex items-start justify-between gap-3">
         <div class="flex-1">
           <div class="flex items-center gap-2">
@@ -1380,7 +1380,7 @@ function ModeRow(props: {
   onExport: () => void;
 }) {
   return (
-    <div class="mb-3 rounded-[10px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]">
+    <div class="liquid-card mb-3 rounded-[10px] p-4 ring-1 ring-[var(--color-border)]">
       <div class="flex items-start justify-between gap-3">
         <div class="flex-1">
           <div class="flex items-center gap-2">
@@ -1511,7 +1511,15 @@ function ModeEditor(props: {
 
   return (
     <div class="fixed inset-0 z-50 flex items-center justify-center bg-[var(--color-scrim)] px-6 py-8">
-      <div class="flex h-full w-full max-w-2xl flex-col overflow-hidden rounded-[12px] bg-[var(--color-bg)] ring-1 ring-[var(--color-border)]">
+      <div
+        class="flex h-full w-full max-w-2xl flex-col overflow-hidden rounded-[14px] ring-1 ring-[var(--color-border-strong)]"
+        style={{
+          background: "var(--color-surface-raised)",
+          "backdrop-filter": "var(--glass-blur)",
+          "-webkit-backdrop-filter": "var(--glass-blur)",
+          "box-shadow": "var(--glass-shadow-stack)",
+        }}
+      >
         <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
           <h2 class="text-[14px] font-semibold">
             {props.mode.id ? "Edit mode" : "New mode"}
@@ -1873,11 +1881,10 @@ function PrivacyTab(_props: { s: Settings }) {
         audio or transcripts to any external service.
       </p>
 
-      <div
-        class="mb-5 rounded-[14px] bg-[var(--color-surface-raised)] p-4 ring-1 ring-[var(--color-border)]"
-        style={{ "box-shadow": "var(--glass-shadow-stack-sm)" }}
-      >
-        <h3 class="mb-2 text-[13px] font-medium">What never leaves</h3>
+      <div class="liquid-card mb-5 rounded-[14px] p-4 ring-1 ring-[var(--color-border)]">
+        <h3 class="mb-2 text-[13px] font-semibold text-[var(--color-ink)]">
+          What never leaves
+        </h3>
         <ul class="space-y-1 text-[12px] text-[var(--color-ink-mute)]">
           <li>• No audio is ever written to disk.</li>
           <li>• No transcripts are sent over the network.</li>
@@ -1955,11 +1962,10 @@ function AboutTab() {
 
   return (
     <>
-      <div
-        class="mb-5 rounded-[14px] bg-[var(--color-surface-raised)] p-5 ring-1 ring-[var(--color-border)]"
-        style={{ "box-shadow": "var(--glass-shadow-stack-sm)" }}
-      >
-        <div class="mb-1 text-[20px] font-semibold">Vox</div>
+      <div class="liquid-card mb-5 rounded-[14px] p-5 ring-1 ring-[var(--color-border)]">
+        <div class="mb-1 text-[20px] font-semibold tracking-[-0.015em] text-[var(--color-ink)]">
+          Vox
+        </div>
         <div class="text-[13px] text-[var(--color-ink-mute)]">
           Talk to any app — now offline by default.
         </div>

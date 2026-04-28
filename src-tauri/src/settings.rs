@@ -315,10 +315,33 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
             _ => stored,
         }
     };
-    let llm_model_id = store
-        .get(KEY_LLM_MODEL_ID)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_llm_model_id);
+    let llm_model_id = {
+        let stored = store
+            .get(KEY_LLM_MODEL_ID)
+            .and_then(|v| v.as_str().map(|s| s.to_string()))
+            .unwrap_or_else(default_llm_model_id);
+        // Rewrite Gemma 4 selections to the current default. The bundled
+        // `llama.cpp` snapshot crashes (`GGML_ASSERT` in the FGDN
+        // auto-detect path) when constructing a context for any Gemma 4
+        // E2B/E4B GGUF — see the file-level docs in `models.rs`. Without
+        // this migration, an existing install with `llm_model_id =
+        // "gemma-4-e2b-q4_k_m"` aborts the process on every polish.
+        if models::is_known_broken_llm_id(&stored) {
+            let replacement = default_llm_model_id();
+            log::error!(
+                "settings: migrating llm_model_id '{stored}' -> '{replacement}' \
+                 (Gemma 4 GGUFs crash this build's llama.cpp; see models.rs)."
+            );
+            store.set(
+                KEY_LLM_MODEL_ID,
+                serde_json::Value::String(replacement.clone()),
+            );
+            store_dirty = true;
+            replacement
+        } else {
+            stored
+        }
+    };
 
     // The polishing on/off toggle. If the user has never seen the new
     // toggle and previously had cloud cleanup configured, treat that as

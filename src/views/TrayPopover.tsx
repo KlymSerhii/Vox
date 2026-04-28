@@ -126,16 +126,7 @@ export default function TrayPopoverView() {
   }
 
   return (
-    <div
-      class="flex h-screen w-screen flex-col overflow-hidden rounded-[14px] text-[13px] text-[var(--color-ink)]"
-      style={{
-        background: "var(--color-surface-glass)",
-        "backdrop-filter": "var(--glass-blur)",
-        "-webkit-backdrop-filter": "var(--glass-blur)",
-        border: "1px solid var(--glass-rim)",
-        "box-shadow": "var(--glass-shadow-stack)",
-      }}
-    >
+    <div class="liquid-glass flex h-screen w-screen flex-col overflow-hidden rounded-[14px] text-[13px] text-[var(--color-ink)]">
       <Show
         when={loaded() && s()}
         fallback={
@@ -149,13 +140,13 @@ export default function TrayPopoverView() {
             <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
               <div class="flex items-center gap-2">
                 <StatusDot tone={statusLine().tone} />
-                <span class="text-[13px] font-medium">
+                <span class="text-[13px] font-semibold tracking-[-0.005em] text-[var(--color-ink)]">
                   {statusLine().label}
                 </span>
               </div>
               <button
                 type="button"
-                class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
+                class="rounded-[6px] p-1 text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
                 title="Open Settings"
                 onClick={() => openSettingsWindow()}
               >
@@ -174,12 +165,12 @@ export default function TrayPopoverView() {
             </header>
 
             <div class="border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between">
-                <div class="flex flex-col">
-                  <span class="text-[13px] font-medium">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
                     {st().hands_free_enabled ? "Press to talk" : "Hold to talk"}
                   </span>
-                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
                     {st().hands_free_enabled
                       ? "Press the hotkey to start, press again to stop."
                       : "Hold the hotkey while speaking, release to stop."}
@@ -193,10 +184,12 @@ export default function TrayPopoverView() {
             </div>
 
             <div class="border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between">
-                <div class="flex flex-col">
-                  <span class="text-[13px] font-medium">Polish transcripts</span>
-                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Polish transcripts
+                  </span>
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
                     {st().polishing_enabled
                       ? "Gemma cleans up the transcript before copying."
                       : "Raw output is copied as-is."}
@@ -210,10 +203,12 @@ export default function TrayPopoverView() {
             </div>
 
             <div class="relative border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between">
-                <div class="flex flex-col">
-                  <span class="text-[13px] font-medium">Voice mode</span>
-                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Voice mode
+                  </span>
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
                     Cycle with{" "}
                     <span class="keycap">
                       {hotkeyLabel(st().mode_cycle_hotkey || "Alt+M")}
@@ -222,8 +217,7 @@ export default function TrayPopoverView() {
                 </div>
                 <button
                   type="button"
-                  class="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] hover:brightness-110"
-                  style={{ background: "var(--color-surface-raised)" }}
+                  class="liquid-card inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
                   onClick={() => setModeMenuOpen(!modeMenuOpen())}
                   aria-haspopup="listbox"
                   aria-expanded={modeMenuOpen()}
@@ -251,12 +245,7 @@ export default function TrayPopoverView() {
               </div>
               <Show when={modeMenuOpen()}>
                 <div
-                  class="absolute right-4 top-full z-10 mt-1 max-h-60 w-56 overflow-y-auto rounded-[10px] py-1 shadow-lg ring-1 ring-[var(--color-border-strong)] scrollbar-thin"
-                  style={{
-                    background: "var(--color-surface-raised)",
-                    "backdrop-filter": "blur(28px) saturate(180%)",
-                    "-webkit-backdrop-filter": "blur(28px) saturate(180%)",
-                  }}
+                  class="liquid-glass absolute right-4 top-full z-10 mt-1 max-h-60 w-56 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
                   role="listbox"
                 >
                   <For each={modes()}>
@@ -287,7 +276,7 @@ export default function TrayPopoverView() {
             </div>
 
             <div class="flex-1 overflow-y-auto scrollbar-thin px-2 py-2">
-              <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-wider text-[var(--color-ink-faint)]">
+              <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
                 Recent (cleared on quit)
               </div>
               <Show
@@ -300,8 +289,8 @@ export default function TrayPopoverView() {
               >
                 <For each={recents()}>
                   {(r, idx) => (
-                    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 hover:bg-[var(--color-overlay)]">
-                      <span class="w-10 shrink-0 text-[11px] text-[var(--color-ink-faint)]">
+                    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
+                      <span class="w-10 shrink-0 text-[11px] font-medium text-[var(--color-ink-faint)]">
                         {ago(r.ts)}
                       </span>
                       <span class="flex-1 truncate text-[12px] text-[var(--color-ink)]">
@@ -344,7 +333,7 @@ export default function TrayPopoverView() {
 
             <div class="border-t border-[var(--color-border)] px-4 py-3">
               <div class="flex items-center justify-between">
-                <span class="text-[12px] text-[var(--color-ink-mute)]">
+                <span class="text-[12px] font-medium text-[var(--color-ink-mute)]">
                   Appearance
                 </span>
                 <AppearanceToggle
@@ -360,7 +349,7 @@ export default function TrayPopoverView() {
             <footer class="flex border-t border-[var(--color-border)]">
               <button
                 type="button"
-                class="flex-1 py-3 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
+                class="flex-1 py-3 text-[12px] font-medium text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
                 onClick={() => quitApp()}
               >
                 Quit
@@ -391,17 +380,18 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
       role="switch"
       aria-checked={props.checked}
       onClick={() => props.onChange(!props.checked)}
-      class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
+      class="relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full ring-1 ring-inset transition-colors"
       classList={{
-        "bg-[var(--color-accent)]": props.checked,
-        "bg-[var(--color-control)]": !props.checked,
+        "bg-[var(--color-accent)] ring-transparent": props.checked,
+        "bg-[var(--color-control)] ring-[var(--color-border-strong)]":
+          !props.checked,
       }}
     >
       <span
-        class="inline-block h-4 w-4 transform rounded-full bg-white transition-transform"
+        class="toggle-knob inline-block h-[18px] w-[18px] transform rounded-full transition-transform"
         classList={{
-          "translate-x-4": props.checked,
-          "translate-x-0.5": !props.checked,
+          "translate-x-[18px]": props.checked,
+          "translate-x-[2px]": !props.checked,
         }}
       />
     </button>
@@ -414,7 +404,7 @@ function AppearanceToggle(props: {
 }) {
   return (
     <div
-      class="inline-flex items-center rounded-[12px] p-0.5"
+      class="inline-flex items-center rounded-full p-[3px] ring-1 ring-inset ring-[var(--color-border)]"
       style={{ background: "var(--color-control)" }}
       role="radiogroup"
       aria-label="Appearance"
@@ -449,18 +439,18 @@ function AppearanceHalf(props: {
       role="radio"
       aria-checked={props.active}
       aria-label={props.label}
-      class="inline-flex h-6 w-8 items-center justify-center rounded-[10px] transition-colors"
+      class="inline-flex h-6 w-7 items-center justify-center rounded-full transition-all"
       classList={{
-        "hover:text-[var(--color-ink-mute)]": !props.active,
+        "hover:text-[var(--color-ink)]": !props.active,
       }}
       style={{
         background: props.active ? "var(--color-surface-raised)" : "transparent",
-        "box-shadow": props.active
-          ? "var(--glass-shadow-stack-sm)"
-          : "none",
+        "backdrop-filter": props.active ? "var(--glass-blur)" : "none",
+        "-webkit-backdrop-filter": props.active ? "var(--glass-blur)" : "none",
+        "box-shadow": props.active ? "var(--glass-shadow-stack-sm)" : "none",
         color: props.active
           ? "var(--color-ink)"
-          : "var(--color-ink-faint)",
+          : "var(--color-ink-mute)",
       }}
       onClick={props.onClick}
     >
