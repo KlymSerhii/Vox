@@ -214,6 +214,7 @@ pub fn get_recent_transcripts() -> Vec<transcripts::RecentTranscript> {
 #[tauri::command]
 pub fn open_settings<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("settings") {
+        crate::tray::position_settings_on_active_display(&win);
         win.show().map_err(|e| e.to_string())?;
         win.set_focus().map_err(|e| e.to_string())?;
     }

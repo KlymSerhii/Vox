@@ -43,8 +43,6 @@
 //! `GGML_OP_GATED_DELTA_NET` ops. It is the recommended fallback if E4B
 //! crashes; it needs ~19 GB RAM at runtime so it isn't the default for
 //! sub-quality tiers.
-//! - Phi-4-mini GGUF: <https://huggingface.co/microsoft/Phi-4-mini-instruct-onnx>
-//!   (mirrored in `bartowski/microsoft_Phi-4-mini-instruct-GGUF`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -177,17 +175,6 @@ pub const CATALOG: &[ModelDescriptor] = &[
         url: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
         engine: "gemma-local",
         ram_peak_mb: 19000,
-        tier: "quality",
-    },
-    ModelDescriptor {
-        id: "phi-4-mini-q4_k_m",
-        kind: ModelKind::Llm,
-        name: "Phi-4-mini Instruct (Q4_K_M)",
-        size_bytes: 2_400_000_000,
-        sha256: None,
-        url: "https://huggingface.co/bartowski/microsoft_Phi-4-mini-instruct-GGUF/resolve/main/microsoft_Phi-4-mini-instruct-Q4_K_M.gguf",
-        engine: "gemma-local",
-        ram_peak_mb: 4000,
         tier: "quality",
     },
 ];
@@ -593,15 +580,21 @@ pub fn recommended_llm_model_id() -> &'static str {
     }
 }
 
-/// Model IDs that point at GGUFs known to crash this build's bundled
-/// `llama.cpp` (see file-level docs). On settings load we rewrite any
-/// stored selection that names one of these to the current default so
-/// the user doesn't get an `abort()` the next time they hit the polish
-/// hotkey. Only E2B is migrated automatically — E4B has the same
-/// MatFormer architecture and is expected to crash too, but it is shipped
-/// at the user's explicit request, so leave it selectable.
+/// Model IDs that should be migrated away from on settings load. Two
+/// reasons land an id here:
+/// 1. The GGUF crashes this build's bundled `llama.cpp` (see file-level
+///    docs) — without migration the user gets an `abort()` the next
+///    time they hit the polish hotkey. E4B has the same MatFormer
+///    architecture as E2B and is expected to crash too, but it is
+///    shipped at the user's explicit request, so leave it selectable.
+/// 2. The id was once in the catalog but has been retired. Without
+///    migration, an upgrader who had it selected would end up with a
+///    dangling reference that `descriptor_for` can't resolve.
+///
+/// In both cases `settings::load` rewrites the stored id to the current
+/// default and persists the change.
 pub fn is_known_broken_llm_id(id: &str) -> bool {
-    matches!(id, "gemma-4-e2b-q4_k_m")
+    matches!(id, "gemma-4-e2b-q4_k_m" | "phi-4-mini-q4_k_m")
 }
 
 #[cfg(test)]

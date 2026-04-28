@@ -320,17 +320,16 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
             .get(KEY_LLM_MODEL_ID)
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .unwrap_or_else(default_llm_model_id);
-        // Rewrite Gemma 4 selections to the current default. The bundled
-        // `llama.cpp` snapshot crashes (`GGML_ASSERT` in the FGDN
-        // auto-detect path) when constructing a context for any Gemma 4
-        // E2B/E4B GGUF — see the file-level docs in `models.rs`. Without
-        // this migration, an existing install with `llm_model_id =
-        // "gemma-4-e2b-q4_k_m"` aborts the process on every polish.
+        // Rewrite stored selections that are either known-crashing or
+        // retired from the catalog (see `models::is_known_broken_llm_id`
+        // for the full list and the rationale per id). Without this
+        // migration, the polish hotkey would either abort the process
+        // or fail to resolve the model.
         if models::is_known_broken_llm_id(&stored) {
             let replacement = default_llm_model_id();
             log::error!(
-                "settings: migrating llm_model_id '{stored}' -> '{replacement}' \
-                 (Gemma 4 GGUFs crash this build's llama.cpp; see models.rs)."
+                "settings: migrating retired/broken llm_model_id '{stored}' -> '{replacement}' \
+                 (see models::is_known_broken_llm_id)."
             );
             store.set(
                 KEY_LLM_MODEL_ID,

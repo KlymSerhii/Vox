@@ -2,7 +2,7 @@
 //!
 //! There are concrete engine implementations under this module:
 //! - [`whisper_local`] — `whisper-rs` 0.16 with Core ML + Metal.
-//! - [`gemma_local`] — `llama-cpp-2` (git pin, Metal) for Gemma 4 / Phi-4-mini.
+//! - [`gemma_local`] — `llama-cpp-2` (git pin, Metal) for Gemma 4.
 //! - [`none`] — no-op cleanup engine that returns its input unchanged.
 //!
 //! 2026-04-26: cloud engines (Groq STT, Anthropic LLM) were removed so

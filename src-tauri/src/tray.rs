@@ -84,6 +84,7 @@ pub fn build<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 
 fn show_settings<R: Runtime>(app: &AppHandle<R>) {
     if let Some(win) = app.get_webview_window("settings") {
+        position_settings_on_active_display(&win);
         let _ = win.show();
         let _ = win.set_focus();
     }
@@ -91,6 +92,41 @@ fn show_settings<R: Runtime>(app: &AppHandle<R>) {
     if let Some(win) = app.get_webview_window(POPOVER_LABEL) {
         let _ = win.hide();
     }
+}
+
+/// Center the settings window on whichever display the tray icon was last
+/// observed on. No-op if we have no tray position yet (e.g. the user hit a
+/// hotkey before ever clicking the tray) — in that case the window keeps
+/// its existing position so we never make multi-display worse than before.
+pub(crate) fn position_settings_on_active_display<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+) {
+    let Some(icon_pos) = *rect_store().lock() else {
+        return;
+    };
+    let Some(monitor) = monitor_for_position(win, icon_pos) else {
+        return;
+    };
+
+    let scale = monitor.scale_factor();
+    let mx = monitor.position().x as f64 / scale;
+    let my = monitor.position().y as f64 / scale;
+    let mw = monitor.size().width as f64 / scale;
+    let mh = monitor.size().height as f64 / scale;
+
+    // Use the window's current outer size so a user-resized settings window
+    // stays the size they chose; fall back to the configured initial size
+    // if we can't read it for any reason.
+    let (w, h) = win
+        .outer_size()
+        .ok()
+        .map(|s| (s.width as f64 / scale, s.height as f64 / scale))
+        .filter(|(w, h)| *w > 0.0 && *h > 0.0)
+        .unwrap_or((660.0, 620.0));
+
+    let x = mx + ((mw - w) / 2.0).max(0.0);
+    let y = my + ((mh - h) / 2.0).max(0.0);
+    let _ = win.set_position(LogicalPosition::new(x, y));
 }
 
 /// Find the monitor whose physical rect contains `pos`. Used to anchor the
