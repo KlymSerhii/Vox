@@ -171,6 +171,60 @@ pub fn run() {
                 let _ = win.hide();
             }
 
+            // Pre-warm the inference server so the first polish
+            // doesn't pay the ~5-10 s cold spawn + GGUF-load cost
+            // on top of the actual roundtrip. This is the single
+            // largest UX win for the live-sales-call use case where
+            // the gap between "first dictation slow" and "every
+            // dictation fast" is exactly the worst time to surface
+            // a 6 s pause.
+            //
+            // Conditional: only pre-warm when polishing is on AND
+            // the assets are already on disk. Users who haven't
+            // finished onboarding, or who turned polishing off,
+            // pay zero RAM cost. The supervisor's spawn-lock
+            // (`inference_proc::ServerStateInner::spawning`)
+            // serialises with any concurrent ensure_running call
+            // from the dictation path, so a fast user dictating
+            // during the warmup window won't double-spawn.
+            //
+            // Fire-and-forget: the warmup itself runs on a Tokio
+            // task so it never delays UI startup. Errors are
+            // logged at info level (not warn) because "binary not
+            // installed yet" is a normal pre-onboarding state.
+            if s.onboarded
+                && s.polishing_enabled
+                && s.llm_engine == "gemma-local"
+                && !s.llm_model_id.is_empty()
+                && crate::inference_server::is_installed(app_handle)
+            {
+                let warm_handle = app_handle.clone();
+                let warm_model_id = s.llm_model_id.clone();
+                tauri::async_runtime::spawn(async move {
+                    let started = std::time::Instant::now();
+                    log::info!(
+                        "inference: pre-warming on app startup (model={})",
+                        warm_model_id
+                    );
+                    match crate::inference_proc::ensure_running(
+                        &warm_handle,
+                        &warm_model_id,
+                    )
+                    .await
+                    {
+                        Ok(server) => log::info!(
+                            "inference: pre-warm complete on port {} in {} ms",
+                            server.port,
+                            started.elapsed().as_millis()
+                        ),
+                        Err(e) => log::info!(
+                            "inference: pre-warm skipped after {} ms: {e}",
+                            started.elapsed().as_millis()
+                        ),
+                    }
+                });
+            }
+
             // First-launch onboarding. The previous "legacy cloud user"
             // migration dialog was removed when cloud engines went away
             // (2026-04-26) — the app is fully local now and there's

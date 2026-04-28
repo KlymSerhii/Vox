@@ -261,7 +261,7 @@ pub fn builtins() -> Vec<VoiceMode> {
     ]
 }
 
-const GENERAL_PROMPT: &str = "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.
+const GENERAL_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.
 
 Rules:
 1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler). Keep them when meaningful.
@@ -273,7 +273,12 @@ Rules:
    - \"X. Actually no, disregard that. Y.\" → \"Y.\"
    - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"
    - \"Forget what I just said. Z.\" → \"Z.\"
-5. When the speaker enumerates items or steps, format them as a numbered list. Only do this when the enumeration is explicit (\"first… second… third…\", \"the three things are…\", \"step one… step two…\"). Leave flowing narrative as prose.
+5. When the speaker enumerates two or more items, actions, or steps, render them as a numbered list. Triggers include:
+   - Ordinal markers: \"first… second… third…\", \"one is… two is…\".
+   - Step markers: \"step one… step two…\".
+   - Enumeration phrases: \"the three things are…\", \"a couple of points:\".
+   - Conversational connectors that introduce a sequence: \"first of all… and then…\", \"to start… after that…\", \"I need you to X and then Y\", \"we should do A and also B\".
+   Preserve any prose lead-in before the list (\"I need you to:\\n1. …\\n2. …\"). Single statements and flowing narrative stay as prose.
 6. Preserve the speaker's register and word choice. Do not formalize casual speech.
 7. Never add facts, names, links, or content the speaker did not say.
 
@@ -281,7 +286,11 @@ Examples:
 - \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"
 - \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"
 - \"first we ship the build then we run tests and finally we deploy\" →
-   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"";
+   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"
+- \"I need you to first of all add tests and then also verify the build passes\" →
+   \"I need you to:\n1. Add tests.\n2. Verify the build passes.\"
+- \"so everything looks fine but now I need you to first of all add tests and then also to verify that the build passes appropriately\" →
+   \"Everything looks fine. I need you to:\n1. Add tests.\n2. Verify that the build passes appropriately.\"";
 
 const EMAIL_PROMPT: &str = "You are formatting a dictated message as the BODY of a professional email. Return plain text only.
 
@@ -696,6 +705,15 @@ const LEGACY_GENERAL_PROMPTS: &[&str] = &[
     // self-corrections only. Did not handle retractions
     // (\"X. Disregard that. Y.\") or list-style structuring.
     "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no explanations.\n\nRules:\n- Remove filler words (um, uh, like as filler, you know, sort of, kind of as filler).\n- Apply standard punctuation and capitalization (commas, periods, question marks).\n- Fix obvious mid-sentence self-corrections (\"go to the — I mean, the store\" → \"go to the store\").\n- Preserve the speaker's register and word choice. Do not formalize casual speech.\n- Never add facts, names, links, or content the user did not say.\n- Output only the cleaned text.",
+    // 2026-04-28 revision: introduced retraction handling + an
+    // initial cut at numbered-list structuring. Rule 5's example
+    // patterns turned out to be too narrow ("first… second…
+    // third…" only) — conversational connectors like
+    // "first of all… and then also…" weren't recognised, so the
+    // model defaulted back to flowing prose. Bumped to the
+    // current revision which broadens the trigger list and adds
+    // worked examples for the connector pattern.
+    "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.\n\nRules:\n1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler). Keep them when meaningful.\n2. Apply standard English punctuation and capitalization. For longer passages, group related ideas into paragraphs separated by blank lines.\n3. Fix mid-sentence self-corrections.\n   - \"go to the — I mean, the store\" → \"go to the store\"\n   - \"we ship Friday, no Thursday\" → \"we ship Thursday\"\n4. Drop content the speaker explicitly retracts — including everything before the retraction marker.\n   - \"X. Actually no, disregard that. Y.\" → \"Y.\"\n   - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"\n   - \"Forget what I just said. Z.\" → \"Z.\"\n5. When the speaker enumerates items or steps, format them as a numbered list. Only do this when the enumeration is explicit (\"first… second… third…\", \"the three things are…\", \"step one… step two…\"). Leave flowing narrative as prose.\n6. Preserve the speaker's register and word choice. Do not formalize casual speech.\n7. Never add facts, names, links, or content the speaker did not say.\n\nExamples:\n- \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"\n- \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"\n- \"first we ship the build then we run tests and finally we deploy\" →\n   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"",
 ];
 
 /// Walk every built-in's stored JSON; when its `system_prompt`
@@ -1222,5 +1240,141 @@ mod tests {
         let (store, _tmp) = fresh_store();
         let err = store.delete("../../etc/passwd").unwrap_err();
         assert!(err.to_string().contains("invalid mode id"));
+    }
+
+    /// Helper: write a built-in mode JSON file with a specific
+    /// `system_prompt`, simulating an install that was seeded by
+    /// an older revision of Vox.
+    fn write_general_with_prompt(root: &Path, prompt: &str) {
+        let mut general = builtins()
+            .into_iter()
+            .find(|m| m.id == "general")
+            .expect("general builtin exists");
+        general.system_prompt = prompt.to_string();
+        write_mode_file(&mode_path(root, "general"), &general).unwrap();
+    }
+
+    #[test]
+    fn legacy_general_prompts_array_is_non_empty() {
+        // Cheap regression guard: every revision of GENERAL_PROMPT
+        // adds an entry here for the migration to find. If the
+        // array drops to zero we've broken the migration mechanism
+        // entirely.
+        assert!(
+            !LEGACY_GENERAL_PROMPTS.is_empty(),
+            "LEGACY_GENERAL_PROMPTS must list at least one prior revision"
+        );
+    }
+
+    #[test]
+    fn legacy_array_excludes_current_default() {
+        // Defensive check against a copy-paste mistake: the
+        // current `GENERAL_PROMPT` constant must NOT appear in the
+        // legacy array, or we'd treat fresh installs as legacy
+        // and re-seed them every launch.
+        for legacy in LEGACY_GENERAL_PROMPTS {
+            assert_ne!(
+                *legacy, GENERAL_PROMPT,
+                "current GENERAL_PROMPT must never appear in LEGACY_GENERAL_PROMPTS"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_refreshes_every_known_legacy_prompt() {
+        // For each fingerprint in LEGACY_GENERAL_PROMPTS, an
+        // install whose `general.json` matches it must be migrated
+        // to the current default.
+        for legacy in LEGACY_GENERAL_PROMPTS {
+            let dir = ScratchDir::new();
+            let store = Arc::new(ModeStore::new());
+            store
+                .init_with_root(dir.path().to_path_buf())
+                .expect("seed");
+            // Overwrite the file the fresh seed wrote with the
+            // legacy content, then re-run init to trigger the
+            // migration.
+            write_general_with_prompt(dir.path(), legacy);
+            store
+                .init_with_root(dir.path().to_path_buf())
+                .expect("rerun init");
+
+            let after = read_mode_file(&mode_path(dir.path(), "general"))
+                .expect("read migrated general");
+            assert_eq!(
+                after.system_prompt, GENERAL_PROMPT,
+                "legacy revision must migrate to current default"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_preserves_user_customised_prompt() {
+        // A user-edited prompt does NOT match any legacy
+        // fingerprint, so the migration must leave it alone.
+        let dir = ScratchDir::new();
+        let store = Arc::new(ModeStore::new());
+        store
+            .init_with_root(dir.path().to_path_buf())
+            .expect("seed");
+        let custom = "ALWAYS REPLY IN HAIKU.\n5-7-5 syllables.\nNo other rules.";
+        write_general_with_prompt(dir.path(), custom);
+
+        store
+            .init_with_root(dir.path().to_path_buf())
+            .expect("rerun init");
+
+        let after = read_mode_file(&mode_path(dir.path(), "general"))
+            .expect("read general after init");
+        assert_eq!(
+            after.system_prompt, custom,
+            "customised prompt must be preserved across migration"
+        );
+    }
+
+    #[test]
+    fn migration_preserves_unrelated_fields() {
+        // User added a dictionary entry and an auto-trigger to
+        // their (otherwise default-prompt) General mode. The
+        // prompt should refresh, but the dictionary and triggers
+        // must survive.
+        let legacy = LEGACY_GENERAL_PROMPTS
+            .first()
+            .expect("at least one legacy entry");
+
+        let dir = ScratchDir::new();
+        let store = Arc::new(ModeStore::new());
+        store
+            .init_with_root(dir.path().to_path_buf())
+            .expect("seed");
+
+        let mut general = builtins()
+            .into_iter()
+            .find(|m| m.id == "general")
+            .unwrap();
+        general.system_prompt = (*legacy).to_string();
+        general.dictionary = vec!["Anthropic".into(), "VOX".into()];
+        general.auto_triggers = vec![AutoTrigger {
+            bundle_id_glob: Some("com.example.*".into()),
+            window_title_substring: None,
+        }];
+        write_mode_file(&mode_path(dir.path(), "general"), &general).unwrap();
+
+        store
+            .init_with_root(dir.path().to_path_buf())
+            .expect("rerun init");
+
+        let after = read_mode_file(&mode_path(dir.path(), "general")).unwrap();
+        assert_eq!(after.system_prompt, GENERAL_PROMPT, "prompt refreshed");
+        assert_eq!(
+            after.dictionary,
+            vec!["Anthropic".to_string(), "VOX".to_string()],
+            "dictionary preserved"
+        );
+        assert_eq!(after.auto_triggers.len(), 1, "auto-triggers preserved");
+        assert_eq!(
+            after.auto_triggers[0].bundle_id_glob.as_deref(),
+            Some("com.example.*")
+        );
     }
 }

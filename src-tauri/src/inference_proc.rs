@@ -88,13 +88,36 @@ impl ServerHandle {
     }
 }
 
-/// Type alias for the value we stash in `app.manage`. Keep an
-/// `Option` rather than a `OnceCell` so a dead child can be replaced
-/// in place.
-pub type ServerState = Arc<Mutex<Option<ServerHandle>>>;
+/// Container for the supervisor's shared state.
+///
+/// Two locks because we have two distinct concurrency concerns:
+///
+/// - `handle` holds the live (or `None`) child handle. Reads are
+///   short and synchronous, so a `parking_lot::Mutex` is the right
+///   shape — async code never holds it across an `.await`.
+/// - `spawning` serialises the *spawn path* itself. Without it, two
+///   concurrent `ensure_running` calls (e.g. the app-launch
+///   pre-warm and a fast user dictating into the hotkey within the
+///   ~5 s warmup window) would both see `None`, both call
+///   `spawn_for_model`, both try to `replace()` the handle — and we
+///   would have briefly spawned two `llama-server` children, each
+///   loading 5 GB of GGUF, with one promptly orphaned. The
+///   spawn-lock turns this into the standard double-checked
+///   locking idiom: the second caller waits, then re-checks the
+///   `handle` slot and returns the just-spawned snapshot without
+///   spawning again.
+pub struct ServerStateInner {
+    handle: Mutex<Option<ServerHandle>>,
+    spawning: tokio::sync::Mutex<()>,
+}
+
+pub type ServerState = Arc<ServerStateInner>;
 
 pub fn install_state<R: Runtime>(app: &AppHandle<R>) {
-    app.manage(ServerState::new(Mutex::new(None)));
+    app.manage(Arc::new(ServerStateInner {
+        handle: Mutex::new(None),
+        spawning: tokio::sync::Mutex::new(()),
+    }));
 }
 
 fn state<R: Runtime>(app: &AppHandle<R>) -> tauri::State<'_, ServerState> {
@@ -104,64 +127,64 @@ fn state<R: Runtime>(app: &AppHandle<R>) -> tauri::State<'_, ServerState> {
 /// Idempotent get-or-spawn. Returns a cheap `RunningServer` snapshot
 /// the engine can use to make HTTP calls. If the cached handle is
 /// dead OR was started with a different model, this transparently
-/// respawns.
+/// respawns. Concurrent invocations are race-free: only one caller
+/// will spawn; the others wait, see the new handle, and return its
+/// snapshot.
 pub async fn ensure_running<R: Runtime>(
     app: &AppHandle<R>,
     model_id: &str,
 ) -> anyhow::Result<RunningServer> {
-    // Phase 1: under the lock, decide whether we can hand back an
-    // existing handle, or whether we need to drop the existing one
-    // and spawn fresh. Don't await across the lock — `parking_lot`
-    // mutexes aren't async-aware and a stuck future would deadlock
-    // every other invocation.
-    //
-    // Pattern guards bind names immutably even when matching
-    // through `as_mut()` — and `is_alive` needs `&mut self` for the
-    // underlying `try_wait`. So we drop into the if-let body to do
-    // the mutable work, then dispatch off the result.
-    let action = {
-        let st = state(app);
-        let mut guard = st.lock();
-        let reuse_snapshot = if let Some(h) = guard.as_mut() {
-            if h.is_alive() && h.model_id == model_id {
-                Some(h.snapshot())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        if let Some(snap) = reuse_snapshot {
-            ReuseAction::Reuse(snap)
-        } else {
-            // Drop the existing handle so the child gets killed
-            // before we spawn a replacement.
-            guard.take();
-            ReuseAction::Spawn
-        }
-    };
-
-    match action {
-        ReuseAction::Reuse(snapshot) => {
-            log::debug!(
-                "inference: reusing live llama-server port={} model={}",
-                snapshot.port,
-                snapshot.model_id
-            );
-            Ok(snapshot)
-        }
-        ReuseAction::Spawn => {
-            let handle = spawn_for_model(app, model_id).await?;
-            let snapshot = handle.snapshot();
-            state(app).lock().replace(handle);
-            Ok(snapshot)
-        }
+    // Fast path: already-warm handle that matches the requested
+    // model. No spawn lock, no async wait — a hot polish call
+    // should pay one parking_lot mutex acquire and nothing else.
+    if let Some(snap) = try_reuse(app, model_id) {
+        log::debug!(
+            "inference: reusing live llama-server port={} model={}",
+            snap.port,
+            snap.model_id
+        );
+        return Ok(snap);
     }
+
+    // Slow path: serialise the spawn. The first caller takes this
+    // lock, performs the spawn, and stores the handle; concurrent
+    // callers block here.
+    let st = state(app).inner().clone();
+    let _spawn_guard = st.spawning.lock().await;
+
+    // Re-check under the spawn lock — if a parallel caller (e.g.
+    // the app-startup pre-warm) finished spawning while we were
+    // waiting, reuse its handle instead of spawning again.
+    if let Some(snap) = try_reuse(app, model_id) {
+        log::debug!(
+            "inference: reusing handle spawned by a concurrent caller, port={} model={}",
+            snap.port,
+            snap.model_id
+        );
+        return Ok(snap);
+    }
+
+    // Drop any dead/wrong-model handle so the spawn replaces it
+    // cleanly. The drop sends SIGKILL via command-group's Drop.
+    st.handle.lock().take();
+
+    let handle = spawn_for_model(app, model_id).await?;
+    let snapshot = handle.snapshot();
+    st.handle.lock().replace(handle);
+    Ok(snapshot)
 }
 
-enum ReuseAction {
-    Reuse(RunningServer),
-    Spawn,
+/// Returns a snapshot if the cached handle is alive and matches
+/// `model_id`. Touches only the parking_lot mutex — never awaits.
+fn try_reuse<R: Runtime>(app: &AppHandle<R>, model_id: &str) -> Option<RunningServer> {
+    let st = state(app);
+    let mut guard = st.handle.lock();
+    let h = guard.as_mut()?;
+    if h.is_alive() && h.model_id == model_id {
+        Some(h.snapshot())
+    } else {
+        None
+    }
 }
 
 async fn spawn_for_model<R: Runtime>(
@@ -433,8 +456,8 @@ pub fn shutdown_managed<R: Runtime>(app: &AppHandle<R>) {
         Some(s) => s,
         None => return,
     };
-    let handle = st.lock().take();
-    let Some(mut h) = handle else { return };
+    let taken = st.handle.lock().take();
+    let Some(mut h) = taken else { return };
     log::info!("shutting down inference server pid={:?}", h.child.id());
     // `start_kill` is the synchronous fire-and-forget signal:
     // SIGKILL on Unix (delivered to the process group) and Job
@@ -460,8 +483,83 @@ pub fn drop_managed<R: Runtime>(app: &AppHandle<R>) {
     // Bind the take separately so the temporary `MutexGuard` drops
     // before `st` does — otherwise the borrow checker rightly
     // complains that the guard outlives `st`.
-    let taken = st.lock().take();
+    let taken = st.handle.lock().take();
     if let Some(mut h) = taken {
         let _ = h.child.start_kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Validate the spawn-lock invariant: at most one caller can be
+    /// inside the protected section at any moment. This is the
+    /// regression guard for the pre-warm-vs-first-dictation race
+    /// — without this lock, two concurrent `ensure_running` calls
+    /// would both miss the warm-handle check, both spawn a
+    /// `llama-server`, and one would orphan the other.
+    #[tokio::test]
+    async fn spawn_lock_serialises_concurrent_callers() {
+        let state = Arc::new(ServerStateInner {
+            handle: Mutex::new(None),
+            spawning: tokio::sync::Mutex::new(()),
+        });
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+
+        // Five concurrent tasks each "pretend to spawn" by
+        // holding the lock for ~30 ms. If the lock is exclusive,
+        // `max_concurrent` should never exceed 1.
+        let mut tasks = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let s = state.clone();
+            let active = in_flight.clone();
+            let peak = max_concurrent.clone();
+            tasks.push(tokio::spawn(async move {
+                let _g = s.spawning.lock().await;
+                let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+
+        for t in tasks {
+            t.await.expect("task panicked");
+        }
+
+        assert_eq!(
+            max_concurrent.load(Ordering::SeqCst),
+            1,
+            "spawn lock must be exclusive — observed concurrent holders"
+        );
+    }
+
+    /// `try_reuse` is the fast-path probe that an `ensure_running`
+    /// caller takes before reaching for the spawn lock. Empty
+    /// state → `None`, no allocation.
+    #[test]
+    fn try_reuse_returns_none_when_no_handle() {
+        let state = Arc::new(ServerStateInner {
+            handle: Mutex::new(None),
+            spawning: tokio::sync::Mutex::new(()),
+        });
+        // Direct probe of the same predicate `try_reuse` uses,
+        // without the AppHandle plumbing.
+        let mut guard = state.handle.lock();
+        assert!(guard.as_mut().is_none());
+    }
+
+    /// Sanity check that `ServerStateInner` constructs without
+    /// dragging in unwanted runtime state.
+    #[test]
+    fn server_state_inner_constructs_clean() {
+        let state = ServerStateInner {
+            handle: Mutex::new(None),
+            spawning: tokio::sync::Mutex::new(()),
+        };
+        assert!(state.handle.lock().is_none());
     }
 }

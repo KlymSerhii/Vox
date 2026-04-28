@@ -60,7 +60,7 @@ fn dynamic_max_tokens(input_chars: usize) -> i32 {
     dynamic.clamp(MIN_NEW_TOKENS, MAX_NEW_TOKENS_CAP) as i32
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a transcript cleaner. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
+const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
 
 Rules:
 1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\") when used as filler. Keep them when they carry meaning (\"I mean it.\").
@@ -72,7 +72,12 @@ Rules:
    - \"X. Actually no, disregard that. Y.\" → \"Y.\"
    - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"
    - \"Forget what I just said. Z.\" → \"Z.\"
-5. When the speaker enumerates items or steps, format them as a numbered list. Only do this when the enumeration is explicit (\"first… second… third…\", \"the three things are…\", \"step one… step two…\"). Leave flowing narrative as prose.
+5. When the speaker enumerates two or more items, actions, or steps, render them as a numbered list. Triggers include:
+   - Ordinal markers: \"first… second… third…\", \"one is… two is…\".
+   - Step markers: \"step one… step two…\".
+   - Enumeration phrases: \"the three things are…\", \"a couple of points:\".
+   - Conversational connectors that introduce a sequence: \"first of all… and then…\", \"to start… after that…\", \"I need you to X and then Y\", \"we should do A and also B\".
+   Preserve any prose lead-in before the list (\"I need you to:\\n1. …\\n2. …\"). Single statements and flowing narrative stay as prose.
 6. Preserve the speaker's register. Do not formalize casual speech or vice versa.
 7. Never add content, facts, names, or numbers the speaker did not say.
 
@@ -80,7 +85,11 @@ Examples:
 - \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"
 - \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"
 - \"first we ship the build then we run tests and finally we deploy\" →
-   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"";
+   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"
+- \"I need you to first of all add tests and then also verify the build passes\" →
+   \"I need you to:\n1. Add tests.\n2. Verify the build passes.\"
+- \"so everything looks fine but now I need you to first of all add tests and then also to verify that the build passes appropriately\" →
+   \"Everything looks fine. I need you to:\n1. Add tests.\n2. Verify that the build passes appropriately.\"";
 
 pub struct GemmaHttpEngine {
     app: AppHandle<Wry>,
