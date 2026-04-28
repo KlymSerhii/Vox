@@ -6,10 +6,10 @@
 #
 #   * onboarding wizard fires (settings file is gone, so `onboarded`
 #     is false)
-#   * mic prompt again (TCC entry reset). 2026-04-26: Accessibility
-#     is no longer required — Vox copies transcripts to the clipboard
-#     and the user pastes manually with ⌘V — but we still reset the
-#     entry so a clean slate looks fully clean to the user.
+#   * mic prompt again (TCC entry reset). Accessibility is no longer
+#     required — Vox copies transcripts to the clipboard and the user
+#     pastes manually with ⌘V — but we still reset the entry so a
+#     clean slate looks fully clean to the user.
 #   * downloaded Whisper / Gemma weights are gone
 #   * Voice Modes are reseeded from the built-in catalog
 #   * legacy cloud Keychain entries (groq, anthropic) are removed
@@ -20,7 +20,6 @@
 # under `~/Library` outside Vox's own directory.
 #
 # Pair with:
-#   ./scripts/dev-clean-state.sh
 #   npm run tauri dev    (or ./scripts/dev-bundle.sh)
 
 set -euo pipefail

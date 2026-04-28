@@ -1,19 +1,6 @@
-//! Voice Modes — Vox's differentiator feature.
-//!
-//! A `VoiceMode` bundles a system prompt, mode-specific dictionary, and
-//! formatting rules (punctuation, case, length cap). The 5 built-in modes
-//! ship with every install; users can fork them, create new ones, and
-//! share via `.voxmode` JSON files.
-//!
-//! Persistence: each mode is one JSON file under
-//! `<app_data_dir>/modes/<id>.json`. Built-in modes are written to the
-//! directory on first launch only when the directory is empty — once a
-//! built-in is on disk the user can fork-and-edit it freely; we never
-//! overwrite an existing file. "Reset to defaults" re-imports any
-//! built-in that has been deleted.
-//!
-//! No telemetry. No mode-usage counters. Per the CEO decision, success
-//! metrics are user-visible logs only.
+//! Voice Modes: per-mode JSON files at `<app_data_dir>/modes/<id>.json`.
+//! Built-ins seed the directory on first launch only — never overwrite
+//! an existing user-edited file.
 
 use std::collections::HashMap;
 use std::fs;
@@ -25,10 +12,6 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
-
-// ---------------------------------------------------------------------------
-// Data model
-// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PunctuationStyle {
@@ -48,11 +31,10 @@ pub enum CaseStyle {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoTrigger {
-    /// Matches frontmost app's bundle id (e.g. "com.tinyspeck.slackmacgap").
-    /// Supports a trailing `*` wildcard (e.g. "com.jetbrains.*").
+    /// Frontmost app bundle id; supports a trailing `*` wildcard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle_id_glob: Option<String>,
-    /// Matches the focused window's title (case-insensitive substring).
+    /// Case-insensitive substring of the focused window title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_title_substring: Option<String>,
 }
@@ -79,24 +61,19 @@ pub struct VoiceMode {
 }
 
 impl VoiceMode {
-    /// Apply this mode's post-processing rules on the cleaned text.
     pub fn apply_post_processing(&self, text: &str) -> String {
         let mut out = text.to_string();
 
-        // Case rule. Sentence and AsSpoken are no-ops — the LLM already
-        // handles them. Title and Lower are post-processed deterministically.
         match self.case {
             CaseStyle::Title => out = title_case(&out),
             CaseStyle::Lower => out = out.to_lowercase(),
             CaseStyle::Sentence | CaseStyle::AsSpoken => {}
         }
 
-        // Strip trailing punctuation per-line if mode says None.
         if matches!(self.punctuation, PunctuationStyle::None) {
             out = strip_terminal_punctuation(&out);
         }
 
-        // Length cap (last so all other rules already applied).
         if let Some(cap) = self.max_length_chars {
             out = truncate_to_cap(&out, cap);
         }
@@ -105,13 +82,6 @@ impl VoiceMode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Built-in catalog (5 defaults)
-// ---------------------------------------------------------------------------
-
-/// Returns the 5 built-in voice modes. They are cloned from this
-/// function on first launch to populate the modes directory; they are
-/// also used by `reset_defaults` to re-seed any deleted built-in.
 pub fn builtins() -> Vec<VoiceMode> {
     let now = Utc::now().timestamp();
     vec![
@@ -334,12 +304,7 @@ Rules:
 - Never invent items, dates, or specifics.
 - Output only the note body.";
 
-// ---------------------------------------------------------------------------
-// Persistence: directory layout, in-memory cache
-// ---------------------------------------------------------------------------
-
-/// Process-wide cache of modes loaded from disk. Rebuilt lazily on
-/// first access; refreshed by every mutation.
+/// Process-wide cache rebuilt lazily; invalidated on every mutation.
 #[derive(Default)]
 pub struct ModeStore {
     inner: RwLock<Option<HashMap<String, VoiceMode>>>,
@@ -351,11 +316,9 @@ impl ModeStore {
         Self::default()
     }
 
-    /// Bind the storage root for this app. Called once at startup.
     pub fn init_with_root(self: &Arc<Self>, root: PathBuf) -> Result<()> {
         fs::create_dir_all(&root).context("create modes dir")?;
         *self.root.write() = Some(root.clone());
-        // Seed built-ins if the directory is empty (first launch).
         if dir_is_empty(&root)? {
             for mode in builtins() {
                 let path = mode_path(&root, &mode.id);
@@ -364,23 +327,9 @@ impl ModeStore {
                 }
             }
         }
-        // Refresh stale built-in prompts. Existing installs already
-        // wrote per-mode JSON files at first launch with whatever
-        // the prompt constants were at the time. When we improve a
-        // built-in prompt (e.g. teaching General to handle
-        // retractions and structuring), users on an upgraded build
-        // would otherwise stay on the old prompt forever because
-        // `reset_defaults` only fills in MISSING files.
-        //
-        // The migration is conservative: it only overwrites when
-        // the on-disk `system_prompt` field exactly matches a known
-        // legacy version. If the user has customised the prompt at
-        // all, the on-disk prompt won't match the legacy fingerprint
-        // and we leave it alone. Other fields (dictionary,
-        // auto_triggers, punctuation/case overrides) are always
-        // preserved — only the prompt text changes.
+        // Refresh built-in prompts on disk that exactly match a known
+        // prior revision; user edits (anything else) are preserved.
         let _ = migrate_legacy_builtin_prompts(&root);
-        // Force a refresh on next read.
         *self.inner.write() = None;
         Ok(())
     }
@@ -428,8 +377,7 @@ impl ModeStore {
         *self.inner.write() = None;
     }
 
-    /// Sorted list — built-ins first (in canonical order), then user
-    /// modes alphabetically by name.
+    /// Built-ins first (canonical order), then user modes alphabetically.
     pub fn list(&self) -> Vec<VoiceMode> {
         let map = match self.cached() {
             Ok(m) => m,
@@ -438,33 +386,23 @@ impl ModeStore {
                 return Vec::new();
             }
         };
-        let mut builtins_in_order = Vec::new();
-        for b in builtins() {
-            if let Some(m) = map.get(&b.id) {
-                builtins_in_order.push(m.clone());
-            }
-        }
-        let mut customs: Vec<VoiceMode> = map
-            .values()
-            .filter(|m| !m.built_in)
-            .cloned()
+        let mut out: Vec<VoiceMode> = builtins()
+            .iter()
+            .filter_map(|b| map.get(&b.id).cloned())
             .collect();
+        let mut customs: Vec<VoiceMode> =
+            map.values().filter(|m| !m.built_in).cloned().collect();
         customs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        builtins_in_order.extend(customs);
-        builtins_in_order
+        out.extend(customs);
+        out
     }
 
     pub fn get(&self, id: &str) -> Option<VoiceMode> {
         self.cached().ok().and_then(|m| m.get(id).cloned())
     }
 
-    /// Save a mode. Built-ins reject (the UI surfaces "Duplicate to edit"
-    /// for built-ins, and a fork is a non-built-in clone).
+    /// Save a user mode; rejects built-ins and unsafe ids (path traversal).
     pub fn save(&self, mode: &VoiceMode) -> Result<()> {
-        // Defense in depth: even though the webview-only commands gate
-        // this path, refuse any id that doesn't match our slug shape so
-        // a future plugin / IPC caller cannot path-traverse through the
-        // modes directory.
         if !is_safe_mode_id(&mode.id) {
             return Err(anyhow!("invalid mode id"));
         }
@@ -474,11 +412,10 @@ impl ModeStore {
             }
         }
         let mut to_save = mode.clone();
-        to_save.built_in = false; // Force false for any user-saved mode.
+        to_save.built_in = false;
         to_save.updated_at = Utc::now().timestamp();
         let root = self.root_or_err()?;
-        let path = mode_path(&root, &to_save.id);
-        write_mode_file(&path, &to_save)?;
+        write_mode_file(&mode_path(&root, &to_save.id), &to_save)?;
         self.invalidate();
         Ok(())
     }
@@ -513,9 +450,7 @@ impl ModeStore {
         let now = Utc::now().timestamp();
         copy.created_at = now;
         copy.updated_at = now;
-        // unique_id_from is built from slugify, which already produces a
-        // safe id, but assert one more time so a future change to the
-        // slugifier can't silently regress this.
+        // Assert again so a future slugifier change can't widen the fs surface.
         if !is_safe_mode_id(&copy.id) {
             return Err(anyhow!("invalid mode id"));
         }
@@ -530,22 +465,16 @@ impl ModeStore {
         Ok(serde_json::to_string_pretty(&mode)?)
     }
 
-    /// Import a mode from JSON. Generates a new id if there's a collision
-    /// or if the id is missing/invalid. Always inserted as `built_in: false`.
+    /// Import a mode from JSON. Generates a new id on collision or
+    /// invalid id. Always saved as `built_in: false`.
     pub fn import_json(&self, json: &str) -> Result<VoiceMode> {
         let mut mode: VoiceMode =
             serde_json::from_str(json).context("invalid .voxmode JSON")?;
         validate(&mode)?;
         mode.built_in = false;
-        // Re-slug any id that doesn't fit our safe-id shape, then dedup.
-        // This both prevents path traversal (`"../foo"` -> rejected and
-        // regenerated from the name) and mirrors the prior behavior of
-        // generating a fresh id when the source file's id is malformed.
         if !is_safe_mode_id(&mode.id) || self.get(&mode.id).is_some() {
             mode.id = self.unique_id_from(&slugify(&mode.name));
         }
-        // unique_id_from always produces a safe id; assert again so a
-        // future regression is caught early rather than at the fs::write.
         if !is_safe_mode_id(&mode.id) {
             return Err(anyhow!("could not derive a valid mode id"));
         }
@@ -560,8 +489,7 @@ impl ModeStore {
         Ok(mode)
     }
 
-    /// Re-seed any built-in that has been deleted; never overwrite an
-    /// existing file.
+    /// Re-seed any deleted built-in; never overwrites an existing file.
     pub fn reset_defaults(&self) -> Result<usize> {
         let root = self.root_or_err()?;
         let mut count = 0;
@@ -576,11 +504,8 @@ impl ModeStore {
         Ok(count)
     }
 
-    /// Heuristic auto-trigger evaluation. Returns the id of the FIRST
-    /// matching mode (in display order), or `None`.
-    ///
-    /// Per the CEO decision this never auto-switches — it's only used
-    /// by the UI to render a "Suggested mode" affordance.
+    /// Returns the id of the first matching mode in display order;
+    /// suggestion only — never auto-switches.
     pub fn suggest_for(
         &self,
         bundle_id: Option<&str>,
@@ -610,10 +535,6 @@ impl ModeStore {
         candidate
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public façade — Tauri-aware helpers used by commands and session.
-// ---------------------------------------------------------------------------
 
 pub fn list_modes<R: Runtime>(app: &AppHandle<R>) -> Vec<VoiceMode> {
     store(app).list()
@@ -655,7 +576,7 @@ pub fn suggest_mode_for<R: Runtime>(
     store(app).suggest_for(bundle_id, window_title)
 }
 
-/// Cycle to the next mode in display order. Returns the now-active mode.
+/// Cycle to the next mode in display order.
 pub fn cycle_active<R: Runtime>(
     app: &AppHandle<R>,
     current_id: &str,
@@ -665,15 +586,13 @@ pub fn cycle_active<R: Runtime>(
         return None;
     }
     let idx = list.iter().position(|m| m.id == current_id).unwrap_or(0);
-    let next = list[(idx + 1) % list.len()].clone();
-    Some(next)
+    Some(list[(idx + 1) % list.len()].clone())
 }
 
 fn store<R: Runtime>(app: &AppHandle<R>) -> Arc<ModeStore> {
     app.state::<Arc<ModeStore>>().inner().clone()
 }
 
-/// Compute the directory where mode JSONs live.
 pub fn modes_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     if let Ok(p) = app.path().app_data_dir() {
         return p.join("modes");
@@ -683,10 +602,6 @@ pub fn modes_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
         .join("app.vox.vox/modes")
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 fn dir_is_empty(dir: &Path) -> Result<bool> {
     if !dir.exists() {
         return Ok(true);
@@ -694,32 +609,14 @@ fn dir_is_empty(dir: &Path) -> Result<bool> {
     Ok(fs::read_dir(dir)?.next().is_none())
 }
 
-/// Past `GENERAL_PROMPT` revisions. When an existing install has any
-/// of these *byte-for-byte* on disk, it means the user never edited
-/// the General mode and is just running an older default — so we
-/// safely refresh it to the current `GENERAL_PROMPT`.
-///
-/// Append a new entry every time we revise `GENERAL_PROMPT`.
+/// Past byte-for-byte `GENERAL_PROMPT` revisions. An on-disk match means
+/// the user never edited it, so we can safely refresh to the current
+/// default. Append a new entry whenever `GENERAL_PROMPT` is revised.
 const LEGACY_GENERAL_PROMPTS: &[&str] = &[
-    // Pre-2026-04-28 default: filler removal + mid-sentence
-    // self-corrections only. Did not handle retractions
-    // (\"X. Disregard that. Y.\") or list-style structuring.
     "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no explanations.\n\nRules:\n- Remove filler words (um, uh, like as filler, you know, sort of, kind of as filler).\n- Apply standard punctuation and capitalization (commas, periods, question marks).\n- Fix obvious mid-sentence self-corrections (\"go to the — I mean, the store\" → \"go to the store\").\n- Preserve the speaker's register and word choice. Do not formalize casual speech.\n- Never add facts, names, links, or content the user did not say.\n- Output only the cleaned text.",
-    // 2026-04-28 revision: introduced retraction handling + an
-    // initial cut at numbered-list structuring. Rule 5's example
-    // patterns turned out to be too narrow ("first… second…
-    // third…" only) — conversational connectors like
-    // "first of all… and then also…" weren't recognised, so the
-    // model defaulted back to flowing prose. Bumped to the
-    // current revision which broadens the trigger list and adds
-    // worked examples for the connector pattern.
     "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.\n\nRules:\n1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler). Keep them when meaningful.\n2. Apply standard English punctuation and capitalization. For longer passages, group related ideas into paragraphs separated by blank lines.\n3. Fix mid-sentence self-corrections.\n   - \"go to the — I mean, the store\" → \"go to the store\"\n   - \"we ship Friday, no Thursday\" → \"we ship Thursday\"\n4. Drop content the speaker explicitly retracts — including everything before the retraction marker.\n   - \"X. Actually no, disregard that. Y.\" → \"Y.\"\n   - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"\n   - \"Forget what I just said. Z.\" → \"Z.\"\n5. When the speaker enumerates items or steps, format them as a numbered list. Only do this when the enumeration is explicit (\"first… second… third…\", \"the three things are…\", \"step one… step two…\"). Leave flowing narrative as prose.\n6. Preserve the speaker's register and word choice. Do not formalize casual speech.\n7. Never add facts, names, links, or content the speaker did not say.\n\nExamples:\n- \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"\n- \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"\n- \"first we ship the build then we run tests and finally we deploy\" →\n   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"",
 ];
 
-/// Walk every built-in's stored JSON; when its `system_prompt`
-/// matches a known legacy fingerprint, replace just the prompt
-/// field with the current default. Other fields (dictionary,
-/// auto-triggers, punctuation/case overrides) are preserved.
 fn migrate_legacy_builtin_prompts(root: &Path) -> Result<()> {
     for current in builtins() {
         let path = mode_path(root, &current.id);
@@ -737,21 +634,14 @@ fn migrate_legacy_builtin_prompts(root: &Path) -> Result<()> {
             }
         };
 
-        let is_legacy = match current.id.as_str() {
-            "general" => LEGACY_GENERAL_PROMPTS
-                .iter()
-                .any(|p| *p == on_disk.system_prompt),
-            // Other built-ins have no past revisions worth
-            // migrating yet. Add similar arms as they evolve.
-            _ => false,
-        };
-
+        let is_legacy = current.id == "general"
+            && LEGACY_GENERAL_PROMPTS.iter().any(|p| *p == on_disk.system_prompt);
         if !is_legacy {
             continue;
         }
 
         log::info!(
-            "modes: refreshing built-in '{}' system_prompt from a legacy revision to current default",
+            "modes: refreshing built-in '{}' system_prompt to current default",
             current.id
         );
         on_disk.system_prompt = current.system_prompt.clone();
@@ -794,11 +684,10 @@ fn validate(mode: &VoiceMode) -> Result<()> {
     Ok(())
 }
 
-/// True if the given id is safe to use as the *filename component* of a
-/// mode JSON file. Allowed shape: `[a-z0-9-]{1,64}`, no leading or
-/// trailing dash. This is intentionally narrower than what `slugify`
-/// produces so a slugifier change can't widen the filesystem-write
-/// surface area.
+/// True if `id` is safe as a mode-JSON filename component:
+/// `[a-z0-9-]{1,64}`, no edge dashes. Intentionally narrower than what
+/// `slugify` produces so a slugifier change can't widen the fs-write
+/// surface area (path-traversal protection).
 pub fn is_safe_mode_id(id: &str) -> bool {
     if id.is_empty() || id.len() > 64 {
         return false;
@@ -849,8 +738,7 @@ fn trigger_matches(
     }
 }
 
-/// Tiny glob: `*` only at end (e.g. `com.jetbrains.*`). Bundle ids
-/// don't have spaces or fancy chars; this is enough for v1.
+/// Tiny glob: trailing `*` only.
 fn glob_match(pattern: &str, value: &str) -> bool {
     if let Some(prefix) = pattern.strip_suffix('*') {
         value.starts_with(prefix)
@@ -859,13 +747,7 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Post-processing primitives
-// ---------------------------------------------------------------------------
-
 fn title_case(input: &str) -> String {
-    // Lower-case "small words" except when they're the first or last
-    // word of the line.
     const SMALL: &[&str] = &[
         "a", "an", "and", "as", "at", "but", "by", "for", "if", "in", "nor", "of",
         "on", "or", "per", "so", "the", "to", "up", "via", "vs", "with", "yet",
@@ -882,9 +764,8 @@ fn title_case(input: &str) -> String {
             }
             let lower = w.to_lowercase();
             let is_small = SMALL.contains(&lower.as_str());
-            let is_first = i == 0;
-            let is_last = i + 1 == words.len();
-            if is_small && !is_first && !is_last {
+            let is_edge = i == 0 || i + 1 == words.len();
+            if is_small && !is_edge {
                 out.push_str(&lower);
             } else {
                 out.push_str(&capitalize_first(&lower));
@@ -915,19 +796,15 @@ fn strip_terminal_punctuation(input: &str) -> String {
     out
 }
 
-/// Truncate at the last sentence boundary that fits, else hard truncate
-/// with an ellipsis (one "…" character — never three dots).
+/// Truncate at the last sentence boundary that fits, else hard-truncate
+/// with a single `…` character.
 pub fn truncate_to_cap(input: &str, cap: usize) -> String {
     if input.chars().count() <= cap {
         return input.to_string();
     }
     let chars: Vec<char> = input.chars().collect();
     let head: String = chars.iter().take(cap).collect();
-    // Look for the last `.`, `!`, `?` in the head — cap at that boundary.
-    let last_term = head.rfind(['.', '!', '?']);
-    if let Some(idx) = last_term {
-        // idx is a byte index into `head` (which is ASCII-clean for these
-        // sentinel chars). Include the terminator.
+    if let Some(idx) = head.rfind(['.', '!', '?']) {
         let cut = &head.as_bytes()[..=idx];
         if let Ok(s) = std::str::from_utf8(cut) {
             let sliced = s.trim().to_string();
@@ -936,15 +813,10 @@ pub fn truncate_to_cap(input: &str, cap: usize) -> String {
             }
         }
     }
-    // Otherwise, hard truncate keeping room for the ellipsis.
     let safe_cap = cap.saturating_sub(1).max(1);
     let head: String = chars.iter().take(safe_cap).collect();
     format!("{}\u{2026}", head.trim_end())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -952,8 +824,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
 
-    /// RAII temp dir with no extra dep — created under
-    /// `std::env::temp_dir()` and removed on drop.
+    /// RAII temp dir under `std::env::temp_dir()`, removed on drop.
     struct ScratchDir {
         path: PathBuf,
     }

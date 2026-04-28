@@ -77,11 +77,9 @@ const TABS: { id: Tab; label: string; icon: string }[] = [
 interface HotkeyOption {
   value: string;
   label: string;
-  /** When true the picker renders a small ⚠︎ glyph and a tooltip
-   * explaining the runtime fallback. Right-Option falls into this
-   * bucket because `tauri-plugin-global-shortcut` reports an
-   * "Unknown scancode for AltRight" error on most macOS keymaps and
-   * the dictation hotkey would silently fail to bind. */
+  /** When set, the picker renders a ⚠︎ glyph and tooltip. Right-Option
+   * falls in this bucket: `tauri-plugin-global-shortcut` reports an
+   * "Unknown scancode for AltRight" on most macOS keymaps. */
   warn?: string;
 }
 
@@ -137,8 +135,9 @@ export default function SettingsView() {
   const [savedFlash, setSavedFlash] = createSignal(false);
 
   let unlistenSettings: (() => void) | null = null;
-  // Bumped each time *we* save from inside this window, so the
-  // settings:changed event handler can ignore the echo it triggers.
+  // Bumped on local saves so the settings:changed echo can be ignored —
+  // a redundant setState would force every controlled input to re-render
+  // mid-typing.
   let lastSelfSaveAt = 0;
 
   onMount(async () => {
@@ -157,12 +156,6 @@ export default function SettingsView() {
       setLoaded(true);
     }
 
-    // Keep this window in sync when settings change elsewhere — for
-    // example when the user flips dictation on/off from the tray
-    // popover. The `lastSelfSaveAt` guard suppresses the echo from our
-    // own `update()` calls so we don't churn through a redundant
-    // setState (which would force every controlled input to re-render
-    // mid-typing).
     unlistenSettings = await onSettingsChanged((next) => {
       if (Date.now() - lastSelfSaveAt < 500) return;
       setState(next);
@@ -449,8 +442,6 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
   );
 }
 
-// -------- Tabs --------
-
 function GeneralTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
@@ -543,11 +534,8 @@ function HotkeysTab(props: {
 
   onMount(() => {
     void refreshDiagnostics();
-    // The backend re-registers hotkeys whenever settings are saved
-    // (see `commands::set_settings`). Listen for that broadcast and
-    // refetch the diagnostic snapshot so the picker rows immediately
-    // reflect what the OS actually has bound — including any fallback
-    // that kicked in or any "Not bound" state if registration failed.
+    // Backend re-registers hotkeys on every save; refetch so the
+    // picker reflects the OS truth (including fallback / "Not bound").
     void (async () => {
       unlistenSettings = await onSettingsChanged(() => {
         void refreshDiagnostics();
@@ -678,11 +666,9 @@ function HotkeyRow(props: {
   const chordRequiresAx = () => {
     const d = props.diagnostic;
     if (!d || d.bound) return false;
-    // Heuristic: any failed binding whose error mentions Accessibility
-    // OR whose configured value parses as a chord (only modifier
-    // tokens). Keeps the link visible even if the underlying error
-    // string changes wording — modifier-only specs only ever fail for
-    // permission reasons.
+    // Modifier-only specs only ever fail for permission reasons, so we
+    // surface Accessibility as the action even if the error wording
+    // changes upstream.
     if (d.error?.toLowerCase().includes("accessibility")) return true;
     return isModifierOnlySpec(d.configured);
   };
@@ -759,8 +745,8 @@ function labelForValue(opts: HotkeyOption[], value: string): string | null {
   return m?.label ?? null;
 }
 
-/** True if the hotkey id is composed only of modifier tokens (no base
- * key). Mirrors the parser in `mac_chord::try_parse_chord`. */
+/** True if the spec is only modifier tokens. Mirrors the Rust parser in
+ * `mac_chord::try_parse_chord`. */
 function isModifierOnlySpec(spec: string | null | undefined): boolean {
   if (!spec) return false;
   const tokens = spec.split("+").map((t) => t.trim());
@@ -780,9 +766,6 @@ function isModifierOnlySpec(spec: string | null | undefined): boolean {
   return tokens.every((t) => MODS.has(t));
 }
 
-/** Subtext under the push-to-talk row. When the bound hotkey is a
- * modifier-only chord we print "Hold both keys to dictate. Release
- * either to stop." — otherwise the standard single-key copy. */
 function pttHint(
   handsFree: boolean,
   diag: HotkeyDiagnostic | null,
@@ -795,8 +778,6 @@ function pttHint(
   }
   return "Hold the key to dictate. Release to stop.";
 }
-
-// -------- Models --------
 
 function ModelsTab(props: {
   s: Settings;
@@ -831,41 +812,35 @@ function ModelsTab(props: {
         }));
       }),
     );
+    const dropDownloading = (id: string) =>
+      setDownloading((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    const dropProgress = (id: string) =>
+      setProgress((prev) => {
+        const { [id]: _, ...rest } = prev;
+        return rest;
+      });
+
     unlistens.push(
       await onModelDone(async (p) => {
-        setDownloading((prev) => {
-          const next = new Set(prev);
-          next.delete(p.id);
-          return next;
-        });
-        setProgress((prev) => {
-          const { [p.id]: _, ...rest } = prev;
-          return rest;
-        });
+        dropDownloading(p.id);
+        dropProgress(p.id);
         await refresh();
       }),
     );
     unlistens.push(
       await onModelError((p) => {
         console.error("model error", p);
-        setDownloading((prev) => {
-          const next = new Set(prev);
-          next.delete(p.id);
-          return next;
-        });
+        dropDownloading(p.id);
       }),
     );
     unlistens.push(
       await onModelCanceled((p) => {
-        setDownloading((prev) => {
-          const next = new Set(prev);
-          next.delete(p.id);
-          return next;
-        });
-        setProgress((prev) => {
-          const { [p.id]: _, ...rest } = prev;
-          return rest;
-        });
+        dropDownloading(p.id);
+        dropProgress(p.id);
       }),
     );
   });
@@ -875,11 +850,7 @@ function ModelsTab(props: {
   });
 
   async function startDownload(id: string) {
-    setDownloading((prev) => {
-      const next = new Set(prev);
-      next.add(id);
-      return next;
-    });
+    setDownloading((prev) => new Set(prev).add(id));
     try {
       await downloadModel(id);
     } catch (e) {
@@ -907,21 +878,11 @@ function ModelsTab(props: {
   }
 
   function setActiveStt(modelId: string) {
-    // Only one STT engine ships now (whisper-local). Keep the field in
-    // sync but never offer to flip it elsewhere.
-    props.update({
-      stt_engine: "whisper-local",
-      stt_model_id: modelId,
-    });
+    props.update({ stt_engine: "whisper-local", stt_model_id: modelId });
   }
 
   function setActiveLlm(modelId: string) {
-    // Local-only LLM cleanup. The model selector is purely for choosing
-    // which Gemma weights live on disk; the engine id is fixed.
-    props.update({
-      llm_engine: "gemma-local",
-      llm_model_id: modelId,
-    });
+    props.update({ llm_engine: "gemma-local", llm_model_id: modelId });
   }
 
   const sttModels = createMemo(() =>
@@ -931,12 +892,9 @@ function ModelsTab(props: {
     models().filter((m) => m.descriptor.kind === "llm"),
   );
 
-  // The on/off switch the user sees. Internally it picks between
-  // `gemma-local` (when on) and `none` (when off). The `llm_engine`
-  // field stays in lockstep so the rest of the app keeps a single
-  // source of truth, while `polishing_enabled` carries the user's
-  // *intent* across periods when the local LLM is unavailable (so we
-  // can restore Gemma the moment it stabilises).
+  // `polishing_enabled` carries user *intent* across LLM outages so we
+  // can restore Gemma when it stabilises. `llm_engine` stays in
+  // lockstep as the active source of truth for the rest of the app.
   function setPolishing(on: boolean) {
     props.update({
       polishing_enabled: on,
@@ -1031,14 +989,10 @@ function formatBytes(b: number) {
   return `${(b / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-// Diagnostic + maintenance row for the out-of-process `llama-server`
-// binary. Sits above the cleanup-models list because the binary is
-// the prerequisite — without it, the GGUF on disk does nothing.
-//
-// Polish requests fail-open in the orchestrator (`session.rs`) when
-// the binary is missing, so the user still gets the raw Whisper
-// transcript. This row is for the user who opens Settings to figure
-// out *why* polish stopped working.
+// Sits above the cleanup-models list because the binary is the
+// prerequisite — without it, GGUFs on disk do nothing. Polish requests
+// fail-open in the orchestrator, so this row exists for the user
+// trying to figure out *why* polish stopped working.
 function InferenceServerSection() {
   const [status, setStatus] = createSignal<InferenceServerStatus | null>(null);
   const [progress, setProgress] = createSignal<{
@@ -1314,8 +1268,6 @@ function ModelRow(props: {
   );
 }
 
-// -------- Modes --------
-
 function ModesTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
@@ -1337,7 +1289,6 @@ function ModesTab(props: {
     await refresh();
   });
 
-  // Drag-drop file import on the whole modes tab.
   function onDragOver(e: DragEvent) {
     e.preventDefault();
   }
@@ -1447,8 +1398,7 @@ function ModesTab(props: {
   async function onSaveDraft(mode: VoiceMode) {
     let id = mode.id;
     if (!id) {
-      // Generate a slug client-side; the backend will dedup if it
-      // collides with an existing mode.
+      // Backend dedups if this collides with an existing mode.
       id = mode.name
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
@@ -1955,13 +1905,6 @@ function ModeEditor(props: {
   );
 }
 
-// -------- Dictionary / Privacy / About --------
-
-// 2026-04-26: API Keys tab and ProviderKey component removed — Vox is
-// fully on-device, so there are no cloud secrets to enter. If a future
-// cloud engine is reintroduced, restore the tab in the `TABS` list and
-// rebuild the picker here.
-
 function DictionaryTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
@@ -2127,8 +2070,7 @@ function AboutTab() {
     try {
       const info = await revealDevBinaryPath();
       setDevInfo(info);
-      // Best-effort: copy the dev binary path to the clipboard so the
-      // user can paste it into System Settings → Privacy & Security →
+      // Pre-copy so the user can paste into Privacy & Security →
       // Accessibility's Cmd+Shift+G "Go to folder" prompt.
       try {
         await navigator.clipboard.writeText(info.binary_path);

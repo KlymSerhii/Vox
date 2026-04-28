@@ -2,7 +2,7 @@
 
 Fully on-device macOS dictation. Press a hotkey, speak, and the transcript lands on your clipboard ready for `⌘V`.
 
-This file is the canonical project reference. It supersedes the historical `docs/` and `README.md` files that were removed when the app pivoted to a clipboard-only, local-only build.
+This file is the canonical project reference. The README that used to live at the project root was removed when the app pivoted to a clipboard-only, local-only build; the surviving `docs/liquid-glass-*.md` files are design notes for the existing light/dark UI tokens, not the project overview.
 
 ---
 
@@ -10,17 +10,16 @@ This file is the canonical project reference. It supersedes the historical `docs
 
 - **macOS menu-bar app**, no Dock icon (`ActivationPolicy::Accessory`).
 - **Tauri 2** Rust core + **SolidJS** + **Tailwind 4** frontend.
-- **Whisper** for STT and **Gemma 4** for transcript polishing — both via Metal/Core ML on Apple Silicon. Models live on disk; nothing leaves the Mac. (See `Known limitations` and the `models.rs` doc comment for which Gemma 4 GGUFs run cleanly on this build's bundled `llama.cpp`.)
-- **Cloud is gone.** No Groq, no Anthropic, no API keys, no telemetry, no analytics. The only network calls remaining are model downloads from Hugging Face and the auto-updater (which is currently stubbed off until signing is wired up).
-- **Output is the clipboard.** The previous synthetic `Cmd+V` path was removed (it required Accessibility, was prone to TCC churn, and `enigo` 0.2 occasionally panicked in native code). Now the transcript replaces the clipboard contents and the user pastes manually.
+- **Whisper** for STT (in-process via `whisper-rs`) and **Gemma 4** for transcript polishing (out-of-process via a downloaded `llama-server` binary we talk to over loopback HTTP) — both Metal/Core ML on Apple Silicon. Models live on disk; nothing leaves the Mac. (See `Known limitations` and the `models.rs` doc comment for which Gemma 4 GGUFs run cleanly under the pinned `llama.cpp` release.)
+- **Cloud is gone.** No Groq, no Anthropic, no API keys, no telemetry, no analytics. The only network calls remaining are model + `llama-server` downloads from Hugging Face / GitHub and the auto-updater (currently stubbed off until signing is wired up).
+- **Output is the clipboard.** The transcript replaces the clipboard contents and the user pastes manually — no synthetic `Cmd+V`, no Accessibility required for the default pipeline.
 
 ## Defaults
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `hotkey` | `Cmd+Ctrl+Space` | Hardcoded — not user-editable. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
+| `hotkey` | `Cmd+Ctrl+Space` | Hardcoded — `settings::load` rewrites any other persisted value back to this on every launch. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
 | `cancel_hotkey` | `Escape` | Aborts the in-flight session. |
-| `paste_last_hotkey` | `Alt+Shift+V` | Re-copies the most recent transcript. (Field name is historical — it copies, never auto-pastes.) |
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
 | `dictation_enabled` | `true` | Master kill-switch from the tray popover. |
@@ -30,6 +29,8 @@ This file is the canonical project reference. It supersedes the historical `docs
 | `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. |
 | `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
+| `appearance` | `dark` | `light` or `dark`; coerced to `dark` if unrecognised. |
+| `inference_api_key` | `""` | Random token generated lazily on first `llama-server` spawn (see `inference_proc::persistent_api_key`); reused so the startup-time orphan reaper can identify our child processes. Loopback-only — not a security secret. |
 
 ## Pipeline
 
@@ -57,7 +58,7 @@ Each mode contributes:
 ## Permissions
 
 - **Microphone** — required, prompted lazily inside the onboarding wizard via `AVCaptureDevice.requestAccessForMediaType`. The non-prompting `authorizationStatusForMediaType:` is used everywhere else (so the tray icon doesn't trigger a TCC prompt at launch).
-- **Accessibility** — **no longer required** for the dictation pipeline. It is still optionally used by the modifier-only chord hotkey path (`mac_chord.rs`, `CGEventTap`), but the default `Cmd+Alt+L` shortcut does not need it.
+- **Accessibility** — **no longer required** for the dictation pipeline. It is still optionally used by the modifier-only chord hotkey path (`mac_chord.rs`, `CGEventTap`), but the default `Cmd+Ctrl+Space` shortcut does not need it.
 
 ## Repository layout
 
@@ -96,12 +97,14 @@ Each mode contributes:
 │       ├── transcripts.rs             ← in-memory ring buffer (cleared on quit)
 │       ├── settings.rs                ← tauri-plugin-store + legacy scrubbing
 │       ├── modes.rs                   ← Voice Modes store + JSON I/O + post-processing
-│       ├── models.rs                  ← model catalog + resumable downloader
+│       ├── models.rs                  ← model catalog + resumable downloader (`stream_to_file` is reused for the llama-server archive)
+│       ├── inference_server.rs        ← llama-server release-binary catalog + downloader/extractor
+│       ├── inference_proc.rs          ← spawn / health-poll / supervise / orphan-reap the llama-server child
 │       ├── commands.rs                ← #[tauri::command] handlers
 │       └── engines/
-│           ├── mod.rs                 ← Registry + SttEngine / LlmEngine traits
-│           ├── whisper_local.rs       ← whisper-rs 0.16 (CoreML+Metal)
-│           ├── gemma_local.rs         ← llama-cpp-2 (git pin, Metal)
+│           ├── mod.rs                 ← Registry + SttEngine / LlmEngine traits + STT pre-warm helper
+│           ├── whisper_local.rs       ← whisper-rs 0.16 (CoreML+Metal), in-process
+│           ├── gemma_http.rs          ← OpenAI chat-completions client against the loopback llama-server
 │           └── none.rs                ← no-op LLM (raw transcript)
 └── scripts/
     ├── dev-bundle.sh                  ← build + open a debug .app for TCC sanity
@@ -109,7 +112,7 @@ Each mode contributes:
     └── dev-reset-permissions.sh       ← only resets TCC, keeps settings/models
 ```
 
-Files that no longer exist (and the migrations that removed them) are documented inline at the top of `settings.rs` (cloud scrub) and `inject.rs` (Cmd+V removal).
+Files that no longer exist (and the migrations that removed them) are documented inline: `settings.rs` (cloud scrub), `inject.rs` (Cmd+V removal), and `engines/gemma_http.rs` (replaced the old in-process `gemma_local.rs` + `llama-cpp-2` to keep C++ asserts from killing the menu-bar app).
 
 ## Development
 
@@ -120,7 +123,7 @@ npm install
 npm run tauri dev
 ```
 
-The first compile is slow (~45 s) because `local-engines` pulls in `whisper-rs` + `llama-cpp-2` with their Metal backends. Subsequent compiles are incremental.
+The first compile is slow because `local-engines` pulls in `whisper-rs` with its Metal backend. Gemma polishing now lives in a separate `llama-server` subprocess we download at runtime, so it no longer participates in the Cargo build. Subsequent compiles are incremental.
 
 Onboarding fires automatically when `onboarded == false`: Welcome → Mic → Accessibility (optional, only matters for chord hotkeys) → Download local models → How to use.
 
@@ -138,6 +141,7 @@ npm run tauri dev
 | Settings JSON | `~/Library/Application Support/com.vox.app/vox-settings.json` |
 | Voice Modes | `~/Library/Application Support/com.vox.app/modes/*.json` |
 | Whisper / Gemma weights | `~/Library/Application Support/com.vox.app/models/{stt,llm}/<id>/model.{bin,gguf}` |
+| `llama-server` binary tree | `~/Library/Application Support/com.vox.app/inference-server/<llama.cpp tag>/` (sentinel: `.complete`) |
 | TCC entries | macOS-managed; reset with `tccutil reset {Microphone,Accessibility} com.vox.app` |
 | Keychain (legacy only) | service `app.vox.vox`, accounts `groq` / `anthropic` — auto-scrubbed on launch |
 
@@ -165,7 +169,7 @@ These four together are the project smoke test:
 
 ```bash
 cargo build  --manifest-path src-tauri/Cargo.toml
-cargo test   --manifest-path src-tauri/Cargo.toml --lib   # 22 tests
+cargo test   --manifest-path src-tauri/Cargo.toml --lib
 npx tsc --noEmit
 npx vite build
 ```
@@ -182,13 +186,13 @@ VOX_LOG=debug npm run tauri dev
 
 `tauri dev` produces an unbundled binary at `src-tauri/target/debug/vox` whose code signature changes on every rebuild. macOS TCC keys grants by signature, so chord-hotkey users may see "Vox is in the Accessibility list but `AXIsProcessTrusted()=false`". `./scripts/dev-bundle.sh` builds a proper `.app` whose identity is stable; use that for any work that touches Accessibility.
 
-The default `Cmd+Alt+L` shortcut sidesteps this entirely — it goes through the Carbon `RegisterEventHotKey` path which doesn't require Accessibility.
+The default `Cmd+Ctrl+Space` shortcut sidesteps this entirely — it goes through the Carbon `RegisterEventHotKey` path which doesn't require Accessibility.
 
 ## Settings tabs
 
-- **General** — language, hotkey behaviour (toggle vs hold), launch at login, sound cues stub, dictation toggle.
-- **Hotkeys** — push-to-talk, cancel, paste-last (copy-last), mode-cycle. Each row shows the configured value, the runtime-bound value (which can differ if a fallback kicked in), and an inline "Test" button that reads the live binding.
-- **Models** — STT engine info + Whisper model rows; Polishing on/off toggle + Gemma model rows. Rows show installed-on-disk size, RAM peak estimate, tier, and Use/Download/Cancel/Delete actions.
+- **General** — language, hotkey behaviour (toggle vs hold), launch at login, dictation toggle.
+- **Hotkeys** — push-to-talk, cancel, mode-cycle. Each row shows the configured value, the runtime-bound value (which can differ if a fallback kicked in), and an inline "Test" button that reads the live binding.
+- **Models** — STT engine info + Whisper model rows; the inference-server installer card; Polishing on/off toggle + Gemma model rows. Rows show installed-on-disk size, RAM peak estimate, tier, and Use/Download/Cancel/Delete actions.
 - **Modes** — list, edit, duplicate, export/import, reset built-ins.
 - **Dictionary** — global proper-noun + acronym list merged into every mode's dictionary.
 - **Privacy** — informational; everything LOCAL.
@@ -196,7 +200,7 @@ The default `Cmd+Alt+L` shortcut sidesteps this entirely — it goes through the
 
 ## Tray popover
 
-Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-memory only), the active mode picker, current hotkey label, Settings, Quit.
+Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-memory only), the active mode picker, current hotkey label, light/dark appearance toggle, Settings, Quit.
 
 ## Important conventions
 
@@ -206,14 +210,16 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - **Engine errors are fail-open.** STT errors abort the session; LLM errors log a warning and the raw transcript is copied. Both states surface a friendly pill.
 - **Mode prompts come from the active mode at session start.** Switching modes mid-pipeline does not affect the current utterance.
 - **Voice Mode IDs are validated** against `[a-z0-9-]{1,64}` with no edge dashes (`is_safe_mode_id`) to prevent path traversal in the JSON store.
+- **Engines pre-warm in the background at launch.** `lib.rs::run`'s setup hook spawns `inference_proc::prewarm_in_background` (boots `llama-server` if the binary + Gemma model are installed) and `engines::prewarm_stt_in_background` (cold-loads the Whisper GGML weights). Both are idempotent and no-op when their preconditions aren't met, so the first dictation doesn't pay the spawn / load cost.
+- **`llama-server` orphans get reaped at startup.** macOS has no `prctl(PR_SET_PDEATHSIG)`, so a force-killed previous Vox parent can leave a `llama-server` child running. `inference_proc::reap_orphans_at_startup` walks the process table and SIGKILLs any whose `--api-key` argument matches the persisted `inference_api_key`. That's why the api key is persisted across launches even though it's not security-relevant.
 
 ## Known limitations
 
 - **Auto-update is stubbed.** `commands::check_for_updates` short-circuits to `unconfigured` until the placeholder endpoint and pubkey are replaced and the bundle is signed + notarized.
 - **No code signing yet.** Built `.app` is ad-hoc signed; macOS Gatekeeper will block it on first launch (control-click → Open once to trust).
-- **Gemma cleanup tracks upstream `llama.cpp` via a git-pinned `llama-cpp-2`.** `src-tauri/Cargo.toml` pins `llama-cpp-2` to a specific commit on the upstream `main` branch (not the latest crates.io release) so we get a `llama.cpp` snapshot with the `<start_of_turn>` chat-template tooling Gemma needs. Bump the `rev` field to track upstream; rebuild; verify polishing works.
-- **MatFormer Gemma 4 GGUFs from Unsloth crash this build.** Their conversion produces `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the bundled `llama.cpp`'s FGDN auto-detect expects, so a `GGML_ASSERT` fires from C++ in `llama-context.cpp::sched_reserve` — bypassing the Rust-side fail-open guard entirely. The internal `fused_gdn_*` / `auto_fgdn` cparams that gate that block are not exposed in the public `llama_context_params` struct, so there is no Rust-side knob to disable it. **bartowski's MatFormer Gemma 4 GGUFs avoid this**: their conversion uses a tensor naming scheme that does not trip FGDN auto-detect. The catalog therefore sources E2B and E4B from bartowski; if a future Unsloth-converted MatFormer variant is added, it'll need an entry in `is_known_broken_llm_id`.
-- **Catalog as of 2026-04-27**: `models.rs` ships three LLM polishing options — **Gemma 4 E2B** (`gemma-4-e2b-q4_k_m`, ~3.5 GB, small — default for <12 GB RAM; bartowski), **Gemma 4 E4B** (`gemma-4-e4b-q4_k_m`, ~5.4 GB, balanced — default for ≥12 GB RAM; bartowski), and **Gemma 4 26B-A4B MoE** (`gemma-4-26b-a4b-q4_k_m`, ~17 GB, quality; Unsloth UD-Q4_K_M for its imatrix calibration edge — safe under any converter because the MoE graph has zero GDN ops, dispatching through `llm_build_gemma4_iswa`'s standard `build_attn` path with `shared_kv_layers=0` and no per-layer embedding). All Gemma releases share the same `<start_of_turn>` chat template, so `gemma_local.rs` is shape-agnostic. `settings.rs::load` migrates retired ids (currently just `phi-4-mini-q4_k_m`) to the current default via `models::is_known_broken_llm_id`.
+- **Gemma polish runs out-of-process.** `inference_server.rs` pins `LLAMA_CPP_TAG` (currently `b8953`) and downloads the matching official `llama-server` archive from the llama.cpp GitHub release. `inference_proc.rs` spawns it as a process-group / Job-Object child so the parent's death tears the child down too, even on SIGKILL. Bumping llama.cpp = bump `LLAMA_CPP_TAG` and (when set) `expected_sha256`; users on the old tag re-download into a different version directory and `cleanup_stale_versions` reaps the previous tree on the launch after.
+- **MatFormer Gemma 4 GGUFs from Unsloth crash llama.cpp.** Their conversion produces `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the FGDN auto-detect path in `llama-context.cpp::sched_reserve` expects, so a `GGML_ASSERT` fires. With the engine out-of-process the assert now exits the child cleanly and `session.rs` fail-opens to the raw transcript (instead of crashing the menu-bar app, as it did under the old in-process `llama-cpp-2`). **bartowski's MatFormer Gemma 4 GGUFs avoid this** — their conversion uses tensor names that do not trip FGDN auto-detect, so we source E2B and E4B from bartowski. If a future Unsloth-converted MatFormer variant is ever added, gate it via `is_known_broken_llm_id`.
+- **LLM catalog**: `models.rs` ships three polishing options — **Gemma 4 E2B** (`gemma-4-e2b-q4_k_m`, ~3.5 GB, small — default for <12 GB RAM; bartowski), **Gemma 4 E4B** (`gemma-4-e4b-q4_k_m`, ~5.4 GB, balanced — default for ≥12 GB RAM; bartowski), and **Gemma 4 26B-A4B MoE** (`gemma-4-26b-a4b-q4_k_m`, ~17 GB, quality; Unsloth UD-Q4_K_M for its imatrix calibration edge — safe under any converter because the MoE graph has zero GDN ops, dispatching through `llm_build_gemma4_iswa`'s standard `build_attn` path with `shared_kv_layers=0` and no per-layer embedding). All Gemma releases share the same `<start_of_turn>` chat template. `settings.rs::load` migrates retired ids (currently just `phi-4-mini-q4_k_m`) to the current default via `models::is_known_broken_llm_id`.
 - **Pill always renders on the primary display.** Multi-display follow-the-focus is a future enhancement.
 
 ## Contact points for changes

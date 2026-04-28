@@ -24,13 +24,11 @@
   --color-overlay: rgb(255 255 255 / 0.06);
   --color-scrim: rgb(0 0 0 / 0.60);
 
-  /* Audio meter bars — defaults to accent in dark, swapped to neutral
-   * grey in light to read as Liquid Glass depth indicator. */
   --color-meter: var(--color-accent);
   --color-meter-shadow: rgba(0, 0, 0, 0.30);
 
-  /* Glass material tokens. The shadow stacks reference the per-theme
-   * shadow primitives so they auto-adapt across light/dark. */
+  /* Glass shadow stacks reference per-theme primitives so they
+   * auto-adapt across light/dark. */
   --glass-highlight: rgb(255 255 255 / 0.08);
   --glass-shadow: rgba(0, 0, 0, 0.45);
   --glass-shadow-soft: rgba(0, 0, 0, 0.22);
@@ -47,10 +45,9 @@
     0 1px 2px var(--glass-shadow-contact), 0 6px 16px var(--glass-shadow-soft);
 }
 
-/* Light theme overrides — applied when `<html data-theme="light">`. The
- * inline early-paint script in each HTML entry sets this synchronously
- * to avoid a flash. Kept outside `@theme` because Tailwind 4's `@theme`
- * only accepts static defaults. */
+/* Light theme. Tailwind 4's `@theme` only accepts static defaults, so
+ * overrides live here and are applied synchronously by the early-paint
+ * script in each HTML entry to avoid a flash. */
 [data-theme="light"] {
   --color-accent: #5b7bff;
   --color-accent-strong: #3d5bff;
@@ -60,48 +57,35 @@
   --color-success: #22a06b;
   --color-warning: #d9870f;
   --color-ink: #161618;
-  /* Mute/faint deepened from the original 0.34/0.55 lightness. The
-   * gradient wallpaper + 24px blur + 180% saturate softens any text
-   * sitting on glass; the source colour has to carry more contrast to
-   * land at AAA-readable through the stack. */
+  /* Mute/faint carry extra contrast — the gradient wallpaper + 24px
+   * blur + 180% saturate softens any text sitting on glass. */
   --color-ink-mute: #3a3a40;
   --color-ink-faint: #5b5b62;
-  /* Slightly cool-tinted near-white. The previous warm cream made the
-   * whole UI read as flat paper. This is closer to macOS Tahoe's system
-   * window background and gives glass surfaces a more believable
-   * "ambient light" to tint. */
   --color-bg: #eef0f5;
-  /* Surfaces sit in the upper Liquid Glass opacity band. Going opaque
-   * here (instead of the original 0.32-0.62) defeats the macOS NSWindow
-   * "fade-when-inactive" behaviour that made the popover and cards
-   * appear to half-disappear when the cursor stopped moving. The
-   * backdrop-filter still tints against the wallpaper, so the frosted
-   * cue survives. */
+  /* Upper Liquid Glass opacity band. Going opaque here defeats the
+   * macOS NSWindow "fade-when-inactive" behaviour that made the
+   * popover half-disappear when the cursor stopped moving. The
+   * backdrop-filter still tints against the wallpaper. */
   --color-surface: rgba(252, 250, 247, 0.88);
   --color-surface-raised: rgba(252, 250, 247, 0.92);
   --color-surface-glass: rgba(252, 250, 247, 0.94);
   --color-sidebar: rgba(252, 250, 247, 0.78);
   --color-border: rgb(15 15 20 / 0.08);
   --color-border-strong: rgb(15 15 20 / 0.14);
-  /* Bumped from 0.06 → 0.14 so toggle off-states (white knob on
-   * --color-control fill) are perceptible against the white-ish glass
-   * surfaces. Same fix benefits hover overlays and segmented controls. */
+  /* 0.14 (not 0.06) so toggle off-states are perceptible against the
+   * white-ish glass surfaces. */
   --color-control: rgb(15 15 20 / 0.14);
   --color-control-hover: rgb(15 15 20 / 0.20);
   --color-input-bg: rgb(255 255 255 / 0.55);
   --color-overlay: rgb(15 15 20 / 0.07);
   --color-scrim: rgb(15 15 20 / 0.35);
 
-  /* Neutral grey meter bars in light mode — keep saturated accent in
-   * dark theme via the @theme default. Slight transparency + an inner
-   * shadow on each bar carries the "carved depth" cue. */
   --color-meter: rgba(40, 44, 56, 0.5);
   --color-meter-shadow: rgba(20, 24, 40, 0.25);
 
-  /* Liquid Glass primitives — cool blue-grey shadow hue + bumped alphas
-   * so floating panels carry visible weight against arbitrary
-   * wallpapers. The bright top inner highlight is the load-bearing
-   * "bevelled glass rim" cue. */
+  /* Cool blue-grey shadow hue + bumped alphas so floating panels carry
+   * visible weight against arbitrary wallpapers. The bright top inner
+   * highlight is the load-bearing "bevelled glass rim" cue. */
   --glass-highlight: rgba(255, 255, 255, 0.75);
   --glass-shadow: rgba(20, 24, 40, 0.22);
   --glass-shadow-soft: rgba(20, 24, 40, 0.12);
@@ -129,14 +113,11 @@ body {
   padding: 0;
   -webkit-font-smoothing: antialiased;
   background-color: var(--color-bg);
-  /* Smooth the theme flip; restrict to bg/color so hover transitions
-   * elsewhere don't get an unintended 150ms lag. */
+  /* Restricted to bg/color so hover transitions elsewhere don't get a
+   * 150ms lag from the theme flip. */
   transition: background-color 150ms ease, color 150ms ease;
 }
 
-/* Windows that render translucent content on top of the desktop use an
- * absolutely-positioned body with no background. The window transparency is
- * set at the Tauri level. */
 body.translucent {
   background: transparent !important;
 }
@@ -156,8 +137,6 @@ button {
 button:disabled {
   cursor: not-allowed;
 }
-
-/* ------- animations --------------------------------------------------- */
 
 @keyframes pulse-mic {
   0%,
@@ -220,22 +199,14 @@ button:disabled {
   }
 }
 
-/* ------- liquid glass utilities --------------------------------------- */
-
-/* Wallpaper-like backdrop for opaque app windows (Settings, Onboarding).
- * Translucent overlay windows (Pill, Tray Popover) use the desktop
- * wallpaper directly via `body.translucent` and don't need this. The
- * radial gradient stack gives glass cards something to refract — without
- * it, the surfaces collapse to flat paint. */
+/* Wallpaper-like backdrop for opaque app windows. Translucent overlay
+ * windows use the desktop wallpaper directly via `body.translucent`.
+ * The radial gradient stack gives glass cards something to refract —
+ * without it, surfaces collapse to flat paint. */
 .liquid-canvas {
   background-color: var(--color-bg);
 }
 
-/* The light-mode wash is intentionally muted (alphas in the 0.06-0.10
- * band) so it reads as ambient depth behind the cream-coloured cards
- * rather than as a competing pastel poster. The popover sits over the
- * actual desktop wallpaper, so its blur picks up neutral tones — these
- * radial stops mimic that same understated wash. */
 [data-theme="light"] .liquid-canvas {
   background-image:
     radial-gradient(
@@ -278,11 +249,8 @@ button:disabled {
   background-attachment: fixed;
 }
 
-/* Standard glass card — frosted backdrop blur + tinted translucent
- * fill + the inner-highlight/edge-shadow stack that gives the surface
- * its bevelled-glass feel. The transition smooths any background-alpha
- * shifts (notably macOS NSWindow vibrancy fades when the popover loses
- * the cursor) so they ease out over ~250ms instead of stepping. */
+/* The transition smooths macOS NSWindow vibrancy fades (popover losing
+ * cursor) so they ease out over ~250ms instead of stepping. */
 .liquid-card {
   background: var(--color-surface-raised);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -295,7 +263,6 @@ button:disabled {
     -webkit-backdrop-filter 250ms ease;
 }
 
-/* Heavier glass for floating panels (popovers, dropdowns, modals). */
 .liquid-glass {
   background: var(--color-surface-glass);
   -webkit-backdrop-filter: var(--glass-blur);
@@ -309,9 +276,6 @@ button:disabled {
     -webkit-backdrop-filter 250ms ease;
 }
 
-/* iOS-style toggle thumb — a soft drop shadow plus a hairline contact
- * shadow so the white knob reads against any switch-track colour
- * (especially the pale --color-control fill in light mode). */
 .toggle-knob {
   background: white;
   box-shadow:
@@ -325,8 +289,6 @@ button:disabled {
     0 0 0 0.5px rgba(0, 0, 0, 0.20),
     0 1px 2px rgba(0, 0, 0, 0.45);
 }
-
-/* ------- utility ------------------------------------------------------ */
 
 .keycap {
   display: inline-flex;

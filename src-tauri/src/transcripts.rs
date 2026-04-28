@@ -1,6 +1,4 @@
-//! In-memory ring buffer of the most recent cleaned transcripts.
-//!
-//! Nothing is persisted — cleared on app quit per the privacy model.
+//! In-memory ring buffer of recent transcripts; cleared on quit.
 
 use std::collections::VecDeque;
 

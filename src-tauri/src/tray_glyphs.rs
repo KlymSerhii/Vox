@@ -1,11 +1,8 @@
 //! Procedurally-drawn template glyphs for the menu-bar tray icon.
 //!
-//! Output is RGBA where R/G/B are zero and only the alpha channel is
-//! populated. This is what macOS expects for a "template image" — the
-//! system tints the alpha to match the menu-bar color (white in dark
-//! mode, near-black in light mode). The same generator is used at build
-//! time (build.rs writes PNGs to `icons/tray/` for design review) and
-//! at runtime (this module renders directly into a Tauri `Image`).
+//! Output is RGBA with R/G/B = 0 and only the alpha channel populated — a
+//! macOS "template image" that the system tints to match the menu bar
+//! (white in dark mode, near-black in light mode).
 
 fn idx(x: i32, y: i32, w: i32) -> Option<usize> {
     if x < 0 || y < 0 || x >= w || y >= w {
@@ -221,16 +218,18 @@ fn lock_glyph(rgba: &mut [u8], w: i32) {
     }
 }
 
-// ---- public draw API -------------------------------------------------------
+fn canvas(w: i32) -> Vec<u8> {
+    vec![0u8; (w * w * 4) as usize]
+}
 
 pub fn idle(w: i32) -> Vec<u8> {
-    let mut rgba = vec![0u8; (w * w * 4) as usize];
+    let mut rgba = canvas(w);
     mic(&mut rgba, w, false);
     rgba
 }
 
 pub fn recording(w: i32, with_dot: bool) -> Vec<u8> {
-    let mut rgba = vec![0u8; (w * w * 4) as usize];
+    let mut rgba = canvas(w);
     mic(&mut rgba, w, true);
     if with_dot {
         rec_dot(&mut rgba, w);
@@ -239,20 +238,20 @@ pub fn recording(w: i32, with_dot: bool) -> Vec<u8> {
 }
 
 pub fn processing(w: i32) -> Vec<u8> {
-    let mut rgba = vec![0u8; (w * w * 4) as usize];
+    let mut rgba = canvas(w);
     spinner(&mut rgba, w);
     rgba
 }
 
 pub fn error(w: i32) -> Vec<u8> {
-    let mut rgba = vec![0u8; (w * w * 4) as usize];
+    let mut rgba = canvas(w);
     mic(&mut rgba, w, false);
     bang(&mut rgba, w);
     rgba
 }
 
 pub fn permission(w: i32) -> Vec<u8> {
-    let mut rgba = vec![0u8; (w * w * 4) as usize];
+    let mut rgba = canvas(w);
     lock_glyph(&mut rgba, w);
     rgba
 }

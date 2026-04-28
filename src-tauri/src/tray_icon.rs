@@ -1,23 +1,3 @@
-//! Tray icon state machine.
-//!
-//! The tray icon reflects the current dictation pipeline state at all times:
-//!
-//! - `Idle` — mic outline (light grey when tinted)
-//! - `Recording` — filled mic + red dot, alternating with dot-off frame at
-//!   2 Hz so the user gets unmistakable visual feedback that the recording
-//!   is live.
-//! - `Processing` — spinner glyph (transcribing or polishing).
-//! - `Error` — mic + exclamation badge.
-//! - `Permission` — padlock glyph, used when accessibility/microphone TCC
-//!   has not been granted.
-//!
-//! All glyphs are alpha-only template images so macOS tints them to match
-//! the menu-bar appearance (white in dark mode, black in light mode).
-//!
-//! Pulse animation is implemented as a simple `tokio::spawn`-ed loop guarded
-//! by an `AtomicBool` so we never have multiple pulse loops running and
-//! never leak a loop after the state moves away from `Recording`.
-
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,15 +39,11 @@ impl TrayState {
     }
 }
 
-/// Process-wide tray state. We use atomics so the pulse loop can read it
-/// without locking, and we keep it on the heap behind `OnceCell` so the
-/// public setter doesn't need an `&AppHandle` to look up the tray.
 static STATE: OnceCell<Arc<TrayStateInner>> = OnceCell::new();
 
 struct TrayStateInner {
     state: AtomicU8,
-    /// Set when a pulse loop is currently active. The loop holds it; whoever
-    /// transitions out of `Recording` clears it so the loop self-terminates.
+    // Lock-free guard so we never spawn two pulse loops; the loop itself clears it on exit.
     pulse_running: AtomicBool,
     tooltip: Mutex<String>,
 }
@@ -96,17 +72,9 @@ fn default_tooltip(state: TrayState) -> &'static str {
     }
 }
 
-// ---- Image construction ----------------------------------------------------
-
-/// Build a Tauri `Image` for a given state at @1x. Tauri will ask for the
-/// @2x variant separately via the macOS template image path; for our
-/// procedurally-generated icons the tint is a flat scale, so the @1x is
-/// sufficient — the menu bar will scale it. (We wrote @2x PNGs to disk in
-/// build.rs so the assets exist, but the runtime path uses a single buffer
-/// for simplicity. Visual quality at 16px is identical.)
 fn image_for_state(state: TrayState, pulse_phase: bool) -> Image<'static> {
-    // Generate at 32 px so on a Retina menu bar (which renders at 2x) the
-    // icon is sharp; macOS will down-sample for non-Retina automatically.
+    // 32 px keeps the icon sharp on Retina menu bars (rendered at 2x);
+    // macOS down-samples to 16 px on non-Retina automatically.
     const W: u32 = 32;
     let buf = match state {
         TrayState::Idle => tray_glyphs::idle(W as i32),
@@ -118,9 +86,6 @@ fn image_for_state(state: TrayState, pulse_phase: bool) -> Image<'static> {
     Image::new_owned(buf, W, W)
 }
 
-// ---- Public API ------------------------------------------------------------
-
-/// Apply the initial tray state at startup. Called once after `tray::build`.
 pub fn init<R: Runtime>(app: &AppHandle<R>) {
     let initial = if missing_permissions() {
         TrayState::Permission
@@ -130,9 +95,6 @@ pub fn init<R: Runtime>(app: &AppHandle<R>) {
     set_state(app, initial);
 }
 
-/// Update the visible tray icon for the given state. Idempotent — calling
-/// `set_state(app, Recording)` while already recording does NOT restart
-/// the pulse loop.
 pub fn set_state<R: Runtime>(app: &AppHandle<R>, state: TrayState) {
     let inner = inner();
     let prev = TrayState::from_u8(inner.state.swap(state.as_u8(), Ordering::SeqCst));
@@ -140,22 +102,14 @@ pub fn set_state<R: Runtime>(app: &AppHandle<R>, state: TrayState) {
         return;
     }
 
-    // Update tooltip + static frame immediately so the icon doesn't lag.
     *inner.tooltip.lock() = default_tooltip(state).to_string();
     apply_frame(app, state, false);
     let _ = update_tooltip(app, &inner.tooltip.lock());
 
-    if state == TrayState::Recording {
-        // Start the pulse loop if one isn't already running. The flag is
-        // *only* cleared by the loop itself when it exits, so simultaneous
-        // re-entries can't double-spawn.
-        if !inner.pulse_running.swap(true, Ordering::SeqCst) {
-            spawn_pulse_loop(app.clone());
-        }
-    } else {
-        // Any non-recording state: the running pulse loop will see
-        // `state != Recording` on its next tick and self-terminate. We
-        // don't toggle `pulse_running` directly — the loop owns it.
+    // Non-recording states are picked up by the running pulse loop on its next
+    // tick, which self-terminates and clears `pulse_running`.
+    if state == TrayState::Recording && !inner.pulse_running.swap(true, Ordering::SeqCst) {
+        spawn_pulse_loop(app.clone());
     }
 }
 
@@ -183,9 +137,8 @@ fn spawn_pulse_loop<R: Runtime>(app: AppHandle<R>) {
         loop {
             let cur = TrayState::from_u8(inner.state.load(Ordering::SeqCst));
             if cur != TrayState::Recording {
-                // Settle on the static (with-dot) frame before exiting so we
-                // don't leave the icon mid-blink if the user lingers in the
-                // Recording → Processing transition.
+                // Settle on a non-blink frame so a Recording→Processing
+                // transition doesn't leave the icon mid-blink.
                 apply_frame(&app, cur, false);
                 inner.pulse_running.store(false, Ordering::SeqCst);
                 return;
@@ -197,23 +150,17 @@ fn spawn_pulse_loop<R: Runtime>(app: AppHandle<R>) {
     });
 }
 
-// ---- Permission probe ------------------------------------------------------
-
 #[cfg(target_os = "macos")]
 fn missing_permissions() -> bool {
     extern "C" {
         fn AXIsProcessTrusted() -> bool;
     }
-    let accessibility = unsafe { AXIsProcessTrusted() };
-    if !accessibility {
+    if !unsafe { AXIsProcessTrusted() } {
         return true;
     }
-    // Microphone — non-prompting status check via AVFoundation. Critically,
-    // we MUST NOT call `cpal::default_input_config()` here at startup: on
-    // macOS 14+ that opens the audio device far enough to trigger the TCC
-    // microphone prompt before the user has reached the onboarding mic
-    // step. `mac_perm::authorization_status()` reads the cached TCC state
-    // without escalating it.
+    // Must use the non-prompting AVFoundation probe here: cpal's
+    // default_input_config() opens the device far enough to fire the TCC
+    // microphone prompt on macOS 14+ before the user reaches onboarding.
     !crate::mac_perm::authorization_status().is_granted()
 }
 

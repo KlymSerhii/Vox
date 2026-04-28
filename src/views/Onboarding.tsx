@@ -37,28 +37,14 @@ import {
   type TierRecommendation,
 } from "../lib/ipc";
 
-// 2026-04-26: cloud onboarding (StackStep + KeysStep) was removed when
-// Vox went fully on-device. The flow is now linear: Welcome → Mic →
-// Accessibility → Local model download → Try it / How to use.
 type Step = 0 | 1 | 2 | 3 | 4;
 
 const STEP_COUNT = 5;
 const LAST_STEP: Step = 4;
 const MODELS_STEP: Step = 3;
 
-/**
- * Render a Tauri global-shortcut spec like "Alt+Shift+V" or "F13" as a
- * compact glyph string, e.g. "⌥⇧V" / "F13".
- *
- * - Bare modifier IDs like `AltRight` / `AltLeft` are rendered as `⌥`
- *   so the keycap row reads naturally even when the user has chosen
- *   Right-Option (which we now warn about separately because it's
- *   unreliable through tauri-plugin-global-shortcut on macOS).
- * - The Tauri spec `"CommandOrControl+Shift+Space"` is collapsed to
- *   `⌘⇧Space` rather than `CommandOrControl⇧Space`.
- * - Other shortcuts are split on `+` and each token mapped through the
- *   modifier table; unknown tokens fall through verbatim.
- */
+/** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a glyph
+ *  string ("⌥⇧V", "F13"). Bare `AltRight`/`AltLeft` map to `⌥`. */
 export function formatHotkey(spec: string | null | undefined): string {
   if (!spec) return "";
   const trimmed = spec.trim();
@@ -79,11 +65,7 @@ export function formatHotkey(spec: string | null | undefined): string {
   };
   return trimmed
     .split("+")
-    .map((tok) => {
-      const t = tok.trim();
-      if (!t) return "";
-      return MODS[t] ?? t;
-    })
+    .map((tok) => MODS[tok.trim()] ?? tok.trim())
     .join("");
 }
 
@@ -95,11 +77,8 @@ export default function OnboardingView() {
     microphone: false,
     accessibility: false,
   });
-  // True from the moment the user clicks "Accept and download" until
-  // every chosen download finishes. Used to gate the Continue button
-  // so the user can't skip ahead while bytes are still moving — but
-  // the "Skip for now" exit stays open at all times so a user with a
-  // dead network can still bail.
+  // Gates Continue while downloads run. "Skip for now" stays open at
+  // all times so a user with a dead network can still bail.
   const [downloadInFlight, setDownloadInFlight] = createSignal(false);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -115,9 +94,7 @@ export default function OnboardingView() {
     const poll = async () => {
       try {
         setPerms(await checkPermissions());
-      } catch {
-        /* non-fatal */
-      }
+      } catch {}
     };
     poll();
     pollTimer = setInterval(poll, 2000);
@@ -136,19 +113,15 @@ export default function OnboardingView() {
   }
 
   async function handleFinish() {
-    console.info("[onboarding] finish: click registered");
     try {
       await finishOnboarding();
-      console.info("[onboarding] finish: backend ack");
     } catch (err) {
       console.error("[onboarding] finish: backend failed", err);
     }
-    // Close from the frontend regardless. Backend already calls close()
-    // too, but if the IPC errored or the window handle was lost, this
-    // guarantees the user gets out of the wizard.
+    // Close from the frontend too — backend close() can race against a
+    // lost window handle and leave the wizard stuck open.
     try {
       await getCurrentWindow().close();
-      console.info("[onboarding] finish: window closed");
     } catch (err) {
       console.error("[onboarding] finish: close failed", err);
     }
@@ -262,16 +235,12 @@ function PrimaryButton(props: {
   onNext: () => void;
   onFinish: () => void;
 }) {
-  const disabled = () => {
-    if (props.step === 1) return !props.perms.microphone;
-    // While downloads are in flight, force the user to either wait
-    // (so the next step's pre-warm finds the assets) or click "Skip
-    // for now" to bail explicitly. This keeps the menu-bar app from
-    // flipping into a broken-on-first-use state if the user races
-    // ahead while a multi-GB GGUF is still streaming.
-    if (props.step === MODELS_STEP && props.downloadInFlight) return true;
-    return false;
-  };
+  // Gate Continue on mic step until granted, and on models step until
+  // downloads finish — racing ahead with a partial GGUF leaves the app
+  // in a broken-on-first-use state.
+  const disabled = () =>
+    (props.step === 1 && !props.perms.microphone) ||
+    (props.step === MODELS_STEP && props.downloadInFlight);
   const label = () => {
     if (props.step === 0) return "Get started";
     if (props.step === LAST_STEP) return "Finish";
@@ -282,14 +251,7 @@ function PrimaryButton(props: {
     <button
       type="button"
       disabled={disabled()}
-      onClick={() => {
-        console.info("[onboarding] PrimaryButton click", { step: props.step, isFinish: isFinish() });
-        if (isFinish()) {
-          props.onFinish();
-        } else {
-          props.onNext();
-        }
-      }}
+      onClick={() => (isFinish() ? props.onFinish() : props.onNext())}
       class="inline-flex h-9 items-center gap-2 rounded-[8px] bg-[var(--color-accent)] px-4 text-[13px] font-medium text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
     >
       <Show
@@ -312,8 +274,6 @@ function PrimaryButton(props: {
     </button>
   );
 }
-
-// -------- Step content --------
 
 function Welcome() {
   return (
@@ -413,17 +373,11 @@ function PermStatus(props: {
   );
 }
 
-// 2026-04-26: StackStep + KeysStep were removed when cloud engines went
-// away. Onboarding is now a fixed local flow: Welcome → Mic →
-// Accessibility → DownloadStep → HowToUseStep.
-
 function DownloadStep(props: {
   s: Settings | null;
   tier: TierRecommendation | null;
   patch: (p: Partial<Settings>) => void;
-  /// Notify the parent so it can gate the "Continue" button while
-  /// large downloads are still streaming. The parent owns the gate;
-  /// this step owns the truth about which IDs are expected.
+  /// Parent owns the Continue gate; this step owns the IDs being downloaded.
   onInFlightChange: (v: boolean) => void;
 }) {
   const [progress, setProgress] = createSignal<
@@ -434,17 +388,13 @@ function DownloadStep(props: {
   const [err, setErr] = createSignal<string | null>(null);
   const [llmModels, setLlmModels] = createSignal<ModelStatus[]>([]);
   const [selectedLlmId, setSelectedLlmId] = createSignal<string | null>(null);
-  // Out-of-process inference server (`llama-server`). Treated as a
-  // first-class download alongside the two model downloads — the
-  // user can't polish without it.
   const [binaryStatus, setBinaryStatus] =
     createSignal<InferenceServerStatus | null>(null);
   const unlistens: (() => void)[] = [];
 
   onMount(async () => {
-    // The binary download emits the same shape on `binary:*` events as
-    // models do on `model:*`, so we share the progress/completed maps.
-    // The per-id key keeps them disambiguated in the UI.
+    // model:* and binary:* emit the same payload shape, so handlers
+    // share the progress/completed maps; per-id keys disambiguate.
     const handleProgress = (p: {
       id: string;
       bytes_downloaded: number;
@@ -456,11 +406,7 @@ function DownloadStep(props: {
       }));
     };
     const handleDone = (p: { id: string }) => {
-      setCompleted((prev) => {
-        const n = new Set(prev);
-        n.add(p.id);
-        return n;
-      });
+      setCompleted((prev) => new Set(prev).add(p.id));
     };
     const handleError = (p: { id: string; error: string }) => {
       setErr(p.error);
@@ -477,23 +423,16 @@ function DownloadStep(props: {
       const [all, bin] = await Promise.all([listModels(), inferenceServerStatus()]);
       setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
       setBinaryStatus(bin);
-      // If the binary is already installed (e.g. the user re-runs
-      // onboarding from Settings), pre-mark it as completed so the
+      // Re-runs from Settings: pre-mark already-installed binary so the
       // gate doesn't block forever.
       if (bin.installed) {
-        setCompleted((prev) => {
-          const n = new Set(prev);
-          n.add(bin.id);
-          return n;
-        });
+        setCompleted((prev) => new Set(prev).add(bin.id));
       }
     } catch (e) {
       console.warn("listModels/inferenceServerStatus failed", e);
     }
   });
 
-  // Default the radio selection to the recommender's preferred LLM id once
-  // both inputs are available. Effect re-runs if either changes.
   createEffect(() => {
     const t = props.tier;
     const llms = llmModels();
@@ -533,15 +472,11 @@ function DownloadStep(props: {
       await Promise.all([
         downloadModel(t.stt_model_id),
         downloadModel(llmId),
-        // Pull the `llama-server` binary alongside the GGUFs — the
-        // three downloads run concurrently so total wall-clock is
-        // dominated by the largest (Gemma) rather than the sum.
         downloadInferenceServer(),
       ]);
-      // Pre-warm so first dictation doesn't pay the cold-load tax.
-      // We don't pre-warm the inference server here — that would
-      // start `llama-server` immediately, but the user might not
-      // dictate for a while, so we defer until the first polish.
+      // Pre-warm so first dictation doesn't pay the cold-load tax. The
+      // inference server is deferred until first polish — spawning it
+      // now would burn RAM before the user even dictates.
       await Promise.allSettled([
         loadModelWarm(t.stt_model_id),
         loadModelWarm(llmId),
@@ -735,15 +670,10 @@ function DownloadBar(props: {
   );
 }
 
-// 2026-04-26: KeysStep + TryStep deleted — no cloud secrets, and the
-// cloud path that rendered TryStep as a model-step fallback is gone.
-
 function HowToUseStep(props: { s: Settings | null }) {
-  // Always render the BOUND hotkey (what the OS will actually fire),
-  // not the configured one — they can differ when the configured key
-  // wasn't registerable and the runtime fell back. We fetch the active
-  // bindings on mount so the keycaps read the truth even on a fresh
-  // install where settings haven't been touched.
+  // Render the BOUND hotkey (what the OS will fire), not the configured
+  // one — they diverge when the configured key wasn't registerable and
+  // the runtime fell back.
   const [diags, setDiags] = createSignal<Map<string, HotkeyDiagnostic>>(
     new Map(),
   );
@@ -751,9 +681,7 @@ function HowToUseStep(props: { s: Settings | null }) {
   onMount(async () => {
     try {
       const d = await diagnoseHotkeys();
-      const map = new Map<string, HotkeyDiagnostic>();
-      for (const e of d.entries) map.set(e.purpose, e);
-      setDiags(map);
+      setDiags(new Map(d.entries.map((e) => [e.purpose, e])));
     } catch (err) {
       console.warn("diagnoseHotkeys failed:", err);
     }
@@ -828,10 +756,6 @@ function fellBackNote(d: HotkeyDiagnostic | undefined): string | null {
   return `Configured ${cfg} wasn't available on your Mac — Vox is using ${bnd}.`;
 }
 
-/** True if push-to-talk diagnostic exists, has no binding, and the user
- * has a non-empty configured hotkey. The "You're ready" view uses this
- * to swap in actionable copy ("grant Accessibility") in place of the
- * normal "to start dictating" hint. */
 function pttFailed(d: HotkeyDiagnostic | undefined): boolean {
   if (!d) return false;
   return !d.bound && d.configured !== "";

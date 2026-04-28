@@ -10,10 +10,6 @@ use crate::{
     transcripts,
 };
 
-// `TestConnectionResult` previously fronted the cloud key-test commands.
-// Cloud engines have been removed (2026-04-26) — the type is no longer
-// referenced but kept here as a small comment so future cloud experiments
-// know where to plug back in.
 #[derive(Debug, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct TestConnectionResult {
@@ -23,13 +19,9 @@ pub struct TestConnectionResult {
 
 const SECRET_WINDOWS: &[&str] = &["settings", "onboarding"];
 
-fn caller_label<R: Runtime>(webview: &Webview<R>) -> String {
-    webview.label().to_string()
-}
-
 fn assert_secret_window<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {
-    let label = caller_label(webview);
-    if SECRET_WINDOWS.iter().any(|w| *w == label) {
+    let label = webview.label();
+    if SECRET_WINDOWS.contains(&label) {
         Ok(())
     } else {
         Err(format!(
@@ -49,7 +41,6 @@ pub fn get_settings<R: Runtime>(
 
 #[tauri::command]
 pub fn get_public_settings<R: Runtime>(app: AppHandle<R>) -> settings::Settings {
-    // No cloud secrets to redact — local-only build.
     settings::load(&app)
 }
 
@@ -61,31 +52,14 @@ pub fn set_settings(
 ) -> Result<(), String> {
     assert_secret_window(&webview)?;
 
-    // Snapshot the previous values so we know whether any of the
-    // hotkey-related fields actually changed. Re-binding global
-    // shortcuts is cheap but not free (and on macOS it briefly
-    // unregisters everything), so we only do it when necessary.
+    // Snapshot before-values so we only re-bind hotkeys / restart engines
+    // when the relevant fields actually changed. Engine lifecycle effects
+    // run AFTER save so on-disk state matches what supervisors see.
     let before = settings::load(&app);
     let hotkeys_changed = before.hotkey != settings.hotkey
         || before.cancel_hotkey != settings.cancel_hotkey
         || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
     let appearance_changed = before.appearance != settings.appearance;
-    // Engine lifecycle diff. We act on these AFTER the save so the
-    // on-disk state matches what the supervisors see.
-    //
-    // - `polish_off`: user turned polishing off. Kill the live
-    //   `llama-server` so the ~5 GB GGUF stops sitting in RAM right
-    //   now, not lazily.
-    // - `stt_changed`: user switched Whisper model or engine. We
-    //   pre-warm the new selection so the next dictation doesn't
-    //   pay the GGML load.
-    //
-    // Note: we don't need a separate "polish_on" branch — the
-    // unconditional `prewarm_in_background` below is a no-op when
-    // polishing is off, so flipping polish on (or changing the LLM
-    // model while it stays on) both go through the same code path
-    // and ensure_running's spawn-lock + model-id check handles the
-    // model swap atomically.
     let polish_off = before.polishing_enabled && !settings.polishing_enabled;
     let llm_left_gemma =
         before.llm_engine == "gemma-local" && settings.llm_engine != "gemma-local";
@@ -95,9 +69,10 @@ pub fn set_settings(
     settings::save(&app, &settings).map_err(|e| e.to_string())?;
 
     if appearance_changed {
-        let theme = match settings.appearance.as_str() {
-            "light" => Some(tauri::Theme::Light),
-            _ => Some(tauri::Theme::Dark),
+        let theme = if settings.appearance == "light" {
+            Some(tauri::Theme::Light)
+        } else {
+            Some(tauri::Theme::Dark)
         };
         for label in ["settings", "onboarding"] {
             if let Some(win) = app.get_webview_window(label) {
@@ -110,23 +85,18 @@ pub fn set_settings(
 
     if hotkeys_changed {
         if let Some(ctx) = app.try_state::<session::SessionCtx>() {
-            let ctx_clone = (*ctx).clone();
             match crate::hotkey::register(
                 &app,
                 &settings.hotkey,
                 &settings.cancel_hotkey,
                 &settings.mode_cycle_hotkey,
-                ctx_clone,
+                (*ctx).clone(),
             ) {
-                Ok(resolved) => {
-                    log::info!("hotkeys re-bound after settings save: {resolved}");
-                }
-                Err(e) => {
-                    log::error!(
-                        "hotkey re-bind failed after settings save: {e}. \
-                         The previous bindings are gone — settings still saved."
-                    );
-                }
+                Ok(resolved) => log::info!("hotkeys re-bound after settings save: {resolved}"),
+                Err(e) => log::error!(
+                    "hotkey re-bind failed after settings save: {e}. \
+                     The previous bindings are gone — settings still saved."
+                ),
             }
         } else {
             log::warn!(
@@ -136,22 +106,14 @@ pub fn set_settings(
         }
     }
 
-    // ---- Engine lifecycle ----
     if polish_off || llm_left_gemma {
         inference_proc::drop_managed(&app);
     }
-    // Always-attempt pre-warm. Both helpers no-op when the relevant
-    // toggles are off (`polishing_enabled` for inference, `dictation_
-    // enabled` for STT), so the conditions for "is this worth doing"
-    // live in one place.
     inference_proc::prewarm_in_background(&app);
     if stt_changed {
         crate::engines::prewarm_stt_in_background(&app);
     }
 
-    // Notify every other window so they can refresh anything cached
-    // off the settings (mainly the displayed hotkey glyphs in the pill,
-    // tray popover and onboarding).
     if let Err(e) = app.emit("settings:changed", &settings) {
         log::warn!("failed to emit settings:changed: {e}");
     }
@@ -167,15 +129,9 @@ pub fn set_dictation_enabled(
     let mut s = settings::load(&app);
     s.dictation_enabled = enabled;
     settings::save(&app, &s).map_err(|e| e.to_string())?;
-    // Pre-warm Whisper when dictation is freshly turned on so the
-    // first hotkey press doesn't pay the model-load tax. The helper
-    // is a no-op if the model isn't downloaded yet, which keeps the
-    // path safe for users who toggle this before completing onboarding.
     if enabled {
         crate::engines::prewarm_stt_in_background(&app);
     }
-    // Broadcast so the Settings window's General tab and the tray
-    // popover's status line update without a manual refresh.
     if let Err(e) = app.emit("settings:changed", &s) {
         log::warn!("failed to emit settings:changed: {e}");
     }
@@ -214,12 +170,8 @@ pub fn set_polishing_enabled<R: Runtime>(
     s.llm_engine = if enabled { "gemma-local".into() } else { "none".into() };
     settings::save(&app, &s).map_err(|e| e.to_string())?;
 
-    // Drive the inference subprocess in lockstep with the toggle so
-    // the user sees the RAM/CPU change immediately, not lazily on the
-    // next dictation: spawn `llama-server` when polishing is turned
-    // on, kill it when turned off. Both helpers are sync fire-and-
-    // forget — `prewarm_in_background` spawns its own Tokio task and
-    // `drop_managed` issues a SIGKILL via command-group's Drop.
+    // Drive the inference subprocess in lockstep with the toggle so the
+    // user sees the RAM change immediately, not lazily on next dictation.
     if enabled {
         inference_proc::prewarm_in_background(&app);
     } else {
@@ -247,8 +199,6 @@ pub fn set_appearance<R: Runtime>(
     s.appearance = appearance;
     settings::save(&app, &s).map_err(|e| e.to_string())?;
 
-    // Flip the macOS title-bar chrome on labelled chrome'd windows. Pill
-    // and tray-popover are decorationless so this is a no-op for them.
     for label in ["settings", "onboarding"] {
         if let Some(win) = app.get_webview_window(label) {
             if let Err(e) = win.set_theme(Some(theme)) {
@@ -305,14 +255,6 @@ pub fn open_accessibility_settings<R: Runtime>(_app: AppHandle<R>) -> Result<(),
     Ok(())
 }
 
-/// Reveal the absolute path of the currently-running binary so the user
-/// can paste it into System Settings → Privacy & Security → Accessibility
-/// (the "+" button on that pane accepts a file path via Cmd+Shift+G).
-///
-/// Returned struct is consumed by the Settings → About row in dev mode:
-/// the UI copies `binary_path` to the clipboard and shows
-/// `bundle_identifier` so the user can verify whether they're looking
-/// at the dev binary (`vox-<hash>`) or the proper bundle (`com.vox.app`).
 #[derive(Debug, Serialize)]
 pub struct DevBinaryInfo {
     pub binary_path: String,
@@ -326,15 +268,9 @@ pub fn reveal_dev_binary_path<R: Runtime>(app: AppHandle<R>) -> DevBinaryInfo {
     let binary_path = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|e| format!("<unknown: {e}>"));
-    let bundle_identifier = app
-        .config()
-        .identifier
-        .clone();
-    // A "dev build" is any binary whose path contains `target/debug` /
-    // `target/release` AND whose parent isn't a `.app` bundle's MacOS
-    // dir. The .app bundle path looks like
-    // `<...>/target/debug/bundle/macos/Vox.app/Contents/MacOS/vox`,
-    // which we want to treat as "real bundle, not dev".
+    let bundle_identifier = app.config().identifier.clone();
+    // Bundled .app paths contain `target/<profile>/` too — exclude them
+    // via the `.app/Contents/MacOS/` segment so they aren't flagged dev.
     let is_dev_build = (binary_path.contains("/target/debug/")
         || binary_path.contains("/target/release/"))
         && !binary_path.contains(".app/Contents/MacOS/");
@@ -366,11 +302,9 @@ pub struct PermissionStatus {
 
 #[tauri::command]
 pub fn check_permissions<R: Runtime>(_app: AppHandle<R>) -> PermissionStatus {
-    let microphone = probe_microphone();
-    let accessibility = probe_accessibility();
     PermissionStatus {
-        microphone,
-        accessibility,
+        microphone: probe_microphone(),
+        accessibility: probe_accessibility(),
     }
 }
 
@@ -387,18 +321,9 @@ fn probe_accessibility() -> bool {
     true
 }
 
-/// Non-prompting microphone status probe. Used by the onboarding poller
-/// (every 2 s) and by the tray icon at startup, so it MUST be safe to
-/// call repeatedly without re-prompting and must never escalate from a
-/// "check" into a "request".
-///
-/// On macOS we use AVFoundation's
-/// `AVCaptureDevice.authorizationStatusForMediaType:`, which returns the
-/// cached TCC state without showing the consent dialog. Crucially we do
-/// NOT touch cpal here: opening (or sometimes even configuring) a CPAL
-/// input device on macOS 14+ implicitly trips the TCC microphone gate
-/// and shows the prompt — exactly what callers of this function must
-/// avoid.
+/// Non-prompting microphone status probe. MUST stay non-prompting: it's
+/// called repeatedly (onboarding poller, tray startup) and any path that
+/// touches cpal on macOS 14+ implicitly trips the TCC consent dialog.
 fn probe_microphone() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -406,18 +331,12 @@ fn probe_microphone() -> bool {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // No TCC on Linux/Windows; treat as always granted at the
-        // permissions layer. Real device errors surface during capture.
         true
     }
 }
 
-/// Explicitly request microphone access. This is the ONLY entry point
-/// allowed to show the macOS TCC dialog; it is wired up to the
-/// "Allow microphone" button on the onboarding mic step.
-///
-/// Returns `true` if access ends up granted (either freshly granted by
-/// the user, or already granted from a prior decision).
+/// Explicitly request microphone access. The ONLY entry point allowed to
+/// show the macOS TCC dialog — wired to the onboarding mic step.
 #[tauri::command]
 pub fn request_microphone() -> bool {
     #[cfg(target_os = "macos")]
@@ -455,9 +374,8 @@ pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     log::error!("onboarding: finish_onboarding IPC entered");
     settings::mark_onboarded(&app);
     if let Some(win) = app.get_webview_window(onboarding::LABEL) {
-        // Use `destroy()` to bypass any close-event handlers and tear the
-        // window down unconditionally. `close()` can race with rebuilds
-        // and silently no-op in dev when the window handle is stale.
+        // destroy() bypasses close-event handlers; close() can silently
+        // no-op in dev when the window handle is stale.
         if let Err(e) = win.destroy() {
             log::error!("onboarding: destroy failed: {e}");
             return Err(e.to_string());
@@ -473,8 +391,6 @@ pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
 pub fn show_tray_popover<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     crate::tray::show_popover(&app).map_err(|e| e.to_string())
 }
-
-// -------- Launch-at-login ----------------------------------------------------
 
 #[tauri::command]
 pub fn get_launch_at_login<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
@@ -499,8 +415,6 @@ pub fn set_launch_at_login<R: Runtime>(
     Ok(())
 }
 
-// -------- Auto-update --------------------------------------------------------
-
 #[derive(Debug, Serialize)]
 pub struct UpdateCheckResult {
     pub status: String,
@@ -518,15 +432,10 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
 
     let cur = app.package_info().version.to_string();
 
-    // Stub-config short-circuit. The released bundles ship with the
-    // placeholder endpoint `https://updates.vox.local/...` and an empty
-    // pubkey until signing + notarization are wired up. In that state
-    // we MUST NOT make a real network request: the placeholder host
-    // won't resolve
-    // (5-15 s DNS timeout, leaks "Vox is running" to anyone watching
-    // the resolver), and an empty pubkey + a real GET would have no
-    // signature pin to fail-closed against if the endpoint config is
-    // ever flipped to a hostile host.
+    // Bundles ship with a placeholder endpoint + empty pubkey until
+    // signing/notarization is wired. Skip the network call: the host
+    // won't resolve (5-15 s DNS timeout leaks "Vox is running" to
+    // resolver watchers) and there's no pubkey to pin against.
     if updater_is_stub(&app) {
         return UpdateCheckResult {
             status: "unconfigured".into(),
@@ -570,40 +479,29 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
     }
 }
 
-/// True if the running config is the documented stub (placeholder host
-/// or empty pubkey). When this is the case `check_for_updates` returns
-/// `"unconfigured"` *without* hitting the network.
+/// True when running with the placeholder host or empty pubkey — the
+/// updater is unconfigured and we skip the network call.
 fn updater_is_stub<R: Runtime>(app: &AppHandle<R>) -> bool {
-    let cfg = app.config();
-    // Walk the plugin config raw — we don't depend on a typed view since
-    // `tauri_plugin_updater::Config` shape may shift.
-    let plugins = match cfg.plugins.0.get("updater") {
-        Some(v) => v,
-        None => return true, // no config at all → stub
+    // Walk plugin config raw — tauri_plugin_updater::Config shape may shift.
+    let Some(plugins) = app.config().plugins.0.get("updater") else {
+        return true;
     };
-    let pubkey = plugins
-        .get("pubkey")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let pubkey = plugins.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
     if pubkey.trim().is_empty() {
         return true;
     }
-    let endpoints = plugins.get("endpoints").and_then(|v| v.as_array());
-    let Some(endpoints) = endpoints else {
+    let Some(endpoints) = plugins.get("endpoints").and_then(|v| v.as_array()) else {
         return true;
     };
     if endpoints.is_empty() {
         return true;
     }
-    // Any endpoint pointing at the placeholder host counts as stub.
     endpoints.iter().any(|e| {
         e.as_str()
             .map(|s| s.contains("updates.vox.local") || s.contains("placeholder"))
             .unwrap_or(false)
     })
 }
-
-// -------- Models tab ---------------------------------------------------------
 
 #[tauri::command]
 pub fn list_models(app: AppHandle<Wry>) -> Vec<models::ModelStatus> {
@@ -627,16 +525,9 @@ pub fn delete_model(app: AppHandle<Wry>, id: String) -> Result<(), String> {
     models::delete_model(&app, &id).map_err(|e| e.to_string())
 }
 
-/// Pre-warm an engine into RAM. Used by onboarding's "Set up local
-/// models" step so the first dictation doesn't pay the cold-load tax.
-///
-/// STT engines actually load the model file here (via the engine's
-/// `prewarm()` hook). LLM cleanup is left to `inference_proc::
-/// prewarm_in_background`, which the rest of the lifecycle plumbing
-/// already drives — onboarding intentionally does NOT spawn
-/// `llama-server` at this point because the user might not dictate
-/// for a while and we don't want a 5 GB GGUF sitting hot for an
-/// audience that may never need it.
+/// Pre-warm an engine. STT loads the model file here; LLM intentionally
+/// does not spawn llama-server (left to `inference_proc::prewarm_in_background`)
+/// so onboarding doesn't pin a ~5 GB GGUF for users who may never dictate.
 #[tauri::command]
 pub async fn load_model_warm(app: AppHandle<Wry>, id: String) -> Result<(), String> {
     let descriptor = models::descriptor_for(&id)
@@ -688,16 +579,6 @@ pub fn accept_gemma_tos<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     settings::save(&app, &s).map_err(|e| e.to_string())
 }
 
-// -------- Inference server (llama-server) -----------------------------------
-//
-// This pipeline downloads + extracts a pre-built `llama-server` binary
-// at first launch and supervises it as a subprocess. See
-// `inference_server.rs` (download/extract) and `inference_proc.rs`
-// (spawn/health/shutdown) for the implementation. The IPC surface
-// mirrors the model-catalog commands so the frontend can reuse its
-// download UI: `binary:progress`, `binary:done`, `binary:error`,
-// `binary:canceled`.
-
 #[tauri::command]
 pub async fn download_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
     inference_server::download_and_extract(&app)
@@ -717,23 +598,17 @@ pub fn inference_server_status(app: AppHandle<Wry>) -> inference_server::Inferen
 
 #[tauri::command]
 pub fn restart_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
-    // The supervisor lazily respawns on the next polish call, so
-    // dropping the cached handle is enough — no need to spawn here.
+    // Supervisor respawns lazily on next polish call; dropping is enough.
     inference_proc::drop_managed(&app);
     Ok(())
 }
 
 #[tauri::command]
 pub fn delete_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
-    // Kill the running child first so we're not deleting files out
-    // from under it on Windows (where holding files open prevents
-    // unlinks) — also frees up the version directory for the next
-    // install.
+    // Kill child first so files aren't deleted while held open (Windows).
     inference_proc::drop_managed(&app);
     inference_server::delete(&app).map_err(|e| e.to_string())
 }
-
-// -------- Voice Modes --------------------------------------------------------
 
 #[tauri::command]
 pub fn list_modes<R: Runtime>(app: AppHandle<R>) -> Vec<VoiceMode> {
@@ -821,8 +696,6 @@ pub fn suggest_active_mode<R: Runtime>(app: AppHandle<R>) -> Option<String> {
     modes::suggest_mode_for(&app, Some(&bundle_id), title.as_deref())
 }
 
-// -------- Hotkey diagnostics ------------------------------------------------
-
 #[derive(Debug, Serialize)]
 pub struct HotkeyDiagnostic {
     pub purpose: String,
@@ -854,9 +727,6 @@ pub struct DiagnoseHotkeys {
     pub entries: Vec<HotkeyDiagnostic>,
 }
 
-/// Snapshot of the push-to-talk binding for the UI to render. The
-/// frontend uses this in onboarding and Settings to show the user the
-/// truth about what's actually bound versus what was configured.
 #[tauri::command]
 pub fn get_active_hotkey<R: Runtime>(app: AppHandle<R>) -> ActiveHotkey {
     match app.try_state::<ActiveHotkeyState>() {
@@ -872,24 +742,13 @@ pub fn get_active_hotkey<R: Runtime>(app: AppHandle<R>) -> ActiveHotkey {
     }
 }
 
-/// Snapshot of every hotkey binding. Used by the Settings → About
-/// "Diagnostics" button to render a full picture in a `<pre>` block.
 #[tauri::command]
 pub fn diagnose_hotkeys<R: Runtime>(app: AppHandle<R>) -> DiagnoseHotkeys {
     let entries = match app.try_state::<ActiveHotkeyState>() {
         Some(state) => vec![
-            HotkeyDiagnostic::from_active(
-                "push-to-talk",
-                state.snapshot(HotkeyPurpose::PushToTalk),
-            ),
-            HotkeyDiagnostic::from_active(
-                "cancel",
-                state.snapshot(HotkeyPurpose::Cancel),
-            ),
-            HotkeyDiagnostic::from_active(
-                "mode-cycle",
-                state.snapshot(HotkeyPurpose::ModeCycle),
-            ),
+            HotkeyDiagnostic::from_active("push-to-talk", state.snapshot(HotkeyPurpose::PushToTalk)),
+            HotkeyDiagnostic::from_active("cancel", state.snapshot(HotkeyPurpose::Cancel)),
+            HotkeyDiagnostic::from_active("mode-cycle", state.snapshot(HotkeyPurpose::ModeCycle)),
         ],
         None => Vec::new(),
     };

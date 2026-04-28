@@ -1,46 +1,19 @@
-//! Model catalog + on-disk cache + resumable HTTP downloader.
+//! Model catalog + on-disk cache + resumable, sha256-verified HTTP
+//! downloader. Cache lives at `<app_data_dir>/models/<kind>/<id>/`;
+//! a `.partial` file is renamed atomically on success.
 //!
-//! Catalog = compile-time metadata (URL, size, sha256). The cache lives
-//! under `~/Library/Application Support/com.vox.app/models/<kind>/<id>/`.
-//! Downloads are resumable via HTTP `Range`; sha256 is verified
-//! streaming. On completion the `.partial` file is renamed atomically
-//! to `model.bin` (or `model.gguf`).
+//! Catalog sha256s start as `None` and are pinned to a sibling
+//! `models.lock` file on first successful download (soft canary, not a
+//! hard gate — HF can rotate assets).
 //!
-//! sha256 sources:
-//! - whisper.cpp models: <https://huggingface.co/ggerganov/whisper.cpp/tree/main>
-//!   (each `.bin` has a `.sha256` sibling on disk; we leave them as
-//!   "TBD" in the catalog and pin the computed hash to a per-machine
-//!   `models.lock` file on first successful download. Treat the lock
-//!   as a warning canary, not a hard gate, because HF can rotate.)
-//! - Gemma 4 E2B GGUF: <https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF>.
-//! - Gemma 4 E4B GGUF: <https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF>.
-//! - Gemma 4 26B-A4B (MoE) GGUF:
-//!   <https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF>.
-//!
-//! NB: MatFormer Gemma 4 GGUFs **as converted by Unsloth** trigger a
-//! `GGML_ASSERT` in `llama-context.cpp::sched_reserve`'s FGDN
-//! auto-detect path: their graphs contain `GGML_OP_GATED_DELTA_NET`
-//! tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR`
-//! prefix that the check expects, so a `GGML_ASSERT` fires from C++ —
-//! bypassing Rust's fail-open guard. There is no Rust-side switch to
-//! disable that block (`fused_gdn_*` and `auto_fgdn` live in the
-//! internal cparams struct, not in the public `llama_context_params`).
-//!
-//! **bartowski's MatFormer Gemma 4 GGUFs avoid this**: their conversion
-//! uses a tensor naming scheme that does not trigger the FGDN
-//! auto-detect path. The E2B and E4B entries in `CATALOG` are therefore
-//! sourced from bartowski. If we ever ship an Unsloth-converted
-//! MatFormer Gemma 4 variant, it'll need an entry in
-//! `is_known_broken_llm_id`.
-//!
-//! Gemma 4 26B-A4B (the MoE variant — 26 B params total, 4 B active,
-//! `shared_kv_layers=0`, no PLE) does NOT hit this code path under
-//! either converter: it dispatches through the same
-//! `llm_build_gemma4_iswa` builder but uses standard `build_attn`
-//! exclusively, so its graph emits zero `GGML_OP_GATED_DELTA_NET` ops.
-//! We keep the Unsloth UD-Q4_K_M variant for its imatrix calibration
-//! edge; it needs ~19 GB RAM at runtime so it isn't the default for
-//! sub-quality tiers.
+//! Gemma 4 MatFormer GGUFs converted by Unsloth crash the bundled
+//! `llama.cpp` from C++ (`GGML_OP_GATED_DELTA_NET` tensors miss the
+//! `LLAMA_TENSOR_NAME_FGDN_AR` prefix that FGDN auto-detect expects),
+//! and the gating cparams are not exposed via Rust. bartowski's
+//! conversion uses a tensor naming scheme that avoids this — E2B and
+//! E4B are sourced from bartowski for that reason. Gemma 4 26B-A4B
+//! (MoE) emits zero GDN ops so it's safe under either converter; we
+//! keep Unsloth's UD-Q4_K_M for its imatrix calibration edge.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,18 +56,14 @@ pub struct ModelDescriptor {
     pub size_bytes: u64,
     pub sha256: Option<&'static str>,
     pub url: &'static str,
-    /// Engine that consumes this model (`"whisper-local"` or
-    /// `"gemma-local"` — local engines only).
+    /// `"whisper-local"` or `"gemma-local"`.
     pub engine: &'static str,
-    /// Approximate peak RAM in MB. Surfaced in the Models UI.
     pub ram_peak_mb: u32,
-    /// Tier label for onboarding ("small" / "balanced" / "quality").
+    /// `"small"` | `"balanced"` | `"quality"`.
     pub tier: &'static str,
 }
 
-/// Compile-time catalog. Adding a new model is a one-line PR.
 pub const CATALOG: &[ModelDescriptor] = &[
-    // ---- STT ----
     ModelDescriptor {
         id: "whisper-tiny-en-q5_1",
         kind: ModelKind::Stt,
@@ -139,12 +108,9 @@ pub const CATALOG: &[ModelDescriptor] = &[
         ram_peak_mb: 1900,
         tier: "quality",
     },
-    // ---- LLM ----
+    // Gemma 4 MatFormer entries are sourced from bartowski; see
+    // file-level docs for why Unsloth's conversion crashes.
     ModelDescriptor {
-        // Gemma 4 E2B (MatFormer): 2 B effective params, n_layer=35.
-        // Sourced from bartowski because Unsloth's E2B conversion
-        // triggers a `GGML_ASSERT` in the FGDN auto-detect path of
-        // `llama-context.cpp::sched_reserve` — see file-level docs.
         id: "gemma-4-e2b-q4_k_m",
         kind: ModelKind::Llm,
         name: "Gemma 4 E2B (Q4_K_M) — Small",
@@ -156,8 +122,6 @@ pub const CATALOG: &[ModelDescriptor] = &[
         tier: "small",
     },
     ModelDescriptor {
-        // Gemma 4 E4B (MatFormer): 4 B effective params, n_layer=42.
-        // Sourced from bartowski for the same reason as E2B above.
         id: "gemma-4-e4b-q4_k_m",
         kind: ModelKind::Llm,
         name: "Gemma 4 E4B (Q4_K_M) — Balanced",
@@ -169,11 +133,6 @@ pub const CATALOG: &[ModelDescriptor] = &[
         tier: "balanced",
     },
     ModelDescriptor {
-        // Gemma 4 26B-A4B (MoE: 26 B total, 4 B active). Has no Gated
-        // Delta Net ops, so it's safe under any converter — we keep
-        // Unsloth's UD-Q4_K_M for its imatrix calibration edge.
-        // ~17 GB on disk, ~19 GB RAM peak with KV cache; comfortable on
-        // 24 GB+ Apple Silicon.
         id: "gemma-4-26b-a4b-q4_k_m",
         kind: ModelKind::Llm,
         name: "Gemma 4 26B-A4B MoE (Q4_K_M) — Quality",
@@ -240,8 +199,6 @@ pub fn cached_model_path<R: Runtime>(
 }
 
 fn verify_present(path: &Path, _d: &ModelDescriptor) -> bool {
-    // Cheap check: file exists + non-empty. Full sha256 verification
-    // happens at download time and is recorded in `models.lock`.
     path.metadata().map(|m| m.len() > 0).unwrap_or(false)
 }
 
@@ -249,7 +206,6 @@ fn root_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     if let Ok(p) = app.path().app_data_dir() {
         return p.join("models");
     }
-    // Fallback: dirs crate (testing / non-Tauri contexts).
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("app.vox.vox/models")
@@ -259,20 +215,14 @@ fn model_dir(root: &Path, d: &ModelDescriptor) -> PathBuf {
     root.join(d.kind.dir()).join(d.id)
 }
 
-// ---------------------------------------------------------------------------
-// Active downloads (cancel handles).
-// ---------------------------------------------------------------------------
-
 #[derive(Default)]
 struct DownloadRegistry {
     inner: Mutex<std::collections::HashMap<String, CancellationToken>>,
 }
 
 impl DownloadRegistry {
-    /// Reserve a slot for `id`. Returns the new cancel token, or `None`
-    /// if a download is already in flight for the same id — callers
-    /// should refuse rather than racing two writers on the same
-    /// `.partial` file.
+    /// Reserve a slot for `id`; `None` if one is already in flight to
+    /// avoid racing two writers on the same `.partial` file.
     fn try_insert(&self, id: &str) -> Option<CancellationToken> {
         let mut guard = self.inner.lock();
         if guard.contains_key(id) {
@@ -316,10 +266,9 @@ struct CancelPayload<'a> {
     id: &'a str,
 }
 
-/// Download a model. Resumable, sha256-verified, atomic on success.
-/// Emits `model:progress` events at most every 200 ms; emits
-/// `model:canceled` if the download is canceled, `model:done` on success,
-/// `model:error` on failure.
+/// Resumable, sha256-verified, atomic-on-success download. Emits
+/// `model:progress` (≥200 ms apart), `model:done`, `model:error`, or
+/// `model:canceled`.
 pub async fn download_model(
     app: AppHandle<Wry>,
     id: String,
@@ -345,10 +294,6 @@ pub async fn download_model(
 
     let resume_from = partial_path.metadata().map(|m| m.len()).unwrap_or(0);
 
-    // Refuse to start a second downloader for the same id while one is
-    // already running. Without this, two writers race on the same
-    // `.partial` file and the result is a corrupt model that survives
-    // the atomic rename to `model.bin`.
     let Some(cancel) = REGISTRY.try_insert(&id) else {
         let _ = app.emit(
             "model:error",
@@ -358,14 +303,11 @@ pub async fn download_model(
     };
 
     let result = do_download(&app, &descriptor, &partial_path, resume_from, cancel.clone()).await;
-
-    // Either way, drop the registry entry.
     REGISTRY.finish(&id);
 
     match result {
         Ok(verified) => {
             if verified {
-                // Atomic rename.
                 std::fs::rename(&partial_path, &final_path)
                     .map_err(|e| anyhow::anyhow!("rename partial: {e}"))?;
                 let _ = app.emit("model:done", serde_json::json!({"id": id}));
@@ -415,49 +357,31 @@ async fn do_download(
     Ok(true)
 }
 
-/// Args for the generic streaming downloader. Reused by both the model
-/// catalog path (`models::download_model`) and the inference-server
-/// binary catalog path (`inference_server::download_and_extract`).
+/// Args for the streaming downloader, shared with the inference-server
+/// binary catalog path.
 #[derive(Debug, Clone, Copy)]
 pub struct StreamArgs<'a> {
-    /// Stable id surfaced on every progress / done / error event so the
-    /// frontend can route a single event stream to the right
-    /// per-asset progress bar.
+    /// Surfaced on every progress / done / error event for routing.
     pub id: &'a str,
-    /// Source URL. Must be HTTPS.
+    /// HTTPS source URL.
     pub url: &'a str,
-    /// On-disk destination for the partial bytes. The caller owns
-    /// the rename to a final filename — keeping the partial separate
-    /// means an interrupted download can resume cleanly the next
-    /// session via the HTTP `Range:` header.
+    /// Destination for the partial bytes; caller renames on success so
+    /// a crash can resume via HTTP `Range:`.
     pub partial_path: &'a Path,
-    /// Hint for total-bytes fallback when the server omits
-    /// `Content-Length`.
+    /// Total-bytes fallback when the server omits `Content-Length`.
     pub expected_size: u64,
-    /// Optional pin: when set, the streamed bytes' sha256 must match.
-    /// When `None`, the computed digest is appended to `lock_file` (if
-    /// set) on first download as a soft canary.
+    /// When set, must match the streamed digest. When `None`, the
+    /// computed digest is appended to `lock_file` as a soft canary.
     pub expected_sha256: Option<&'a str>,
-    /// Tauri event family name. This downloader emits
-    /// `<event_prefix>:progress` events (the caller is responsible for
-    /// `:done`, `:error`, `:canceled` — they belong to the higher-level
-    /// orchestration around rename/extract/etc.).
+    /// Tauri event family name; emits `<event_prefix>:progress` only.
     pub event_prefix: &'a str,
-    /// Optional lockfile to append the computed sha256 to when no
-    /// `expected_sha256` was pinned at compile time.
+    /// Lockfile for soft sha256 canary when no `expected_sha256` is set.
     pub lock_file: Option<&'a Path>,
 }
 
-/// Streaming, resumable, sha256-verified download into `partial_path`.
-///
-/// Memory residency is bounded by reqwest's chunk size (16 KiB by
-/// default) regardless of total file size — verified safe for 17 GB
-/// downloads on 8 GB Macs. Cancellation is checked on every chunk so
-/// the worst-case latency between `cancel.cancel()` and the function
-/// returning is one chunk's transfer time.
-///
-/// Atomic rename on success is the **caller's** responsibility — this
-/// function only writes to `partial_path`.
+/// Streams `partial_path` from `args.url`. Memory residency is bounded
+/// by reqwest's chunk size, so 17 GB downloads work on 8 GB Macs.
+/// Caller owns the rename to the final path.
 pub async fn stream_to_file<R: Runtime>(
     app: &AppHandle<R>,
     args: StreamArgs<'_>,
@@ -514,7 +438,8 @@ pub async fn stream_to_file<R: Runtime>(
         let mut left = resume_from;
         while left > 0 {
             let want = (buf.len() as u64).min(left) as usize;
-            let n = existing.read(&mut buf[..want])
+            let n = existing
+                .read(&mut buf[..want])
                 .map_err(|e| anyhow::anyhow!("rehash read: {e}"))?;
             if n == 0 {
                 break;
@@ -562,7 +487,7 @@ pub async fn stream_to_file<R: Runtime>(
         }
     }
 
-    // Final progress emit so the UI snaps to 100%.
+    // Snap UI to 100%.
     let _ = app.emit(
         &progress_event,
         ProgressPayload {
@@ -585,9 +510,7 @@ pub async fn stream_to_file<R: Runtime>(
 
     if let Some(expected) = args.expected_sha256 {
         if !computed.eq_ignore_ascii_case(expected) {
-            // Clean up the corrupted partial so a retry starts fresh
-            // — resuming a corrupted prefix would re-fail at every
-            // attempt forever.
+            // Drop the corrupted partial so a retry doesn't resume into the same failure.
             let _ = std::fs::remove_file(args.partial_path);
             return Err(anyhow::anyhow!(
                 "sha256 mismatch for {}: got {computed}, expected {expected}",
@@ -595,9 +518,6 @@ pub async fn stream_to_file<R: Runtime>(
             ));
         }
     } else if let Some(lp) = args.lock_file {
-        // First-time pinning: write the computed digest to the
-        // sibling lockfile so a future build can pin against it. Soft
-        // canary — useful for diagnosing HF asset rotation.
         let _ = append_to_lock(lp, args.id, &computed);
     }
 
@@ -626,7 +546,7 @@ pub fn delete_model<R: Runtime>(app: &AppHandle<R>, id: &str) -> anyhow::Result<
     Ok(())
 }
 
-/// Detect physical RAM (rounded GB). 0 if unknown.
+/// Physical RAM in rounded GB; 0 if unknown.
 pub fn physical_ram_gb() -> u64 {
     let mut sys = sysinfo::System::new_with_specifics(
         sysinfo::RefreshKind::new().with_memory(sysinfo::MemoryRefreshKind::new().with_ram()),
@@ -635,7 +555,6 @@ pub fn physical_ram_gb() -> u64 {
     sys.total_memory() / (1024 * 1024 * 1024)
 }
 
-/// Recommend a tier based on physical RAM. Soft: just a recommendation.
 pub fn recommend_tier() -> &'static str {
     if physical_ram_gb() < 12 {
         "small"
@@ -660,14 +579,9 @@ pub fn recommended_llm_model_id() -> &'static str {
     }
 }
 
-/// Model IDs that should be migrated away from on settings load. An id
-/// lands here when it has been retired from the catalog — without
-/// migration, an upgrader who had it selected would end up with a
-/// dangling reference that `descriptor_for` can't resolve. The list
-/// also covers ids known to crash this build's bundled `llama.cpp`,
-/// though no current entries fall in that bucket. `settings::load`
-/// rewrites the stored id to the current default and persists the
-/// change.
+/// IDs `settings::load` migrates to the current default — either
+/// retired from the catalog (a dangling reference `descriptor_for`
+/// can't resolve) or known to crash the bundled `llama.cpp`.
 pub fn is_known_broken_llm_id(id: &str) -> bool {
     matches!(id, "phi-4-mini-q4_k_m")
 }

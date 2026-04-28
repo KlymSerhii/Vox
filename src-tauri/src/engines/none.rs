@@ -1,7 +1,3 @@
-//! No-op cleanup engine — selected when `llm_engine == "none"`. Returns
-//! the input transcript unchanged. Lets us drop `cleanup_enabled` as a
-//! dedicated bool: "off" is just `llm_engine = "none"`.
-
 use crate::engines::LlmEngine;
 
 pub struct NoOpEngine;

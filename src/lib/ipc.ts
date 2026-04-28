@@ -10,25 +10,20 @@ export interface Settings {
   language: string;
   onboarded: boolean;
   dictionary: string[];
-  // Local-only engines (cloud paths removed 2026-04-26).
-  stt_engine: string;        // "whisper-local"
+  stt_engine: string;
   stt_model_id: string;
-  llm_engine: string;        // "gemma-local" | "none"
+  llm_engine: string;
   llm_model_id: string;
-  /// User-facing on/off toggle for transcript polishing. Survives across
-  /// engine outages so the user's intent isn't lost when the local LLM
-  /// is temporarily unavailable.
+  /// Survives engine outages so user intent isn't lost while the local
+  /// LLM is temporarily unavailable.
   polishing_enabled: boolean;
   gemma_tos_accepted: boolean;
-  // Voice Modes.
   active_mode_id: string;
   mode_cycle_hotkey: string;
   auto_suggest_modes: boolean;
-  // Appearance.
   appearance: "light" | "dark";
-  // Out-of-process Gemma — see `inference_proc.rs`. Token used to
-  // identify our `llama-server` children for orphan reaping. Not a
-  // secret in the security sense (server is loopback-only).
+  /// Token identifying our `llama-server` children for orphan reaping.
+  /// Not a secret (server is loopback-only).
   inference_api_key: string;
 }
 
@@ -193,8 +188,6 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke<UpdateCheckResult>("check_for_updates");
 }
 
-// ---- Models ----
-
 export async function listModels(): Promise<ModelStatus[]> {
   return invoke<ModelStatus[]>("list_models");
 }
@@ -252,19 +245,12 @@ export async function onModelCanceled(
   return listen<{ id: string }>("model:canceled", (e) => cb(e.payload));
 }
 
-// ---- Inference server (out-of-process llama-server) ----
-//
-// Mirrors the model:* event family on the wire so the existing
-// progress-bar component can be reused 1:1 in onboarding. The
-// `id` field on every event matches `InferenceServerStatus.id`.
-
 export interface InferenceServerStatus {
   id: string;
   version: string;
   installed: boolean;
-  /** False on platforms where we don't ship a llama.cpp binary (e.g.
-   *  Linux today). The frontend should hide the polish path entirely
-   *  when this is false. */
+  /** False on platforms where we don't ship a llama.cpp binary. The
+   *  frontend hides the polish path entirely when this is false. */
   supported_host: boolean;
   binary_path: string | null;
   size_bytes: number;
@@ -319,11 +305,6 @@ export async function onBinaryCanceled(
   return listen<{ id: string }>("binary:canceled", (e) => cb(e.payload));
 }
 
-/// Subscribe to backend `settings:changed` events. Fired after every
-/// successful `set_settings` call, with the full new `Settings` payload.
-/// Use this in any window that displays settings-derived UI (hotkey
-/// glyphs, "polish transcripts" status, etc.) so they refresh
-/// immediately when the user saves changes from the Settings window.
 export async function onSettingsChanged(
   cb: (s: Settings) => void,
 ): Promise<UnlistenFn> {
@@ -335,8 +316,6 @@ export async function onTranscriptsChanged(
 ): Promise<UnlistenFn> {
   return listen<RecentTranscript[]>("transcripts:changed", (e) => cb(e.payload));
 }
-
-// ---- Voice Modes ----
 
 export async function listModes(): Promise<VoiceMode[]> {
   return invoke<VoiceMode[]>("list_modes");
@@ -382,15 +361,12 @@ export async function suggestActiveMode(): Promise<string | null> {
   return invoke<string | null>("suggest_active_mode");
 }
 
-// ---- Hotkey diagnostics ----
-
 export interface ActiveHotkey {
   configured: string;
   bound: string;
   fell_back: boolean;
-  /** "shortcut" | "chord" | "" — which mechanism the binding uses.
-   *  "chord" means a CGEventTap modifier-only listener; "shortcut" is
-   *  the standard `tauri-plugin-global-shortcut` (Carbon) path. */
+  /** "shortcut" | "chord" | "". "chord" = CGEventTap modifier-only
+   *  listener; "shortcut" = `tauri-plugin-global-shortcut` (Carbon). */
   mechanism: string;
   error: string | null;
   error_chain: string[];
@@ -412,9 +388,8 @@ export interface HotkeyDiagnostic {
   configured: string;
   bound: string;
   fell_back: boolean;
-  /** "shortcut" | "chord" | "" — which mechanism the binding uses.
-   *  "chord" means a CGEventTap modifier-only listener; "shortcut" is
-   *  the standard `tauri-plugin-global-shortcut` (Carbon) path. */
+  /** "shortcut" | "chord" | "". "chord" = CGEventTap modifier-only
+   *  listener; "shortcut" = `tauri-plugin-global-shortcut` (Carbon). */
   mechanism: string;
   error: string | null;
   error_chain: string[];

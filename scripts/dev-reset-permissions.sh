@@ -27,7 +27,8 @@ echo "Permissions reset. Re-launch Vox via:"
 echo
 echo "    ./scripts/dev-bundle.sh"
 echo
-echo "and grant Accessibility (and Microphone, when the prompt fires)"
-echo "when System Settings asks. After granting, hold Option+Control"
-echo "in any text field — the listening pill should appear."
+echo "and grant Accessibility (only needed for the optional chord-hotkey"
+echo "fallback) and Microphone when System Settings asks. After granting,"
+echo "press Cmd+Ctrl+Space in any text field — the listening pill"
+echo "should appear."
 echo "============================================================="

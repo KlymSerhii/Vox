@@ -1,17 +1,8 @@
 //! Frontmost-app detection (bundle id + focused window title).
 //!
-//! Used by the Voice Modes "Suggest mode" affordance only — never to
-//! auto-switch silently (per the CEO decision). The heuristic always
-//! fails open: if the AX or NSWorkspace probe fails, we return `None`
-//! and the UI just doesn't render a suggestion.
-//!
-//! Bundle id comes from `NSWorkspace.frontmostApplication`. Window
-//! title comes from the macOS Accessibility API
-//! (`AXUIElementCopyAttributeValue` with `kAXFocusedWindowAttribute`
-//! then `kAXTitleAttribute`). The AX call requires Accessibility
-//! permission — when it fails we simply return `None` for the title.
-//!
-//! On non-macOS targets `detect()` returns `None`.
+//! Bundle id comes from NSWorkspace; window title comes from the AX API
+//! (`AXFocusedWindow` → `AXTitle`), which requires Accessibility permission.
+//! Any probe failure returns `None` — fail-open, no suggestion shown.
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -87,27 +78,18 @@ mod imp {
             let title_attr = make_cfstr("AXTitle");
 
             let mut focused_window: CFTypeRef = std::ptr::null();
-            let err = AXUIElementCopyAttributeValue(
-                app_elem,
-                focused_attr,
-                &mut focused_window,
-            );
+            let err = AXUIElementCopyAttributeValue(app_elem, focused_attr, &mut focused_window);
             CFRelease(focused_attr);
             CFRelease(app_elem);
 
             let title_attr = title_attr?;
-
             if err != 0 || focused_window.is_null() {
                 CFRelease(title_attr);
                 return None;
             }
 
             let mut title_cf: CFTypeRef = std::ptr::null();
-            let err2 = AXUIElementCopyAttributeValue(
-                focused_window,
-                title_attr,
-                &mut title_cf,
-            );
+            let err2 = AXUIElementCopyAttributeValue(focused_window, title_attr, &mut title_cf);
             CFRelease(title_attr);
             CFRelease(focused_window);
 
@@ -116,35 +98,24 @@ mod imp {
             }
             let result = cfstring_to_rust(title_cf);
             CFRelease(title_cf);
-            match result {
-                Some(s) if !s.trim().is_empty() => Some(s),
-                _ => None,
-            }
+            result.filter(|s| !s.trim().is_empty())
         }
     }
 
     unsafe fn make_cfstr(s: &str) -> Option<CFStringRef> {
         let bytes = CString::new(s).ok()?;
-        let cf = CFStringCreateWithCString(
-            std::ptr::null(),
-            bytes.as_ptr(),
-            K_CF_STRING_ENCODING_UTF8,
-        );
-        if cf.is_null() {
-            None
-        } else {
-            Some(cf)
-        }
+        let cf =
+            CFStringCreateWithCString(std::ptr::null(), bytes.as_ptr(), K_CF_STRING_ENCODING_UTF8);
+        (!cf.is_null()).then_some(cf)
     }
 
     unsafe fn cfstring_to_rust(s: CFTypeRef) -> Option<String> {
         let s_ref: CFStringRef = s;
-        // Fast path: zero-copy pointer.
+        // Zero-copy fast path.
         let ptr = CFStringGetCStringPtr(s_ref, K_CF_STRING_ENCODING_UTF8);
         if !ptr.is_null() {
-            return CStr::from_ptr(ptr).to_str().ok().map(|s| s.to_string());
+            return CStr::from_ptr(ptr).to_str().ok().map(str::to_string);
         }
-        // Slow path: copy into a buffer.
         let len = CFStringGetLength(s_ref);
         let max = CFStringGetMaximumSizeForEncoding(len, K_CF_STRING_ENCODING_UTF8);
         if max <= 0 {
@@ -152,19 +123,15 @@ mod imp {
         }
         let buf_len = (max as usize) + 1;
         let mut buf: Vec<c_char> = vec![0; buf_len];
-        let ok = CFStringGetCString(
+        if !CFStringGetCString(
             s_ref,
             buf.as_mut_ptr(),
             buf_len as isize,
             K_CF_STRING_ENCODING_UTF8,
-        );
-        if !ok {
+        ) {
             return None;
         }
-        CStr::from_ptr(buf.as_ptr())
-            .to_str()
-            .ok()
-            .map(|s| s.to_string())
+        CStr::from_ptr(buf.as_ptr()).to_str().ok().map(str::to_string)
     }
 }
 

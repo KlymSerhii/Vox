@@ -70,6 +70,6 @@ echo "'+' and paste this absolute path (Cmd+Shift+G works too):"
 echo
 echo "    $APP_ABS"
 echo
-echo "Then hold Option+Control in any text field — the listening pill"
-echo "should appear. Release to transcribe and paste."
+echo "Then press Cmd+Ctrl+Space in any text field — the listening pill"
+echo "should appear. Press again to stop and copy the transcript."
 echo "============================================================="

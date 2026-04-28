@@ -1,18 +1,8 @@
-//! HTTP-based LLM cleanup engine. Talks to the out-of-process
-//! `llama-server` over loopback HTTP using the OpenAI chat-completions
-//! shape.
-//!
-//! Replaces the old in-process `gemma_local.rs` (`llama-cpp-2`). The
-//! whole point of the move is crash isolation: a C++ assert in
-//! `llama-server` exits the child process with a non-zero status,
-//! `inference_proc` notices, and either respawns transparently on the
-//! next request or returns `Err` and lets `session.rs::run`'s
-//! existing fail-open path ship the raw Whisper transcript. Either
-//! way the menu-bar app stays alive.
-//!
-//! Engine ID is unchanged (`"gemma-local"`). Settings persist the
-//! user's *intent* ("polish locally"), not the implementation
-//! detail of how. No migration required.
+//! Out-of-process LLM polish over loopback HTTP (OpenAI chat-completions
+//! shape). A C++ assert in llama.cpp now exits the child rather than the
+//! menu-bar app — `inference_proc` respawns or `session.rs` fail-opens
+//! to the raw transcript. Engine ID stays `"gemma-local"` so settings
+//! survive the move.
 
 use std::time::{Duration, Instant};
 
@@ -22,38 +12,17 @@ use tauri::{AppHandle, Wry};
 use crate::engines::LlmEngine;
 use crate::inference_proc;
 
-/// Wall-clock ceiling on the whole HTTP polish call, including a
-/// possible respawn of the server. Sized for the worst case: a
-/// 30-min dictation (~6.7k input tokens, ~7k output tokens) at the
-/// measured ~52 tok/s on Apple Silicon = ~135 s generation + ~30 s
-/// prompt eval + ~10 s margin. A short polish finishes in under
-/// 2 s and is unaffected by this ceiling — it only matters for
-/// the long-form path.
+// Sized for a 30-min dictation: ~135 s generation + ~30 s prompt eval +
+// margin at the measured ~52 tok/s on Apple Silicon.
 const HARD_TIMEOUT: Duration = Duration::from_secs(240);
 
-/// Lower bound on `max_tokens` so a one-sentence polish always has
-/// room to emit punctuation + the eos token.
 const MIN_NEW_TOKENS: u32 = 256;
 
-/// Upper bound on `max_tokens`. At ~52 tok/s this corresponds to
-/// ~160 s of pure generation — past that we'd rather fail-open to
-/// the raw transcript than wait. 30 min of speech is ~6.7k tokens
-/// of input which polishes to ≤ that many output tokens, so 8192
-/// covers the worst supported case with margin for structural
-/// markup (numbered lists, paragraph breaks) the prompt below now
-/// asks for.
+// ~160 s of generation at ~52 tok/s; past that we'd rather fail-open.
 const MAX_NEW_TOKENS_CAP: u32 = 8192;
 
-/// Estimate `max_tokens` from input char count. Polish output is
-/// bounded by input — cleanup is ≈ a subset of input — so we size
-/// the cap proportionally instead of always asking llama-server
-/// for a full 8k tokens regardless of input size. The 1.2× factor
-/// pads for structural markup the rewritten prompt encourages
-/// (numbered lists, paragraph breaks) without giving the model
-/// license to ramble.
-///
-/// English BPE averages ~4 chars/token; the formula is therefore
-/// `(input_chars / 4) * 1.2 + base`.
+// English BPE ≈ 4 chars/token; 1.2× pads for structural markup
+// (numbered lists, paragraph breaks) the prompt encourages.
 fn dynamic_max_tokens(input_chars: usize) -> i32 {
     let estimated_input = input_chars / 4;
     let dynamic = ((estimated_input * 12) / 10 + 128) as u32;
@@ -99,15 +68,10 @@ pub struct GemmaHttpEngine {
 
 impl GemmaHttpEngine {
     pub fn new(app: AppHandle<Wry>, model_id: String) -> Self {
-        // One client per engine instance so we benefit from
-        // connection reuse across rapid-fire dictations. Keepalive
-        // matters on macOS — opening a fresh socket per request
-        // adds ~10 ms which compounds across short utterances.
+        // Reuse one client across dictations — fresh-socket cost is
+        // ~10 ms on macOS and compounds across short utterances.
         let client = reqwest::Client::builder()
             .timeout(HARD_TIMEOUT)
-            // No pooling cap surprises here: we only ever talk to
-            // the single loopback server, but be explicit so a
-            // future move to multi-server doesn't silently throttle.
             .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_else(|e| {
@@ -158,9 +122,6 @@ impl LlmEngine for GemmaHttpEngine {
     ) -> anyhow::Result<String> {
         let trimmed = transcript.trim();
         if trimmed.split_whitespace().count() < 2 {
-            // Match the legacy local-engine semantics: skip cleanup
-            // on near-empty utterances so the user sees their words
-            // immediately instead of paying a roundtrip for nothing.
             return Ok(trimmed.to_string());
         }
 
@@ -176,12 +137,8 @@ impl LlmEngine for GemmaHttpEngine {
             self.post_cleanup(&server, system_prompt, dictionary, trimmed).await
         };
 
-        // Single retry on the supervisor: if the cached child is
-        // stale (assert during the previous request, OOM-kill, etc.)
-        // the first attempt fails, the supervisor's `is_alive` check
-        // notices, and the second attempt spawns fresh. A second
-        // failure is a real problem and bubbles up as Err — at that
-        // point session.rs falls open to the raw transcript.
+        // One retry: a stale child (post-assert / OOM-kill) fails first,
+        // the supervisor's is_alive check trips, second attempt spawns fresh.
         let result = match request_once().await {
             Ok(s) => Ok(s),
             Err(first) => {
@@ -219,9 +176,7 @@ impl LlmEngine for GemmaHttpEngine {
     }
 
     fn requires_network(&self) -> bool {
-        // The server runs on 127.0.0.1, never reaches a public
-        // network. Audit-friendly answer is the same as the old
-        // in-process engine.
+        // 127.0.0.1 only — never leaves the Mac.
         false
     }
 }
@@ -241,9 +196,6 @@ impl GemmaHttpEngine {
             transcript.len()
         );
         let body = ChatRequest {
-            // The server doesn't actually validate this against the
-            // loaded GGUF — it just echoes it in responses — but
-            // we set it for log clarity.
             model: &server.model_id,
             messages: vec![
                 ChatMessage {
@@ -256,10 +208,7 @@ impl GemmaHttpEngine {
                 },
             ],
             max_tokens,
-            // Low temperature: the cleanup task is closer to
-            // editing than generation. We want determinism so the
-            // user can re-dictate the same sentence and get the
-            // same polish.
+            // Cleanup is editing, not generation — keep it deterministic.
             temperature: 0.2,
             stream: false,
         };
@@ -275,16 +224,9 @@ impl GemmaHttpEngine {
 
         let status = resp.status();
         if !status.is_success() {
-            let snippet = resp
-                .text()
-                .await
-                .unwrap_or_default()
-                .chars()
-                .take(200)
-                .collect::<String>();
-            return Err(anyhow::anyhow!(
-                "llama-server HTTP {status}: {snippet}"
-            ));
+            let snippet: String =
+                resp.text().await.unwrap_or_default().chars().take(200).collect();
+            return Err(anyhow::anyhow!("llama-server HTTP {status}: {snippet}"));
         }
 
         let parsed: ChatResponse = resp
@@ -347,10 +289,6 @@ mod tests {
 
     #[test]
     fn dynamic_max_tokens_floors_short_inputs() {
-        // A 5-char input would be ~1 token of estimated input,
-        // which the formula would size to 129 tokens. Floor to
-        // MIN_NEW_TOKENS so even a one-word polish has room for
-        // the eos sentinel.
         assert_eq!(dynamic_max_tokens(5), MIN_NEW_TOKENS as i32);
         assert_eq!(dynamic_max_tokens(0), MIN_NEW_TOKENS as i32);
     }
@@ -358,22 +296,13 @@ mod tests {
     #[test]
     fn dynamic_max_tokens_scales_for_30min_audio() {
         // 30 min × 150 wpm × ~5 chars/word ≈ 22.5k chars input.
-        // The cap should be in the multi-thousand range so the
-        // model has room to emit the polished version.
         let cap = dynamic_max_tokens(22_500);
-        assert!(
-            cap >= 6_000,
-            "30-min polish needs at least 6k output tokens, got {cap}"
-        );
-        assert!(
-            cap <= MAX_NEW_TOKENS_CAP as i32,
-            "must respect the runaway-generation ceiling"
-        );
+        assert!(cap >= 6_000, "30-min polish needs at least 6k output tokens, got {cap}");
+        assert!(cap <= MAX_NEW_TOKENS_CAP as i32);
     }
 
     #[test]
     fn dynamic_max_tokens_caps_pathological_inputs() {
-        // A 200k-char paste shouldn't unlock unbounded generation.
         assert_eq!(dynamic_max_tokens(200_000), MAX_NEW_TOKENS_CAP as i32);
     }
 }

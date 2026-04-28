@@ -44,18 +44,13 @@ export default function TrayPopoverView() {
       setLoaded(true);
     }
 
-    // The popover webview is built once and reused on every tray click —
-    // `onMount` only runs the first time. Subscribe to backend events so
-    // the recents list and settings stay live across reopens.
-    unlistenSettings = await onSettingsChanged((next) => {
-      setS(next);
-    });
-    unlistenTranscripts = await onTranscriptsChanged((rec) => {
-      setRecents(rec);
-    });
+    // The popover webview is built once and reused on every tray click,
+    // so onMount only runs the first time. Live events keep state fresh
+    // across reopens; the focus handler is a backstop for events that
+    // fire while the popover is hidden.
+    unlistenSettings = await onSettingsChanged(setS);
+    unlistenTranscripts = await onTranscriptsChanged(setRecents);
 
-    // Backstop: refetch on focus, in case the popover was hidden when
-    // an event fired (e.g. earlier app launches that pre-date this code).
     window.addEventListener("focus", () => {
       void getRecentTranscripts().then(setRecents);
     });
@@ -91,20 +86,18 @@ export default function TrayPopoverView() {
   async function toggleHandsFree(v: boolean) {
     const cur = s();
     if (!cur) return;
-    const next = { ...cur, hands_free_enabled: v };
-    setS(next);
+    setS({ ...cur, hands_free_enabled: v });
     await setHandsFreeEnabled(v);
   }
 
   async function togglePolishing(v: boolean) {
     const cur = s();
     if (!cur) return;
-    const next = {
+    setS({
       ...cur,
       polishing_enabled: v,
       llm_engine: v ? "gemma-local" : "none",
-    };
-    setS(next);
+    });
     await setPolishingEnabled(v);
   }
 

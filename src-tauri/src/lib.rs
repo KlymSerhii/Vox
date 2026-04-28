@@ -101,36 +101,21 @@ pub fn run() {
 
             let app_handle = app.handle();
 
-            // Audio capture thread.
             let audio = AudioHandle::spawn();
             let ctx = SessionCtx::new(audio);
             app.manage(ctx.clone());
 
-            // Hotkey-binding state. We register this BEFORE
-            // `hotkey::register` so the per-purpose snapshots are
-            // ready for the IPC handlers from the very first call.
+            // Register hotkey state BEFORE hotkey::register so per-purpose
+            // snapshots are ready for IPC handlers from the first call.
             app.manage(crate::hotkey::ActiveHotkeyState::default());
-
-            // Engine registry — lazy-built, kept warm.
             app.manage(crate::engines::Registry::new());
 
-            // Out-of-process Gemma supervisor state. Stored as
-            // `Arc<Mutex<Option<ServerHandle>>>` so the engine layer
-            // can lazily spawn (or respawn after a crash) without
-            // serializing every polish call.
             crate::inference_proc::install_state(app_handle);
-
-            // Best-effort cleanup of any `llama-server` left behind by
-            // a previous force-killed parent (macOS has no
-            // PR_SET_PDEATHSIG, so we can't rely on the kernel).
-            // Followed immediately by a stale-version sweep so old
-            // tag directories don't pile up after a llama.cpp bump.
+            // macOS has no PR_SET_PDEATHSIG; reap orphan llama-servers from
+            // a previously force-killed parent before they confuse spawn.
             crate::inference_proc::reap_orphans_at_startup(app_handle);
             crate::inference_server::cleanup_stale_versions(app_handle);
 
-            // Voice Modes store. First-launch seed is gated inside
-            // `init_with_root` (only writes built-ins when the dir is
-            // empty), so it's safe to call on every boot.
             let mode_store = std::sync::Arc::new(crate::modes::ModeStore::new());
             let modes_root = crate::modes::modes_dir(app_handle);
             if let Err(e) = mode_store.init_with_root(modes_root) {
@@ -138,10 +123,8 @@ pub fn run() {
             }
             app.manage(mode_store);
 
-            // Load settings (also migrates plaintext keys into the Keychain).
             let s = settings::load(app_handle);
 
-            // Register global hotkeys.
             match hotkey::register(
                 app_handle,
                 &s.hotkey,
@@ -156,49 +139,24 @@ pub fn run() {
                 ),
             }
 
-            // Create the listening-pill window up-front (hidden).
             if let Err(e) = pill::create(app_handle) {
                 log::error!("failed to create pill window: {e}");
             }
-
-            // Tray icon.
             if let Err(e) = tray::build(app_handle) {
                 log::error!("failed to build tray icon: {e}");
             }
-
-            // Keep settings window hidden until user opens it.
             if let Some(win) = app.get_webview_window("settings") {
                 let _ = win.hide();
             }
 
-            // Pre-warm both engines on startup so the first dictation
-            // doesn't pay the cold-load tax — Whisper's ~1-2 s GGML
-            // load and Gemma's ~5-10 s spawn + GGUF load. The single
-            // biggest UX win for the live-sales-call use case where
-            // the gap between "first dictation slow" and "every
-            // dictation fast" is exactly the worst time to surface
-            // a multi-second pause.
-            //
-            // Both helpers are conditional and fire-and-forget:
-            // - `inference_proc::prewarm_in_background` is a no-op if
-            //   polishing is off / the binary isn't installed.
-            // - `engines::prewarm_stt_in_background` is a no-op if
-            //   dictation is disabled / the model isn't downloaded.
-            //
-            // Users who haven't finished onboarding, or who turned a
-            // feature off, pay zero RAM cost. The supervisor's
-            // spawn-lock (`inference_proc::ServerStateInner::spawning`)
-            // and `OnceCell::get_or_try_init` (Whisper) make these
+            // Pre-warm both engines so the first dictation doesn't pay
+            // Whisper's ~1-2 s GGML load and Gemma's ~5-10 s spawn. Both
+            // helpers no-op when their feature is off/uninstalled, and are
             // safe to call again later from settings/tray toggles.
             crate::inference_proc::prewarm_in_background(app_handle);
             crate::engines::prewarm_stt_in_background(app_handle);
 
-            // First-launch onboarding. The previous "legacy cloud user"
-            // migration dialog was removed when cloud engines went away
-            // (2026-04-26) — the app is fully local now and there's
-            // nothing to migrate to.
-            let _ = s; // settings still loaded above for hotkey wiring
-            if !settings::load(app_handle).onboarded {
+            if !s.onboarded {
                 if let Err(e) = onboarding::show(app_handle) {
                     log::warn!("failed to show onboarding: {e}");
                 }
@@ -208,15 +166,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                match window.label() {
-                    "settings" | "tray-popover" | "pill" => {
-                        let _ = window.hide();
-                        api.prevent_close();
-                    }
-                    "onboarding" => {
-                        // Let onboarding truly close — state is persisted.
-                    }
-                    _ => {}
+                if matches!(window.label(), "settings" | "tray-popover" | "pill") {
+                    let _ = window.hide();
+                    api.prevent_close();
                 }
             }
             if let tauri::WindowEvent::Focused(false) = event {
@@ -228,11 +180,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while running tauri application")
         .run(|app_handle, event| {
-            // Tear down the out-of-process `llama-server` on app
-            // shutdown. `Exit` is the last event Tauri emits — by
-            // the time we get here all windows are closed and the
-            // event loop is unwinding. Doing it on `ExitRequested`
-            // would race with a Cmd+Q the user might cancel.
+            // Tear down on Exit (not ExitRequested) so a canceled Cmd+Q
+            // doesn't kill the inference subprocess prematurely.
             if let tauri::RunEvent::Exit = event {
                 crate::inference_proc::shutdown_managed(app_handle);
             }

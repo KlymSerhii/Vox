@@ -1,14 +1,6 @@
-//! Orchestrates the dictation pipeline.
-//!
-//! Flow: hotkey down → show pill (Listening) → mic capture + emit levels.
-//! Hotkey up → stop mic → STT (engine of user's choice) → optional LLM
-//! cleanup (engine of user's choice) → copy to clipboard → Done pill.
-//!
-//! 2026-04-26: dropped the synthetic-Cmd+V path — see `inject.rs`.
-//!
-//! STT and cleanup engines are resolved from the per-app
-//! `engines::Registry` based on `prefs.stt_engine` / `prefs.llm_engine`.
-//! Engines are lazy-loaded and kept warm.
+//! Orchestrates the dictation pipeline: mic capture → STT → optional LLM
+//! cleanup → clipboard. STT/LLM engines come from the per-app
+//! `engines::Registry`; both are lazy-loaded and kept warm.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,8 +75,6 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
     pill::show(&app);
     pill::emit_state(&app, PillState::Listening, None);
 
-    // Push the active mode chip to the pill immediately so the user
-    // sees which mode is going to handle this utterance.
     if let Some(mode) = app
         .try_state::<Arc<ModeStore>>()
         .map(|s| s.inner().clone())
@@ -92,10 +82,8 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
     {
         pill::emit_active_mode(&app, &mode);
     }
-    // Clear any stale suggestion from a previous session.
     pill::emit_mode_suggestion(&app, None);
 
-    // Suggest-mode HUD (per CEO §1: suggest only, never auto-switch).
     if prefs.auto_suggest_modes {
         spawn_suggestion_probe(app.clone(), prefs.active_mode_id.clone());
     }
@@ -189,23 +177,12 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
-        // Read prefs ONCE per utterance — both engine choices, the
-        // active voice mode, the language, and the dictionary all
-        // originate from this snapshot. If the user switches an engine
-        // or mode between hotkey-release and STT completion, the
-        // change takes effect on the *next* utterance, not this one.
-        // This is the right behavior (changing mid-flight would let a
-        // user pin a different prompt to a transcript that was
-        // recorded under the old mode), but it's load-bearing — please
-        // don't add a second `settings::prefs(&...)` call below this
-        // line without thinking about the ordering invariants.
+        // Snapshot prefs ONCE per utterance — engines, mode, language and
+        // dictionary all derive from this read. Adding a second
+        // `settings::prefs` call below would let a mid-flight mode switch
+        // pin a different prompt to a transcript recorded under the old mode.
         let prefs = settings::prefs(&app_for_pill);
 
-        // Engine resolution. We narrow `AppHandle<R>` to the production
-        // `Wry` runtime via a type-id check: at startup we always build
-        // with the default Wry runtime, so this should always succeed.
-        // If the registry isn't installed for some reason we fall back
-        // to a clear error pill.
         let app_wry: AppHandle<Wry> = match try_into_wry(&app_for_pill) {
             Some(a) => a,
             None => {
@@ -247,20 +224,12 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             }
         };
 
-        // The polishing toggle is the user-facing knob. When off, we
-        // skip cleanup entirely (no engine resolution, no log noise) so
-        // raw whisper output goes straight to the paste step. When on,
-        // we resolve whichever local LLM is configured (currently
-        // always `gemma-local`).
         let llm_engine = if prefs.polishing_enabled {
             registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id)
         } else {
             registry.llm(&app_wry, "none", "")
         };
 
-        // Resolve the active Voice Mode (default `general`). The mode
-        // contributes its system prompt + dictionary to the cleanup
-        // call, and its post-processing rules to the final text.
         let active_mode = resolve_active_mode(&app_wry, &prefs.active_mode_id);
         if let Some(m) = active_mode.as_ref() {
             pill::emit_active_mode(&app_for_pill, m);
@@ -268,11 +237,7 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 
         pill::emit_state(&app_for_pill, PillState::Transcribing, None);
 
-        let language = if prefs.language == "auto" {
-            None
-        } else {
-            Some(prefs.language.as_str())
-        };
+        let language = (prefs.language != "auto").then_some(prefs.language.as_str());
 
         let transcript = {
             let stt_fut = stt_engine.transcribe(&wav, language, &prefs.dictionary);
@@ -316,9 +281,6 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             return;
         }
 
-        // Build the merged dictionary (global + mode-specific) and the
-        // mode's system prompt for the cleanup call. If no mode is
-        // resolved we fall back to the engine's built-in prompt.
         let (mode_system_prompt, merged_dictionary) = match active_mode.as_ref() {
             Some(m) => (m.system_prompt.clone(), merge_dictionaries(&prefs.dictionary, &m.dictionary)),
             None => (String::new(), prefs.dictionary.clone()),
@@ -355,8 +317,6 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             _ => transcript.clone(),
         };
 
-        // Apply mode post-processing (case rules, punctuation strip,
-        // length cap). When no mode is resolved this is a no-op.
         let cleaned = match active_mode.as_ref() {
             Some(m) => m.apply_post_processing(&cleaned),
             None => cleaned,
@@ -497,12 +457,12 @@ fn wav_peak_pcm16(wav: &[u8]) -> f32 {
 fn friendly_stt_error(e: &anyhow::Error, _engine_id: &str) -> String {
     let s = format!("{e}");
     if s.contains("not downloaded") {
-        return "Local model not downloaded — open Settings → Models.".into();
+        "Local model not downloaded — open Settings → Models.".into()
+    } else if s.contains("compiled out") {
+        "Local engines not enabled in this build.".into()
+    } else {
+        "Transcription failed.".into()
     }
-    if s.contains("compiled out") {
-        return "Local engines not enabled in this build.".into();
-    }
-    "Transcription failed.".into()
 }
 
 fn spawn_max_record_guard<R: Runtime>(
@@ -541,12 +501,10 @@ fn spawn_audio_level_sampler<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
     });
 }
 
-/// Best-effort downcast of a generic AppHandle into the concrete Wry
-/// runtime we use in production. Returns `None` for non-Wry runtimes
-/// (only relevant for headless tests).
+/// Downcast a generic `AppHandle<R>` to the production `Wry` runtime.
+/// Returns `None` for non-Wry runtimes (only relevant for headless tests).
 fn try_into_wry<R: Runtime>(app: &AppHandle<R>) -> Option<AppHandle<Wry>> {
     use std::any::Any;
-    // 'static guarantees Any-eligibility; AppHandle<R> is 'static.
     let any: &dyn Any = app as &dyn Any;
     any.downcast_ref::<AppHandle<Wry>>().cloned()
 }
@@ -562,17 +520,13 @@ fn resolve_active_mode<R: Runtime>(app: &AppHandle<R>, id: &str) -> Option<Voice
 
 fn spawn_suggestion_probe<R: Runtime>(app: AppHandle<R>, active_mode_id: String) {
     tauri::async_runtime::spawn_blocking(move || {
-        let detected = crate::frontmost::detect();
-        let Some((bundle_id, title)) = detected else {
+        let Some((bundle_id, title)) = crate::frontmost::detect() else {
             return;
         };
-        let store = match app.try_state::<Arc<ModeStore>>() {
-            Some(s) => s.inner().clone(),
-            None => return,
+        let Some(store) = app.try_state::<Arc<ModeStore>>().map(|s| s.inner().clone()) else {
+            return;
         };
-        let suggestion_id =
-            store.suggest_for(Some(&bundle_id), title.as_deref());
-        let suggestion = match suggestion_id {
+        let suggestion = match store.suggest_for(Some(&bundle_id), title.as_deref()) {
             Some(id) if id != active_mode_id => store.get(&id),
             _ => None,
         };
@@ -581,16 +535,14 @@ fn spawn_suggestion_probe<R: Runtime>(app: AppHandle<R>, active_mode_id: String)
 }
 
 fn merge_dictionaries(global: &[String], mode: &[String]) -> Vec<String> {
-    let mut out: Vec<String> = Vec::with_capacity(global.len() + mode.len());
     let mut seen = std::collections::HashSet::new();
-    for term in global.iter().chain(mode.iter()) {
-        let trimmed = term.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_lowercase()) {
-            out.push(trimmed.to_string());
-        }
-    }
-    out
+    global
+        .iter()
+        .chain(mode.iter())
+        .filter_map(|term| {
+            let trimmed = term.trim();
+            (!trimmed.is_empty() && seen.insert(trimmed.to_lowercase()))
+                .then(|| trimmed.to_string())
+        })
+        .collect()
 }

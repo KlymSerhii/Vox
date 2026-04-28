@@ -1,8 +1,3 @@
-//! Onboarding window: first-run wizard.
-//!
-//! Shown at startup when `settings.onboarded` is false. Re-triggerable from
-//! the Settings → About tab via the `replay_onboarding` command.
-
 use tauri::{AppHandle, Manager, Runtime, WebviewUrl};
 
 pub const LABEL: &str = "onboarding";

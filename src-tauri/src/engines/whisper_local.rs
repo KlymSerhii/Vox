@@ -1,13 +1,3 @@
-//! Local Whisper STT — `whisper-rs` 0.16 with Core ML + Metal.
-//!
-//! Loads the GGML model from the user-data cache on first use, keeps the
-//! `WhisperContext` warm for repeat dictations. The Core ML encoder
-//! (`*.mlmodelc`) is auto-discovered alongside the GGML file when present.
-//!
-//! Falls back to a clear `anyhow!` error if the model isn't installed —
-//! the session orchestrator surfaces "Model not downloaded. Open
-//! Settings → Models." in that case.
-
 use std::path::{Path, PathBuf};
 #[cfg(feature = "local-engines")]
 use std::sync::Arc;
@@ -51,9 +41,6 @@ impl WhisperLocalEngine {
     }
 }
 
-/// Construct a `WhisperContext` from a GGML file on disk. Pulled out of
-/// `transcribe()` so the pre-warm path can use the same loader without
-/// duplicating the param/log/wrap incantation.
 #[cfg(feature = "local-engines")]
 fn load_context_blocking(
     model_id: &str,
@@ -77,18 +64,15 @@ impl SttEngine for WhisperLocalEngine {
         language: Option<&str>,
         dictionary: &[String],
     ) -> anyhow::Result<String> {
-        let path = self
-            .cache_path()
-            .ok_or_else(|| self.fallback_error())?;
+        let path = self.cache_path().ok_or_else(|| self.fallback_error())?;
 
         let model_id = self.model_id.clone();
         let lang = language.map(|s| s.to_string());
         let dict = dictionary.to_vec();
         let wav_owned = wav.to_vec();
 
-        // Decode + transcribe runs on a blocking thread — whisper-rs
-        // inference is CPU/GPU-bound and `WhisperState::full` would
-        // otherwise hold the async runtime.
+        // Inference is CPU/GPU-bound; `WhisperState::full` would otherwise
+        // pin the async runtime.
         #[cfg(feature = "local-engines")]
         {
             let ctx_cell = self.ctx.clone();
@@ -115,17 +99,12 @@ impl SttEngine for WhisperLocalEngine {
                 params.set_print_realtime(false);
                 params.set_print_special(false);
                 params.set_print_timestamps(false);
-                if let Some(l) = lang.as_deref() {
-                    if l != "auto" {
-                        params.set_language(Some(l));
-                    }
+                if let Some(l) = lang.as_deref().filter(|l| *l != "auto") {
+                    params.set_language(Some(l));
                 }
                 let prompt;
-                let cleaned: Vec<&str> = dict
-                    .iter()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect();
+                let cleaned: Vec<&str> =
+                    dict.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
                 if !cleaned.is_empty() {
                     prompt = cleaned.join(", ");
                     params.set_initial_prompt(&prompt);
@@ -136,8 +115,7 @@ impl SttEngine for WhisperLocalEngine {
                     .map_err(|e| anyhow::anyhow!("whisper run: {e}"))?;
 
                 let mut out = String::new();
-                let segments = state.full_n_segments();
-                for i in 0..segments {
+                for i in 0..state.full_n_segments() {
                     if let Some(seg) = state.get_segment(i) {
                         match seg.to_str_lossy() {
                             Ok(s) => out.push_str(s.as_ref()),
@@ -172,15 +150,6 @@ impl SttEngine for WhisperLocalEngine {
         false
     }
 
-    /// Force the heavy `WhisperContext` load so the first dictation
-    /// pays only the spawn-state + inference cost, not the ~1-2 s
-    /// model-from-disk cost. Idempotent: a second call is a no-op
-    /// because `OnceCell::get_or_try_init` short-circuits.
-    ///
-    /// If the model file isn't downloaded yet we silently return
-    /// `Ok(())` — the user hasn't finished onboarding, and the real
-    /// `transcribe()` path will surface the missing-model error with
-    /// the proper "open Settings → Models" hint.
     async fn prewarm(&self) -> anyhow::Result<()> {
         let Some(path) = self.cache_path() else {
             return Ok(());
@@ -208,9 +177,7 @@ impl SttEngine for WhisperLocalEngine {
     }
 }
 
-/// Decode a PCM-16 mono 16 kHz WAV (the shape `audio::stop_and_encode`
-/// produces) into the f32 PCM whisper-rs expects. We don't trust a
-/// foreign WAV — re-validate the spec and bail if it doesn't match.
+// Re-validate spec defensively even though we produced the WAV ourselves.
 #[cfg(feature = "local-engines")]
 fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
     use std::io::Cursor;
@@ -218,29 +185,22 @@ fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
         .map_err(|e| anyhow::anyhow!("wav header: {e}"))?;
     let spec = reader.spec();
     if spec.channels != 1 {
-        return Err(anyhow::anyhow!(
-            "expected mono WAV, got {} channels",
-            spec.channels
-        ));
+        return Err(anyhow::anyhow!("expected mono WAV, got {} channels", spec.channels));
     }
     if spec.sample_rate != 16_000 {
-        return Err(anyhow::anyhow!(
-            "expected 16 kHz WAV, got {} Hz",
-            spec.sample_rate
-        ));
+        return Err(anyhow::anyhow!("expected 16 kHz WAV, got {} Hz", spec.sample_rate));
     }
-    let samples: Vec<f32> = match spec.sample_format {
+    match spec.sample_format {
         hound::SampleFormat::Int => reader
             .samples::<i16>()
             .map(|s| {
                 s.map(|v| v as f32 / i16::MAX as f32)
                     .map_err(|e| anyhow::anyhow!("wav sample: {e}"))
             })
-            .collect::<Result<_, _>>()?,
+            .collect(),
         hound::SampleFormat::Float => reader
             .samples::<f32>()
             .map(|s| s.map_err(|e| anyhow::anyhow!("wav sample: {e}")))
-            .collect::<Result<_, _>>()?,
-    };
-    Ok(samples)
+            .collect(),
+    }
 }

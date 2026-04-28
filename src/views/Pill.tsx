@@ -61,11 +61,7 @@ export default function PillView() {
     unlisten.push(
       await listen<AudioLevelPayload>("pill:audio_level", (e) => {
         const v = clamp(e.payload.level);
-        setLevels((prev) => {
-          const next = prev.slice(1);
-          next.push(v);
-          return next;
-        });
+        setLevels((prev) => [...prev.slice(1), v]);
         setMeter((prev) => nextMeter(prev, v));
       }),
     );
@@ -92,10 +88,6 @@ export default function PillView() {
     for (const u of unlisten) u();
   });
 
-  // Done state should show a brief green flash before the pill auto-
-  // hides (Rust calls hide_after with 700ms). We mirror that timing on
-  // the visual layer so the inset glow runs for the full visible
-  // window. CSS handles the actual transition.
   const isDone = () => state() === "done";
 
   return (
@@ -153,10 +145,6 @@ export default function PillView() {
 }
 
 function ModeChip(props: { name: string; icon: string }) {
-  // Small read-only chip on the listening pill. Switching is done via
-  // the tray popover or the cycle hotkey — never on the pill itself.
-  // Sits on top of the pill's glass backdrop, so a second backdrop-blur
-  // layer + the small shadow stack creates the "glass on glass" lift.
   return (
     <span
       class="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium text-[var(--color-ink)]"
@@ -178,8 +166,6 @@ function ModeChip(props: { name: string; icon: string }) {
 }
 
 function SuggestionHud(props: { name: string; icon: string }) {
-  // Floats just to the right of the pill — non-intrusive, never blocks
-  // the user's flow. Tells them how to switch with the cycle hotkey.
   return (
     <div
       class="pointer-events-none absolute"
@@ -218,12 +204,10 @@ function clamp(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
+// Each bar trails the next by a frame so samples ripple through the
+// cluster. Decay 0.85 keeps the leftmost bars alive across 10 bars
+// (0.7 damps to nothing before reaching the far edge).
 function nextMeter(prev: number[], sample: number): number[] {
-  // Each bar trails the next one by a frame so an incoming sample
-  // visibly "ripples" through the cluster instead of moving every bar
-  // in unison. Slower decay (0.85) keeps the leftmost bars in motion
-  // even with 10 bars — at 0.7 they'd damp to nothing before reaching
-  // the far edge.
   const next = new Array(prev.length).fill(0);
   next[next.length - 1] = sample;
   for (let i = 0; i < next.length - 1; i++) {
@@ -304,10 +288,6 @@ function LeftIcon(props: { state: PillState; meter: number[] }) {
 }
 
 function MicLevelMeter(props: { bars: number[] }) {
-  // 10-bar level meter that replaces the static mic icon during
-  // Listening. Center-tall profile keeps the cluster cohesive.
-  // 1.8× gain (clamped) on raw level pushes speech peaks to the full
-  // 30px height so quiet vs speaking is dramatic at a glance.
   const PROFILE = [0.7, 0.82, 0.92, 0.98, 1.0, 1.0, 0.98, 0.92, 0.82, 0.7];
   const MAX_H = 30;
   const MIN_H = 2;
@@ -423,11 +403,9 @@ function Waveform(props: { levels: number[] }) {
       aria-hidden="true"
     >
       {props.levels.map((level) => {
-        // Soft gamma so the bottom half of the dynamic range opens up
-        // (Whisper-grade RMS spends most of its life in [0, 0.3]).
+        // Gamma 0.7 opens up the bottom of the range — Whisper-grade
+        // RMS spends most of its life in [0, 0.3].
         const shaped = Math.pow(level, 0.7);
-        // 1px floor when silent — clearly a flat line, not a wall of
-        // bars. Speech peaks to the full 24px height.
         const h = Math.max(1, Math.round(shaped * 24));
         const opacity = 0.25 + shaped * 0.75;
         return (

@@ -1,17 +1,7 @@
 //! Settings — backed by `tauri-plugin-store` for non-secret fields.
 //!
-//! 2026-04-26: Vox went fully on-device. Cloud engines (Groq STT,
-//! Anthropic LLM cleanup) and their API keys were removed. Settings now
-//! persists only local-first preferences. Any historical cloud values
-//! are scrubbed at load time:
-//!
-//! - `stt_engine = "groq"`            → `"whisper-local"`
-//! - `llm_engine = "anthropic"`       → `"none"` (raw transcript)
-//! - `groq_api_key` / `anthropic_api_key` (plaintext) → deleted
-//! - Keychain entries `groq` / `anthropic` → deleted
-//!
-//! API keys never leave the user's machine in any form afterward — the
-//! HTTP code paths that used them are gone from the binary.
+//! Local-only build: `load` scrubs any historical cloud engine selections
+//! and Keychain entries from upgrades of the pre-local build.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Runtime};
@@ -30,7 +20,6 @@ const KEY_DICTIONARY: &str = "dictionary";
 const KEY_HANDS_FREE: &str = "hands_free_enabled";
 const KEY_LANGUAGE: &str = "language";
 
-// New local-first keys.
 const KEY_STT_ENGINE: &str = "stt_engine";
 const KEY_STT_MODEL_ID: &str = "stt_model_id";
 const KEY_LLM_ENGINE: &str = "llm_engine";
@@ -38,24 +27,18 @@ const KEY_LLM_MODEL_ID: &str = "llm_model_id";
 const KEY_GEMMA_TOS_ACCEPTED: &str = "gemma_tos_accepted";
 const KEY_POLISHING_ENABLED: &str = "polishing_enabled";
 
-// Voice Modes keys.
 const KEY_ACTIVE_MODE_ID: &str = "active_mode_id";
 const KEY_MODE_CYCLE_HOTKEY: &str = "mode_cycle_hotkey";
 const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
 
-// Appearance.
 const KEY_APPEARANCE: &str = "appearance";
 
-// Out-of-process Gemma — see `inference_proc.rs`. The api_key is
-// generated on first spawn and reused across sessions so the
-// startup-time orphan reaper can identify stale `llama-server`
-// instances by their `--api-key` argument. Not a secret in the
-// security sense (the server only listens on 127.0.0.1) — it's a
-// process-identification token.
+// Process-identification token passed to `llama-server` as `--api-key`,
+// reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
 
-// Legacy keys we still read once for migration. Any time we touch the
-// store we delete these so they never come back.
+// Legacy keys read once at load for scrubbing — see the cloud-scrub
+// block in `load`.
 const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
 const KEY_LEGACY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
 const KEY_LEGACY_GROQ: &str = "groq_api_key";
@@ -82,13 +65,9 @@ fn default_stt_engine() -> String {
     "whisper-local".into()
 }
 fn default_llm_engine() -> String {
-    // Local cleanup engine — runs Gemma on-device via llama-cpp-2.
     "gemma-local".into()
 }
 fn default_polishing_enabled() -> bool {
-    // Polishing is on by default: raw Whisper output is run through
-    // local Gemma to fix punctuation, drop filler words, and apply the
-    // active Voice Mode.
     true
 }
 fn default_stt_model_id() -> String {
@@ -110,7 +89,6 @@ fn default_appearance() -> String {
     "dark".into()
 }
 
-/// User-visible settings. Local-only — no API keys, no cloud secrets.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default = "default_hotkey")]
@@ -134,7 +112,6 @@ pub struct Settings {
     #[serde(default)]
     pub dictionary: Vec<String>,
 
-    // ---- Local-first ----
     #[serde(default = "default_stt_engine")]
     pub stt_engine: String,
     #[serde(default = "default_stt_model_id")]
@@ -143,17 +120,13 @@ pub struct Settings {
     pub llm_engine: String,
     #[serde(default = "default_llm_model_id")]
     pub llm_model_id: String,
-    /// User-facing on/off switch for transcript polishing. Independent of
-    /// `llm_engine` so the user's preference survives across periods
-    /// when no working local LLM is available — when the engine is
-    /// fixed, flipping this back on flips `llm_engine` to `gemma-local`
-    /// without needing to remember the model id.
+    /// Independent of `llm_engine` so the user's preference survives
+    /// engine outages — flipping this back on restores `gemma-local`.
     #[serde(default = "default_polishing_enabled")]
     pub polishing_enabled: bool,
     #[serde(default)]
     pub gemma_tos_accepted: bool,
 
-    // ---- Voice Modes ----
     #[serde(default = "default_active_mode_id")]
     pub active_mode_id: String,
     #[serde(default = "default_mode_cycle_hotkey")]
@@ -161,16 +134,12 @@ pub struct Settings {
     #[serde(default = "default_auto_suggest_modes")]
     pub auto_suggest_modes: bool,
 
-    // ---- Appearance ----
     #[serde(default = "default_appearance")]
     pub appearance: String,
 
-    /// Random alphanumeric token passed to `llama-server` as
-    /// `--api-key`. Generated lazily on first spawn (see
-    /// `inference_proc::persistent_api_key`) and reused thereafter so
-    /// the startup-time orphan reaper can identify stale child
-    /// processes from a force-killed previous session. Empty string
-    /// means "not yet generated".
+    /// Token passed to `llama-server` as `--api-key`; generated lazily
+    /// on first spawn and reused so the orphan reaper can identify
+    /// stale children. Empty = not yet generated.
     #[serde(default)]
     pub inference_api_key: String,
 }
@@ -182,11 +151,6 @@ impl Default for Settings {
             cancel_hotkey: default_cancel_hotkey(),
             launch_at_login: false,
             dictation_enabled: true,
-            // 2026-04-26: toggle is the new default — press the hotkey
-            // once to start dictating, press again to stop. Holding the
-            // key is still supported (it just acts as a no-op down/up
-            // toggle pair), but discoverability of "press once" is much
-            // better than "hold for the whole sentence".
             hands_free_enabled: true,
             language: default_language(),
             onboarded: false,
@@ -201,18 +165,12 @@ impl Default for Settings {
             mode_cycle_hotkey: default_mode_cycle_hotkey(),
             auto_suggest_modes: default_auto_suggest_modes(),
             appearance: default_appearance(),
-            // Generated on first spawn (see `inference_proc`).
             inference_api_key: String::new(),
         }
     }
 }
 
-// ---------- Legacy cloud key scrubbing -------------------------------------
-
-/// Best-effort delete of a Keychain entry. Used only to scrub legacy
-/// cloud API keys when an old install upgrades to the local-only build;
-/// any error is logged and ignored — the keys are useless to a binary
-/// that doesn't ship the cloud HTTP client.
+/// Best-effort delete of a Keychain entry left over from the cloud-era build.
 fn keyring_delete(account: &str) {
     match keyring::Entry::new(KEYRING_SERVICE, account) {
         Ok(entry) => match entry.delete_credential() {
@@ -224,8 +182,6 @@ fn keyring_delete(account: &str) {
     }
 }
 
-// ---------- Load / save full settings --------------------------------------
-
 pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let store = match app.store(STORE_FILE) {
         Ok(s) => s,
@@ -235,34 +191,25 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         }
     };
 
+    let get_str =
+        |k: &str| store.get(k).and_then(|v| v.as_str().map(|s| s.to_string()));
+    let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+
+    // Hotkey is currently hardcoded; force the stored value to match so
+    // the picker reflects reality.
     let hotkey = {
-        let stored = store
-            .get(KEY_HOTKEY)
-            .and_then(|v| v.as_str().map(|s| s.to_string()));
         let forced = default_hotkey();
-        if stored.as_deref() != Some(forced.as_str()) {
-            store.set(
-                KEY_HOTKEY,
-                serde_json::Value::String(forced.clone()),
-            );
+        if get_str(KEY_HOTKEY).as_deref() != Some(forced.as_str()) {
+            store.set(KEY_HOTKEY, serde_json::Value::String(forced.clone()));
             let _ = store.save();
         }
         forced
     };
-    let cancel_hotkey = store
-        .get(KEY_CANCEL_HOTKEY)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_cancel_hotkey);
-    let language = store
-        .get(KEY_LANGUAGE)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_language);
-
-    let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
+    let cancel_hotkey = get_str(KEY_CANCEL_HOTKEY).unwrap_or_else(default_cancel_hotkey);
+    let language = get_str(KEY_LANGUAGE).unwrap_or_else(default_language);
 
     let launch_at_login = get_bool(KEY_LAUNCH_AT_LOGIN, false);
     let dictation_enabled = get_bool(KEY_DICTATION_ENABLED, true);
-    // Defaults to true: see `Settings::default` and the file-level docs.
     let hands_free_enabled = get_bool(KEY_HANDS_FREE, true);
     let onboarded = get_bool(KEY_ONBOARDED, false);
     let gemma_tos_accepted = get_bool(KEY_GEMMA_TOS_ACCEPTED, false);
@@ -277,83 +224,42 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         })
         .unwrap_or_default();
 
-    // -------- Local-only engine selection ---------------------------------
-    //
-    // Any historical cloud value coming back from disk is rewritten to
-    // its local equivalent before we even hand it to the rest of the
-    // app. The store is updated in-place so the migration only logs once.
     let mut store_dirty = false;
 
+    // Rewrite historical cloud engine selections to local equivalents.
     let stt_engine = {
-        let stored = store
-            .get(KEY_STT_ENGINE)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(default_stt_engine);
-        if stored == "groq" || stored == "cloud" {
-            log::error!(
-                "settings: migrating stt_engine '{stored}' -> 'whisper-local' \
-                 (Vox is now fully local)."
-            );
-            store.set(
-                KEY_STT_ENGINE,
-                serde_json::Value::String("whisper-local".into()),
-            );
+        let stored = get_str(KEY_STT_ENGINE).unwrap_or_else(default_stt_engine);
+        if matches!(stored.as_str(), "groq" | "cloud") {
+            log::error!("settings: migrating stt_engine '{stored}' -> 'whisper-local'.");
+            store.set(KEY_STT_ENGINE, serde_json::Value::String("whisper-local".into()));
             store_dirty = true;
             "whisper-local".into()
         } else {
             stored
         }
     };
-    let stt_model_id = store
-        .get(KEY_STT_MODEL_ID)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_stt_model_id);
+    let stt_model_id = get_str(KEY_STT_MODEL_ID).unwrap_or_else(default_stt_model_id);
 
     let llm_engine = {
-        let stored = store
-            .get(KEY_LLM_ENGINE)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(default_llm_engine);
-        // Cloud cleanup was removed — any historical `anthropic` /
-        // `claude` / `cloud` value gets rewritten to `none` so the
-        // transcript pipeline finishes successfully without ever
-        // attempting a network call. `gemma-local` is preserved as-is.
-        match stored.as_str() {
-            "anthropic" | "claude" | "cloud" => {
-                log::error!(
-                    "settings: migrating llm_engine '{stored}' -> 'none' \
-                     (cloud polishing was removed; Vox is fully local now)."
-                );
-                store.set(
-                    KEY_LLM_ENGINE,
-                    serde_json::Value::String("none".into()),
-                );
-                store_dirty = true;
-                "none".to_string()
-            }
-            _ => stored,
+        let stored = get_str(KEY_LLM_ENGINE).unwrap_or_else(default_llm_engine);
+        if matches!(stored.as_str(), "anthropic" | "claude" | "cloud") {
+            log::error!("settings: migrating llm_engine '{stored}' -> 'none'.");
+            store.set(KEY_LLM_ENGINE, serde_json::Value::String("none".into()));
+            store_dirty = true;
+            "none".to_string()
+        } else {
+            stored
         }
     };
+    // Rewrite retired or known-crashing model ids to the current default.
     let llm_model_id = {
-        let stored = store
-            .get(KEY_LLM_MODEL_ID)
-            .and_then(|v| v.as_str().map(|s| s.to_string()))
-            .unwrap_or_else(default_llm_model_id);
-        // Rewrite stored selections that are either known-crashing or
-        // retired from the catalog (see `models::is_known_broken_llm_id`
-        // for the full list and the rationale per id). Without this
-        // migration, the polish hotkey would either abort the process
-        // or fail to resolve the model.
+        let stored = get_str(KEY_LLM_MODEL_ID).unwrap_or_else(default_llm_model_id);
         if models::is_known_broken_llm_id(&stored) {
             let replacement = default_llm_model_id();
             log::error!(
-                "settings: migrating retired/broken llm_model_id '{stored}' -> '{replacement}' \
-                 (see models::is_known_broken_llm_id)."
+                "settings: migrating retired/broken llm_model_id '{stored}' -> '{replacement}'."
             );
-            store.set(
-                KEY_LLM_MODEL_ID,
-                serde_json::Value::String(replacement.clone()),
-            );
+            store.set(KEY_LLM_MODEL_ID, serde_json::Value::String(replacement.clone()));
             store_dirty = true;
             replacement
         } else {
@@ -361,65 +267,37 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         }
     };
 
-    // The polishing on/off toggle. If the user has never seen the new
-    // toggle and previously had cloud cleanup configured, treat that as
-    // "polishing was on" so when Gemma comes back online we can restore
-    // their intent. Otherwise default to off.
+    // First-run inference for upgraders: if cloud cleanup was on (or any
+    // LLM engine was set), preserve "polishing on" so it returns when
+    // Gemma is available.
     let polishing_enabled = match store.get(KEY_POLISHING_ENABLED) {
         Some(v) => v.as_bool().unwrap_or_else(default_polishing_enabled),
         None => {
-            // First-run inference for upgraders.
-            let was_using_cloud_cleanup = store
-                .get(KEY_LEGACY_CLEANUP_ENABLED)
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
+            let inferred = get_bool(KEY_LEGACY_CLEANUP_ENABLED, false)
                 || matches!(
-                    store
-                        .get(KEY_LLM_ENGINE)
-                        .and_then(|v| v.as_str().map(|s| s.to_string()))
-                        .as_deref(),
+                    get_str(KEY_LLM_ENGINE).as_deref(),
                     Some("anthropic") | Some("gemma-local")
                 );
-            let inferred = was_using_cloud_cleanup;
             store.set(KEY_POLISHING_ENABLED, serde_json::Value::Bool(inferred));
             store_dirty = true;
             inferred
         }
     };
 
-    let active_mode_id = store
-        .get(KEY_ACTIVE_MODE_ID)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_active_mode_id);
-    let mode_cycle_hotkey = store
-        .get(KEY_MODE_CYCLE_HOTKEY)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_else(default_mode_cycle_hotkey);
+    let active_mode_id = get_str(KEY_ACTIVE_MODE_ID).unwrap_or_else(default_active_mode_id);
+    let mode_cycle_hotkey =
+        get_str(KEY_MODE_CYCLE_HOTKEY).unwrap_or_else(default_mode_cycle_hotkey);
     let auto_suggest_modes = get_bool(KEY_AUTO_SUGGEST_MODES, default_auto_suggest_modes());
 
-    // Appearance: "light" | "dark"; coerce anything else to "dark".
-    let appearance = match store
-        .get(KEY_APPEARANCE)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .as_deref()
-    {
+    let appearance = match get_str(KEY_APPEARANCE).as_deref() {
         Some("light") => "light".to_string(),
         Some("dark") => "dark".to_string(),
         _ => default_appearance(),
     };
 
-    let inference_api_key = store
-        .get(KEY_INFERENCE_API_KEY)
-        .and_then(|v| v.as_str().map(|s| s.to_string()))
-        .unwrap_or_default();
+    let inference_api_key = get_str(KEY_INFERENCE_API_KEY).unwrap_or_default();
 
-    // -------- Scrub legacy cloud secrets ----------------------------------
-    //
-    // Historic plaintext API keys and the old `migration_seen` /
-    // cleanup-enabled bools are deleted on the first local-only launch.
-    // These are best-effort: a failure here only means a stale, unusable
-    // key sits in the Keychain until the next save — there's no live
-    // code path that reads it.
+    // Scrub legacy cloud-era keys + Keychain entries on first local-only launch.
     for key in [
         KEY_LEGACY_GROQ,
         KEY_LEGACY_ANTHROPIC,
@@ -468,33 +346,16 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         .store(STORE_FILE)
         .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
 
-    // Local-only build — no cloud secrets to persist anywhere.
+    let s = |k: &str, v: &str| store.set(k, serde_json::Value::String(v.to_string()));
+    let b = |k: &str, v: bool| store.set(k, serde_json::Value::Bool(v));
 
-    store.set(
-        KEY_HOTKEY,
-        serde_json::Value::String(settings.hotkey.clone()),
-    );
-    store.set(
-        KEY_CANCEL_HOTKEY,
-        serde_json::Value::String(settings.cancel_hotkey.clone()),
-    );
-    store.set(
-        KEY_LANGUAGE,
-        serde_json::Value::String(settings.language.clone()),
-    );
-    store.set(
-        KEY_HANDS_FREE,
-        serde_json::Value::Bool(settings.hands_free_enabled),
-    );
-    store.set(
-        KEY_LAUNCH_AT_LOGIN,
-        serde_json::Value::Bool(settings.launch_at_login),
-    );
-    store.set(
-        KEY_DICTATION_ENABLED,
-        serde_json::Value::Bool(settings.dictation_enabled),
-    );
-    store.set(KEY_ONBOARDED, serde_json::Value::Bool(settings.onboarded));
+    s(KEY_HOTKEY, &settings.hotkey);
+    s(KEY_CANCEL_HOTKEY, &settings.cancel_hotkey);
+    s(KEY_LANGUAGE, &settings.language);
+    b(KEY_HANDS_FREE, settings.hands_free_enabled);
+    b(KEY_LAUNCH_AT_LOGIN, settings.launch_at_login);
+    b(KEY_DICTATION_ENABLED, settings.dictation_enabled);
+    b(KEY_ONBOARDED, settings.onboarded);
     store.set(
         KEY_DICTIONARY,
         serde_json::Value::Array(
@@ -506,62 +367,23 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         ),
     );
 
-    store.set(
-        KEY_STT_ENGINE,
-        serde_json::Value::String(settings.stt_engine.clone()),
-    );
-    store.set(
-        KEY_STT_MODEL_ID,
-        serde_json::Value::String(settings.stt_model_id.clone()),
-    );
-    store.set(
-        KEY_LLM_ENGINE,
-        serde_json::Value::String(settings.llm_engine.clone()),
-    );
-    store.set(
-        KEY_LLM_MODEL_ID,
-        serde_json::Value::String(settings.llm_model_id.clone()),
-    );
-    store.set(
-        KEY_POLISHING_ENABLED,
-        serde_json::Value::Bool(settings.polishing_enabled),
-    );
-    store.set(
-        KEY_GEMMA_TOS_ACCEPTED,
-        serde_json::Value::Bool(settings.gemma_tos_accepted),
-    );
+    s(KEY_STT_ENGINE, &settings.stt_engine);
+    s(KEY_STT_MODEL_ID, &settings.stt_model_id);
+    s(KEY_LLM_ENGINE, &settings.llm_engine);
+    s(KEY_LLM_MODEL_ID, &settings.llm_model_id);
+    b(KEY_POLISHING_ENABLED, settings.polishing_enabled);
+    b(KEY_GEMMA_TOS_ACCEPTED, settings.gemma_tos_accepted);
 
-    store.set(
-        KEY_ACTIVE_MODE_ID,
-        serde_json::Value::String(settings.active_mode_id.clone()),
-    );
-    store.set(
-        KEY_MODE_CYCLE_HOTKEY,
-        serde_json::Value::String(settings.mode_cycle_hotkey.clone()),
-    );
-    store.set(
-        KEY_AUTO_SUGGEST_MODES,
-        serde_json::Value::Bool(settings.auto_suggest_modes),
-    );
+    s(KEY_ACTIVE_MODE_ID, &settings.active_mode_id);
+    s(KEY_MODE_CYCLE_HOTKEY, &settings.mode_cycle_hotkey);
+    b(KEY_AUTO_SUGGEST_MODES, settings.auto_suggest_modes);
 
-    // Appearance — store-side validation mirrors `load`.
-    let appearance = match settings.appearance.as_str() {
-        "light" => "light",
-        _ => "dark",
-    };
-    store.set(
-        KEY_APPEARANCE,
-        serde_json::Value::String(appearance.to_string()),
-    );
+    let appearance = if settings.appearance == "light" { "light" } else { "dark" };
+    s(KEY_APPEARANCE, appearance);
 
-    store.set(
-        KEY_INFERENCE_API_KEY,
-        serde_json::Value::String(settings.inference_api_key.clone()),
-    );
+    s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
 
-    // Drop deprecated keys defensively on every save — these may have
-    // been re-introduced by a downgraded build, and any cloud-related
-    // value here is unreachable code in this binary.
+    // Drop legacy keys defensively in case a downgraded build re-introduced them.
     for key in [
         KEY_LEGACY_GROQ,
         KEY_LEGACY_ANTHROPIC,
@@ -585,8 +407,7 @@ pub fn mark_onboarded<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Lightweight, secret-free view of the user's preferences. Cheap enough
-/// to call on the hotkey thread because it never touches the Keychain.
+/// Lightweight view of the user's preferences for the hotkey thread.
 #[derive(Debug, Clone)]
 pub struct Prefs {
     pub dictation_enabled: bool,
@@ -627,10 +448,9 @@ pub fn set_active_mode_id<R: Runtime>(app: &AppHandle<R>, id: &str) -> anyhow::R
     save(app, &s)
 }
 
-/// Persist a single hotkey field by name, without rewriting the rest of
-/// the settings document. Used by `hotkey::register` when a configured
-/// shortcut couldn't be bound and we resolved a fallback — we mirror the
-/// truth back to disk so the picker shows what is actually active.
+/// Persist a single hotkey field without rewriting the rest of the
+/// settings document — used when `hotkey::register` falls back so the
+/// picker reflects the bound shortcut.
 pub fn set_hotkey_field<R: Runtime>(
     app: &AppHandle<R>,
     purpose: HotkeyPurpose,
@@ -651,7 +471,6 @@ pub fn set_hotkey_field<R: Runtime>(
     Ok(())
 }
 
-/// Identifies which hotkey field a `set_hotkey_field` call refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyPurpose {
     PushToTalk,
