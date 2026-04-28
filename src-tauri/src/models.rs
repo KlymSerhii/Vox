@@ -12,36 +12,34 @@
 //!   "TBD" in the catalog and pin the computed hash to a per-machine
 //!   `models.lock` file on first successful download. Treat the lock
 //!   as a warning canary, not a hard gate, because HF can rotate.)
-//! - Gemma 4 E4B GGUF: <https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF>.
+//! - Gemma 4 E2B GGUF: <https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF>.
+//! - Gemma 4 E4B GGUF: <https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF>.
 //! - Gemma 4 26B-A4B (MoE) GGUF:
 //!   <https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF>.
 //!
-//! NB: Gemma 4 E2B (the smaller MatFormer "elastic" variant — `n_layer=35`,
-//! `shared_kv_layers=20`, `embedding_length_per_layer_input=256`) hits a
-//! `GGML_ASSERT` in `llama-context.cpp::sched_reserve` when the bundled
-//! `llama.cpp` (rev `e21cdc1`, the latest available through
-//! `llama-cpp-2`) runs its FGDN auto-detect: that graph contains
-//! `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the
-//! `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the check expects, so a
-//! `GGML_ASSERT` fires from C++ — bypassing Rust's fail-open guard.
-//! There is no Rust-side switch to disable that block (`fused_gdn_*` and
-//! `auto_fgdn` live in the internal cparams struct, not in the public
-//! `llama_context_params`), and the bug is unfixed at upstream HEAD.
-//! E2B is therefore in `is_known_broken_llm_id` and any stored selection
-//! pointing at it gets migrated to the current default on settings load.
+//! NB: MatFormer Gemma 4 GGUFs **as converted by Unsloth** trigger a
+//! `GGML_ASSERT` in `llama-context.cpp::sched_reserve`'s FGDN
+//! auto-detect path: their graphs contain `GGML_OP_GATED_DELTA_NET`
+//! tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR`
+//! prefix that the check expects, so a `GGML_ASSERT` fires from C++ —
+//! bypassing Rust's fail-open guard. There is no Rust-side switch to
+//! disable that block (`fused_gdn_*` and `auto_fgdn` live in the
+//! internal cparams struct, not in the public `llama_context_params`).
 //!
-//! E4B is the bigger MatFormer variant (`n_layer=42`, same family as
-//! E2B). Source-level analysis predicts it crashes the same way, but it
-//! is shipped here at the user's explicit request — without empirical
-//! verification we can't be 100% sure, and the failure (if any) is
-//! recoverable: the user picks a different model in Settings.
+//! **bartowski's MatFormer Gemma 4 GGUFs avoid this**: their conversion
+//! uses a tensor naming scheme that does not trigger the FGDN
+//! auto-detect path. The E2B and E4B entries in `CATALOG` are therefore
+//! sourced from bartowski. If we ever ship an Unsloth-converted
+//! MatFormer Gemma 4 variant, it'll need an entry in
+//! `is_known_broken_llm_id`.
 //!
 //! Gemma 4 26B-A4B (the MoE variant — 26 B params total, 4 B active,
-//! `shared_kv_layers=0`, no PLE) does NOT hit this code path: it
-//! dispatches through the same `llm_build_gemma4_iswa` builder but uses
-//! standard `build_attn` exclusively, so its graph emits zero
-//! `GGML_OP_GATED_DELTA_NET` ops. It is the recommended fallback if E4B
-//! crashes; it needs ~19 GB RAM at runtime so it isn't the default for
+//! `shared_kv_layers=0`, no PLE) does NOT hit this code path under
+//! either converter: it dispatches through the same
+//! `llm_build_gemma4_iswa` builder but uses standard `build_attn`
+//! exclusively, so its graph emits zero `GGML_OP_GATED_DELTA_NET` ops.
+//! We keep the Unsloth UD-Q4_K_M variant for its imatrix calibration
+//! edge; it needs ~19 GB RAM at runtime so it isn't the default for
 //! sub-quality tiers.
 
 use std::path::{Path, PathBuf};
@@ -143,30 +141,39 @@ pub const CATALOG: &[ModelDescriptor] = &[
     },
     // ---- LLM ----
     ModelDescriptor {
-        // Gemma 4 E4B (MatFormer): 4 B effective params, n_layer=42,
-        // shared_kv_layers > 0, PLE. **WARNING:** in this build's
-        // bundled `llama.cpp` (rev `e21cdc1`), MatFormer Gemma 4 hits a
-        // `GGML_ASSERT` in the FGDN auto-detect path of
-        // `llama-context.cpp::sched_reserve` — see file-level docs and
-        // `is_known_broken_llm_id`. Shipped here at the user's explicit
-        // request; if Polish is enabled with this selected and the
-        // assertion still fires, fall back to 26B-A4B or wait for an
-        // upstream `llama.cpp` fix.
+        // Gemma 4 E2B (MatFormer): 2 B effective params, n_layer=35.
+        // Sourced from bartowski because Unsloth's E2B conversion
+        // triggers a `GGML_ASSERT` in the FGDN auto-detect path of
+        // `llama-context.cpp::sched_reserve` — see file-level docs.
+        id: "gemma-4-e2b-q4_k_m",
+        kind: ModelKind::Llm,
+        name: "Gemma 4 E2B (Q4_K_M) — Small",
+        size_bytes: 3_462_677_760,
+        sha256: None,
+        url: "https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF/resolve/main/google_gemma-4-E2B-it-Q4_K_M.gguf",
+        engine: "gemma-local",
+        ram_peak_mb: 4000,
+        tier: "small",
+    },
+    ModelDescriptor {
+        // Gemma 4 E4B (MatFormer): 4 B effective params, n_layer=42.
+        // Sourced from bartowski for the same reason as E2B above.
         id: "gemma-4-e4b-q4_k_m",
         kind: ModelKind::Llm,
         name: "Gemma 4 E4B (Q4_K_M) — Balanced",
-        size_bytes: 4_977_169_088,
+        size_bytes: 5_405_167_904,
         sha256: None,
-        url: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_K_M.gguf",
+        url: "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf",
         engine: "gemma-local",
         ram_peak_mb: 6000,
         tier: "balanced",
     },
     ModelDescriptor {
-        // Gemma 4 26B-A4B (MoE: 26 B total, 4 B active). Avoids the FGDN
-        // crash that affects E2B/E4B because its graph has no Gated
-        // Delta Net ops — see file-level docs. ~17 GB on disk, ~19 GB
-        // RAM peak with KV cache; comfortable on 24 GB+ Apple Silicon.
+        // Gemma 4 26B-A4B (MoE: 26 B total, 4 B active). Has no Gated
+        // Delta Net ops, so it's safe under any converter — we keep
+        // Unsloth's UD-Q4_K_M for its imatrix calibration edge.
+        // ~17 GB on disk, ~19 GB RAM peak with KV cache; comfortable on
+        // 24 GB+ Apple Silicon.
         id: "gemma-4-26b-a4b-q4_k_m",
         kind: ModelKind::Llm,
         name: "Gemma 4 26B-A4B MoE (Q4_K_M) — Quality",
@@ -576,25 +583,21 @@ pub fn recommended_stt_model_id() -> &'static str {
 pub fn recommended_llm_model_id() -> &'static str {
     match recommend_tier() {
         "quality" => "gemma-4-26b-a4b-q4_k_m",
+        "small" => "gemma-4-e2b-q4_k_m",
         _ => "gemma-4-e4b-q4_k_m",
     }
 }
 
-/// Model IDs that should be migrated away from on settings load. Two
-/// reasons land an id here:
-/// 1. The GGUF crashes this build's bundled `llama.cpp` (see file-level
-///    docs) — without migration the user gets an `abort()` the next
-///    time they hit the polish hotkey. E4B has the same MatFormer
-///    architecture as E2B and is expected to crash too, but it is
-///    shipped at the user's explicit request, so leave it selectable.
-/// 2. The id was once in the catalog but has been retired. Without
-///    migration, an upgrader who had it selected would end up with a
-///    dangling reference that `descriptor_for` can't resolve.
-///
-/// In both cases `settings::load` rewrites the stored id to the current
-/// default and persists the change.
+/// Model IDs that should be migrated away from on settings load. An id
+/// lands here when it has been retired from the catalog — without
+/// migration, an upgrader who had it selected would end up with a
+/// dangling reference that `descriptor_for` can't resolve. The list
+/// also covers ids known to crash this build's bundled `llama.cpp`,
+/// though no current entries fall in that bucket. `settings::load`
+/// rewrites the stored id to the current default and persists the
+/// change.
 pub fn is_known_broken_llm_id(id: &str) -> bool {
-    matches!(id, "gemma-4-e2b-q4_k_m" | "phi-4-mini-q4_k_m")
+    matches!(id, "phi-4-mini-q4_k_m")
 }
 
 #[cfg(test)]

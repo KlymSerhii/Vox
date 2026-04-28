@@ -57,17 +57,14 @@ num_cpus = "1"
 # Heavy native engines — see `local-engines` feature above.
 whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
 # Pin llama-cpp-2 to a specific git commit on the upstream `main` branch
-# rather than the latest crates.io release (0.1.145). This is what
-# unblocks Gemma 4 polishing: the bundled `llama.cpp` submodule on this
-# revision sits on commit `e21cdc1` which carries the
-# `common/gemma4 : handle parsing edge cases` fix plus the rest of the
-# llama.cpp tree post-Gemma-4-launch. The crates.io snapshot we used
-# previously bundled an older `llama.cpp` that mis-tokenized the Gemma 4
-# chat template and produced gibberish or aborted under
-# `GGML_ASSERT`. Cargo materializes the git submodule for us, so the
-# build is fully reproducible: bumping `rev` is the only knob for
-# tracking upstream llama.cpp going forward, and it's far less work
-# than maintaining a fork.
+# rather than the latest crates.io release (0.1.145). The git pin gives
+# us a `llama.cpp` snapshot post-Gemma-4-launch with the
+# `<start_of_turn>` chat-template tooling Gemma needs; older crates.io
+# snapshots mis-tokenized that template and produced gibberish or
+# aborted under `GGML_ASSERT`. Cargo materializes the git submodule for
+# us, so the build is fully reproducible: bumping `rev` is the only
+# knob for tracking upstream llama.cpp going forward, and it's far less
+# work than maintaining a fork.
 llama-cpp-2 = { git = "https://github.com/utilityai/llama-cpp-rs", rev = "7d1b2f69777b588c70f35a69c6125d6b626713e5", default-features = false, features = ["metal"], optional = true }
 encoding_rs = { version = "0.8", optional = true }
 
