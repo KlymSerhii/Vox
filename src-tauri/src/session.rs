@@ -286,6 +286,12 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
             None => (String::new(), prefs.dictionary.clone()),
         };
 
+        // Carries a user-facing reason when polish was attempted but
+        // we substituted the raw transcript. Propagated to the Done
+        // pill so the user sees an amber warning instead of a silent
+        // green check.
+        let mut polish_warning: Option<&'static str> = None;
+
         let cleaned = match llm_engine {
             Some(engine) if engine.id() != "none" => {
                 pill::emit_state(&app_for_pill, PillState::Polishing, None);
@@ -310,10 +316,12 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                             log::info!(
                                 "LLM polish returned empty content; falling back to raw transcript"
                             );
+                            polish_warning = Some("Polish was empty — raw text copied.");
                             transcript.clone()
                         }
                         Err(e) => {
                             log::warn!("LLM cleanup failed: {e}; falling back to raw transcript");
+                            polish_warning = Some("Polish failed — raw text copied.");
                             transcript.clone()
                         }
                     }
@@ -353,12 +361,26 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
 
         match copy_result {
             Ok(Ok(())) => {
-                pill::emit_state(
-                    &app_for_pill,
-                    PillState::Done,
-                    Some("Copied — press ⌘V to paste.".into()),
-                );
-                hide_after_session(&app_for_pill, &ctx, my_sid, 1800);
+                match polish_warning {
+                    // Soft-fail: clipboard has the raw transcript. Hold
+                    // longer so the user can read why polish was skipped.
+                    Some(msg) => {
+                        pill::emit_state_warning(
+                            &app_for_pill,
+                            PillState::Done,
+                            Some(msg.into()),
+                        );
+                        hide_after_session(&app_for_pill, &ctx, my_sid, 3500);
+                    }
+                    None => {
+                        pill::emit_state(
+                            &app_for_pill,
+                            PillState::Done,
+                            Some("Copied — press ⌘V to paste.".into()),
+                        );
+                        hide_after_session(&app_for_pill, &ctx, my_sid, 1800);
+                    }
+                }
             }
             Ok(Err(e)) => {
                 log::error!("copy failed: {e}");

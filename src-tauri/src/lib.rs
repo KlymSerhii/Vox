@@ -78,6 +78,7 @@ pub fn run() {
             commands::inference_server_status,
             commands::restart_inference_server,
             commands::delete_inference_server,
+            commands::apple_fm_availability,
             commands::list_modes,
             commands::get_mode,
             commands::save_mode,

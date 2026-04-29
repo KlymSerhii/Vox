@@ -276,6 +276,28 @@ export async function deleteInferenceServer(): Promise<void> {
   await invoke("delete_inference_server");
 }
 
+export type AppleFmAvailabilityCode =
+  | "available"
+  | "device_not_eligible"
+  | "intelligence_not_enabled"
+  | "model_not_ready"
+  | "os_too_old"
+  | "internal_error"
+  | "framework_missing";
+
+export interface AppleFmAvailability {
+  available: boolean;
+  code: AppleFmAvailabilityCode;
+  message: string;
+  /** False on non-macOS / when the apple-fm feature was compiled out.
+   *  Frontend hides the entire Apple Intelligence section when false. */
+  supported_host: boolean;
+}
+
+export async function appleFmAvailability(): Promise<AppleFmAvailability> {
+  return invoke<AppleFmAvailability>("apple_fm_availability");
+}
+
 export async function onBinaryProgress(
   cb: (p: ModelProgress) => void,
 ): Promise<UnlistenFn> {

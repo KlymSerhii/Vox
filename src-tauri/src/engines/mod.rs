@@ -8,6 +8,10 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Manager, Wry};
 
+#[cfg(all(target_os = "macos", feature = "apple-fm"))]
+pub mod apple_fm;
+#[cfg(all(target_os = "macos", feature = "apple-fm"))]
+pub mod apple_fm_bridge;
 pub mod gemma_http;
 pub mod none;
 pub mod whisper_local;
@@ -116,6 +120,8 @@ impl Registry {
                 app.clone(),
                 model_id.to_string(),
             )),
+            #[cfg(all(target_os = "macos", feature = "apple-fm"))]
+            "apple-fm" => Arc::new(apple_fm::AppleFmEngine::new()),
             "none" => Arc::new(none::NoOpEngine),
             _ => return None,
         };

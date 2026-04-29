@@ -167,11 +167,20 @@ pub fn set_polishing_enabled<R: Runtime>(
 ) -> Result<(), String> {
     let mut s = settings::load(&app);
     s.polishing_enabled = enabled;
-    s.llm_engine = if enabled { "gemma-local".into() } else { "none".into() };
+    // Preserve the user's engine choice (apple-fm / gemma-local) across
+    // the toggle: session.rs short-circuits to the no-op when
+    // polishing_enabled is false, so we don't need to overwrite
+    // llm_engine. Only fix up the edge case where engine was left as
+    // "none" (cloud migration, fresh install) — pick gemma-local as the
+    // safe default when polishing is being turned ON.
+    if enabled && s.llm_engine == "none" {
+        s.llm_engine = "gemma-local".into();
+    }
     settings::save(&app, &s).map_err(|e| e.to_string())?;
 
     // Drive the inference subprocess in lockstep with the toggle so the
     // user sees the RAM change immediately, not lazily on next dictation.
+    // `prewarm_in_background` is engine-aware — it no-ops on apple-fm.
     if enabled {
         inference_proc::prewarm_in_background(&app);
     } else {
@@ -608,6 +617,54 @@ pub fn delete_inference_server(app: AppHandle<Wry>) -> Result<(), String> {
     // Kill child first so files aren't deleted while held open (Windows).
     inference_proc::drop_managed(&app);
     inference_server::delete(&app).map_err(|e| e.to_string())
+}
+
+/// Status of Apple Intelligence (Foundation Models) on this Mac.
+/// `available` drives the onboarding "recommended" pill and the Settings
+/// "Use" button; `code` lets the UI tailor the disabled-state message
+/// (download in progress vs unsupported hardware vs OS too old).
+#[derive(Debug, Serialize)]
+pub struct AppleFmAvailabilityResult {
+    pub available: bool,
+    pub code: String,
+    pub message: String,
+    /// `false` on non-macOS / when the apple-fm feature was compiled
+    /// out — frontend hides the entire Apple Intelligence UI section.
+    pub supported_host: bool,
+}
+
+#[tauri::command]
+pub fn apple_fm_availability() -> AppleFmAvailabilityResult {
+    #[cfg(all(target_os = "macos", feature = "apple-fm"))]
+    {
+        use crate::engines::apple_fm;
+        use crate::engines::apple_fm_bridge::AvailabilityCode;
+        let code = crate::engines::apple_fm_bridge::availability();
+        let code_str = match code {
+            AvailabilityCode::Available => "available",
+            AvailabilityCode::DeviceNotEligible => "device_not_eligible",
+            AvailabilityCode::IntelligenceNotEnabled => "intelligence_not_enabled",
+            AvailabilityCode::ModelNotReady => "model_not_ready",
+            AvailabilityCode::OsTooOld => "os_too_old",
+            AvailabilityCode::InternalError => "internal_error",
+            AvailabilityCode::FrameworkMissing => "framework_missing",
+        };
+        AppleFmAvailabilityResult {
+            available: matches!(code, AvailabilityCode::Available),
+            code: code_str.into(),
+            message: apple_fm::availability_message(code).into(),
+            supported_host: true,
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "apple-fm")))]
+    {
+        AppleFmAvailabilityResult {
+            available: false,
+            code: "framework_missing".into(),
+            message: "Apple Intelligence is only available on macOS".into(),
+            supported_host: false,
+        }
+    }
 }
 
 #[tauri::command]

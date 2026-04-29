@@ -17,22 +17,31 @@ use crate::inference_proc;
 const HARD_TIMEOUT: Duration = Duration::from_secs(240);
 
 // Gemma 4 is a thinking model: llama.cpp's `peg-gemma4` chat handler
-// routes ~250-300 tokens of chain-of-thought into `reasoning_content`
-// before any answer tokens land in `content`. The floor must therefore
-// cover *thinking + answer*, not just answer. 256 was tight enough that
-// short inputs (e.g. 100 chars) had thinking eat the entire budget,
-// leaving content empty and finish_reason=length. 1024 leaves roughly
-// 3× headroom for the model's internal reasoning plus a short reply.
-const MIN_NEW_TOKENS: u32 = 1024;
+// routes chain-of-thought into `reasoning_content` before any answer
+// tokens land in `content`. Reasoning grows with input *complexity*
+// (numbered lists, conditionals, multi-step instructions) and not
+// just length — empirically a ~400-token input on a structuring task
+// burns 1 200+ tokens of thinking. The previous 1024 floor truncated
+// the completion mid-thought, leaving `content` empty and tripping
+// the empty-content fail-open in `session.rs`. 2048 covers reasoning
+// + a short reply for typical short utterances.
+const MIN_NEW_TOKENS: u32 = 2048;
 
 // ~160 s of generation at ~52 tok/s; past that we'd rather fail-open.
 const MAX_NEW_TOKENS_CAP: u32 = 8192;
 
-// English BPE ≈ 4 chars/token; 1.2× pads for structural markup
-// (numbered lists, paragraph breaks) the prompt encourages.
+// English BPE ≈ 4 chars/token. Budget = reasoning + output + margin:
+// - Reasoning: ~3× input. Gemma 4's chain-of-thought consistently
+//   runs 2-4× the input length on cleanup-with-structuring tasks;
+//   3× is the empirical median.
+// - Output: 1.2× input. Cleaned text is roughly input length plus
+//   structural markup (numbered lists, paragraph breaks).
+// - Margin: 256 tokens for chat-template overhead and rounding.
 fn dynamic_max_tokens(input_chars: usize) -> i32 {
     let estimated_input = input_chars / 4;
-    let dynamic = ((estimated_input * 12) / 10 + 128) as u32;
+    let reasoning_budget = estimated_input * 3;
+    let output_budget = (estimated_input * 12) / 10;
+    let dynamic = (reasoning_budget + output_budget + 256) as u32;
     dynamic.clamp(MIN_NEW_TOKENS, MAX_NEW_TOKENS_CAP) as i32
 }
 
@@ -374,6 +383,23 @@ mod tests {
     fn dynamic_max_tokens_floors_short_inputs() {
         assert_eq!(dynamic_max_tokens(5), MIN_NEW_TOKENS as i32);
         assert_eq!(dynamic_max_tokens(0), MIN_NEW_TOKENS as i32);
+    }
+
+    #[test]
+    fn dynamic_max_tokens_covers_thinking_for_medium_inputs() {
+        // Regression guard for the silent fail-open we hit in
+        // production: a 1600-char (~400-token) transcript consumed
+        // ~1200 tokens on Gemma 4's reasoning_content before the
+        // answer began, while max_tokens was clamped at 1024. The
+        // model emitted reasoning exclusively, content came back
+        // empty, and the session fell through to copying the raw
+        // Whisper transcript untouched. The budget must now leave
+        // room for thinking + a polished reply.
+        let cap = dynamic_max_tokens(1_600);
+        assert!(
+            cap >= 1_800,
+            "1600-char input must budget for thinking + answer, got {cap}"
+        );
     }
 
     #[test]

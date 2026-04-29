@@ -242,13 +242,26 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
 
     let llm_engine = {
         let stored = get_str(KEY_LLM_ENGINE).unwrap_or_else(default_llm_engine);
-        if matches!(stored.as_str(), "anthropic" | "claude" | "cloud") {
-            log::error!("settings: migrating llm_engine '{stored}' -> 'none'.");
-            store.set(KEY_LLM_ENGINE, serde_json::Value::String("none".into()));
-            store_dirty = true;
-            "none".to_string()
-        } else {
-            stored
+        match stored.as_str() {
+            "anthropic" | "claude" | "cloud" => {
+                log::error!("settings: migrating llm_engine '{stored}' -> 'none'.");
+                store.set(KEY_LLM_ENGINE, serde_json::Value::String("none".into()));
+                store_dirty = true;
+                "none".to_string()
+            }
+            // Whitelist of engines the Registry knows how to construct.
+            // Anything else (a setting from a future build, a hand-edit)
+            // becomes the default so the pipeline doesn't dead-end.
+            "gemma-local" | "apple-fm" | "none" => stored,
+            other => {
+                let replacement = default_llm_engine();
+                log::error!(
+                    "settings: unknown llm_engine '{other}' -> '{replacement}'."
+                );
+                store.set(KEY_LLM_ENGINE, serde_json::Value::String(replacement.clone()));
+                store_dirty = true;
+                replacement
+            }
         }
     };
     // Rewrite retired or known-crashing model ids to the current default.

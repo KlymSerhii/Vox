@@ -27,8 +27,16 @@ png = "0.17"
 # subprocess we talk to over HTTP — see `inference_proc.rs`), so it
 # does not participate in this feature gate. Crash isolation, not a
 # compile-time toggle, was the whole point of moving it out.
-default = ["local-engines"]
+#
+# `apple-fm` builds the Swift static library that talks to Apple
+# Intelligence's Foundation Models framework. macOS-only at link time
+# (build.rs gates on `target_os = "macos"`); the feature compiles
+# cleanly on Linux/Windows but produces no native code there. CI
+# machines without Xcode/Swift can opt out via
+# `--no-default-features --features local-engines`.
+default = ["local-engines", "apple-fm"]
 local-engines = ["dep:whisper-rs"]
+apple-fm = []
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }

@@ -12,6 +12,11 @@ type PillState =
 interface PillStatePayload {
   state: PillState;
   message?: string;
+  /** Soft-fail flag on `Done` — clipboard succeeded but a step
+   *  (typically LLM polish) was substituted. Drives the amber
+   *  warning treatment so the user notices their cleanup was
+   *  skipped instead of mistaking it for a successful polish. */
+  warning?: boolean;
 }
 
 interface AudioLevelPayload {
@@ -36,6 +41,7 @@ const METER_BARS = 10;
 export default function PillView() {
   const [state, setState] = createSignal<PillState>("listening");
   const [message, setMessage] = createSignal<string | null>(null);
+  const [warning, setWarning] = createSignal(false);
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
   const [meter, setMeter] = createSignal<number[]>(
     new Array(METER_BARS).fill(0),
@@ -56,6 +62,7 @@ export default function PillView() {
       await listen<PillStatePayload>("pill:state", (e) => {
         setState(e.payload.state);
         setMessage(e.payload.message ?? null);
+        setWarning(e.payload.warning ?? false);
       }),
     );
     unlisten.push(
@@ -70,6 +77,7 @@ export default function PillView() {
         setLevels(new Array(BARS).fill(0));
         setMeter(new Array(METER_BARS).fill(0));
         setSuggestion(null);
+        setWarning(false);
       }),
     );
     unlisten.push(
@@ -89,6 +97,8 @@ export default function PillView() {
   });
 
   const isDone = () => state() === "done";
+  const isDoneWarning = () => isDone() && warning();
+  const isDoneSuccess = () => isDone() && !warning();
 
   return (
     <div class="flex h-screen w-screen items-center justify-center bg-transparent">
@@ -99,20 +109,22 @@ export default function PillView() {
           "backdrop-filter": "var(--glass-blur)",
           "-webkit-backdrop-filter": "var(--glass-blur)",
           border: "1px solid var(--glass-rim)",
-          "box-shadow": isDone()
+          "box-shadow": isDoneSuccess()
             ? "inset 0 0 0 2px var(--color-success), 0 0 24px rgba(74, 222, 128, 0.55), var(--glass-shadow-stack)"
-            : "var(--glass-shadow-stack)",
+            : isDoneWarning()
+              ? "inset 0 0 0 2px var(--color-warning), 0 0 24px rgba(251, 191, 36, 0.45), var(--glass-shadow-stack)"
+              : "var(--glass-shadow-stack)",
         }}
         role="status"
         aria-live="polite"
       >
-        <LeftIcon state={state()} meter={meter()} />
+        <LeftIcon state={state()} meter={meter()} warning={warning()} />
         <div class="min-w-0 flex-1">
           <Show
             when={state() === "listening"}
             fallback={
               <span class="block truncate text-[13px] font-medium text-[var(--color-ink)]">
-                {pillLabel(state(), message())}
+                {pillLabel(state(), message(), warning())}
               </span>
             }
           >
@@ -129,12 +141,13 @@ export default function PillView() {
               state() === "listening" ||
               state() === "transcribing" ||
               state() === "polishing",
-            "text-[var(--color-success)]": state() === "done",
+            "text-[var(--color-success)]": isDoneSuccess(),
+            "text-[var(--color-warning)]": isDoneWarning(),
             "text-[var(--color-danger)]": state() === "error",
             "text-[var(--color-ink-mute)] italic": state() === "canceled",
           }}
         >
-          {rightLabel(state())}
+          {rightLabel(state(), warning())}
         </span>
       </div>
       <Show when={state() === "listening" ? suggestion() : null}>
@@ -220,7 +233,11 @@ function nextMeter(prev: number[], sample: number): number[] {
   return next;
 }
 
-function pillLabel(state: PillState, message: string | null): string {
+function pillLabel(
+  state: PillState,
+  message: string | null,
+  _warning: boolean,
+): string {
   if (message) return message;
   switch (state) {
     case "transcribing":
@@ -238,7 +255,7 @@ function pillLabel(state: PillState, message: string | null): string {
   }
 }
 
-function rightLabel(state: PillState): string {
+function rightLabel(state: PillState, warning: boolean): string {
   switch (state) {
     case "listening":
       return "Listening…";
@@ -247,7 +264,7 @@ function rightLabel(state: PillState): string {
     case "polishing":
       return "Polishing";
     case "done":
-      return "Done";
+      return warning ? "Raw copy" : "Done";
     case "canceled":
       return "Canceled";
     case "error":
@@ -255,7 +272,11 @@ function rightLabel(state: PillState): string {
   }
 }
 
-function LeftIcon(props: { state: PillState; meter: number[] }) {
+function LeftIcon(props: {
+  state: PillState;
+  meter: number[];
+  warning: boolean;
+}) {
   return (
     <div
       class="flex h-8 shrink-0 items-center justify-center"
@@ -274,8 +295,11 @@ function LeftIcon(props: { state: PillState; meter: number[] }) {
       >
         <Spinner violet={props.state === "polishing"} />
       </Show>
-      <Show when={props.state === "done"}>
+      <Show when={props.state === "done" && !props.warning}>
         <CheckIcon />
+      </Show>
+      <Show when={props.state === "done" && props.warning}>
+        <WarningIcon />
       </Show>
       <Show when={props.state === "error"}>
         <AlertIcon />
@@ -373,6 +397,26 @@ function AlertIcon() {
       <circle cx="12" cy="12" r="9" />
       <line x1="12" y1="8" x2="12" y2="12" />
       <line x1="12" y1="16" x2="12.01" y2="16" />
+    </svg>
+  );
+}
+
+function WarningIcon() {
+  return (
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="var(--color-warning)"
+      stroke-width="1.75"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3 L22 20 L2 20 Z" />
+      <line x1="12" y1="10" x2="12" y2="14" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
     </svg>
   );
 }

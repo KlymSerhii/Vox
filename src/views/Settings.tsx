@@ -8,6 +8,7 @@ import {
   Show,
 } from "solid-js";
 import {
+  appleFmAvailability,
   cancelDownload,
   cancelInferenceServerDownload,
   checkForUpdates,
@@ -41,8 +42,10 @@ import {
   restartInferenceServer,
   revealDevBinaryPath,
   saveMode,
+  setAppearance,
   setLaunchAtLogin,
   setSettings,
+  type AppleFmAvailability,
   type CaseStyle,
   type DevBinaryInfo,
   type DiagnoseHotkeys,
@@ -54,6 +57,7 @@ import {
   type UpdateCheckResult,
   type VoiceMode,
 } from "../lib/ipc";
+import { VoxLogo } from "../components/VoxLogo";
 
 type Tab =
   | "general"
@@ -64,14 +68,49 @@ type Tab =
   | "privacy"
   | "about";
 
-const TABS: { id: Tab; label: string; icon: string }[] = [
-  { id: "general", label: "General", icon: "sliders" },
-  { id: "hotkeys", label: "Hotkeys", icon: "keyboard" },
-  { id: "models", label: "Models", icon: "cube" },
-  { id: "modes", label: "Modes", icon: "modes" },
-  { id: "dictionary", label: "Dictionary", icon: "book" },
-  { id: "privacy", label: "Privacy", icon: "lock" },
-  { id: "about", label: "About", icon: "info" },
+const TABS: { id: Tab; label: string; icon: string; subtitle: string }[] = [
+  {
+    id: "general",
+    label: "General",
+    icon: "sliders",
+    subtitle: "How Vox starts, listens, and looks.",
+  },
+  {
+    id: "hotkeys",
+    label: "Hotkeys",
+    icon: "keyboard",
+    subtitle: "Shortcuts for dictating, cancelling, and switching modes.",
+  },
+  {
+    id: "models",
+    label: "Models",
+    icon: "cube",
+    subtitle: "Manage the on-device speech and polishing engines.",
+  },
+  {
+    id: "modes",
+    label: "Modes",
+    icon: "modes",
+    subtitle: "Tone, punctuation, and dictionary per situation.",
+  },
+  {
+    id: "dictionary",
+    label: "Dictionary",
+    icon: "book",
+    subtitle: "Names and acronyms Vox should always spell correctly.",
+  },
+  {
+    id: "privacy",
+    label: "Privacy",
+    icon: "lock",
+    subtitle: "What stays on this Mac (everything).",
+  },
+  {
+    id: "about",
+    label: "About",
+    icon: "info",
+    subtitle: "Version, diagnostics, and updates.",
+  },
 ];
 
 interface HotkeyOption {
@@ -175,7 +214,7 @@ export default function SettingsView() {
       lastSelfSaveAt = Date.now();
       await setSettings(next);
       setSavedFlash(true);
-      setTimeout(() => setSavedFlash(false), 240);
+      setTimeout(() => setSavedFlash(false), 1200);
     } catch (err) {
       console.error("Save failed:", err);
     }
@@ -229,7 +268,7 @@ function Loader() {
 function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
   return (
     <aside
-      class="flex h-full w-[210px] flex-col border-r border-[var(--color-border)] px-3 py-5"
+      class="flex h-full w-[208px] flex-col border-r border-[var(--color-border)] px-3 pt-5 pb-3"
       style={{
         background: "var(--color-sidebar)",
         "backdrop-filter": "var(--glass-blur)",
@@ -238,12 +277,15 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
           "inset 0 1px 0 var(--glass-highlight), 1px 0 0 var(--glass-edge-bottom)",
       }}
     >
-      <div class="mb-5 px-2">
-        <div class="text-[15px] font-semibold tracking-[-0.01em] text-[var(--color-ink)]">
-          Vox
-        </div>
-        <div class="text-[11px] text-[var(--color-ink-mute)]">
-          Talk to any app.
+      <div class="mb-5 flex items-center gap-2 px-2">
+        <SidebarLogo />
+        <div class="flex flex-col">
+          <div class="text-[14px] font-semibold tracking-[-0.01em] text-[var(--color-ink)]">
+            Vox
+          </div>
+          <div class="text-[10px] uppercase tracking-[0.08em] text-[var(--color-ink-faint)]">
+            On-device dictation
+          </div>
         </div>
       </div>
       <nav class="flex flex-col gap-0.5">
@@ -252,10 +294,9 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
             <button
               type="button"
               onClick={() => props.onTab(t.id)}
-              class="flex items-center gap-2.5 rounded-[8px] px-3 py-1.5 text-left text-[13px] font-medium transition-all"
+              class="flex items-center gap-2.5 rounded-[8px] px-2.5 py-1.5 text-left text-[13px] font-medium transition-all"
               classList={{
-                "text-[var(--color-ink)] ring-1 ring-[var(--color-border)]":
-                  props.tab === t.id,
+                "text-[var(--color-ink)]": props.tab === t.id,
                 "text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]":
                   props.tab !== t.id,
               }}
@@ -276,11 +317,21 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
           )}
         </For>
       </nav>
-      <div class="mt-auto px-3 text-center text-[11px] text-[var(--color-ink-faint)]">
-        Vox 1.0.0
+      <div class="mt-auto flex items-center justify-between px-2 text-[10px] text-[var(--color-ink-faint)]">
+        <span>Vox 1.0.0</span>
+        <span
+          class="rounded-full bg-[var(--color-success)]/15 px-1.5 py-[1px] text-[9px] font-medium uppercase tracking-[0.08em] text-[var(--color-success)]"
+          title="Audio and transcripts never leave this Mac."
+        >
+          Local
+        </span>
       </div>
     </aside>
   );
+}
+
+function SidebarLogo() {
+  return <VoxLogo size={28} />;
 }
 
 function TabIcon(props: { name: string; active: boolean }) {
@@ -366,19 +417,42 @@ function TabIcon(props: { name: string; active: boolean }) {
 }
 
 function Header(props: { tab: Tab; savedFlash: boolean }) {
-  const title = createMemo(
-    () => TABS.find((t) => t.id === props.tab)?.label ?? "",
-  );
+  const meta = createMemo(() => TABS.find((t) => t.id === props.tab));
   return (
-    <header class="mb-6 flex items-center justify-between border-b border-[var(--color-border)] pb-4">
-      <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[var(--color-ink)]">
-        {title()}
-      </h1>
-      <Show when={props.savedFlash}>
-        <span class="text-[11px] font-medium text-[var(--color-success)]">
-          ✓ Saved
+    <header class="mb-5 flex items-end justify-between gap-4 border-b border-[var(--color-border)] pb-4">
+      <div class="flex flex-col">
+        <h1 class="text-[20px] font-semibold tracking-[-0.015em] text-[var(--color-ink)]">
+          {meta()?.label ?? ""}
+        </h1>
+        <p class="mt-0.5 text-[12px] text-[var(--color-ink-mute)]">
+          {meta()?.subtitle ?? ""}
+        </p>
+      </div>
+      <div class="flex h-[22px] items-center">
+        <span
+          class="inline-flex items-center gap-1 rounded-full bg-[var(--color-success)]/15 px-2 py-0.5 text-[11px] font-medium text-[var(--color-success)] transition-opacity duration-200"
+          classList={{
+            "opacity-100": props.savedFlash,
+            "opacity-0 pointer-events-none": !props.savedFlash,
+          }}
+          aria-live="polite"
+        >
+          <svg
+            width="11"
+            height="11"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="3"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="5 12 10 17 19 7" />
+          </svg>
+          Saved
         </span>
-      </Show>
+      </div>
     </header>
   );
 }
@@ -404,7 +478,7 @@ function Row(props: {
         "border-b border-[var(--color-border)]": !props.last,
       }}
     >
-      <div class="flex flex-col">
+      <div class="flex min-w-0 flex-1 flex-col">
         <span class="text-[13px] text-[var(--color-ink)]">{props.label}</span>
         <Show when={props.hint}>
           <span class="text-[11px] text-[var(--color-ink-mute)]">
@@ -412,7 +486,7 @@ function Row(props: {
           </span>
         </Show>
       </div>
-      <div class="flex items-center gap-2">{props.children}</div>
+      <div class="flex shrink-0 items-center gap-2">{props.children}</div>
     </div>
   );
 }
@@ -442,6 +516,78 @@ function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
   );
 }
 
+function SegmentedControl<T extends string>(props: {
+  value: T;
+  options: { value: T; label: string }[];
+  onChange: (v: T) => void;
+  ariaLabel?: string;
+}) {
+  return (
+    <div
+      role="radiogroup"
+      aria-label={props.ariaLabel}
+      class="inline-flex shrink-0 items-center rounded-[8px] bg-[var(--color-control)] p-[2px] ring-1 ring-inset ring-[var(--color-border)]"
+    >
+      <For each={props.options}>
+        {(o) => {
+          const active = () => props.value === o.value;
+          return (
+            <button
+              type="button"
+              role="radio"
+              aria-checked={active()}
+              onClick={() => props.onChange(o.value)}
+              class="rounded-[6px] px-3 py-[3px] text-[12px] font-medium transition-all"
+              classList={{
+                "text-[var(--color-ink)]": active(),
+                "text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]":
+                  !active(),
+              }}
+              style={
+                active()
+                  ? {
+                      background: "var(--color-surface-raised)",
+                      "box-shadow": "var(--glass-shadow-stack-sm)",
+                    }
+                  : {}
+              }
+            >
+              {o.label}
+            </button>
+          );
+        }}
+      </For>
+    </div>
+  );
+}
+
+function SectionHeader(props: { title: string; hint?: string }) {
+  return (
+    <div class="mt-1 mb-2 flex items-baseline justify-between gap-3 px-1">
+      <h2 class="text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
+        {props.title}
+      </h2>
+      <Show when={props.hint}>
+        <span class="text-[11px] text-[var(--color-ink-faint)]">
+          {props.hint}
+        </span>
+      </Show>
+    </div>
+  );
+}
+
+function Keycap(props: { children: any }) {
+  return <span class="keycap">{props.children}</span>;
+}
+
+function StaticValue(props: { children: any }) {
+  return (
+    <span class="text-[12px] font-medium text-[var(--color-ink-mute)]">
+      {props.children}
+    </span>
+  );
+}
+
 function GeneralTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
@@ -455,58 +601,101 @@ function GeneralTab(props: {
     }
   }
 
+  async function changeAppearance(v: "light" | "dark") {
+    try {
+      await setAppearance(v);
+      props.update({ appearance: v });
+    } catch (err) {
+      console.error("Appearance change failed:", err);
+    }
+  }
+
   return (
-    <Card>
-      <Row
-        label="Launch at login"
-        hint="Vox will start quietly in your menu bar."
-      >
-        <Toggle
-          checked={props.s.launch_at_login}
-          onChange={(v) => void toggleLaunchAtLogin(v)}
-        />
-      </Row>
-      <Row
-        label="Hotkey behavior"
-        hint="Hands-free toggle (press once to start, press again to stop) or push-to-talk (hold)."
-      >
-        <select
-          class="rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-          value={props.s.hands_free_enabled ? "toggle" : "ptt"}
-          onChange={(e) =>
-            props.update({
-              hands_free_enabled: e.currentTarget.value === "toggle",
-            })
-          }
+    <>
+      <SectionHeader title="Recording" />
+      <Card>
+        <Row
+          label="When you press the hotkey"
+          hint="Hands-free toggles on a press; push-to-talk records while you hold."
+          last
         >
-          <option value="toggle">Hands-free toggle (recommended)</option>
-          <option value="ptt">Push-to-talk (hold)</option>
-        </select>
-      </Row>
-      <Row
-        label="Language"
-        hint="Whisper language hint. Auto detects from speech."
-      >
-        <select
-          class="rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-          value={props.s.language}
-          onChange={(e) => props.update({ language: e.currentTarget.value })}
+          <SegmentedControl<"toggle" | "ptt">
+            ariaLabel="Hotkey behavior"
+            value={props.s.hands_free_enabled ? "toggle" : "ptt"}
+            options={[
+              { value: "toggle", label: "Hands-free" },
+              { value: "ptt", label: "Push-to-talk" },
+            ]}
+            onChange={(v) =>
+              props.update({ hands_free_enabled: v === "toggle" })
+            }
+          />
+        </Row>
+      </Card>
+
+      <SectionHeader title="Voice" />
+      <Card>
+        <Row
+          label="Spoken language"
+          hint="Whisper detects automatically when set to Auto."
         >
-          <For each={LANGUAGE_OPTIONS}>
-            {(o) => <option value={o.value}>{o.label}</option>}
-          </For>
-        </select>
-      </Row>
-      <Row
-        label="Default microphone"
-        hint="Vox uses the current system default input device."
-        last
-      >
-        <span class="text-[12px] text-[var(--color-ink-mute)]">
-          System default
-        </span>
-      </Row>
-    </Card>
+          <select
+            class="rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            value={props.s.language}
+            onChange={(e) => props.update({ language: e.currentTarget.value })}
+          >
+            <For each={LANGUAGE_OPTIONS}>
+              {(o) => <option value={o.value}>{o.label}</option>}
+            </For>
+          </select>
+        </Row>
+        <Row
+          label="Suggest mode for the focused app"
+          hint="Vox hints, never auto-switches."
+        >
+          <Toggle
+            checked={props.s.auto_suggest_modes}
+            onChange={(v) => props.update({ auto_suggest_modes: v })}
+          />
+        </Row>
+        <Row
+          label="Microphone"
+          hint="Vox follows the macOS default input — change it in System Settings → Sound."
+          last
+        >
+          <StaticValue>System default</StaticValue>
+        </Row>
+      </Card>
+
+      <SectionHeader title="Appearance" />
+      <Card>
+        <Row label="Theme" hint="Switches all Vox windows immediately." last>
+          <SegmentedControl<"light" | "dark">
+            ariaLabel="Theme"
+            value={props.s.appearance}
+            options={[
+              { value: "light", label: "Light" },
+              { value: "dark", label: "Dark" },
+            ]}
+            onChange={(v) => void changeAppearance(v)}
+          />
+        </Row>
+      </Card>
+
+      <SectionHeader title="Startup" />
+      <Card>
+        <Row
+          label="Launch at login"
+          hint="Vox starts quietly in your menu bar after sign-in."
+          last
+        >
+          <Toggle
+            checked={props.s.launch_at_login}
+            onChange={(v) => void toggleLaunchAtLogin(v)}
+          />
+        </Row>
+      </Card>
+    </>
   );
 }
 
@@ -569,33 +758,41 @@ function HotkeysTab(props: {
 
   return (
     <>
+      <SectionHeader title="Primary shortcut" />
       <Card>
-        <div class="flex items-start justify-between gap-4 border-b border-[var(--color-border)] px-4 py-3">
-          <div class="flex flex-col">
+        <div class="flex items-start justify-between gap-4 px-4 py-3">
+          <div class="flex flex-col gap-1.5">
             <div class="flex items-center gap-2">
-              <span class="text-[13px] text-[var(--color-ink)]">
+              <span class="text-[13px] font-medium text-[var(--color-ink)]">
                 Push-to-talk
               </span>
-              <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] text-[var(--color-ink-mute)]">
-                ⌘ + ⌃ + Space
+              <span class="rounded-full bg-[var(--color-ink-mute)]/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.06em] text-[var(--color-ink-mute)]">
+                Built-in
               </span>
             </div>
-            <span class="mt-0.5 text-[11px] text-[var(--color-ink-mute)]">
+            <div class="flex items-center gap-1">
+              <Keycap>⌘</Keycap>
+              <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
+              <Keycap>⌃</Keycap>
+              <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
+              <Keycap>Space</Keycap>
+            </div>
+            <span class="text-[11px] text-[var(--color-ink-mute)]">
               {pttHint(props.s.hands_free_enabled, ptt())}
             </span>
           </div>
-          <div class="flex shrink-0 items-center gap-2">
+          <div class="flex shrink-0 flex-col items-end gap-1">
             <button
               type="button"
               onClick={() => void onTest()}
               class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
               title="Read the current binding from the runtime"
             >
-              Test
+              Test binding
             </button>
             <Show when={testStatus()}>
               <span
-                class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px]"
+                class="text-[10px]"
                 classList={{
                   "text-[var(--color-success)]":
                     testStatus()?.startsWith("Bound") ?? false,
@@ -610,6 +807,10 @@ function HotkeysTab(props: {
             </Show>
           </div>
         </div>
+      </Card>
+
+      <SectionHeader title="Secondary shortcuts" />
+      <Card>
         <HotkeyRow
           label="Cancel while recording"
           hint="Abort the pipeline without copying."
@@ -629,9 +830,9 @@ function HotkeysTab(props: {
         />
       </Card>
       <p class="text-[11px] text-[var(--color-ink-mute)]">
-        Hotkey changes take effect after the app restarts. If the
-        configured key fails to bind on macOS, Vox falls back to the
-        next compatible shortcut and shows it under the picker.
+        Changes take effect after the app restarts. If the configured key
+        fails to bind on macOS, Vox falls back to the next compatible
+        shortcut and shows it under the picker.
       </p>
     </>
   );
@@ -877,12 +1078,43 @@ function ModelsTab(props: {
     await refresh();
   }
 
+  const [appleFm, setAppleFm] = createSignal<AppleFmAvailability | null>(null);
+
+  async function refreshAppleFm() {
+    try {
+      setAppleFm(await appleFmAvailability());
+    } catch (e) {
+      console.warn("appleFmAvailability:", e);
+    }
+  }
+
+  onMount(() => {
+    refreshAppleFm();
+  });
+
   function setActiveStt(modelId: string) {
     props.update({ stt_engine: "whisper-local", stt_model_id: modelId });
   }
 
   function setActiveLlm(modelId: string) {
+    // Switching to a Gemma model implicitly switches the engine too —
+    // a user clicking "Use" on a Gemma row probably wants it active,
+    // not "selected for some future toggle".
     props.update({ llm_engine: "gemma-local", llm_model_id: modelId });
+  }
+
+  function setEngineAppleFm() {
+    // Re-probe right before switching so we surface the current
+    // availability error if the user toggled Apple Intelligence off in
+    // System Settings since the tab was last opened.
+    refreshAppleFm();
+    props.update({ llm_engine: "apple-fm" });
+  }
+
+  function setEngineGemma() {
+    // Use the existing llm_model_id if it still maps to a Gemma model,
+    // otherwise the field stays as-is and the user picks one below.
+    props.update({ llm_engine: "gemma-local" });
   }
 
   const sttModels = createMemo(() =>
@@ -893,31 +1125,48 @@ function ModelsTab(props: {
   );
 
   // `polishing_enabled` carries user *intent* across LLM outages so we
-  // can restore Gemma when it stabilises. `llm_engine` stays in
-  // lockstep as the active source of truth for the rest of the app.
+  // can restore the engine when it stabilises. `llm_engine` carries the
+  // engine choice (apple-fm vs gemma-local) and survives the toggle —
+  // session.rs short-circuits to the no-op when polishing_enabled is
+  // false, so we don't need to clobber the field on toggle off.
   function setPolishing(on: boolean) {
-    props.update({
-      polishing_enabled: on,
-      llm_engine: on ? "gemma-local" : "none",
-    });
+    const next: Partial<Settings> = { polishing_enabled: on };
+    if (on && props.s.llm_engine === "none") {
+      // Cloud-migration / fresh-install rescue: pick a sensible engine
+      // when turning polishing back on with no engine remembered.
+      next.llm_engine = appleFm()?.available ? "apple-fm" : "gemma-local";
+    }
+    props.update(next);
   }
+
+  const activeStt = createMemo(() =>
+    sttModels().find((m) => m.descriptor.id === props.s.stt_model_id),
+  );
+  const activeLlm = createMemo(() =>
+    llmModels().find((m) => m.descriptor.id === props.s.llm_model_id),
+  );
 
   return (
     <>
+      <SectionHeader
+        title="Speech recognition"
+        hint="Local · Whisper"
+      />
       <Card>
         <Row
-          label="Transcription"
-          hint="Whisper runs entirely on this Mac. No audio ever leaves the device."
+          label="Active model"
+          hint={
+            activeStt()
+              ? `${activeStt()!.descriptor.name} · ${activeStt()!.installed ? "installed" : "not yet downloaded"}`
+              : "No model selected. Pick one below."
+          }
           last
         >
-          <span class="text-[12px] text-[var(--color-ink-mute)]">
-            Local (Whisper)
-          </span>
+          <StaticValue>
+            {activeStt() ? activeStt()!.descriptor.tier : "—"} tier
+          </StaticValue>
         </Row>
       </Card>
-      <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-        Whisper models
-      </div>
       <For each={sttModels()}>
         {(m) => (
           <ModelRow
@@ -933,10 +1182,14 @@ function ModelsTab(props: {
         )}
       </For>
 
+      <SectionHeader
+        title="Transcript polishing"
+        hint={props.s.polishing_enabled ? "Local · Gemma" : "Off"}
+      />
       <Card>
         <Row
-          label="Polish transcripts"
-          hint="Run a local Gemma model on each transcript to fix punctuation, remove filler words, and apply your active Voice Mode. When off, raw output is copied verbatim."
+          label="Clean up each transcript"
+          hint="Fix punctuation, drop filler words, and apply the active Voice Mode."
           last
         >
           <Toggle
@@ -946,39 +1199,185 @@ function ModelsTab(props: {
         </Row>
       </Card>
       <Show when={props.s.polishing_enabled}>
-        <Show when={!props.s.gemma_tos_accepted}>
-          <div class="mb-3 rounded-[10px] bg-[var(--color-accent-soft)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
-            You'll be asked to accept the{" "}
-            <a
-              class="underline"
-              href="https://ai.google.dev/gemma/terms"
-              target="_blank"
-            >
-              Gemma Terms of Use
-            </a>{" "}
-            on first download.
-          </div>
+        <SectionHeader
+          title="Polishing engine"
+          hint={
+            props.s.llm_engine === "apple-fm"
+              ? "Apple Intelligence"
+              : "Gemma 4 (local)"
+          }
+        />
+        <Show when={appleFm()?.supported_host}>
+          <AppleFmEngineRow
+            availability={appleFm()}
+            isActive={props.s.llm_engine === "apple-fm"}
+            onUse={setEngineAppleFm}
+            onRefresh={refreshAppleFm}
+          />
         </Show>
-        <InferenceServerSection />
-        <div class="mb-4 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-          Cleanup models
-        </div>
-        <For each={llmModels()}>
-          {(m) => (
-            <ModelRow
-              m={m}
-              isActive={props.s.llm_model_id === m.descriptor.id}
-              progress={progress()[m.descriptor.id]}
-              downloading={downloading().has(m.descriptor.id)}
-              onUse={() => setActiveLlm(m.descriptor.id)}
-              onDownload={() => startDownload(m.descriptor.id)}
-              onCancel={() => cancel(m.descriptor.id)}
-              onDelete={() => remove(m.descriptor.id)}
-            />
-          )}
-        </For>
+        <GemmaEngineRow
+          isActive={props.s.llm_engine === "gemma-local"}
+          onUse={setEngineGemma}
+        />
+        <Show when={props.s.llm_engine === "gemma-local"}>
+          <Show when={!props.s.gemma_tos_accepted}>
+            <div class="mb-3 rounded-[10px] bg-[var(--color-accent-soft)] p-3 ring-1 ring-[var(--color-accent)]/40 text-[12px] text-[var(--color-ink)]">
+              You'll be asked to accept the{" "}
+              <a
+                class="underline"
+                href="https://ai.google.dev/gemma/terms"
+                target="_blank"
+              >
+                Gemma Terms of Use
+              </a>{" "}
+              on first download.
+            </div>
+          </Show>
+          <InferenceServerSection />
+          <SectionHeader
+            title="Polishing model"
+            hint={activeLlm()?.descriptor.tier ? `${activeLlm()!.descriptor.tier} tier` : undefined}
+          />
+          <For each={llmModels()}>
+            {(m) => (
+              <ModelRow
+                m={m}
+                isActive={
+                  props.s.llm_engine === "gemma-local" &&
+                  props.s.llm_model_id === m.descriptor.id
+                }
+                progress={progress()[m.descriptor.id]}
+                downloading={downloading().has(m.descriptor.id)}
+                onUse={() => setActiveLlm(m.descriptor.id)}
+                onDownload={() => startDownload(m.descriptor.id)}
+                onCancel={() => cancel(m.descriptor.id)}
+                onDelete={() => remove(m.descriptor.id)}
+              />
+            )}
+          </For>
+        </Show>
       </Show>
     </>
+  );
+}
+
+function AppleFmEngineRow(props: {
+  availability: AppleFmAvailability | null;
+  isActive: boolean;
+  onUse: () => void;
+  onRefresh: () => void;
+}) {
+  const a = () => props.availability;
+  const reachable = () => a()?.available ?? false;
+  return (
+    <div class="mb-3 rounded-[14px] bg-[var(--color-surface-raised)] p-3 ring-1 ring-[var(--color-border)]">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1">
+          <div class="flex items-center gap-2">
+            <span class="text-[13px] font-medium text-[var(--color-ink)]">
+              Apple Intelligence
+            </span>
+            <Show when={props.isActive}>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Active
+              </span>
+            </Show>
+            <Show when={!props.isActive && reachable()}>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Recommended
+              </span>
+            </Show>
+          </div>
+          <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
+            On-device, no download. Uses Apple's Foundation Models on
+            macOS 26+ Apple Silicon Macs.
+          </p>
+          <Show when={!reachable() && a()}>
+            <p class="mt-1 text-[11px] text-[var(--color-danger)]">
+              Unavailable: {a()!.message}
+            </p>
+          </Show>
+        </div>
+        <div class="flex shrink-0 flex-col gap-1">
+          <Show
+            when={!props.isActive}
+            fallback={
+              <button
+                type="button"
+                disabled
+                class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] disabled:cursor-default"
+              >
+                In use
+              </button>
+            }
+          >
+            <button
+              type="button"
+              disabled={!reachable()}
+              onClick={props.onUse}
+              class="rounded-[8px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-black hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Use
+            </button>
+          </Show>
+          <Show when={!reachable()}>
+            <button
+              type="button"
+              onClick={props.onRefresh}
+              class="rounded-[8px] bg-transparent px-3 py-1 text-[10px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+            >
+              Re-check
+            </button>
+          </Show>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function GemmaEngineRow(props: { isActive: boolean; onUse: () => void }) {
+  return (
+    <div class="mb-3 rounded-[14px] bg-[var(--color-surface-raised)] p-3 ring-1 ring-[var(--color-border)]">
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1">
+          <div class="flex items-center gap-2">
+            <span class="text-[13px] font-medium text-[var(--color-ink)]">
+              Gemma 4 (open-source)
+            </span>
+            <Show when={props.isActive}>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Active
+              </span>
+            </Show>
+          </div>
+          <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
+            Runs offline once downloaded. Pick a model size below.
+          </p>
+        </div>
+        <div class="flex shrink-0">
+          <Show
+            when={!props.isActive}
+            fallback={
+              <button
+                type="button"
+                disabled
+                class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] disabled:cursor-default"
+              >
+                In use
+              </button>
+            }
+          >
+            <button
+              type="button"
+              onClick={props.onUse}
+              class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] font-medium text-[var(--color-ink)] hover:bg-[var(--color-control-hover)]"
+            >
+              Use
+            </button>
+          </Show>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -1089,9 +1488,10 @@ function InferenceServerSection() {
 
   return (
     <Show when={supported()}>
-      <div class="mb-2 text-[11px] uppercase tracking-wider text-[var(--color-ink-faint)]">
-        Inference engine
-      </div>
+      <SectionHeader
+        title="Inference engine"
+        hint={installed() ? "Installed" : "Required"}
+      />
       <Card>
         <Row
           label={`llama-server ${version()}`}
@@ -1422,6 +1822,7 @@ function ModesTab(props: {
         <Row
           label="Active mode"
           hint="Used for the next utterance unless you cycle or pick a different mode."
+          last
         >
           <select
             class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
@@ -1436,16 +1837,6 @@ function ModesTab(props: {
               )}
             </For>
           </select>
-        </Row>
-        <Row
-          label="Show suggestion HUD"
-          hint="Hint a mode based on the focused app. Vox never auto-switches."
-          last
-        >
-          <Toggle
-            checked={props.s.auto_suggest_modes}
-            onChange={(v) => props.update({ auto_suggest_modes: v })}
-          />
         </Row>
       </Card>
 
@@ -1528,10 +1919,10 @@ function ModeRow(props: {
   onExport: () => void;
 }) {
   return (
-    <div class="liquid-card mb-3 rounded-[10px] p-4 ring-1 ring-[var(--color-border)]">
-      <div class="flex items-start justify-between gap-3">
-        <div class="flex-1">
-          <div class="flex items-center gap-2">
+    <div class="liquid-card mb-3 rounded-[10px] px-5 py-4 ring-1 ring-[var(--color-border)]">
+      <div class="flex items-start justify-between gap-4">
+        <div class="flex min-w-0 flex-1 flex-col gap-1">
+          <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span class="text-[16px]" aria-hidden="true">
               {props.m.icon}
             </span>
@@ -1552,11 +1943,11 @@ function ModeRow(props: {
               </span>
             </Show>
           </div>
-          <div class="mt-0.5 text-[11px] text-[var(--color-ink-mute)]">
+          <div class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
             {props.m.description || "No description."}
           </div>
         </div>
-        <div class="flex shrink-0 flex-wrap items-center gap-1.5">
+        <div class="flex shrink-0 items-center gap-1.5">
           <Show when={!props.isActive}>
             <button
               type="button"
@@ -1571,8 +1962,9 @@ function ModeRow(props: {
               type="button"
               class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
               onClick={props.onDuplicate}
+              title="Make a custom copy you can edit"
             >
-              Duplicate to edit
+              Duplicate
             </button>
           </Show>
           <Show when={!props.m.built_in}>
@@ -1583,25 +1975,114 @@ function ModeRow(props: {
             >
               Edit
             </button>
-            <button
-              type="button"
-              class="rounded-[6px] bg-[var(--color-control)] px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-control-hover)]"
-              onClick={props.onExport}
-              title="Export as .voxmode"
-            >
-              Export
-            </button>
-            <button
-              type="button"
-              class="rounded-[6px] bg-[var(--color-control)] px-2 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
-              onClick={props.onDelete}
-            >
-              Delete
-            </button>
+            <ModeOverflowMenu
+              onExport={props.onExport}
+              onDuplicate={props.onDuplicate}
+              onDelete={props.onDelete}
+            />
           </Show>
         </div>
       </div>
     </div>
+  );
+}
+
+function ModeOverflowMenu(props: {
+  onExport: () => void;
+  onDuplicate: () => void;
+  onDelete: () => void;
+}) {
+  const [open, setOpen] = createSignal(false);
+  let containerRef: HTMLDivElement | undefined;
+
+  function onDocClick(e: MouseEvent) {
+    if (!containerRef) return;
+    if (!containerRef.contains(e.target as Node)) setOpen(false);
+  }
+
+  onMount(() => document.addEventListener("mousedown", onDocClick));
+  onCleanup(() => document.removeEventListener("mousedown", onDocClick));
+
+  return (
+    <div ref={containerRef} class="relative">
+      <button
+        type="button"
+        aria-label="More actions"
+        class="flex h-[28px] w-[28px] items-center justify-center rounded-[6px] bg-[var(--color-control)] text-[var(--color-ink-mute)] hover:bg-[var(--color-control-hover)] hover:text-[var(--color-ink)]"
+        onClick={() => setOpen(!open())}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="currentColor"
+          aria-hidden="true"
+        >
+          <circle cx="5" cy="12" r="1.6" />
+          <circle cx="12" cy="12" r="1.6" />
+          <circle cx="19" cy="12" r="1.6" />
+        </svg>
+      </button>
+      <Show when={open()}>
+        <div
+          class="absolute right-0 top-[32px] z-30 flex min-w-[160px] flex-col overflow-hidden rounded-[8px] ring-1 ring-[var(--color-border-strong)]"
+          style={{
+            background: "var(--color-surface-raised)",
+            "backdrop-filter": "var(--glass-blur)",
+            "-webkit-backdrop-filter": "var(--glass-blur)",
+            "box-shadow": "var(--glass-shadow-stack-sm)",
+          }}
+          role="menu"
+        >
+          <MenuItem
+            onClick={() => {
+              setOpen(false);
+              props.onDuplicate();
+            }}
+          >
+            Duplicate
+          </MenuItem>
+          <MenuItem
+            onClick={() => {
+              setOpen(false);
+              props.onExport();
+            }}
+          >
+            Export…
+          </MenuItem>
+          <MenuItem
+            danger
+            onClick={() => {
+              setOpen(false);
+              props.onDelete();
+            }}
+          >
+            Delete
+          </MenuItem>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
+function MenuItem(props: {
+  children: any;
+  onClick: () => void;
+  danger?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={props.onClick}
+      class="px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+      classList={{
+        "text-[var(--color-ink)]": !props.danger,
+        "text-[var(--color-danger)]": props.danger,
+      }}
+    >
+      {props.children}
+    </button>
   );
 }
 
@@ -1996,44 +2477,114 @@ function DictionaryTab(props: {
 }
 
 function PrivacyTab(_props: { s: Settings }) {
+  const guarantees: { title: string; detail: string }[] = [
+    {
+      title: "Audio never leaves the Mac",
+      detail:
+        "Captured into memory, transcribed locally, freed before the pipeline ends.",
+    },
+    {
+      title: "Transcripts stay on the device",
+      detail:
+        "Whisper and Gemma both run on Apple Silicon. No network calls in the dictation path.",
+    },
+    {
+      title: "Nothing is written to disk",
+      detail:
+        "Audio is never saved. Transcripts live only in a process-lifetime ring buffer.",
+    },
+    {
+      title: "No telemetry",
+      detail: "No analytics, no crash uploads, no remote logs.",
+    },
+    {
+      title: "No keys to leak",
+      detail:
+        "There are no API keys to store, because there are no third-party services.",
+    },
+  ];
+
   return (
     <>
-      <Card>
-        <Row label="Audio" hint="Stays on this Mac." last>
-          <span class="rounded-full bg-[var(--color-success)]/20 px-2 py-0.5 text-[10px] text-[var(--color-success)]">
-            LOCAL
-          </span>
-        </Row>
-      </Card>
-      <Card>
-        <Row
-          label="Transcript polishing"
-          hint="Stays on this Mac (or skipped, if polishing is off)."
-          last
-        >
-          <span class="rounded-full bg-[var(--color-success)]/20 px-2 py-0.5 text-[10px] text-[var(--color-success)]">
-            LOCAL
-          </span>
-        </Row>
-      </Card>
-
-      <p class="mb-4 text-[11px] text-[var(--color-ink-mute)]">
-        Vox is now fully on-device. There is no setting that sends your
-        audio or transcripts to any external service.
-      </p>
-
-      <div class="liquid-card mb-5 rounded-[14px] p-4 ring-1 ring-[var(--color-border)]">
-        <h3 class="mb-2 text-[13px] font-semibold text-[var(--color-ink)]">
-          What never leaves
-        </h3>
-        <ul class="space-y-1 text-[12px] text-[var(--color-ink-mute)]">
-          <li>• No audio is ever written to disk.</li>
-          <li>• No transcripts are sent over the network.</li>
-          <li>• No transcript history is persisted across app quits.</li>
-          <li>• No telemetry, no analytics, no crash uploads.</li>
-          <li>• No API keys are stored — there is nothing to leak.</li>
+      <div
+        class="liquid-card mb-5 overflow-hidden rounded-[14px] ring-1 ring-[var(--color-border)]"
+      >
+        <div class="flex items-start gap-3 border-b border-[var(--color-border)] px-4 py-4">
+          <div
+            class="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px]"
+            style={{
+              background: "var(--color-success)",
+              "box-shadow":
+                "inset 0 1px 0 rgba(255,255,255,0.35), 0 1px 2px rgba(0,0,0,0.15)",
+            }}
+            aria-hidden="true"
+          >
+            <svg
+              width="18"
+              height="18"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="white"
+              stroke-width="2.25"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <rect x="4" y="11" width="16" height="10" rx="2" />
+              <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+            </svg>
+          </div>
+          <div class="flex flex-col">
+            <h3 class="text-[14px] font-semibold text-[var(--color-ink)]">
+              Fully on-device
+            </h3>
+            <p class="mt-0.5 text-[12px] text-[var(--color-ink-mute)]">
+              Vox runs entirely on this Mac. There is no setting that
+              would send your audio or transcripts to any external
+              service.
+            </p>
+          </div>
+        </div>
+        <ul class="flex flex-col">
+          <For each={guarantees}>
+            {(g, i) => (
+              <li
+                class="flex items-start gap-3 px-4 py-3"
+                classList={{
+                  "border-b border-[var(--color-border)]":
+                    i() < guarantees.length - 1,
+                }}
+              >
+                <svg
+                  class="mt-0.5 shrink-0 text-[var(--color-success)]"
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                  aria-hidden="true"
+                >
+                  <polyline points="5 12 10 17 19 7" />
+                </svg>
+                <div class="flex flex-col">
+                  <span class="text-[13px] text-[var(--color-ink)]">
+                    {g.title}
+                  </span>
+                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+                    {g.detail}
+                  </span>
+                </div>
+              </li>
+            )}
+          </For>
         </ul>
       </div>
+      <p class="text-[11px] text-[var(--color-ink-faint)]">
+        Verifiable: Vox is open source — open Activity Monitor while
+        dictating to confirm there are no outbound connections.
+      </p>
     </>
   );
 }
@@ -2103,20 +2654,37 @@ function AboutTab() {
   return (
     <>
       <div class="liquid-card mb-5 rounded-[14px] p-5 ring-1 ring-[var(--color-border)]">
-        <div class="mb-1 text-[20px] font-semibold tracking-[-0.015em] text-[var(--color-ink)]">
-          Vox
+        <div class="flex items-center gap-3">
+          <VoxLogo size={48} />
+
+          <div class="flex flex-col">
+            <div class="text-[20px] font-semibold tracking-[-0.015em] text-[var(--color-ink)]">
+              Vox
+            </div>
+            <div class="text-[12px] text-[var(--color-ink-mute)]">
+              On-device dictation. Press, speak, paste.
+            </div>
+          </div>
         </div>
-        <div class="text-[13px] text-[var(--color-ink-mute)]">
-          Talk to any app — now offline by default.
-        </div>
-        <div class="mt-3 text-[11px] text-[var(--color-ink-faint)]">
-          Version 1.0.0 · Local-first · Built with Tauri
+        <div class="mt-3 flex flex-wrap items-center gap-1.5">
+          <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
+            v1.0.0
+          </span>
+          <span class="rounded-full bg-[var(--color-success)]/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-success)]">
+            Local-first
+          </span>
+          <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
+            Tauri 2
+          </span>
         </div>
       </div>
+
+      <SectionHeader title="Updates" />
       <Card>
         <Row
           label="Check for updates"
           hint="Auto-update requires a signed release."
+          last={!updateResult()}
         >
           <button
             type="button"
@@ -2129,7 +2697,7 @@ function AboutTab() {
         </Row>
         <Show when={updateResult()}>
           {(r) => (
-            <div class="px-4 py-3 border-b border-[var(--color-border)]">
+            <div class="px-4 py-3">
               <span
                 class="text-[12px]"
                 classList={{
@@ -2145,6 +2713,10 @@ function AboutTab() {
             </div>
           )}
         </Show>
+      </Card>
+
+      <SectionHeader title="Help & diagnostics" />
+      <Card>
         <Row
           label="Replay onboarding"
           hint="Walk through the setup wizard again."
@@ -2158,8 +2730,8 @@ function AboutTab() {
           </button>
         </Row>
         <Row
-          label="Diagnostics"
-          hint="Print hotkey bindings and any registration errors."
+          label="Hotkey diagnostics"
+          hint="Print bindings and any registration errors."
         >
           <button
             type="button"
@@ -2170,8 +2742,9 @@ function AboutTab() {
           </button>
         </Row>
         <Row
-          label="Open Accessibility settings"
-          hint="Copies this build's binary path to the clipboard so you can paste it into Privacy & Security → Accessibility (Cmd+Shift+G)."
+          label="Reveal binary for Accessibility"
+          hint="For chord hotkeys only. Copies the build path so you can add it under Privacy & Security."
+          last={!devInfo() && !diagErr() && !diag()}
         >
           <button
             type="button"
@@ -2183,17 +2756,24 @@ function AboutTab() {
         </Row>
         <Show when={devInfo()}>
           {(d) => (
-            <div class="px-4 py-3 border-b border-[var(--color-border)] flex flex-col gap-1">
+            <div class="flex flex-col gap-1 border-t border-[var(--color-border)] px-4 py-3">
               <span class="text-[11px] text-[var(--color-ink-mute)]">
-                Bundle id: <code class="text-[var(--color-ink)]">{d().bundle_identifier}</code>
+                Bundle id:{" "}
+                <code class="text-[var(--color-ink)]">
+                  {d().bundle_identifier}
+                </code>
                 <Show when={d().is_dev_build}>
-                  <span class="ml-2 rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">dev build</span>
+                  <span class="ml-2 rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">
+                    dev build
+                  </span>
                 </Show>
                 <Show when={!d().accessibility_granted}>
-                  <span class="ml-2 rounded-full bg-[var(--color-danger)]/20 px-2 py-0.5 text-[10px] text-[var(--color-danger)]">accessibility denied</span>
+                  <span class="ml-2 rounded-full bg-[var(--color-danger)]/20 px-2 py-0.5 text-[10px] text-[var(--color-danger)]">
+                    accessibility denied
+                  </span>
                 </Show>
               </span>
-              <span class="text-[11px] text-[var(--color-ink-faint)] break-all">
+              <span class="break-all text-[11px] text-[var(--color-ink-faint)]">
                 {d().binary_path}
               </span>
               <Show when={devCopied()}>
@@ -2205,28 +2785,19 @@ function AboutTab() {
           )}
         </Show>
         <Show when={diagErr()}>
-          <div class="px-4 py-3 text-[12px] text-[var(--color-danger)] border-b border-[var(--color-border)]">
+          <div class="border-t border-[var(--color-border)] px-4 py-3 text-[12px] text-[var(--color-danger)]">
             {diagErr()}
           </div>
         </Show>
         <Show when={diag()}>
           {(d) => (
-            <div class="px-4 py-3 border-b border-[var(--color-border)]">
+            <div class="border-t border-[var(--color-border)] px-4 py-3">
               <pre class="overflow-x-auto rounded-[6px] bg-[var(--color-input-bg)] p-3 text-[11px] text-[var(--color-ink)]">
                 {formatDiagnostics(d())}
               </pre>
             </div>
           )}
         </Show>
-        <Row
-          label="GitHub"
-          hint="Report an issue or read the source."
-          last
-        >
-          <span class="text-[12px] text-[var(--color-ink-mute)]">
-            (coming soon)
-          </span>
-        </Row>
       </Card>
     </>
   );

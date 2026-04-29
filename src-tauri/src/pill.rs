@@ -25,6 +25,12 @@ pub struct PillStatePayload {
     pub state: PillState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// True when the state is `Done` but a non-fatal step (typically
+    /// LLM polish) failed and we copied the raw transcript instead.
+    /// Without this flag a silent fail-open is indistinguishable from
+    /// a successful polish — the user has no idea their cleanup was
+    /// skipped.
+    pub warning: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,12 +96,33 @@ pub fn hide<R: Runtime>(app: &AppHandle<R>) {
 }
 
 pub fn emit_state<R: Runtime>(app: &AppHandle<R>, state: PillState, message: Option<String>) {
+    emit_state_inner(app, state, message, false);
+}
+
+/// Same as [`emit_state`] but flags the payload with `warning=true`. Use
+/// for `Done` states where the clipboard write succeeded but a soft
+/// step (e.g. LLM polish) was skipped, so the frontend can swap the
+/// green-success treatment for an amber warning treatment.
+pub fn emit_state_warning<R: Runtime>(
+    app: &AppHandle<R>,
+    state: PillState,
+    message: Option<String>,
+) {
+    emit_state_inner(app, state, message, true);
+}
+
+fn emit_state_inner<R: Runtime>(
+    app: &AppHandle<R>,
+    state: PillState,
+    message: Option<String>,
+    warning: bool,
+) {
     // Errors are interactive (dismissable); everything else stays click-through.
     let click_through = !matches!(state, PillState::Error);
     if let Some(win) = app.get_webview_window(LABEL) {
         let _ = win.set_ignore_cursor_events(click_through);
     }
-    let payload = PillStatePayload { state, message };
+    let payload = PillStatePayload { state, message, warning };
     let _ = app.emit_to(LABEL, "pill:state", payload);
 
     let tray_state = match state {

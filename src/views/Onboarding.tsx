@@ -10,6 +10,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   acceptGemmaTos,
+  appleFmAvailability,
   checkPermissions,
   diagnoseHotkeys,
   downloadInferenceServer,
@@ -29,6 +30,7 @@ import {
   recommendTier,
   requestMicrophone,
   setSettings,
+  type AppleFmAvailability,
   type HotkeyDiagnostic,
   type InferenceServerStatus,
   type ModelStatus,
@@ -36,6 +38,9 @@ import {
   type Settings,
   type TierRecommendation,
 } from "../lib/ipc";
+import { VoxLogo } from "../components/VoxLogo";
+
+type PolishChoice = "apple-fm" | "gemma-local";
 
 type Step = 0 | 1 | 2 | 3 | 4;
 
@@ -278,32 +283,12 @@ function PrimaryButton(props: {
 function Welcome() {
   return (
     <div class="flex flex-col items-center gap-5 text-center">
-      <div
-        class="flex h-24 w-24 items-center justify-center rounded-full"
-        style={{
-          background:
-            "radial-gradient(circle, rgba(124,156,255,0.35), rgba(124,156,255,0.05) 70%)",
-        }}
-      >
-        <svg
-          width="56"
-          height="56"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="var(--color-accent)"
-          stroke-width="1.5"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-        >
-          <rect x="9" y="2" width="6" height="12" rx="3" />
-          <path d="M5 10a7 7 0 0 0 14 0" />
-          <line x1="12" y1="17" x2="12" y2="22" />
-        </svg>
-      </div>
+      <VoxLogo size={96} />
       <div>
-        <h1 class="text-[24px] font-semibold">Talk to any app.</h1>
+        <h1 class="text-[24px] font-semibold">On-device dictation.</h1>
         <p class="mt-2 max-w-[360px] text-[13px] text-[var(--color-ink-mute)]">
-          Vox runs offline on your Mac.
+          Press, speak, paste. Vox runs entirely on this Mac — nothing
+          leaves the device.
         </p>
       </div>
     </div>
@@ -390,6 +375,12 @@ function DownloadStep(props: {
   const [selectedLlmId, setSelectedLlmId] = createSignal<string | null>(null);
   const [binaryStatus, setBinaryStatus] =
     createSignal<InferenceServerStatus | null>(null);
+  const [appleFm, setAppleFm] = createSignal<AppleFmAvailability | null>(null);
+  // Default to Apple Intelligence when available — saves the 3.5–5.4 GB
+  // Gemma download. Set after the availability probe resolves below.
+  const [polishChoice, setPolishChoice] = createSignal<PolishChoice | null>(
+    null,
+  );
   const unlistens: (() => void)[] = [];
 
   onMount(async () => {
@@ -420,16 +411,22 @@ function DownloadStep(props: {
     unlistens.push(await onBinaryError(handleError));
 
     try {
-      const [all, bin] = await Promise.all([listModels(), inferenceServerStatus()]);
+      const [all, bin, fm] = await Promise.all([
+        listModels(),
+        inferenceServerStatus(),
+        appleFmAvailability(),
+      ]);
       setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
       setBinaryStatus(bin);
+      setAppleFm(fm);
+      setPolishChoice(fm.available ? "apple-fm" : "gemma-local");
       // Re-runs from Settings: pre-mark already-installed binary so the
       // gate doesn't block forever.
       if (bin.installed) {
         setCompleted((prev) => new Set(prev).add(bin.id));
       }
     } catch (e) {
-      console.warn("listModels/inferenceServerStatus failed", e);
+      console.warn("onboarding probes failed", e);
     }
   });
 
@@ -454,9 +451,39 @@ function DownloadStep(props: {
   async function start() {
     const t = props.tier;
     const cur = props.s;
-    const llmId = selectedLlmId();
-    if (!t || !cur || !llmId) return;
+    const choice = polishChoice();
+    if (!t || !cur || !choice) return;
     setStarted(true);
+
+    if (choice === "apple-fm") {
+      // Apple Intelligence: no GGUF download, no llama-server. Whisper
+      // is still local and still needs to come down.
+      await props.patch({
+        stt_engine: "whisper-local",
+        stt_model_id: t.stt_model_id,
+        llm_engine: "apple-fm",
+        // Keep the recommended Gemma id so a later switch in Settings
+        // doesn't have to re-pick the tier-matched one.
+        llm_model_id: t.llm_model_id,
+        polishing_enabled: true,
+      });
+      try {
+        props.onInFlightChange(true);
+        await downloadModel(t.stt_model_id);
+        await loadModelWarm(t.stt_model_id);
+      } catch (e) {
+        setErr(String(e));
+      } finally {
+        props.onInFlightChange(false);
+      }
+      return;
+    }
+
+    const llmId = selectedLlmId();
+    if (!llmId) {
+      setStarted(false);
+      return;
+    }
     if (!cur.gemma_tos_accepted) {
       await acceptGemmaTos();
     }
@@ -466,6 +493,7 @@ function DownloadStep(props: {
       llm_engine: "gemma-local",
       llm_model_id: llmId,
       gemma_tos_accepted: true,
+      polishing_enabled: true,
     });
     try {
       props.onInFlightChange(true);
@@ -490,23 +518,37 @@ function DownloadStep(props: {
 
   return (
     <div class="flex w-full max-w-[420px] flex-col gap-4">
-      <h2 class="text-[20px] font-semibold">Set up local models.</h2>
+      <h2 class="text-[20px] font-semibold">Choose your polishing engine.</h2>
       <Show when={!started()}>
         <p class="text-[13px] text-[var(--color-ink-mute)]">
-          Vox will download Whisper and Gemma 4 from Hugging Face. By
-          continuing you accept the{" "}
-          <a
-            class="underline"
-            href="https://ai.google.dev/gemma/terms"
-            target="_blank"
-          >
-            Gemma Terms of Use
-          </a>
-          .
+          Vox cleans up your transcripts before copying them — punctuation,
+          capitalization, structure. Pick the model it should use.
         </p>
-        <Show when={llmModels().length > 0 && props.tier}>
+        <div class="flex flex-col gap-2" role="radiogroup" aria-label="Polishing engine">
+          <PolishEngineCard
+            engine="apple-fm"
+            title="Apple Intelligence"
+            subtitle="On-device. No download. Requires macOS 26 + Apple Silicon."
+            recommended={appleFm()?.available ?? false}
+            disabled={!(appleFm()?.available ?? false)}
+            disabledReason={appleFm()?.message ?? null}
+            selected={polishChoice() === "apple-fm"}
+            onSelect={() => setPolishChoice("apple-fm")}
+          />
+          <PolishEngineCard
+            engine="gemma-local"
+            title="Gemma 4 (open-source)"
+            subtitle="Runs entirely offline. Choose a size below."
+            recommended={!(appleFm()?.available ?? false)}
+            disabled={false}
+            disabledReason={null}
+            selected={polishChoice() === "gemma-local"}
+            onSelect={() => setPolishChoice("gemma-local")}
+          />
+        </div>
+        <Show when={polishChoice() === "gemma-local" && llmModels().length > 0 && props.tier}>
           {(t) => (
-            <div class="flex flex-col gap-2" role="radiogroup" aria-label="Gemma 4 model">
+            <div class="flex flex-col gap-2 mt-2" role="radiogroup" aria-label="Gemma 4 model">
               <div class="flex items-baseline justify-between">
                 <span class="text-[13px] font-medium">Choose your Gemma 4 model</span>
                 <Show when={t().physical_ram_gb > 0}>
@@ -530,16 +572,29 @@ function DownloadStep(props: {
                   />
                 )}
               </For>
+              <p class="text-[11px] text-[var(--color-ink-faint)]">
+                By continuing you accept the{" "}
+                <a class="underline" href="https://ai.google.dev/gemma/terms" target="_blank">
+                  Gemma Terms of Use
+                </a>
+                .
+              </p>
             </div>
           )}
         </Show>
         <button
           type="button"
           class="self-start rounded-[8px] bg-[var(--color-accent)] px-4 py-2 text-[13px] font-medium text-black hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={!selectedLlmId() || !props.tier}
+          disabled={
+            !polishChoice() ||
+            !props.tier ||
+            (polishChoice() === "gemma-local" && !selectedLlmId())
+          }
           onClick={start}
         >
-          Accept and download
+          {polishChoice() === "apple-fm"
+            ? "Continue with Apple Intelligence"
+            : "Accept and download"}
         </button>
       </Show>
       <Show when={started() && props.tier}>
@@ -550,7 +605,7 @@ function DownloadStep(props: {
               done={completed().has(t().stt_model_id)}
               prog={progress()[t().stt_model_id]}
             />
-            <Show when={selectedDescriptor()} fallback={null}>
+            <Show when={polishChoice() === "gemma-local" && selectedDescriptor()} fallback={null}>
               {(d) => (
                 <DownloadBar
                   label={shortLlmName(d().name)}
@@ -559,7 +614,7 @@ function DownloadStep(props: {
                 />
               )}
             </Show>
-            <Show when={binaryStatus()}>
+            <Show when={polishChoice() === "gemma-local" && binaryStatus()}>
               {(b) => (
                 <DownloadBar
                   label="Inference engine"
@@ -575,6 +630,68 @@ function DownloadStep(props: {
         <p class="text-[12px] text-[var(--color-danger)]">{err()}</p>
       </Show>
     </div>
+  );
+}
+
+function PolishEngineCard(props: {
+  engine: PolishChoice;
+  title: string;
+  subtitle: string;
+  recommended: boolean;
+  disabled: boolean;
+  disabledReason: string | null;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={props.selected}
+      disabled={props.disabled}
+      onClick={props.onSelect}
+      class="flex flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color] disabled:cursor-not-allowed"
+      classList={{
+        "ring-1 ring-[var(--color-border)]": !props.selected && !props.disabled,
+        "ring-2 ring-[var(--color-accent)]": props.selected,
+        "opacity-50": props.disabled,
+      }}
+    >
+      <div class="flex items-center justify-between gap-2">
+        <span class="text-[13px] font-medium text-[var(--color-ink)]">
+          {props.title}
+        </span>
+        <span
+          class="flex h-3.5 w-3.5 items-center justify-center rounded-full"
+          classList={{
+            "ring-1 ring-[var(--color-border-strong)]": !props.selected,
+            "bg-[var(--color-accent)]": props.selected,
+          }}
+          aria-hidden="true"
+        >
+          <Show when={props.selected}>
+            <span class="h-1.5 w-1.5 rounded-full bg-black" />
+          </Show>
+        </span>
+      </div>
+      <span class="text-[11px] text-[var(--color-ink-mute)]">
+        {props.subtitle}
+      </span>
+      <Show when={props.recommended || props.disabled}>
+        <div class="mt-1 flex flex-wrap gap-1">
+          <Show when={props.recommended && !props.disabled}>
+            <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+              Recommended
+            </span>
+          </Show>
+          <Show when={props.disabled && props.disabledReason}>
+            <span class="rounded-full bg-[var(--color-ink-faint)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-ink-mute)]">
+              {props.disabledReason}
+            </span>
+          </Show>
+        </div>
+      </Show>
+    </button>
   );
 }
 

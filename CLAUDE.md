@@ -10,7 +10,11 @@ This file is the canonical project reference. The README that used to live at th
 
 - **macOS menu-bar app**, no Dock icon (`ActivationPolicy::Accessory`).
 - **Tauri 2** Rust core + **SolidJS** + **Tailwind 4** frontend.
-- **Whisper** for STT (in-process via `whisper-rs`) and **Gemma 4** for transcript polishing (out-of-process via a downloaded `llama-server` binary we talk to over loopback HTTP) — both Metal/Core ML on Apple Silicon. Models live on disk; nothing leaves the Mac. (See `Known limitations` and the `models.rs` doc comment for which Gemma 4 GGUFs run cleanly under the pinned `llama.cpp` release.)
+- **Whisper** for STT (in-process via `whisper-rs`).
+- **Two polishing engines, user-pickable in onboarding and Settings → Models:**
+  - **Apple Intelligence** via Apple's `FoundationModels` framework. Implemented as an in-process Swift FFI bridge (`swift/AppleFmBridge.swift` compiled to a static library by `build.rs::build_apple_fm_bridge`, called from `engines::apple_fm` through `engines::apple_fm_bridge`). Recommended default on Macs with macOS 26+ Apple Silicon and Apple Intelligence enabled in System Settings. No download. Apple's safety guardrails can refuse certain dictation; the engine returns a clear error and `session.rs` fail-opens to the raw Whisper transcript.
+  - **Gemma 4** out-of-process via a downloaded `llama-server` binary we talk to over loopback HTTP (`engines::gemma_http`). Default fallback when Apple Intelligence is unavailable, and the only option on macOS < 26.
+- All inference is on-device: Metal / Core ML on Apple Silicon, plus the Apple Neural Engine and `modelinferenced` system daemon for Foundation Models. Models live on disk; nothing leaves the Mac.
 - **Cloud is gone.** No Groq, no Anthropic, no API keys, no telemetry, no analytics. The only network calls remaining are model + `llama-server` downloads from Hugging Face / GitHub and the auto-updater (currently stubbed off until signing is wired up).
 - **Output is the clipboard.** The transcript replaces the clipboard contents and the user pastes manually — no synthetic `Cmd+V`, no Accessibility required for the default pipeline.
 
@@ -24,8 +28,8 @@ This file is the canonical project reference. The README that used to live at th
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
 | `dictation_enabled` | `true` | Master kill-switch from the tray popover. |
 | `stt_engine` / `stt_model_id` | `whisper-local` / tier-recommended | Auto-tier via `recommend_tier`. |
-| `llm_engine` / `llm_model_id` | `gemma-local` / tier-recommended | |
-| `polishing_enabled` | `true` | UI toggle that maps to `llm_engine ∈ {gemma-local, none}`. Persisted independently so the user's intent survives engine outages. |
+| `llm_engine` / `llm_model_id` | `gemma-local` / tier-recommended on disk; onboarding flips to `apple-fm` when `apple_fm_availability` reports `available` | `apple-fm` ignores the `llm_model_id` field but we still keep a tier-matched Gemma id there so a later switch in Settings doesn't have to re-pick one. |
+| `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
 | `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. |
 | `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
@@ -34,9 +38,9 @@ This file is the canonical project reference. The README that used to live at th
 
 ## Pipeline
 
-Hotkey down → **Listening** pill + live waveform → hotkey up → **Transcribing** (Whisper local) → optional **Polishing** (Gemma local with the active mode's system prompt + dictionary) → **Done** with `Copied — press ⌘V to paste.`
+Hotkey down → **Listening** pill + live waveform → hotkey up → **Transcribing** (Whisper local) → optional **Polishing** (Apple Intelligence or Gemma local, with the active mode's system prompt + dictionary) → **Done** with `Copied — press ⌘V to paste.`
 
-Errors surface in the pill: missing model, mic denied, audio device error, silence, polishing timeout. The pipeline is fail-open: any LLM error logs `WARN` and the raw Whisper output is copied instead.
+Errors surface in the pill: missing model, mic denied, audio device error, silence, polishing timeout. The pipeline is fail-open: any LLM error — including Apple Intelligence guardrail rejections and `LanguageModelSession.GenerationError` — logs `WARN` and the raw Whisper output is copied instead.
 
 ## Voice Modes
 
@@ -105,7 +109,11 @@ Each mode contributes:
 │           ├── mod.rs                 ← Registry + SttEngine / LlmEngine traits + STT pre-warm helper
 │           ├── whisper_local.rs       ← whisper-rs 0.16 (CoreML+Metal), in-process
 │           ├── gemma_http.rs          ← OpenAI chat-completions client against the loopback llama-server
+│           ├── apple_fm.rs            ← Apple Intelligence (Foundation Models) LlmEngine, macOS 26+
+│           ├── apple_fm_bridge.rs     ← unsafe FFI wrappers for the Swift static library
 │           └── none.rs                ← no-op LLM (raw transcript)
+├── src-tauri/swift/
+│   └── AppleFmBridge.swift            ← Swift `@_cdecl` exports calling LanguageModelSession
 └── scripts/
     ├── dev-bundle.sh                  ← build + open a debug .app for TCC sanity
     ├── dev-clean-state.sh             ← wipe ALL Vox state for a clean first run
@@ -123,7 +131,15 @@ npm install
 npm run tauri dev
 ```
 
-The first compile is slow because `local-engines` pulls in `whisper-rs` with its Metal backend. Gemma polishing now lives in a separate `llama-server` subprocess we download at runtime, so it no longer participates in the Cargo build. Subsequent compiles are incremental.
+The first compile is slow because `local-engines` pulls in `whisper-rs` with its Metal backend, and the `apple-fm` feature drives `build.rs::build_apple_fm_bridge` to invoke `swiftc` on `src-tauri/swift/AppleFmBridge.swift`. Gemma polishing lives in a separate `llama-server` subprocess we download at runtime, so it doesn't participate in the Cargo build. Subsequent compiles are incremental.
+
+CI / dev machines without Xcode-bundled `swiftc` can opt out of the Swift bridge:
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --features local-engines
+```
+
+In that mode `commands::apple_fm_availability` returns `framework_missing`, the onboarding wizard's Apple Intelligence card is disabled, and only the Gemma 4 path is reachable.
 
 Onboarding fires automatically when `onboarded == false`: Welcome → Mic → Accessibility (optional, only matters for chord hotkeys) → Download local models → How to use.
 
@@ -210,11 +226,14 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - **Engine errors are fail-open.** STT errors abort the session; LLM errors log a warning and the raw transcript is copied. Both states surface a friendly pill.
 - **Mode prompts come from the active mode at session start.** Switching modes mid-pipeline does not affect the current utterance.
 - **Voice Mode IDs are validated** against `[a-z0-9-]{1,64}` with no edge dashes (`is_safe_mode_id`) to prevent path traversal in the JSON store.
-- **Engines pre-warm in the background at launch.** `lib.rs::run`'s setup hook spawns `inference_proc::prewarm_in_background` (boots `llama-server` if the binary + Gemma model are installed) and `engines::prewarm_stt_in_background` (cold-loads the Whisper GGML weights). Both are idempotent and no-op when their preconditions aren't met, so the first dictation doesn't pay the spawn / load cost.
+- **Engines pre-warm in the background at launch.** `lib.rs::run`'s setup hook spawns `inference_proc::prewarm_in_background` (boots `llama-server` only when `llm_engine == "gemma-local"` and the binary + Gemma model are installed — it's a no-op for `apple-fm`, which has no spawn cost to amortise; the OS's `modelinferenced` daemon handles its own warmup) and `engines::prewarm_stt_in_background` (cold-loads the Whisper GGML weights). Both are idempotent and no-op when their preconditions aren't met.
 - **`llama-server` orphans get reaped at startup.** macOS has no `prctl(PR_SET_PDEATHSIG)`, so a force-killed previous Vox parent can leave a `llama-server` child running. `inference_proc::reap_orphans_at_startup` walks the process table and SIGKILLs any whose `--api-key` argument matches the persisted `inference_api_key`. That's why the api key is persisted across launches even though it's not security-relevant.
 
 ## Known limitations
 
+- **Apple Intelligence content guardrails.** The Foundation Models framework hard-blocks high-severity content categories (self-harm, violence, adult sexual content) on both input *and* output, and there is no developer opt-out — guardrail rejections surface as `LanguageModelSession.GenerationError`. We translate that into an `anyhow::Error` from `engines::apple_fm`, which the existing `session.rs` fail-open path turns into a "use the raw Whisper transcript" outcome. Users dictating medical / legal / profanity-heavy content who'd rather not hit this should switch to Gemma 4 in Settings → Models.
+- **Apple Intelligence requires user opt-in.** Even on a supported Mac, `SystemLanguageModel.default.availability` returns `.unavailable(.appleIntelligenceNotEnabled)` until the user toggles Apple Intelligence on in System Settings → Apple Intelligence & Siri. The onboarding card detects this and shows the reason; the Settings → Models tab has a "Re-check" button that re-probes via `commands::apple_fm_availability` so the user can flip the System Settings toggle without restarting Vox.
+- **Windows polishing is Gemma-only.** Phi Silica was evaluated as a Windows analogue of Apple Intelligence and rejected for v1: Microsoft archived `windows-app-rs` (no Rust binding path), Phi Silica is still a Limited Access Feature behind a token gate on the experimental Windows App SDK 2.0-preview1, and only ~3% of Windows boxes meet the Copilot+ PC hardware requirement. When Vox eventually ships on Windows we'll reuse the existing `llama-server` + Gemma pipeline (llama.cpp publishes Windows binaries on the same release tag).
 - **Auto-update is stubbed.** `commands::check_for_updates` short-circuits to `unconfigured` until the placeholder endpoint and pubkey are replaced and the bundle is signed + notarized.
 - **No code signing yet.** Built `.app` is ad-hoc signed; macOS Gatekeeper will block it on first launch (control-click → Open once to trust).
 - **Gemma polish runs out-of-process.** `inference_server.rs` pins `LLAMA_CPP_TAG` (currently `b8953`) and downloads the matching official `llama-server` archive from the llama.cpp GitHub release. `inference_proc.rs` spawns it as a process-group / Job-Object child so the parent's death tears the child down too, even on SIGKILL. Bumping llama.cpp = bump `LLAMA_CPP_TAG` and (when set) `expected_sha256`; users on the old tag re-download into a different version directory and `cleanup_stale_versions` reaps the previous tree on the launch after.
@@ -227,4 +246,5 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - New IPC command: add to `src-tauri/src/commands.rs`, register in `src-tauri/src/lib.rs::invoke_handler!`, expose a typed binding in `src/lib/ipc.ts`.
 - New Settings field: extend the `Settings` struct + `Default` impl + `load`/`save` in `settings.rs`, mirror the field in `src/lib/ipc.ts::Settings`, and add a one-shot migration if old installs need backfill.
 - New Voice Mode built-in: add a clone in `modes::builtins()` plus a brand new `*_PROMPT` constant, update tests in `modes::tests`.
-- New engine: implement `SttEngine` or `LlmEngine` in `engines/`, wire it into `engines::Registry`, add a settings-id case for it in `set_settings` migration if reachable.
+- New engine: implement `SttEngine` or `LlmEngine` in `engines/`, wire it into `engines::Registry`, and add the engine id to the whitelist in `settings::load`'s `llm_engine` migration so a stored value of `"<your-engine>"` round-trips intact.
+- New native FFI bridge (Swift / Objective-C / C++): mirror `swift/AppleFmBridge.swift` + `engines/apple_fm_bridge.rs` + `build.rs::build_apple_fm_bridge`. The pattern: hand-rolled `@_cdecl` exports with `strdup`'d return strings, a thread-local error slot, and a Cargo feature flag so non-macOS builds skip both the build.rs step and the engine module via `#[cfg(all(target_os = "macos", feature = "..."))]`.
