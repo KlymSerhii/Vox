@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, onMount, Show } from "solid-js";
+import { createMemo, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 type PillState =
@@ -23,35 +23,13 @@ interface AudioLevelPayload {
   level: number;
 }
 
-interface ActiveModePayload {
-  id: string;
-  name: string;
-  icon: string;
-}
-
-interface ModeSuggestionPayload {
-  id: string;
-  name: string;
-  icon: string;
-}
-
-const BARS = 24;
-const METER_BARS = 10;
+const BARS = 32;
 
 export default function PillView() {
   const [state, setState] = createSignal<PillState>("listening");
   const [message, setMessage] = createSignal<string | null>(null);
   const [warning, setWarning] = createSignal(false);
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
-  const [meter, setMeter] = createSignal<number[]>(
-    new Array(METER_BARS).fill(0),
-  );
-  const [activeMode, setActiveMode] = createSignal<ActiveModePayload | null>(
-    null,
-  );
-  const [suggestion, setSuggestion] = createSignal<ModeSuggestionPayload | null>(
-    null,
-  );
 
   let unlisten: UnlistenFn[] = [];
 
@@ -69,25 +47,12 @@ export default function PillView() {
       await listen<AudioLevelPayload>("pill:audio_level", (e) => {
         const v = clamp(e.payload.level);
         setLevels((prev) => [...prev.slice(1), v]);
-        setMeter((prev) => nextMeter(prev, v));
       }),
     );
     unlisten.push(
       await listen("pill:show", () => {
         setLevels(new Array(BARS).fill(0));
-        setMeter(new Array(METER_BARS).fill(0));
-        setSuggestion(null);
         setWarning(false);
-      }),
-    );
-    unlisten.push(
-      await listen<ActiveModePayload>("pill:active_mode", (e) => {
-        setActiveMode(e.payload);
-      }),
-    );
-    unlisten.push(
-      await listen<ModeSuggestionPayload | null>("pill:mode_suggestion", (e) => {
-        setSuggestion(e.payload ?? null);
       }),
     );
   });
@@ -99,114 +64,70 @@ export default function PillView() {
   const isDone = () => state() === "done";
   const isDoneWarning = () => isDone() && warning();
   const isDoneSuccess = () => isDone() && !warning();
+  const isProcessing = () =>
+    state() === "transcribing" || state() === "polishing";
+
+  // Listening swaps the meter to warm coral so the brand color earns
+  // its keep at the one moment the device is recording. DESIGN.md §5.4.
+  const meterColor = createMemo(() => {
+    switch (state()) {
+      case "listening":
+        return "var(--color-coral)";
+      case "transcribing":
+        return "var(--color-accent)";
+      case "polishing":
+        return "var(--color-violet)";
+      default:
+        return "var(--color-meter)";
+    }
+  });
 
   return (
     <div class="flex h-screen w-screen items-center justify-center bg-transparent">
       <div
-        class="animate-pill-in pointer-events-none flex h-14 w-[272px] items-center gap-3 rounded-full px-4 transition-shadow duration-300"
+        class="animate-pill-in pointer-events-none flex h-[26px] w-[116px] items-center justify-center rounded-full px-1 transition-shadow duration-300"
         style={{
-          background: "var(--color-surface-glass)",
+          background: "var(--color-pill-surface)",
           "backdrop-filter": "var(--glass-blur)",
           "-webkit-backdrop-filter": "var(--glass-blur)",
           border: "1px solid var(--glass-rim)",
           "box-shadow": isDoneSuccess()
-            ? "inset 0 0 0 2px var(--color-success), 0 0 24px rgba(74, 222, 128, 0.55), var(--glass-shadow-stack)"
+            ? "inset 0 0 0 1.5px var(--color-success), 0 0 18px rgba(74, 222, 128, 0.42), var(--glass-shadow-pill)"
             : isDoneWarning()
-              ? "inset 0 0 0 2px var(--color-warning), 0 0 24px rgba(251, 191, 36, 0.45), var(--glass-shadow-stack)"
-              : "var(--glass-shadow-stack)",
+              ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px rgba(251, 191, 36, 0.38), var(--glass-shadow-pill)"
+              : "var(--glass-shadow-pill)",
         }}
         role="status"
         aria-live="polite"
       >
-        <LeftIcon state={state()} meter={meter()} warning={warning()} />
-        <div class="min-w-0 flex-1">
-          <Show
-            when={state() === "listening"}
-            fallback={
-              <span class="block truncate text-[13px] font-medium text-[var(--color-ink)]">
-                {pillLabel(state(), message(), warning())}
-              </span>
-            }
-          >
-            <Waveform levels={levels()} />
-          </Show>
-        </div>
-        <Show when={activeMode()}>
-          {(m) => <ModeChip name={m().name} icon={m().icon} />}
+        <Show when={state() === "listening"}>
+          <Waveform levels={levels()} color={meterColor()} />
         </Show>
-        <span
-          class="shrink-0 text-[12px] font-medium"
-          classList={{
-            "text-[var(--color-ink-mute)]":
-              state() === "listening" ||
-              state() === "transcribing" ||
-              state() === "polishing",
-            "text-[var(--color-success)]": isDoneSuccess(),
-            "text-[var(--color-warning)]": isDoneWarning(),
-            "text-[var(--color-danger)]": state() === "error",
-            "text-[var(--color-ink-mute)] italic": state() === "canceled",
-          }}
-        >
-          {rightLabel(state(), warning())}
-        </span>
-      </div>
-      <Show when={state() === "listening" ? suggestion() : null}>
-        {(sg) => <SuggestionHud name={sg().name} icon={sg().icon} />}
-      </Show>
-    </div>
-  );
-}
 
-function ModeChip(props: { name: string; icon: string }) {
-  return (
-    <span
-      class="inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium text-[var(--color-ink)]"
-      style={{
-        background: "var(--color-surface-glass)",
-        "backdrop-filter": "blur(18px) saturate(200%)",
-        "-webkit-backdrop-filter": "blur(18px) saturate(200%)",
-        border: "1px solid var(--glass-rim)",
-        "box-shadow": "var(--glass-shadow-stack-sm)",
-      }}
-      title={`Voice mode: ${props.name}`}
-    >
-      <span class="leading-none" aria-hidden="true">
-        {props.icon}
-      </span>
-      <span class="max-w-[80px] truncate">{props.name}</span>
-    </span>
-  );
-}
+        <Show when={isProcessing()}>
+          <ShimmerWord
+            text={state() === "transcribing" ? "Transcribing" : "Polishing"}
+            tint={meterColor()}
+          />
+        </Show>
 
-function SuggestionHud(props: { name: string; icon: string }) {
-  return (
-    <div
-      class="pointer-events-none absolute"
-      style={{
-        bottom: "12px",
-        right: "12px",
-        display: "flex",
-        "align-items": "center",
-      }}
-    >
-      <div
-        class="flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] text-[var(--color-ink)]"
-        style={{
-          background: "var(--color-surface-glass)",
-          "backdrop-filter": "var(--glass-blur)",
-          "-webkit-backdrop-filter": "var(--glass-blur)",
-          border: "1px solid var(--glass-rim)",
-          "box-shadow": "var(--glass-shadow-stack-sm)",
-        }}
-      >
-        <span aria-hidden="true">{props.icon}</span>
-        <span>Switch to {props.name}?</span>
-        <span
-          class="rounded px-1.5 py-0.5 text-[10px] text-[var(--color-ink-mute)]"
-          style={{ background: "var(--color-control)" }}
-        >
-          ⌥M
-        </span>
+        <Show when={state() === "done"}>
+          <TerminalLine
+            tone={warning() ? "warning" : "success"}
+            label={message() ?? (warning() ? "Raw copy" : "Done")}
+          />
+        </Show>
+
+        <Show when={state() === "error"}>
+          <TerminalLine
+            tone="error"
+            label={message() ?? "Error"}
+          />
+        </Show>
+
+        <Show when={state() === "canceled"}>
+          <TerminalLine tone="muted" label={message() ?? "Canceled"} />
+        </Show>
       </div>
     </div>
   );
@@ -217,125 +138,38 @@ function clamp(n: number): number {
   return Math.max(0, Math.min(1, n));
 }
 
-// Each bar trails the next by a frame so samples ripple through the
-// cluster. Decay 0.85 keeps the leftmost bars alive across 10 bars
-// (0.7 damps to nothing before reaching the far edge).
-function nextMeter(prev: number[], sample: number): number[] {
-  const next = new Array(prev.length).fill(0);
-  next[next.length - 1] = sample;
-  for (let i = 0; i < next.length - 1; i++) {
-    const incoming = prev[i + 1] ?? 0;
-    const decayed = (prev[i] ?? 0) * 0.85;
-    next[i] = Math.max(decayed, incoming);
-  }
-  const tailDecayed = (prev[prev.length - 1] ?? 0) * 0.85;
-  next[next.length - 1] = Math.max(tailDecayed, sample);
-  return next;
-}
-
-function pillLabel(
-  state: PillState,
-  message: string | null,
-  _warning: boolean,
-): string {
-  if (message) return message;
-  switch (state) {
-    case "transcribing":
-      return "Transcribing…";
-    case "polishing":
-      return "Polishing…";
-    case "done":
-      return "Copied";
-    case "canceled":
-      return "Canceled";
-    case "error":
-      return "Error";
-    default:
-      return "";
-  }
-}
-
-function rightLabel(state: PillState, warning: boolean): string {
-  switch (state) {
-    case "listening":
-      return "Listening…";
-    case "transcribing":
-      return "Transcribing";
-    case "polishing":
-      return "Polishing";
-    case "done":
-      return warning ? "Raw copy" : "Done";
-    case "canceled":
-      return "Canceled";
-    case "error":
-      return "Error";
-  }
-}
-
-function LeftIcon(props: {
-  state: PillState;
-  meter: number[];
-  warning: boolean;
-}) {
+function Waveform(props: { levels: number[]; color: string }) {
+  // Waveform spans the full pill width; the edge-envelope opacity is
+  // what the eye reads as "the wave fades into the pill" instead of a
+  // hard cluster floating in the middle with visible empty padding on
+  // the sides.
   return (
     <div
-      class="flex h-8 shrink-0 items-center justify-center"
-      classList={{
-        "w-[52px]": props.state === "listening",
-        "w-7": props.state !== "listening",
-      }}
-    >
-      <Show when={props.state === "listening"}>
-        <MicLevelMeter bars={props.meter} />
-      </Show>
-      <Show
-        when={
-          props.state === "transcribing" || props.state === "polishing"
-        }
-      >
-        <Spinner violet={props.state === "polishing"} />
-      </Show>
-      <Show when={props.state === "done" && !props.warning}>
-        <CheckIcon />
-      </Show>
-      <Show when={props.state === "done" && props.warning}>
-        <WarningIcon />
-      </Show>
-      <Show when={props.state === "error"}>
-        <AlertIcon />
-      </Show>
-      <Show when={props.state === "canceled"}>
-        <XIcon />
-      </Show>
-    </div>
-  );
-}
-
-function MicLevelMeter(props: { bars: number[] }) {
-  const PROFILE = [0.7, 0.82, 0.92, 0.98, 1.0, 1.0, 0.98, 0.92, 0.82, 0.7];
-  const MAX_H = 30;
-  const MIN_H = 2;
-  const GAIN = 1.8;
-  return (
-    <div
-      class="flex h-8 items-center justify-center gap-[2px]"
+      class="flex h-full w-full items-center justify-between"
       aria-hidden="true"
     >
-      {props.bars.map((level, i) => {
-        const amped = Math.min(1.0, level * GAIN);
-        const shaped = amped * (PROFILE[i] ?? 1);
-        const h = MIN_H + Math.round(shaped * (MAX_H - MIN_H));
-        const active = level > 0.06;
+      {props.levels.map((level, i) => {
+        // Gamma 0.65 opens up the bottom of the range — Whisper-grade
+        // RMS spends most of its life in [0, 0.3].
+        const shaped = Math.pow(level, 0.65);
+        // Sine bell across the bar index. 0 at edges, 1 at the
+        // middle — both height and opacity ride this so the wave
+        // visually disappears into the pill rim.
+        const env = edgeEnvelope(i, props.levels.length);
+        const h = Math.max(
+          1.5,
+          Math.round((0.22 + shaped * 0.78) * 18 * (0.4 + 0.6 * env)),
+        );
+        const opacity = (0.32 + shaped * 0.68) * env;
         return (
           <div
             style={{
-              width: "3px",
+              width: "1.5px",
               height: `${h}px`,
-              "border-radius": "2px",
-              background: "var(--color-meter)",
-              "box-shadow": "inset 0 -1px 0 var(--color-meter-shadow)",
-              opacity: active ? 0.95 : 0.5,
-              transition: "height 120ms ease-out, opacity 200ms ease-out",
+              "border-radius": "1.5px",
+              background: props.color,
+              opacity,
+              transition: "height 110ms ease-out, opacity 180ms ease-out",
             }}
           />
         );
@@ -344,34 +178,81 @@ function MicLevelMeter(props: { bars: number[] }) {
   );
 }
 
-function Spinner(props: { violet?: boolean }) {
-  const color = props.violet ? "var(--color-violet)" : "var(--color-accent)";
+// Soft sine bell. Returns ~0 at i=0 and i=n-1, peaks at 1 in the
+// middle. Used as an envelope on both height and opacity so the
+// waveform fades into the pill rim.
+function edgeEnvelope(i: number, n: number): number {
+  const t = (i + 0.5) / n;
+  return Math.sin(Math.PI * t);
+}
+
+function ShimmerWord(props: { text: string; tint: string }) {
+  // A continuous left-to-right luminance sweep across the letters. The
+  // base glyphs sit at ink-mute; a brighter band travels through them
+  // on a 1.6s loop to communicate active progress without the visual
+  // noise of a spinner. CSS variables drive the gradient so the
+  // shimmer recolours per-state (teal → violet) to match the pipeline
+  // stage.
   return (
-    <svg
-      class="animate-spinner"
-      width="20"
-      height="20"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke={color}
-      stroke-width="1.75"
-      stroke-linecap="round"
-      aria-hidden="true"
+    <span
+      class="pill-shimmer select-none text-[10.5px] font-medium leading-none"
+      style={{
+        "--shimmer-base": "var(--color-ink-mute)",
+        "--shimmer-tint": props.tint,
+        "letter-spacing": "0.01em",
+      }}
     >
-      <path d="M21 12a9 9 0 1 1-6.2-8.5" />
-    </svg>
+      {props.text}
+    </span>
+  );
+}
+
+function TerminalLine(props: {
+  tone: "success" | "warning" | "error" | "muted";
+  label: string;
+}) {
+  return (
+    <div class="flex items-center gap-1.5">
+      <Show when={props.tone === "success"}>
+        <CheckIcon />
+      </Show>
+      <Show when={props.tone === "warning"}>
+        <WarningIcon />
+      </Show>
+      <Show when={props.tone === "error"}>
+        <AlertIcon />
+      </Show>
+      <Show when={props.tone === "muted"}>
+        <XIcon />
+      </Show>
+      <span
+        class="text-[11px] font-medium leading-none"
+        style={{
+          color:
+            props.tone === "success"
+              ? "var(--color-success)"
+              : props.tone === "warning"
+                ? "var(--color-warning)"
+                : props.tone === "error"
+                  ? "var(--color-danger)"
+                  : "var(--color-ink-mute)",
+        }}
+      >
+        {props.label}
+      </span>
+    </div>
   );
 }
 
 function CheckIcon() {
   return (
     <svg
-      width="20"
-      height="20"
+      width="12"
+      height="12"
       viewBox="0 0 24 24"
       fill="none"
       stroke="var(--color-success)"
-      stroke-width="2"
+      stroke-width="2.5"
       stroke-linecap="round"
       stroke-linejoin="round"
       aria-hidden="true"
@@ -384,12 +265,12 @@ function CheckIcon() {
 function AlertIcon() {
   return (
     <svg
-      width="20"
-      height="20"
+      width="12"
+      height="12"
       viewBox="0 0 24 24"
       fill="none"
       stroke="var(--color-danger)"
-      stroke-width="1.75"
+      stroke-width="2.25"
       stroke-linecap="round"
       stroke-linejoin="round"
       aria-hidden="true"
@@ -404,12 +285,12 @@ function AlertIcon() {
 function WarningIcon() {
   return (
     <svg
-      width="20"
-      height="20"
+      width="12"
+      height="12"
       viewBox="0 0 24 24"
       fill="none"
       stroke="var(--color-warning)"
-      stroke-width="1.75"
+      stroke-width="2.25"
       stroke-linecap="round"
       stroke-linejoin="round"
       aria-hidden="true"
@@ -424,12 +305,12 @@ function WarningIcon() {
 function XIcon() {
   return (
     <svg
-      width="20"
-      height="20"
+      width="12"
+      height="12"
       viewBox="0 0 24 24"
       fill="none"
       stroke="var(--color-ink-mute)"
-      stroke-width="1.75"
+      stroke-width="2.25"
       stroke-linecap="round"
       stroke-linejoin="round"
       aria-hidden="true"
@@ -437,34 +318,5 @@ function XIcon() {
       <line x1="6" y1="6" x2="18" y2="18" />
       <line x1="6" y1="18" x2="18" y2="6" />
     </svg>
-  );
-}
-
-function Waveform(props: { levels: number[] }) {
-  return (
-    <div
-      class="flex h-6 items-center gap-[2px] overflow-hidden"
-      aria-hidden="true"
-    >
-      {props.levels.map((level) => {
-        // Gamma 0.7 opens up the bottom of the range — Whisper-grade
-        // RMS spends most of its life in [0, 0.3].
-        const shaped = Math.pow(level, 0.7);
-        const h = Math.max(1, Math.round(shaped * 24));
-        const opacity = 0.25 + shaped * 0.75;
-        return (
-          <div
-            style={{
-              width: "4px",
-              height: `${h}px`,
-              "border-radius": "2px",
-              background: "var(--color-meter)",
-              "box-shadow": "inset 0 -1px 0 var(--color-meter-shadow)",
-              opacity,
-            }}
-          />
-        );
-      })}
-    </div>
   );
 }

@@ -3,288 +3,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Share the runtime drawing code via `include!` so build.rs and the
+// running app never disagree about what each state looks like. The
+// runtime module uses only `std::f32::consts`, so it compiles in either
+// context without the Tauri/AppKit dependencies pulling in.
 mod tray_glyphs {
-    // ---- coordinate helpers ------------------------------------------------
-
-    fn idx(x: i32, y: i32, w: i32) -> Option<usize> {
-        if x < 0 || y < 0 || x >= w || y >= w {
-            None
-        } else {
-            Some(((y * w + x) * 4) as usize)
-        }
-    }
-
-    fn put(rgba: &mut [u8], x: i32, y: i32, w: i32, alpha: u8) {
-        if let Some(i) = idx(x, y, w) {
-            // Template image: only alpha varies; RGB stays 0 so macOS can
-            // tint freely. We additively blend alpha (max-of-two) so multiple
-            // strokes overlap without darkening.
-            let cur = rgba[i + 3];
-            rgba[i + 3] = cur.max(alpha);
-        }
-    }
-
-    /// Draws a filled (or outlined) rounded rect.
-    fn rect(rgba: &mut [u8], x0: i32, y0: i32, x1: i32, y1: i32, w: i32, alpha: u8) {
-        for y in y0..=y1 {
-            for x in x0..=x1 {
-                put(rgba, x, y, w, alpha);
-            }
-        }
-    }
-
-    /// Filled circle at (cx, cy) with radius r.
-    fn circle(rgba: &mut [u8], cx: f32, cy: f32, r: f32, w: i32, alpha: u8) {
-        let r2 = r * r;
-        let xmin = (cx - r - 1.0).floor() as i32;
-        let xmax = (cx + r + 1.0).ceil() as i32;
-        let ymin = (cy - r - 1.0).floor() as i32;
-        let ymax = (cy + r + 1.0).ceil() as i32;
-        for y in ymin..=ymax {
-            for x in xmin..=xmax {
-                let dx = x as f32 + 0.5 - cx;
-                let dy = y as f32 + 0.5 - cy;
-                let d2 = dx * dx + dy * dy;
-                if d2 <= r2 {
-                    put(rgba, x, y, w, alpha);
-                } else if d2 <= (r + 1.0) * (r + 1.0) {
-                    // Soft edge — anti-alias.
-                    let dist = d2.sqrt() - r;
-                    let a = ((1.0 - dist).clamp(0.0, 1.0) * alpha as f32) as u8;
-                    put(rgba, x, y, w, a);
-                }
-            }
-        }
-    }
-
-    /// Hollow circle (1 px stroke at the given scale).
-    fn ring(rgba: &mut [u8], cx: f32, cy: f32, r: f32, stroke: f32, w: i32, alpha: u8) {
-        let r_out = r;
-        let r_in = (r - stroke).max(0.0);
-        let xmin = (cx - r_out - 1.0).floor() as i32;
-        let xmax = (cx + r_out + 1.0).ceil() as i32;
-        let ymin = (cy - r_out - 1.0).floor() as i32;
-        let ymax = (cy + r_out + 1.0).ceil() as i32;
-        for y in ymin..=ymax {
-            for x in xmin..=xmax {
-                let dx = x as f32 + 0.5 - cx;
-                let dy = y as f32 + 0.5 - cy;
-                let d = (dx * dx + dy * dy).sqrt();
-                if d <= r_out && d >= r_in {
-                    put(rgba, x, y, w, alpha);
-                } else if d <= r_out + 1.0 && d >= r_in - 1.0 {
-                    let edge_dist = if d > r_out {
-                        d - r_out
-                    } else if d < r_in {
-                        r_in - d
-                    } else {
-                        0.0
-                    };
-                    let a = ((1.0 - edge_dist).clamp(0.0, 1.0) * alpha as f32) as u8;
-                    put(rgba, x, y, w, a);
-                }
-            }
-        }
-    }
-
-    /// Mic glyph: rounded body + base bar + stem. Centered for the given
-    /// canvas size. `filled` controls whether the body is filled (recording)
-    /// or just outlined (idle).
-    fn mic(rgba: &mut [u8], w: i32, filled: bool) {
-        let s = w as f32 / 16.0; // unit scale: 1.0 at 16px, 2.0 at 32px
-
-        // Body dims.
-        let body_w = 6.0 * s;
-        let body_h = 9.0 * s;
-        let cx = w as f32 / 2.0;
-        let cy = w as f32 / 2.0 - 1.5 * s;
-
-        // Filled rounded rect — approximated by a rect + two end-caps
-        // (semicircles).
-        let body_top = (cy - body_h / 2.0).round() as i32;
-        let body_bot = (cy + body_h / 2.0).round() as i32;
-        let body_left = (cx - body_w / 2.0).round() as i32;
-        let body_right = (cx + body_w / 2.0).round() as i32;
-        let radius = body_w / 2.0;
-
-        if filled {
-            rect(
-                rgba,
-                body_left,
-                (cy - body_h / 2.0 + radius).round() as i32,
-                body_right,
-                (cy + body_h / 2.0 - radius).round() as i32,
-                w,
-                255,
-            );
-            // Top + bottom rounded caps.
-            circle(rgba, cx, cy - body_h / 2.0 + radius, radius, w, 255);
-            circle(rgba, cx, cy + body_h / 2.0 - radius, radius, w, 255);
-        } else {
-            // 1 px stroke (well, ~1.25 px scaled).
-            let stroke = (1.25 * s).max(1.0);
-            // Vertical sides.
-            for y in body_top..=body_bot {
-                for d in 0..stroke.ceil() as i32 {
-                    put(rgba, body_left + d, y, w, 220);
-                    put(rgba, body_right - d, y, w, 220);
-                }
-            }
-            // Top + bottom caps.
-            ring(rgba, cx, cy - body_h / 2.0 + radius, radius, stroke, w, 220);
-            ring(rgba, cx, cy + body_h / 2.0 - radius, radius, stroke, w, 220);
-        }
-
-        // Base arc (the swoosh under the mic body).
-        let arc_r = (5.0 * s).round();
-        let arc_cx = cx;
-        let arc_cy = cy + body_h / 2.0 + 0.5 * s;
-        let stroke = (1.25 * s).max(1.0);
-        let r2_out = arc_r * arc_r;
-        let r2_in = (arc_r - stroke) * (arc_r - stroke);
-        for y in (arc_cy.round() as i32)..((arc_cy + arc_r + 1.0).ceil() as i32) {
-            for x in ((arc_cx - arc_r - 1.0).floor() as i32)..=((arc_cx + arc_r + 1.0).ceil() as i32)
-            {
-                let dx = x as f32 + 0.5 - arc_cx;
-                let dy = y as f32 + 0.5 - arc_cy;
-                let d2 = dx * dx + dy * dy;
-                if d2 <= r2_out && d2 >= r2_in {
-                    put(rgba, x, y, w, 220);
-                }
-            }
-        }
-
-        // Stand stem.
-        let stem_top = (arc_cy + arc_r - 1.0 * s).round() as i32;
-        let stem_bot = (arc_cy + arc_r + 1.5 * s).round() as i32;
-        let stem_left = (cx - 0.5 * s).round() as i32;
-        let stem_right = (cx + 0.5 * s).round() as i32;
-        rect(rgba, stem_left, stem_top, stem_right, stem_bot, w, 220);
-
-        // Stand foot.
-        let foot_left = (cx - 1.5 * s).round() as i32;
-        let foot_right = (cx + 1.5 * s).round() as i32;
-        let foot_y_top = stem_bot;
-        let foot_y_bot = stem_bot + (0.75 * s).ceil() as i32;
-        rect(rgba, foot_left, foot_y_top, foot_right, foot_y_bot, w, 220);
-    }
-
-    /// Recording dot — solid red dot bottom-right (template alpha only;
-    /// AppKit will tint accent or red as configured).
-    fn rec_dot(rgba: &mut [u8], w: i32) {
-        let s = w as f32 / 16.0;
-        let r = 2.5 * s;
-        let cx = w as f32 - r - 0.5 * s;
-        let cy = w as f32 - r - 0.5 * s;
-        circle(rgba, cx, cy, r, w, 255);
-    }
-
-    /// Spinner arc (3/4 circle) — used for processing.
-    fn spinner(rgba: &mut [u8], w: i32) {
-        let s = w as f32 / 16.0;
-        let cx = w as f32 / 2.0;
-        let cy = w as f32 / 2.0;
-        let r = 5.5 * s;
-        let stroke = (1.5 * s).max(1.0);
-        let r2_out = r * r;
-        let r2_in = (r - stroke) * (r - stroke);
-        for y in 0..w {
-            for x in 0..w {
-                let dx = x as f32 + 0.5 - cx;
-                let dy = y as f32 + 0.5 - cy;
-                let d2 = dx * dx + dy * dy;
-                if d2 > r2_out || d2 < r2_in {
-                    continue;
-                }
-                // Skip the bottom-right quadrant for a "loading" look.
-                if dx > 0.0 && dy > 0.0 {
-                    continue;
-                }
-                put(rgba, x, y, w, 220);
-            }
-        }
-    }
-
-    /// Exclamation mark — used for error.
-    fn bang(rgba: &mut [u8], w: i32) {
-        let s = w as f32 / 16.0;
-        let cx = w as f32 / 2.0;
-        // Vertical bar.
-        let bar_w = (1.5 * s).max(1.0);
-        let bar_top = (3.0 * s).round() as i32;
-        let bar_bot = (10.0 * s).round() as i32;
-        let bar_left = (cx - bar_w / 2.0).round() as i32;
-        let bar_right = (cx + bar_w / 2.0).round() as i32;
-        rect(rgba, bar_left, bar_top, bar_right, bar_bot, w, 255);
-        // Dot.
-        circle(rgba, cx, 12.5 * s, 1.0 * s, w, 255);
-    }
-
-    /// Lock body — used for permission missing.
-    fn lock(rgba: &mut [u8], w: i32) {
-        let s = w as f32 / 16.0;
-        let cx = w as f32 / 2.0;
-        let cy = w as f32 / 2.0 + 1.0 * s;
-        // Lock body.
-        let body_top = (cy - 2.5 * s).round() as i32;
-        let body_bot = (cy + 3.5 * s).round() as i32;
-        let body_left = (cx - 3.5 * s).round() as i32;
-        let body_right = (cx + 3.5 * s).round() as i32;
-        rect(rgba, body_left, body_top, body_right, body_bot, w, 255);
-
-        // Shackle (the U-shape on top).
-        let shackle_r = 2.5 * s;
-        let shackle_cx = cx;
-        let shackle_cy = cy - 2.5 * s;
-        let stroke = (1.5 * s).max(1.0);
-        let r2_out = shackle_r * shackle_r;
-        let r2_in = (shackle_r - stroke) * (shackle_r - stroke);
-        for y in 0..w {
-            for x in 0..w {
-                let dx = x as f32 + 0.5 - shackle_cx;
-                let dy = y as f32 + 0.5 - shackle_cy;
-                let d2 = dx * dx + dy * dy;
-                if d2 <= r2_out && d2 >= r2_in && dy <= 0.5 * s {
-                    put(rgba, x, y, w, 255);
-                }
-            }
-        }
-    }
-
-    pub fn idle(w: i32) -> Vec<u8> {
-        let mut rgba = vec![0u8; (w * w * 4) as usize];
-        mic(&mut rgba, w, false);
-        rgba
-    }
-
-    pub fn recording(w: i32, with_dot: bool) -> Vec<u8> {
-        let mut rgba = vec![0u8; (w * w * 4) as usize];
-        mic(&mut rgba, w, true);
-        if with_dot {
-            rec_dot(&mut rgba, w);
-        }
-        rgba
-    }
-
-    pub fn processing(w: i32) -> Vec<u8> {
-        let mut rgba = vec![0u8; (w * w * 4) as usize];
-        spinner(&mut rgba, w);
-        rgba
-    }
-
-    pub fn error(w: i32) -> Vec<u8> {
-        let mut rgba = vec![0u8; (w * w * 4) as usize];
-        mic(&mut rgba, w, false);
-        // Overlay a corner badge: small bang.
-        bang(&mut rgba, w);
-        rgba
-    }
-
-    pub fn permission(w: i32) -> Vec<u8> {
-        let mut rgba = vec![0u8; (w * w * 4) as usize];
-        lock(&mut rgba, w);
-        rgba
-    }
+    include!("src/tray_glyphs.rs");
 }
 
 fn write_png(path: &Path, rgba: &[u8], w: u32) {
@@ -298,59 +22,34 @@ fn write_png(path: &Path, rgba: &[u8], w: u32) {
 }
 
 fn emit_tray_icons() {
-    // Always re-run if the build script changes.
+    // Re-run when either the build script or the shared drawing module
+    // changes — `include!` doesn't add a dep edge by itself.
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/tray_glyphs.rs");
 
     let dir = Path::new("icons/tray");
     if !dir.exists() {
         fs::create_dir_all(dir).expect("create icons/tray");
     }
 
-    type Draw = fn(i32) -> Vec<u8>;
-    // (state, primary-frame, alt-frame-for-pulse)
-    let states: &[(&str, Draw, Draw)] = &[
-        ("idle", |w| tray_glyphs::idle(w), |w| tray_glyphs::idle(w)),
-        // For "recording", the @1x and @2x are the static frame; the alt
-        // (pulse-off) variant is the same mic without the dot. Both go to
-        // disk so they're inspectable; runtime uses the in-memory generator.
-        (
-            "recording",
-            |w| tray_glyphs::recording(w, true),
-            |w| tray_glyphs::recording(w, false),
-        ),
-        (
-            "processing",
-            |w| tray_glyphs::processing(w),
-            |w| tray_glyphs::processing(w),
-        ),
-        ("error", |w| tray_glyphs::error(w), |w| tray_glyphs::error(w)),
-        (
-            "permission",
-            |w| tray_glyphs::permission(w),
-            |w| tray_glyphs::permission(w),
-        ),
+    // Designer reference dump only — the runtime renders procedurally
+    // and doesn't read these files. For animated states we sample a
+    // representative phase: 0.25 catches the recording dot at peak
+    // breath (sin = 1, halo just emerging); 0.0 anchors the spinner gap
+    // at the right edge of the ring.
+    type Draw = Box<dyn Fn(i32) -> Vec<u8>>;
+    let states: &[(&str, Draw)] = &[
+        ("idle", Box::new(|w| tray_glyphs::idle(w))),
+        ("recording", Box::new(|w| tray_glyphs::recording(w, 0.25))),
+        ("processing", Box::new(|w| tray_glyphs::processing(w, 0.0))),
+        ("error", Box::new(|w| tray_glyphs::error(w))),
+        ("permission", Box::new(|w| tray_glyphs::permission(w))),
     ];
 
-    for (name, draw_a, _draw_b) in states {
-        let p1 = dir.join(format!("{name}.png"));
-        let p2 = dir.join(format!("{name}@2x.png"));
-        write_png(&p1, &draw_a(16), 16);
-        write_png(&p2, &draw_a(32), 32);
+    for (name, draw) in states {
+        write_png(&dir.join(format!("{name}.png")), &draw(16), 16);
+        write_png(&dir.join(format!("{name}@2x.png")), &draw(32), 32);
     }
-
-    // Pulse-off variant for recording (mic without dot), so designers can
-    // see what the alternate frame looks like. The runtime uses the same
-    // procedural generator and doesn't read these files.
-    write_png(
-        &dir.join("recording-off.png"),
-        &tray_glyphs::recording(16, false),
-        16,
-    );
-    write_png(
-        &dir.join("recording-off@2x.png"),
-        &tray_glyphs::recording(32, false),
-        32,
-    );
 }
 
 /// Compile `swift/AppleFmBridge.swift` into a static library and emit the

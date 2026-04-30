@@ -5,8 +5,11 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, WebviewUrl};
 
 pub const LABEL: &str = "pill";
-pub const WIDTH: f64 = 280.0;
-pub const HEIGHT: f64 = 56.0;
+// Slimmer pill — about half the previous footprint. The webview leaves
+// a small slack around the visible element so the soft drop shadow can
+// fade into transparency instead of clipping flush at the window edge.
+pub const WIDTH: f64 = 144.0;
+pub const HEIGHT: f64 = 36.0;
 const BOTTOM_MARGIN: f64 = 96.0;
 
 #[derive(Debug, Clone, Copy, Serialize)]

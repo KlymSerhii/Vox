@@ -316,12 +316,16 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                             log::info!(
                                 "LLM polish returned empty content; falling back to raw transcript"
                             );
-                            polish_warning = Some("Polish was empty — raw text copied.");
+                            // Short pill copy. The differentiation between
+                            // "empty" and "failed" lives in the log; the
+                            // user-facing surface only needs to flag that
+                            // the raw transcript was copied as fallback.
+                            polish_warning = Some("Raw copy");
                             transcript.clone()
                         }
                         Err(e) => {
                             log::warn!("LLM cleanup failed: {e}; falling back to raw transcript");
-                            polish_warning = Some("Polish failed — raw text copied.");
+                            polish_warning = Some("Raw copy");
                             transcript.clone()
                         }
                     }
@@ -373,10 +377,14 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
                         hide_after_session(&app_for_pill, &ctx, my_sid, 3500);
                     }
                     None => {
+                        // Short success copy — the slim pill (~116px wide)
+                        // can't hold a sentence, and the user just performed
+                        // the action so we don't need to remind them about
+                        // the paste step.
                         pill::emit_state(
                             &app_for_pill,
                             PillState::Done,
-                            Some("Copied — press ⌘V to paste.".into()),
+                            Some("Copied".into()),
                         );
                         hide_after_session(&app_for_pill, &ctx, my_sid, 1800);
                     }

@@ -11,7 +11,12 @@ use crate::tray_icon;
 
 pub const POPOVER_LABEL: &str = "tray-popover";
 const POPOVER_W: f64 = 320.0;
-const POPOVER_H: f64 = 400.0;
+// 540 px gives the `flex-1` Recent list ~200 px of room (enough for all
+// five transcripts at once, which is the cap from `transcripts::snapshot`),
+// and pushes the Voice-mode trigger far enough up the popover that its
+// dropdown — absolutely positioned and clipped by the popover's
+// `overflow-hidden` root — has room to expand downward without truncation.
+const POPOVER_H: f64 = 540.0;
 
 static LAST_TRAY_RECT: OnceCell<Mutex<Option<PhysicalPosition<f64>>>> = OnceCell::new();
 

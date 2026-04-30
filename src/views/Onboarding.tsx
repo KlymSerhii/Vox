@@ -1,5 +1,6 @@
 import {
   createEffect,
+  createMemo,
   createSignal,
   For,
   type JSX,
@@ -82,9 +83,12 @@ export default function OnboardingView() {
     microphone: false,
     accessibility: false,
   });
-  // Gates Continue while downloads run. "Skip for now" stays open at
-  // all times so a user with a dead network can still bail.
+  // Gates Continue while downloads run, AND until the chosen engine's
+  // required artifacts are on disk. The user cannot skip past the models
+  // step: Whisper is mandatory, plus Gemma + llama-server when the
+  // Gemma engine is chosen.
   const [downloadInFlight, setDownloadInFlight] = createSignal(false);
+  const [modelsReady, setModelsReady] = createSignal(false);
 
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -159,33 +163,42 @@ export default function OnboardingView() {
         <div class="h-6 w-6" />
       </header>
 
-      <main class="flex flex-1 flex-col items-center justify-center px-10">
-        <Show when={step() === 0}>
-          <Welcome />
-        </Show>
-        <Show when={step() === 1}>
-          <MicStep
-            granted={perms().microphone}
-            onAllow={async () => {
-              await requestMicrophone();
-              setPerms(await checkPermissions());
-            }}
-          />
-        </Show>
-        <Show when={step() === 2}>
-          <AccessibilityStep granted={perms().accessibility} />
-        </Show>
-        <Show when={step() === MODELS_STEP}>
-          <DownloadStep
-            s={s()}
-            tier={tier()}
-            patch={patch}
-            onInFlightChange={setDownloadInFlight}
-          />
-        </Show>
-        <Show when={step() === LAST_STEP}>
-          <HowToUseStep s={s()} />
-        </Show>
+      {/* Scroll lives on `main` so its scrollbar tracks the window
+          edge instead of slicing through the content card. The inner
+          wrapper uses auto block-margins so short steps stay centered
+          while the long models step scrolls. `min-h-0` lets `flex-1`
+          actually constrain main's height (default flex children
+          can't shrink below content). */}
+      <main class="flex flex-1 flex-col items-center px-10 min-h-0 overflow-y-auto">
+        <div class="my-auto flex w-full flex-col items-center py-6">
+          <Show when={step() === 0}>
+            <Welcome />
+          </Show>
+          <Show when={step() === 1}>
+            <MicStep
+              granted={perms().microphone}
+              onAllow={async () => {
+                await requestMicrophone();
+                setPerms(await checkPermissions());
+              }}
+            />
+          </Show>
+          <Show when={step() === 2}>
+            <AccessibilityStep granted={perms().accessibility} />
+          </Show>
+          <Show when={step() === MODELS_STEP}>
+            <DownloadStep
+              s={s()}
+              tier={tier()}
+              patch={patch}
+              onInFlightChange={setDownloadInFlight}
+              onReadyChange={setModelsReady}
+            />
+          </Show>
+          <Show when={step() === LAST_STEP}>
+            <HowToUseStep s={s()} />
+          </Show>
+        </div>
       </main>
 
       <footer class="flex items-center justify-between border-t border-[var(--color-border)] px-6 py-4">
@@ -193,19 +206,27 @@ export default function OnboardingView() {
           when={step() !== LAST_STEP}
           fallback={<span aria-hidden="true" />}
         >
-          <button
-            type="button"
-            class="text-[12px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
-            onClick={next}
+          {/* The models step is gated — no Skip path. Other optional
+              steps keep the soft Skip link. */}
+          <Show
+            when={step() !== 0 && step() !== MODELS_STEP}
+            fallback={<span aria-hidden="true" />}
           >
-            {step() === 0 ? "" : step() === MODELS_STEP ? "Skip for now" : "Skip"}
-          </button>
+            <button
+              type="button"
+              class="text-[12px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+              onClick={next}
+            >
+              Skip
+            </button>
+          </Show>
         </Show>
         <PrimaryButton
           step={step()}
           perms={perms()}
           s={s()}
           downloadInFlight={downloadInFlight()}
+          modelsReady={modelsReady()}
           onNext={next}
           onFinish={handleFinish}
         />
@@ -237,15 +258,17 @@ function PrimaryButton(props: {
   perms: PermissionStatus;
   s: Settings | null;
   downloadInFlight: boolean;
+  modelsReady: boolean;
   onNext: () => void;
   onFinish: () => void;
 }) {
   // Gate Continue on mic step until granted, and on models step until
-  // downloads finish — racing ahead with a partial GGUF leaves the app
-  // in a broken-on-first-use state.
+  // every required artifact is on disk for the chosen engine. Racing
+  // ahead with a partial GGUF leaves the app broken on first use.
   const disabled = () =>
     (props.step === 1 && !props.perms.microphone) ||
-    (props.step === MODELS_STEP && props.downloadInFlight);
+    (props.step === MODELS_STEP &&
+      (props.downloadInFlight || !props.modelsReady));
   const label = () => {
     if (props.step === 0) return "Get started";
     if (props.step === LAST_STEP) return "Finish";
@@ -257,7 +280,7 @@ function PrimaryButton(props: {
       type="button"
       disabled={disabled()}
       onClick={() => (isFinish() ? props.onFinish() : props.onNext())}
-      class="inline-flex h-9 items-center gap-2 rounded-[8px] bg-[var(--color-accent)] px-4 text-[13px] font-medium text-black transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+      class="inline-flex h-9 items-center gap-2 rounded-[8px] bg-[var(--color-accent)] px-4 text-[13px] font-medium text-[var(--color-on-accent)] transition-[filter] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
     >
       <Show
         when={isFinish()}
@@ -364,6 +387,9 @@ function DownloadStep(props: {
   patch: (p: Partial<Settings>) => void;
   /// Parent owns the Continue gate; this step owns the IDs being downloaded.
   onInFlightChange: (v: boolean) => void;
+  /// Tells the parent when every required artifact for the chosen
+  /// engine is on disk. Continue stays disabled until this flips true.
+  onReadyChange: (v: boolean) => void;
 }) {
   const [progress, setProgress] = createSignal<
     Record<string, { downloaded: number; total: number }>
@@ -371,15 +397,18 @@ function DownloadStep(props: {
   const [completed, setCompleted] = createSignal<Set<string>>(new Set());
   const [started, setStarted] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
+  const [sttModels, setSttModels] = createSignal<ModelStatus[]>([]);
   const [llmModels, setLlmModels] = createSignal<ModelStatus[]>([]);
+  const [selectedSttId, setSelectedSttId] = createSignal<string | null>(null);
   const [selectedLlmId, setSelectedLlmId] = createSignal<string | null>(null);
   const [binaryStatus, setBinaryStatus] =
     createSignal<InferenceServerStatus | null>(null);
   const [appleFm, setAppleFm] = createSignal<AppleFmAvailability | null>(null);
-  // Default to Apple Intelligence when available — saves the 3.5–5.4 GB
-  // Gemma download. Set after the availability probe resolves below.
-  const [polishChoice, setPolishChoice] = createSignal<PolishChoice | null>(
-    null,
+  // Always default to the local Gemma stack: Apple Intelligence is
+  // faster but produces lower-quality polishing in our testing, so we
+  // surface it as a tradeoff rather than the default.
+  const [polishChoice, setPolishChoice] = createSignal<PolishChoice>(
+    "gemma-local",
   );
   const unlistens: (() => void)[] = [];
 
@@ -416,33 +445,85 @@ function DownloadStep(props: {
         inferenceServerStatus(),
         appleFmAvailability(),
       ]);
+      setSttModels(all.filter((m) => m.descriptor.kind === "stt"));
       setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
       setBinaryStatus(bin);
       setAppleFm(fm);
-      setPolishChoice(fm.available ? "apple-fm" : "gemma-local");
-      // Re-runs from Settings: pre-mark already-installed binary so the
-      // gate doesn't block forever.
-      if (bin.installed) {
-        setCompleted((prev) => new Set(prev).add(bin.id));
-      }
+      // Re-runs via "Replay onboarding": pre-mark anything already
+      // on disk so the requirements gate doesn't block forever and
+      // returning users are not asked to re-download.
+      setCompleted((prev) => {
+        const next = new Set(prev);
+        for (const m of all) {
+          if (m.installed) next.add(m.descriptor.id);
+        }
+        if (bin.installed) next.add(bin.id);
+        return next;
+      });
     } catch (e) {
       console.warn("onboarding probes failed", e);
     }
   });
 
+  // Auto-select default models. Prefer the user's persisted setting if
+  // it still maps to a catalog entry (Replay onboarding), else the
+  // hardware-tier recommendation. Runs once each — `selectedXId()` gate
+  // makes the effect idempotent.
+  createEffect(() => {
+    const t = props.tier;
+    const stts = sttModels();
+    const cur = props.s;
+    if (!t || stts.length === 0 || selectedSttId()) return;
+    const stored = cur?.stt_model_id;
+    const ok = stored && stts.some((m) => m.descriptor.id === stored);
+    setSelectedSttId(ok ? stored! : t.stt_model_id);
+  });
+
   createEffect(() => {
     const t = props.tier;
     const llms = llmModels();
-    if (t && llms.length > 0 && !selectedLlmId()) {
-      setSelectedLlmId(t.llm_model_id);
-    }
+    const cur = props.s;
+    if (!t || llms.length === 0 || selectedLlmId()) return;
+    const stored = cur?.llm_model_id;
+    const ok = stored && llms.some((m) => m.descriptor.id === stored);
+    setSelectedLlmId(ok ? stored! : t.llm_model_id);
+  });
+
+  // Compute "all required artifacts on disk" for the chosen engine and
+  // forward it to the parent's Continue button. The user must click
+  // the action button at least once (`started()`) so settings are
+  // committed for their current selection — otherwise a returning
+  // user could advance with stale `llm_engine` from a prior session.
+  const requirementsMet = createMemo(() => {
+    if (!started()) return false;
+    const sttId = selectedSttId();
+    const choice = polishChoice();
+    const inst = completed();
+    if (!sttId || !inst.has(sttId)) return false;
+    if (choice === "apple-fm") return true;
+    const llmId = selectedLlmId();
+    const bin = binaryStatus();
+    if (!llmId || !bin) return false;
+    return inst.has(llmId) && inst.has(bin.id);
+  });
+
+  createEffect(() => {
+    props.onReadyChange(requirementsMet());
   });
 
   onCleanup(() => {
     unlistens.forEach((u) => u());
+    // Stop pretending the gate is met when this step unmounts —
+    // otherwise a back-nav into the mic step would still advance.
+    props.onReadyChange(false);
   });
 
-  const selectedDescriptor = () => {
+  const selectedSttDescriptor = () => {
+    const id = selectedSttId();
+    if (!id) return null;
+    return sttModels().find((m) => m.descriptor.id === id)?.descriptor ?? null;
+  };
+  const selectedLlmDescriptor = () => {
     const id = selectedLlmId();
     if (!id) return null;
     return llmModels().find((m) => m.descriptor.id === id)?.descriptor ?? null;
@@ -451,8 +532,9 @@ function DownloadStep(props: {
   async function start() {
     const t = props.tier;
     const cur = props.s;
+    const sttId = selectedSttId();
     const choice = polishChoice();
-    if (!t || !cur || !choice) return;
+    if (!t || !cur || !sttId) return;
     setStarted(true);
 
     if (choice === "apple-fm") {
@@ -460,17 +542,18 @@ function DownloadStep(props: {
       // is still local and still needs to come down.
       await props.patch({
         stt_engine: "whisper-local",
-        stt_model_id: t.stt_model_id,
+        stt_model_id: sttId,
         llm_engine: "apple-fm",
         // Keep the recommended Gemma id so a later switch in Settings
-        // doesn't have to re-pick the tier-matched one.
-        llm_model_id: t.llm_model_id,
+        // doesn't have to re-pick the tier-matched one. Honour the
+        // user's prior pick if they had one; else fall back to tier.
+        llm_model_id: selectedLlmId() ?? t.llm_model_id,
         polishing_enabled: true,
       });
       try {
         props.onInFlightChange(true);
-        await downloadModel(t.stt_model_id);
-        await loadModelWarm(t.stt_model_id);
+        await downloadModel(sttId);
+        await loadModelWarm(sttId);
       } catch (e) {
         setErr(String(e));
       } finally {
@@ -489,7 +572,7 @@ function DownloadStep(props: {
     }
     await props.patch({
       stt_engine: "whisper-local",
-      stt_model_id: t.stt_model_id,
+      stt_model_id: sttId,
       llm_engine: "gemma-local",
       llm_model_id: llmId,
       gemma_tos_accepted: true,
@@ -498,7 +581,7 @@ function DownloadStep(props: {
     try {
       props.onInFlightChange(true);
       await Promise.all([
-        downloadModel(t.stt_model_id),
+        downloadModel(sttId),
         downloadModel(llmId),
         downloadInferenceServer(),
       ]);
@@ -506,7 +589,7 @@ function DownloadStep(props: {
       // inference server is deferred until first polish — spawning it
       // now would burn RAM before the user even dictates.
       await Promise.allSettled([
-        loadModelWarm(t.stt_model_id),
+        loadModelWarm(sttId),
         loadModelWarm(llmId),
       ]);
     } catch (e) {
@@ -516,53 +599,110 @@ function DownloadStep(props: {
     }
   }
 
+  // Disable the action button until the user has made the necessary
+  // selections. Once clicked, `started()` swaps the form for the
+  // progress bars; the top-right Continue button takes over from there.
+  const startDisabled = () =>
+    !props.tier ||
+    !selectedSttId() ||
+    (polishChoice() === "gemma-local" && !selectedLlmId());
+
+  // The wrapping <main> owns the scrollbar. Setting overflow-y here
+  // would also activate horizontal clipping (browsers compute
+  // overflow-x: auto when overflow-y is set with default x), which
+  // pinches the selected card's `ring-2` accent at the box edge.
   return (
-    <div class="flex w-full max-w-[420px] flex-col gap-4">
-      <h2 class="text-[20px] font-semibold">Choose your polishing engine.</h2>
+    <div class="flex w-full max-w-[440px] flex-col gap-4">
+      <h2 class="text-[20px] font-semibold">Set up your dictation models.</h2>
       <Show when={!started()}>
         <p class="text-[13px] text-[var(--color-ink-mute)]">
-          Vox cleans up your transcripts before copying them — punctuation,
-          capitalization, structure. Pick the model it should use.
+          Vox runs everything on this Mac. Pick a Whisper for transcription
+          and a polishing engine to clean each transcript up.
         </p>
-        <div class="flex flex-col gap-2" role="radiogroup" aria-label="Polishing engine">
-          <PolishEngineCard
-            engine="apple-fm"
-            title="Apple Intelligence"
-            subtitle="On-device. No download. Requires macOS 26 + Apple Silicon."
-            recommended={appleFm()?.available ?? false}
-            disabled={!(appleFm()?.available ?? false)}
-            disabledReason={appleFm()?.message ?? null}
-            selected={polishChoice() === "apple-fm"}
-            onSelect={() => setPolishChoice("apple-fm")}
-          />
-          <PolishEngineCard
-            engine="gemma-local"
-            title="Gemma 4 (open-source)"
-            subtitle="Runs entirely offline. Choose a size below."
-            recommended={!(appleFm()?.available ?? false)}
-            disabled={false}
-            disabledReason={null}
-            selected={polishChoice() === "gemma-local"}
-            onSelect={() => setPolishChoice("gemma-local")}
-          />
-        </div>
-        <Show when={polishChoice() === "gemma-local" && llmModels().length > 0 && props.tier}>
+
+        <Show when={sttModels().length > 0 && props.tier}>
           {(t) => (
-            <div class="flex flex-col gap-2 mt-2" role="radiogroup" aria-label="Gemma 4 model">
+            <div
+              class="flex flex-col gap-2"
+              role="radiogroup"
+              aria-label="Whisper model"
+            >
               <div class="flex items-baseline justify-between">
-                <span class="text-[13px] font-medium">Choose your Gemma 4 model</span>
+                <span class="text-[13px] font-medium">
+                  Speech recognition (Whisper)
+                </span>
                 <Show when={t().physical_ram_gb > 0}>
                   <span class="text-[11px] text-[var(--color-ink-faint)]">
                     Your Mac has {t().physical_ram_gb} GB RAM
                   </span>
                 </Show>
               </div>
+              <For each={sttModels()}>
+                {(m) => (
+                  <ModelCard
+                    model={m}
+                    selected={selectedSttId() === m.descriptor.id}
+                    recommended={m.descriptor.id === t().stt_model_id}
+                    swapWarn={
+                      t().physical_ram_gb > 0 &&
+                      m.descriptor.ram_peak_mb >
+                        t().physical_ram_gb * 1024 * 0.85
+                    }
+                    onSelect={() => setSelectedSttId(m.descriptor.id)}
+                  />
+                )}
+              </For>
+            </div>
+          )}
+        </Show>
+
+        <div
+          class="flex flex-col gap-2"
+          role="radiogroup"
+          aria-label="Polishing engine"
+        >
+          <span class="text-[13px] font-medium">Transcript polishing</span>
+          <PolishEngineCard
+            engine="gemma-local"
+            title="Gemma 4 (open-source)"
+            subtitle="Runs entirely offline. Choose a size below."
+            recommended={true}
+            note={null}
+            disabled={false}
+            disabledReason={null}
+            selected={polishChoice() === "gemma-local"}
+            onSelect={() => setPolishChoice("gemma-local")}
+          />
+          <PolishEngineCard
+            engine="apple-fm"
+            title="Apple Intelligence"
+            subtitle="On-device. No download. Requires macOS 26 + Apple Silicon."
+            recommended={false}
+            // Surfaces the quality tradeoff so the user picks the
+            // tradeoff knowingly: Apple's Foundation Models polish
+            // faster but produce lower-quality cleanups in our tests.
+            note="Faster, but lower polishing quality."
+            disabled={!(appleFm()?.available ?? false)}
+            disabledReason={appleFm()?.message ?? null}
+            selected={polishChoice() === "apple-fm"}
+            onSelect={() => setPolishChoice("apple-fm")}
+          />
+        </div>
+
+        <Show when={polishChoice() === "gemma-local" && llmModels().length > 0 && props.tier}>
+          {(t) => (
+            <div
+              class="flex flex-col gap-2"
+              role="radiogroup"
+              aria-label="Gemma 4 model"
+            >
+              <span class="text-[13px] font-medium">Gemma 4 model</span>
               <For each={llmModels()}>
                 {(m) => (
-                  <LlmCard
+                  <ModelCard
                     model={m}
                     selected={selectedLlmId() === m.descriptor.id}
-                    recommended={m.descriptor.tier === t().tier}
+                    recommended={m.descriptor.id === t().llm_model_id}
                     swapWarn={
                       t().physical_ram_gb > 0 &&
                       m.descriptor.ram_peak_mb >
@@ -582,14 +722,11 @@ function DownloadStep(props: {
             </div>
           )}
         </Show>
+
         <button
           type="button"
-          class="self-start rounded-[8px] bg-[var(--color-accent)] px-4 py-2 text-[13px] font-medium text-black hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-          disabled={
-            !polishChoice() ||
-            !props.tier ||
-            (polishChoice() === "gemma-local" && !selectedLlmId())
-          }
+          class="self-start rounded-[8px] bg-[var(--color-accent)] px-4 py-2 text-[13px] font-medium text-[var(--color-on-accent)] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={startDisabled()}
           onClick={start}
         >
           {polishChoice() === "apple-fm"
@@ -597,34 +734,36 @@ function DownloadStep(props: {
             : "Accept and download"}
         </button>
       </Show>
-      <Show when={started() && props.tier}>
-        {(t) => (
-          <div class="space-y-3">
-            <DownloadBar
-              label="Whisper"
-              done={completed().has(t().stt_model_id)}
-              prog={progress()[t().stt_model_id]}
-            />
-            <Show when={polishChoice() === "gemma-local" && selectedDescriptor()} fallback={null}>
-              {(d) => (
-                <DownloadBar
-                  label={shortLlmName(d().name)}
-                  done={completed().has(d().id)}
-                  prog={progress()[d().id]}
-                />
-              )}
-            </Show>
-            <Show when={polishChoice() === "gemma-local" && binaryStatus()}>
-              {(b) => (
-                <DownloadBar
-                  label="Inference engine"
-                  done={completed().has(b().id)}
-                  prog={progress()[b().id]}
-                />
-              )}
-            </Show>
-          </div>
-        )}
+      <Show when={started()}>
+        <div class="space-y-3">
+          <Show when={selectedSttDescriptor()}>
+            {(d) => (
+              <DownloadBar
+                label={shortModelName(d().name)}
+                done={completed().has(d().id)}
+                prog={progress()[d().id]}
+              />
+            )}
+          </Show>
+          <Show when={polishChoice() === "gemma-local" && selectedLlmDescriptor()} fallback={null}>
+            {(d) => (
+              <DownloadBar
+                label={shortModelName(d().name)}
+                done={completed().has(d().id)}
+                prog={progress()[d().id]}
+              />
+            )}
+          </Show>
+          <Show when={polishChoice() === "gemma-local" && binaryStatus()}>
+            {(b) => (
+              <DownloadBar
+                label="Inference engine"
+                done={completed().has(b().id)}
+                prog={progress()[b().id]}
+              />
+            )}
+          </Show>
+        </div>
       </Show>
       <Show when={err()}>
         <p class="text-[12px] text-[var(--color-danger)]">{err()}</p>
@@ -638,6 +777,9 @@ function PolishEngineCard(props: {
   title: string;
   subtitle: string;
   recommended: boolean;
+  /// Optional caveat pill rendered below the subtitle. Hidden when the
+  /// card is disabled — the disabled-reason message takes precedence.
+  note: string | null;
   disabled: boolean;
   disabledReason: string | null;
   selected: boolean;
@@ -670,18 +812,44 @@ function PolishEngineCard(props: {
           aria-hidden="true"
         >
           <Show when={props.selected}>
-            <span class="h-1.5 w-1.5 rounded-full bg-black" />
+            <span class="h-1.5 w-1.5 rounded-full bg-[var(--color-on-accent)]" />
           </Show>
         </span>
       </div>
       <span class="text-[11px] text-[var(--color-ink-mute)]">
         {props.subtitle}
       </span>
-      <Show when={props.recommended || props.disabled}>
+      <Show
+        when={
+          (props.recommended && !props.disabled) ||
+          (props.note && !props.disabled) ||
+          (props.disabled && props.disabledReason)
+        }
+      >
         <div class="mt-1 flex flex-wrap gap-1">
           <Show when={props.recommended && !props.disabled}>
             <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
               Recommended
+            </span>
+          </Show>
+          <Show when={props.note && !props.disabled}>
+            <span class="inline-flex items-center gap-1 rounded-full bg-[var(--color-ink-faint)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-ink-mute)]">
+              <svg
+                width="10"
+                height="10"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2.5"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="10" />
+                <line x1="12" y1="11" x2="12" y2="17" />
+                <line x1="12" y1="7.5" x2="12" y2="7.51" />
+              </svg>
+              {props.note}
             </span>
           </Show>
           <Show when={props.disabled && props.disabledReason}>
@@ -695,7 +863,10 @@ function PolishEngineCard(props: {
   );
 }
 
-function LlmCard(props: {
+/// Generic model card used for both Whisper and Gemma rows. Sizing is
+/// derived from `ModelDescriptor.size_bytes`, so MB-class Whisper
+/// models render their disk footprint in MB rather than "0.1 GB".
+function ModelCard(props: {
   model: ModelStatus;
   selected: boolean;
   recommended: boolean;
@@ -704,8 +875,16 @@ function LlmCard(props: {
 }) {
   const d = () => props.model.descriptor;
   const displayName = () => d().name.replace(/\s*\([^)]*\)/g, "");
-  const sizeGb = () => (d().size_bytes / 1e9).toFixed(1);
-  const ramGb = () => (d().ram_peak_mb / 1024).toFixed(0);
+  const sizeLabel = () => {
+    const bytes = d().size_bytes;
+    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB on disk`;
+    return `${Math.round(bytes / 1e6)} MB on disk`;
+  };
+  const ramLabel = () => {
+    const mb = d().ram_peak_mb;
+    if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GB peak RAM`;
+    return `${mb} MB peak RAM`;
+  };
   return (
     <button
       type="button"
@@ -731,18 +910,25 @@ function LlmCard(props: {
           aria-hidden="true"
         >
           <Show when={props.selected}>
-            <span class="h-1.5 w-1.5 rounded-full bg-black" />
+            <span class="h-1.5 w-1.5 rounded-full bg-[var(--color-on-accent)]" />
           </Show>
         </span>
       </div>
       <span class="text-[11px] text-[var(--color-ink-mute)]">
-        ~{sizeGb()} GB on disk · ~{ramGb()} GB peak RAM
+        ~{sizeLabel()} · ~{ramLabel()}
       </span>
-      <Show when={props.recommended || props.swapWarn}>
+      <Show
+        when={props.recommended || props.swapWarn || props.model.installed}
+      >
         <div class="mt-1 flex flex-wrap gap-1">
           <Show when={props.recommended}>
             <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
               Recommended
+            </span>
+          </Show>
+          <Show when={props.model.installed}>
+            <span class="rounded-full bg-[var(--color-success)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-success)]">
+              Installed
             </span>
           </Show>
           <Show when={props.swapWarn}>
@@ -756,7 +942,7 @@ function LlmCard(props: {
   );
 }
 
-function shortLlmName(name: string): string {
+function shortModelName(name: string): string {
   return name.replace(/\s*\([^)]*\)/g, "").replace(/ —.*$/, "");
 }
 

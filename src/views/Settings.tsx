@@ -1315,7 +1315,7 @@ function AppleFmEngineRow(props: {
               type="button"
               disabled={!reachable()}
               onClick={props.onUse}
-              class="rounded-[8px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-black hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+              class="rounded-[8px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-on-accent)] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Use
             </button>
@@ -1506,7 +1506,7 @@ function InferenceServerSection() {
             <Show when={!installed() && !downloading()}>
               <button
                 type="button"
-                class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-black hover:brightness-110"
+                class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
                 onClick={install}
               >
                 Install
@@ -1584,6 +1584,7 @@ function ModelRow(props: {
 }) {
   const sizeMb = () => Math.round(props.m.descriptor.size_bytes / 1_000_000);
   const ramMb = () => props.m.descriptor.ram_peak_mb;
+  const blurb = () => modelBlurb(props.m.descriptor.id);
 
   return (
     <div class="liquid-card mb-3 rounded-[10px] p-4 ring-1 ring-[var(--color-border)]">
@@ -1597,6 +1598,11 @@ function ModelRow(props: {
               </span>
             </Show>
           </div>
+          <Show when={blurb()}>
+            <div class="mt-1 text-[12px] text-[var(--color-ink)]/85">
+              {blurb()}
+            </div>
+          </Show>
           <div class="mt-0.5 text-[11px] text-[var(--color-ink-mute)]">
             ~{sizeMb()} MB on disk · ~{ramMb()} MB peak RAM · tier:{" "}
             {props.m.descriptor.tier}
@@ -1606,7 +1612,7 @@ function ModelRow(props: {
           <Show when={props.m.installed && !props.isActive}>
             <button
               type="button"
-              class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-black hover:bg-[var(--color-accent)]"
+              class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent)]"
               onClick={props.onUse}
             >
               Use
@@ -1615,7 +1621,7 @@ function ModelRow(props: {
           <Show when={!props.m.installed && !props.downloading}>
             <button
               type="button"
-              class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-black hover:brightness-110"
+              class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
               onClick={props.onDownload}
             >
               Download
@@ -1864,7 +1870,7 @@ function ModesTab(props: {
         <button
           type="button"
           onClick={onNew}
-          class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-black hover:brightness-110"
+          class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
         >
           + New mode
         </button>
@@ -1951,7 +1957,7 @@ function ModeRow(props: {
           <Show when={!props.isActive}>
             <button
               type="button"
-              class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-black hover:bg-[var(--color-accent)]"
+              class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent)]"
               onClick={props.onActivate}
             >
               Use
@@ -2375,7 +2381,7 @@ function ModeEditor(props: {
           </button>
           <button
             type="button"
-            class="rounded-[6px] bg-[var(--color-accent)] px-4 py-1.5 text-[12px] font-medium text-black hover:brightness-110"
+            class="rounded-[6px] bg-[var(--color-accent)] px-4 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
             onClick={() => props.onSave(draft())}
           >
             Save
@@ -2421,7 +2427,7 @@ function DictionaryTab(props: {
             <input
               type="text"
               class="flex-1 rounded-[6px] bg-[var(--color-input-bg)] px-3 py-2 text-[13px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-              placeholder="Add proper nouns, acronyms, or technical terms — one per line."
+              placeholder="Anthropic, kubectl, OAuth…"
               value={draft()}
               onInput={(e) => setDraft(e.currentTarget.value)}
               onKeyDown={(e) => {
@@ -2433,7 +2439,7 @@ function DictionaryTab(props: {
             />
             <button
               type="button"
-              class="rounded-[6px] bg-[var(--color-accent)] px-4 py-2 text-[12px] font-medium text-black hover:brightness-110 disabled:opacity-50"
+              class="rounded-[6px] bg-[var(--color-accent)] px-4 py-2 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110 disabled:opacity-50"
               disabled={!draft().trim()}
               onClick={add}
             >
@@ -2444,7 +2450,8 @@ function DictionaryTab(props: {
             when={props.s.dictionary.length > 0}
             fallback={
               <p class="text-[12px] text-[var(--color-ink-mute)]">
-                Add names or technical words Vox should spell correctly.
+                Add a word once and Vox will spell <em>Anthropic</em> even if
+                you sound like you're saying <em>Anthropik</em>.
               </p>
             }
           >
@@ -2801,6 +2808,30 @@ function AboutTab() {
       </Card>
     </>
   );
+}
+
+// One-line, user-facing description per model. DESIGN.md §5.6 — explain
+// what *changes* for the user (speed / quality trade-offs), not RAM
+// numbers (those already live in the metadata row underneath).
+function modelBlurb(id: string): string | null {
+  switch (id) {
+    case "whisper-tiny-en-q5_1":
+      return "Fastest. English-only. Good for short notes; misses uncommon words.";
+    case "whisper-small-en-q5_1":
+      return "Fast. English-only. Better with technical terms and names.";
+    case "whisper-large-v3-turbo-q5_0":
+      return "Multilingual. Sharp accuracy with near-realtime turnaround.";
+    case "whisper-large-v3-q5_0":
+      return "Multilingual. Best accuracy on long or noisy dictations.";
+    case "gemma-4-e2b-q4_k_m":
+      return "Snappy cleanup. Punctuation and capitalisation; light filler-word removal.";
+    case "gemma-4-e4b-q4_k_m":
+      return "Balanced. Reliable filler-word removal and natural sentence flow.";
+    case "gemma-4-26b-a4b-q4_k_m":
+      return "Slowest. Best at preserving your voice and intent over long dictations.";
+    default:
+      return null;
+  }
 }
 
 function formatDiagnostics(d: DiagnoseHotkeys): string {

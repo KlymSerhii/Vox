@@ -1,13 +1,36 @@
 @import "tailwindcss";
 
 @theme {
-  --color-accent: #7c9cff;
-  --color-accent-strong: #3d5bff;
-  --color-accent-soft: rgb(124 156 255 / 0.16);
+  /* Deep teal as the primary accent. Replaces the previous cobalt-blue
+   * accent because (a) it carves Vox a distinct lane in the menu bar
+   * vs. the blue-skewed peer set (Things 3, Wispr Flow, iA Writer),
+   * (b) it pairs with the warm-cream light surface without going cold,
+   * and (c) it lets the existing palette read as a coherent
+   * teal/violet/coral trio instead of a near-blue/violet near-collision.
+   * The recording-state coral and the polishing-state violet keep their
+   * roles. */
+  --color-accent: #3fb8b0;
+  --color-accent-strong: #5bcfc6;
+  --color-accent-soft: rgb(63 184 176 / 0.18);
+  /* Foreground colour for text/icons rendered on top of `--color-accent`
+   * fills. Inverted across themes for optimal contrast and a designed
+   * feel: in dark mode the teal accent is bright (`#3fb8b0`), so a
+   * near-black foreground reads cleanest; in light mode the teal is
+   * dark (`#0f8c8c`), so a near-white foreground takes over.
+   *
+   * Both shades are deliberately not pure: the dark variant carries a
+   * touch of warmth so it doesn't feel inky-cold against the teal,
+   * and the light variant uses the brand cream (the same hue as the
+   * icon glyph) so primary buttons inherit a subtle thread of brand
+   * identity. */
+  --color-on-accent: #16161a;
   --color-violet: #b49bff;
   --color-danger: #ff6b6b;
   --color-success: #4ade80;
   --color-warning: #fbbf24;
+  /* Coral lifted from the icon gradient. Lives only in moments where
+   * the brand earns the spotlight (active dictation). DESIGN.md §5.4. */
+  --color-coral: #ff8e6a;
   --color-ink: #f4f4f5;
   --color-ink-mute: #a1a1aa;
   --color-ink-faint: #71717a;
@@ -15,6 +38,11 @@
   --color-surface: rgb(39 39 42 / 0.85);
   --color-surface-raised: rgb(50 50 55 / 0.94);
   --color-surface-glass: rgba(28, 28, 32, 0.95);
+  /* Dedicated pill background. Sits a touch below the heavier
+   * surface-glass token so the pill still reads as floating glass,
+   * but stays opaque enough that the rim doesn't outshine the
+   * interior on dark wallpapers. */
+  --color-pill-surface: rgba(34, 34, 38, 0.78);
   --color-sidebar: rgba(24, 24, 27, 0.78);
   --color-border: rgb(255 255 255 / 0.08);
   --color-border-strong: rgb(255 255 255 / 0.14);
@@ -43,19 +71,35 @@
     0 28px 64px var(--glass-shadow);
   --glass-shadow-stack-sm: inset 0 1px 0 var(--glass-highlight),
     0 1px 2px var(--glass-shadow-contact), 0 6px 16px var(--glass-shadow-soft);
+  /* Pill-specific shadow. The deep 28px blur from the regular stack
+   * paints a visible dark cloud around the floating pill on light
+   * wallpapers; this lighter stack keeps a crisp rim + a near-contact
+   * shadow only. */
+  --glass-shadow-pill: inset 0 1px 0 var(--glass-highlight),
+    0 1px 2px var(--glass-shadow-contact), 0 4px 12px var(--glass-shadow-soft),
+    0 12px 28px var(--glass-shadow-soft);
 }
 
 /* Light theme. Tailwind 4's `@theme` only accepts static defaults, so
  * overrides live here and are applied synchronously by the early-paint
  * script in each HTML entry to avoid a flash. */
 [data-theme="light"] {
-  --color-accent: #5b7bff;
-  --color-accent-strong: #3d5bff;
-  --color-accent-soft: rgb(91 123 255 / 0.12);
+  /* Light-mode accent: deep teal. White text on this hue clears WCAG
+   * AA Large on filled buttons; the chip on cream surface clears AA
+   * Large for small toggles. */
+  --color-accent: #0f8c8c;
+  --color-accent-strong: #0a7575;
+  --color-accent-soft: rgb(15 140 140 / 0.12);
+  /* Brand cream — same hue as the icon glyph. Slightly warmer than
+   * pure white so the buttons feel designed rather than clinical. */
+  --color-on-accent: #fff4e8;
   --color-violet: #8a6dff;
   --color-danger: #e5484d;
   --color-success: #22a06b;
   --color-warning: #d9870f;
+  /* On light glass the pure-coral icon hue glares; we step the saturation
+   * down a touch so the meter reads warm without dominating the panel. */
+  --color-coral: #ff7556;
   --color-ink: #161618;
   /* Mute/faint carry extra contrast — the gradient wallpaper + 24px
    * blur + 180% saturate softens any text sitting on glass. */
@@ -69,6 +113,11 @@
   --color-surface: rgba(252, 250, 247, 0.88);
   --color-surface-raised: rgba(252, 250, 247, 0.92);
   --color-surface-glass: rgba(252, 250, 247, 0.94);
+  /* Pill-specific glass — slightly more translucent than the rest of
+   * the UI but still opaque enough that the bright rim doesn't read
+   * as a separate ring against the cream interior on dark wallpapers
+   * (the "pill-inside-a-pill" effect). */
+  --color-pill-surface: rgba(252, 250, 247, 0.95);
   --color-sidebar: rgba(252, 250, 247, 0.78);
   --color-border: rgb(15 15 20 / 0.08);
   --color-border-strong: rgb(15 15 20 / 0.14);
@@ -139,10 +188,12 @@ button:disabled {
 }
 
 @keyframes pulse-mic {
+
   0%,
   100% {
     opacity: 1;
   }
+
   50% {
     opacity: 0.55;
   }
@@ -159,6 +210,7 @@ button:disabled {
     opacity: 0;
     transform: translateY(8px) scale(0.98);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
@@ -169,9 +221,42 @@ button:disabled {
   0% {
     background: rgba(74, 222, 128, 0.2);
   }
+
   100% {
     background: transparent;
   }
+}
+
+/* Continuous left-to-right luminance sweep across processing-state
+ * labels. The base sits at ink-mute; a ~30% wide bright band travels
+ * through the glyphs on a 1.6s loop. Reads as "alive and progressing"
+ * without any spinner geometry — the word itself is the indicator. */
+@keyframes pill-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: 0% 0;
+  }
+}
+
+.pill-shimmer {
+  background-image: linear-gradient(100deg,
+      var(--shimmer-base, var(--color-ink-mute)) 0%,
+      var(--shimmer-base, var(--color-ink-mute)) 38%,
+      var(--shimmer-tint, var(--color-ink)) 50%,
+      var(--shimmer-base, var(--color-ink-mute)) 62%,
+      var(--shimmer-base, var(--color-ink-mute)) 100%);
+  /* 250% size + animating from 100% → 0% keeps the peak inside the
+   * container for the whole cycle and minimises the snap at wrap. */
+  background-size: 250% 100%;
+  background-repeat: no-repeat;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: pill-shimmer 1.6s linear infinite;
 }
 
 .animate-pulse-mic {
@@ -191,11 +276,21 @@ button:disabled {
 }
 
 @media (prefers-reduced-motion: reduce) {
+
   .animate-pulse-mic,
   .animate-spinner,
   .animate-pill-in,
-  .animate-flash-done {
+  .animate-flash-done,
+  .pill-shimmer {
     animation: none !important;
+  }
+
+  .pill-shimmer {
+    /* Without the sweep the word would render transparent under
+     * background-clip: text. Hand the glyphs back to a solid colour. */
+    -webkit-text-fill-color: var(--color-ink);
+    color: var(--color-ink);
+    background-image: none;
   }
 }
 
@@ -209,42 +304,30 @@ button:disabled {
 
 [data-theme="light"] .liquid-canvas {
   background-image:
-    radial-gradient(
-      ellipse 90% 65% at 0% 0%,
+    radial-gradient(ellipse 90% 65% at 0% 0%,
       rgba(124, 156, 255, 0.10),
-      transparent 60%
-    ),
-    radial-gradient(
-      ellipse 80% 55% at 100% 0%,
+      transparent 60%),
+    radial-gradient(ellipse 80% 55% at 100% 0%,
       rgba(255, 196, 158, 0.07),
-      transparent 60%
-    ),
-    radial-gradient(
-      ellipse 100% 70% at 100% 100%,
+      transparent 60%),
+    radial-gradient(ellipse 100% 70% at 100% 100%,
       rgba(180, 155, 255, 0.10),
-      transparent 60%
-    ),
-    radial-gradient(
-      ellipse 70% 50% at 0% 100%,
+      transparent 60%),
+    radial-gradient(ellipse 70% 50% at 0% 100%,
       rgba(112, 220, 200, 0.06),
-      transparent 60%
-    );
+      transparent 60%);
   background-color: var(--color-bg);
   background-attachment: fixed;
 }
 
 [data-theme="dark"] .liquid-canvas {
   background-image:
-    radial-gradient(
-      ellipse 90% 65% at 0% 0%,
+    radial-gradient(ellipse 90% 65% at 0% 0%,
       rgba(124, 156, 255, 0.08),
-      transparent 60%
-    ),
-    radial-gradient(
-      ellipse 100% 70% at 100% 100%,
+      transparent 60%),
+    radial-gradient(ellipse 100% 70% at 100% 100%,
       rgba(180, 155, 255, 0.06),
-      transparent 60%
-    );
+      transparent 60%);
   background-color: var(--color-bg);
   background-attachment: fixed;
 }
@@ -309,10 +392,12 @@ button:disabled {
   width: 6px;
   height: 6px;
 }
+
 .scrollbar-thin::-webkit-scrollbar-thumb {
   background: var(--color-border-strong);
   border-radius: 3px;
 }
+
 .scrollbar-thin::-webkit-scrollbar-thumb:hover {
   background: var(--color-ink-faint);
 }
