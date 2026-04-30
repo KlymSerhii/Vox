@@ -40,6 +40,24 @@ fn put(rgba: &mut [u8], x: i32, y: i32, w: i32, alpha: u8) {
     }
 }
 
+/// Coloured-image write with max-alpha overlap, for non-template glyphs
+/// that need to render with a fixed RGB regardless of AppKit tinting.
+/// Used by the animated Processing ring: tray-icon 0.21's `set_icon`
+/// hardcodes `setTemplate(NO)` on each new image, which makes alpha-only
+/// pixels render as invisible-on-transparent for one redraw cycle
+/// before `set_icon_as_template` flips them back. Baking the colour in
+/// up front sidesteps that flicker entirely.
+fn put_colour(rgba: &mut [u8], x: i32, y: i32, w: i32, ink: [u8; 3], alpha: u8) {
+    if let Some(i) = idx(x, y, w) {
+        if alpha >= rgba[i + 3] {
+            rgba[i] = ink[0];
+            rgba[i + 1] = ink[1];
+            rgba[i + 2] = ink[2];
+            rgba[i + 3] = alpha;
+        }
+    }
+}
+
 /// Coloured-image write: source-over alpha compositing onto whatever was
 /// there before. Used only by `recording()`, which is shipped as a
 /// non-template image.
@@ -363,8 +381,11 @@ pub fn recording(w: i32, phase: f32) -> Vec<u8> {
 }
 
 /// Three-quarter ring with a rotating gap. `phase ∈ [0, 1)` advances the
-/// gap clockwise around the circle. Template (alpha-only).
-pub fn processing(w: i32, phase: f32) -> Vec<u8> {
+/// gap clockwise around the circle. Non-template — RGB is baked in to
+/// dodge the tray-icon 0.21 `setTemplate(NO)` flicker described in
+/// `put_colour`. The caller picks `ink` based on the current menu-bar
+/// appearance (white in dark mode, dark grey in light mode).
+pub fn processing(w: i32, phase: f32, ink: [u8; 3]) -> Vec<u8> {
     let mut rgba = canvas(w);
     let s = w as f32 / 16.0;
     let cx = w as f32 / 2.0;
@@ -423,7 +444,7 @@ pub fn processing(w: i32, phase: f32) -> Vec<u8> {
                 (1.0 - edge_dist).clamp(0.0, 1.0)
             };
             let a = (radial * gap_factor * 220.0) as u8;
-            put(&mut rgba, x, y, w, a);
+            put_colour(&mut rgba, x, y, w, ink, a);
         }
     }
     rgba
@@ -495,18 +516,29 @@ mod tests {
 
     #[test]
     fn processing_phases_differ() {
-        let a = processing(32, 0.0);
-        let b = processing(32, 0.5);
+        let a = processing(32, 0.0, [255, 255, 255]);
+        let b = processing(32, 0.5, [255, 255, 255]);
         assert_ne!(a, b, "processing gap should rotate with phase");
     }
 
     #[test]
-    fn processing_is_template() {
-        // All RGB should be 0 — template image, AppKit tints.
-        let buf = processing(32, 0.3);
+    fn processing_bakes_ink_colour() {
+        // Processing is intentionally non-template now (see comment on
+        // `put_colour`): RGB must match the requested ink so AppKit
+        // can render it directly without the setTemplate flicker.
+        let buf = processing(32, 0.3, [255, 255, 255]);
+        let mut hit_white = 0;
         for p in buf.chunks_exact(4) {
-            assert_eq!((p[0], p[1], p[2]), (0, 0, 0), "processing must be alpha-only");
+            if p[3] > 0 {
+                assert_eq!(
+                    (p[0], p[1], p[2]),
+                    (255, 255, 255),
+                    "any opaque pixel should carry the baked ink colour"
+                );
+                hit_white += 1;
+            }
         }
+        assert!(hit_white > 20, "ring should produce visible pixels");
     }
 
     #[test]

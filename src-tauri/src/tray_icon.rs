@@ -8,6 +8,17 @@ use tauri::{image::Image, AppHandle, Runtime};
 
 use crate::tray_glyphs;
 
+/// Colour baked into the animated Processing frames. Always white so
+/// the icon visually matches every other template-tinted icon in a
+/// dark menu bar (the common case). `defaults read -g
+/// AppleInterfaceStyle` only reports the system's *Appearance*
+/// preference, which doesn't actually predict what the menu bar looks
+/// like — a Light-mode user with a dark wallpaper sees a dark menu
+/// bar with white-tinted template icons. Picking white unconditionally
+/// is the closest match to that majority appearance and was the
+/// explicit user preference after the first run.
+const PROCESSING_INK: [u8; 3] = [255, 255, 255];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayState {
     Idle,
@@ -42,10 +53,14 @@ impl TrayState {
         matches!(self, Self::Recording | Self::Processing)
     }
 
-    /// Recording is the only state that ships in colour (solid coral) — the
-    /// rest are template images that AppKit tints to match the menu bar.
+    /// Recording (coral) and Processing (white/grey baked from
+    /// `menu_bar_ink`) ship as non-template RGBA so the rotating ring
+    /// is immune to the tray-icon 0.21 `setTemplate(NO)` flicker (see
+    /// `tray_glyphs::put_colour`). Idle / Error / Permission stay as
+    /// alpha-only templates: they never animate, so the one-time flicker
+    /// at a state transition is invisible in practice.
     fn is_template(self) -> bool {
-        !matches!(self, Self::Recording)
+        !matches!(self, Self::Recording | Self::Processing)
     }
 }
 
@@ -90,7 +105,7 @@ fn image_for_state(state: TrayState, phase: f32) -> Image<'static> {
     let buf = match state {
         TrayState::Idle => tray_glyphs::idle(W as i32),
         TrayState::Recording => tray_glyphs::recording(W as i32, phase),
-        TrayState::Processing => tray_glyphs::processing(W as i32, phase),
+        TrayState::Processing => tray_glyphs::processing(W as i32, phase, PROCESSING_INK),
         TrayState::Error => tray_glyphs::error(W as i32),
         TrayState::Permission => tray_glyphs::permission(W as i32),
     };
@@ -131,7 +146,19 @@ fn apply_frame<R: Runtime>(app: &AppHandle<R>, state: TrayState, phase: f32) {
     };
     let img = image_for_state(state, phase);
     let _ = tray.set_icon(Some(img));
-    let _ = tray.set_icon_as_template(state.is_template());
+    // Re-assert the template flag on every install for alpha-only
+    // states. tray-icon 0.21's `set_icon` hardcodes `setTemplate(NO)`
+    // (https://github.com/tauri-apps/tray-icon/pull/204), which would
+    // render an alpha-only RGB=0 glyph as a black silhouette on
+    // transparent — exactly what was happening to Idle/Error/Permission
+    // when the animation loop's settle path called `apply_frame` after
+    // a state transition. Animated states (Recording, Processing) bake
+    // their colour into RGBA up front so the hardcoded `false` is what
+    // they want; they skip the flip to keep the per-frame loop free of
+    // the two-call redraw flicker.
+    if state.is_template() {
+        let _ = tray.set_icon_as_template(true);
+    }
 }
 
 fn update_tooltip<R: Runtime>(app: &AppHandle<R>, tip: &str) -> tauri::Result<()> {

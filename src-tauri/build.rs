@@ -41,7 +41,10 @@ fn emit_tray_icons() {
     let states: &[(&str, Draw)] = &[
         ("idle", Box::new(|w| tray_glyphs::idle(w))),
         ("recording", Box::new(|w| tray_glyphs::recording(w, 0.25))),
-        ("processing", Box::new(|w| tray_glyphs::processing(w, 0.0))),
+        // Designer dump uses the dark-mode ink (white) so the reference
+        // PNG matches the most common menu-bar appearance; the runtime
+        // re-derives ink from `mac_appearance::is_dark_menu_bar`.
+        ("processing", Box::new(|w| tray_glyphs::processing(w, 0.0, [255, 255, 255]))),
         ("error", Box::new(|w| tray_glyphs::error(w))),
         ("permission", Box::new(|w| tray_glyphs::permission(w))),
     ];
