@@ -773,9 +773,9 @@ function HotkeysTab(props: {
             <div class="flex items-center gap-1">
               <Keycap>⌘</Keycap>
               <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
-              <Keycap>⌃</Keycap>
+              <Keycap>⌥</Keycap>
               <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
-              <Keycap>Space</Keycap>
+              <Keycap>.</Keycap>
             </div>
             <span class="text-[11px] text-[var(--color-ink-mute)]">
               {pttHint(props.s.hands_free_enabled, ptt())}

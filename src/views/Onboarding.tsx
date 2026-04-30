@@ -50,7 +50,13 @@ const LAST_STEP: Step = 4;
 const MODELS_STEP: Step = 3;
 
 /** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a glyph
- *  string ("⌥⇧V", "F13"). Bare `AltRight`/`AltLeft` map to `⌥`. */
+ *  string ("⌥⇧V", "F13"). Bare `AltRight`/`AltLeft` map to `⌥`.
+ *
+ *  When the trailing key is one whose shifted glyph is more readable
+ *  than `Shift+<key>` (e.g. `Slash` → `?`, `Semicolon` → `:`), and
+ *  `Shift` is in the modifier set, the rendering collapses `Shift+key`
+ *  to the shifted glyph alone. This matches macOS menu conventions —
+ *  `Cmd+Shift+/` is shown as `⌘?`, not `⌘⇧/`. */
 export function formatHotkey(spec: string | null | undefined): string {
   if (!spec) return "";
   const trimmed = spec.trim();
@@ -67,11 +73,35 @@ export function formatHotkey(spec: string | null | undefined): string {
     Ctrl: "⌃",
     Control: "⌃",
     CommandOrControl: "⌘",
-    Semicolon: ";",
   };
-  return trimmed
-    .split("+")
-    .map((tok) => MODS[tok.trim()] ?? tok.trim())
+  const KEYS_UNSHIFTED: Record<string, string> = {
+    Slash: "/",
+    Semicolon: ";",
+    Backslash: "\\",
+    Comma: ",",
+    Period: ".",
+    Quote: "'",
+  };
+  const KEYS_SHIFTED: Record<string, string> = {
+    Slash: "?",
+    Semicolon: ":",
+    Backslash: "|",
+    Comma: "<",
+    Period: ">",
+    Quote: "\"",
+  };
+  const tokens = trimmed.split("+").map((t) => t.trim());
+  const last = tokens[tokens.length - 1];
+  const hasShift = tokens.includes("Shift");
+  if (hasShift && KEYS_SHIFTED[last]) {
+    const head = tokens
+      .slice(0, -1)
+      .filter((t) => t !== "Shift")
+      .map((t) => MODS[t] ?? t);
+    return head.join("") + KEYS_SHIFTED[last];
+  }
+  return tokens
+    .map((t) => MODS[t] ?? KEYS_UNSHIFTED[t] ?? t)
     .join("");
 }
 
@@ -996,7 +1026,7 @@ function HowToUseStep(props: { s: Settings | null }) {
   const pttGlyph = () =>
     formatHotkey(ptt()?.bound) ||
     formatHotkey(props.s?.hotkey) ||
-    "⌘⌥L";
+    "⌘⌥.";
   const cycleGlyph = () =>
     formatHotkey(cycle()?.bound) ||
     formatHotkey(props.s?.mode_cycle_hotkey) ||

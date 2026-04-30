@@ -171,20 +171,32 @@ body.translucent {
   background: transparent !important;
 }
 
-input,
-button,
-select,
-textarea {
-  font: inherit;
-  color: inherit;
-}
+/* Form-control inheritance has to live inside `@layer base` so that
+ * Tailwind utility classes (in the `utilities` layer) win over it. As
+ * an unlayered rule it would beat every layered rule regardless of
+ * specificity — that's exactly the cascade trap that made
+ * `text-[var(--color-on-accent)]` get struck out in DevTools by this
+ * rule's `color: inherit`, leaving primary-button text as the body's
+ * `--color-ink`. The Tailwind 4 layer order is `theme, base,
+ * components, utilities`, so dropping into `base` keeps the inherit
+ * defaults for unstyled controls while letting any explicit utility
+ * override them. */
+@layer base {
+  input,
+  button,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
 
-button {
-  cursor: pointer;
-}
+  button {
+    cursor: pointer;
+  }
 
-button:disabled {
-  cursor: not-allowed;
+  button:disabled {
+    cursor: not-allowed;
+  }
 }
 
 @keyframes pulse-mic {
@@ -355,6 +367,27 @@ button:disabled {
   transition:
     background-color 250ms ease,
     box-shadow 250ms ease,
+    backdrop-filter 250ms ease,
+    -webkit-backdrop-filter 250ms ease;
+}
+
+/* Window-root variant of .liquid-glass. The full glass-shadow-stack adds
+ * a 28px-blur outer drop shadow that gets hard-clipped to the NSWindow's
+ * rectangular bounds when the glass element fills the whole window
+ * (h-screen w-screen) — visible as a dark rectangular halo around the
+ * rounded corners. NSWindow's own system shadow (`shadow(true)`) already
+ * follows the alpha channel of the rounded content, so we keep just the
+ * inset rim cues here and let the OS draw the drop shadow. */
+.liquid-glass-window {
+  background: var(--color-surface-glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-rim);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    inset 0 -1px 0 var(--glass-edge-bottom);
+  transition:
+    background-color 250ms ease,
     backdrop-filter 250ms ease,
     -webkit-backdrop-filter 250ms ease;
 }

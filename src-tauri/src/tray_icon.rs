@@ -79,7 +79,7 @@ fn default_tooltip(state: TrayState) -> &'static str {
         TrayState::Recording => "Vox — listening…",
         TrayState::Processing => "Vox — transcribing…",
         TrayState::Error => "Vox — error (click for details)",
-        TrayState::Permission => "Vox — needs Accessibility / Mic permission",
+        TrayState::Permission => "Vox — needs Microphone access (click to grant)",
     }
 }
 
@@ -178,12 +178,13 @@ fn spawn_anim_loop<R: Runtime>(app: AppHandle<R>) {
 
 #[cfg(target_os = "macos")]
 fn missing_permissions() -> bool {
-    extern "C" {
-        fn AXIsProcessTrusted() -> bool;
-    }
-    if !unsafe { AXIsProcessTrusted() } {
-        return true;
-    }
+    // Only the mic is required for the default `Cmd+Alt+Period` (⌘⌥.)
+    // pipeline — Carbon `RegisterEventHotKey` doesn't need a TCC grant.
+    // Accessibility is optional (chord PTT path), so a missing AX grant
+    // must not surface the lock-badge tray state on launch: every user
+    // who skips chord setup would otherwise see a "needs permission"
+    // indicator forever.
+    //
     // Must use the non-prompting AVFoundation probe here: cpal's
     // default_input_config() opens the device far enough to fire the TCC
     // microphone prompt on macOS 14+ before the user reaches onboarding.

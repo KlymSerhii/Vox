@@ -235,29 +235,49 @@ fn mic_outline(rgba: &mut [u8], w: i32) {
     rect(rgba, foot_left, stem_bot, foot_right, stem_bot + (0.75 * s).ceil() as i32, w, 220);
 }
 
-/// Padlock — body rect + shackle arc on top. Used for `Permission`.
-fn lock_glyph(rgba: &mut [u8], w: i32) {
+/// Small lock badge in the lower-right corner — used by `Permission`.
+/// Mirrors the bang-badge pattern: the mic outline carries the Vox
+/// identity, the corner badge tells the user *what kind* of attention is
+/// needed. A standalone padlock — like macOS uses for FileVault — reads
+/// as "system thing, not mine" in the menu bar; pairing it with the mic
+/// keeps it unambiguously a Vox state.
+fn lock_badge(rgba: &mut [u8], w: i32) {
     let s = w as f32 / 16.0;
-    let cx = w as f32 / 2.0;
-    let cy = w as f32 / 2.0 + 1.0 * s;
+    let bcx = w as f32 - 3.75 * s;
+    let bcy = w as f32 - 3.5 * s;
 
-    let body_top = (cy - 2.5 * s).round() as i32;
-    let body_bot = (cy + 3.5 * s).round() as i32;
-    let body_left = (cx - 3.5 * s).round() as i32;
-    let body_right = (cx + 3.5 * s).round() as i32;
+    // Body: small rounded-feel rectangle. We don't AA the corners — at 32 px
+    // the body is only ~5 px wide, sub-pixel rounding reads as fuzz.
+    let body_w = (2.6 * s).round();
+    let body_h = (2.2 * s).round();
+    let body_left = (bcx - body_w / 2.0).round() as i32;
+    let body_right = (bcx + body_w / 2.0).round() as i32;
+    let body_top = (bcy - 0.2 * s).round() as i32;
+    let body_bot = (body_top as f32 + body_h).round() as i32;
     rect(rgba, body_left, body_top, body_right, body_bot, w, 255);
 
-    let shackle_r = 2.5 * s;
-    let shackle_cy = cy - 2.5 * s;
-    let stroke = (1.5 * s).max(1.0);
-    let r2_out = shackle_r * shackle_r;
-    let r2_in = (shackle_r - stroke) * (shackle_r - stroke);
-    for y in 0..w {
-        for x in 0..w {
-            let dx = x as f32 + 0.5 - cx;
+    // Shackle: half-ring sitting on the body. Draw only the upper hemisphere
+    // (dy <= 0) so it reads as a U, not an O.
+    let shackle_r = (1.0 * s).max(1.5);
+    let shackle_cy = body_top as f32;
+    let stroke = (0.55 * s).max(1.0);
+    let r_out = shackle_r;
+    let r_in = (shackle_r - stroke).max(0.0);
+    let r2_out = r_out * r_out;
+    let r2_in = r_in * r_in;
+    let xmin = (bcx - r_out - 1.0).floor() as i32;
+    let xmax = (bcx + r_out + 1.0).ceil() as i32;
+    let ymin = (shackle_cy - r_out - 1.0).floor() as i32;
+    let ymax = shackle_cy.ceil() as i32;
+    for y in ymin..=ymax {
+        for x in xmin..=xmax {
+            let dx = x as f32 + 0.5 - bcx;
             let dy = y as f32 + 0.5 - shackle_cy;
+            if dy > 0.0 {
+                continue;
+            }
             let d2 = dx * dx + dy * dy;
-            if d2 <= r2_out && d2 >= r2_in && dy <= 0.5 * s {
+            if d2 <= r2_out && d2 >= r2_in {
                 put(rgba, x, y, w, 255);
             }
         }
@@ -405,10 +425,15 @@ pub fn error(w: i32) -> Vec<u8> {
     rgba
 }
 
-/// Padlock glyph — needs Mic / Accessibility permission. Static.
+/// Hollow microphone with a small padlock badge in the lower-right corner.
+/// Used when Mic / Accessibility permission is missing. Mirrors the
+/// error-state composition (mic + bang badge) so all three "needs the
+/// user" states share a consistent silhouette: identity in the centre,
+/// attention cue in the corner.
 pub fn permission(w: i32) -> Vec<u8> {
     let mut rgba = canvas(w);
-    lock_glyph(&mut rgba, w);
+    mic_outline(&mut rgba, w);
+    lock_badge(&mut rgba, w);
     rgba
 }
 
@@ -479,7 +504,43 @@ mod tests {
     #[test]
     fn permission_renders_pixels() {
         let buf = permission(32);
-        assert!(nonzero_alpha_count(&buf) > 30, "permission lock should draw visible pixels");
+        assert!(nonzero_alpha_count(&buf) > 30, "permission glyph should draw visible pixels");
+    }
+
+    #[test]
+    fn permission_includes_mic_body() {
+        // Composition assertion: permission must render both the central mic
+        // outline (so it reads as Vox, not a generic system lock) and the
+        // corner badge. Concretely, both the centre band of the canvas and
+        // the lower-right quadrant must contain non-zero alpha pixels.
+        let buf = permission(32);
+        let mut centre_pixels = 0;
+        let mut corner_pixels = 0;
+        for y in 0..32 {
+            for x in 0..32 {
+                let i = ((y * 32 + x) * 4) as usize;
+                if buf[i + 3] == 0 {
+                    continue;
+                }
+                // Mic capsule occupies roughly x∈[10,21], y∈[3,13] on a 32px
+                // canvas with the current `mic_outline` geometry.
+                if (10..=21).contains(&x) && (3..=14).contains(&y) {
+                    centre_pixels += 1;
+                }
+                // Lock badge sits in the lower-right corner.
+                if x >= 22 && y >= 22 {
+                    corner_pixels += 1;
+                }
+            }
+        }
+        assert!(
+            centre_pixels > 10,
+            "permission must keep the mic body visible (centre={centre_pixels})"
+        );
+        assert!(
+            corner_pixels > 5,
+            "permission must overlay the lock badge in the corner (corner={corner_pixels})"
+        );
     }
 
     #[test]

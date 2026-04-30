@@ -71,6 +71,11 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
     ctx.pipeline_active.store(true, Ordering::SeqCst);
     *ctx.started_at.lock() = Some(Instant::now());
 
+    // Acquire the global Escape grab now (and not at app launch) so
+    // Escape only short-circuits to Vox while a dictation session is in
+    // flight. `PipelineGuard::drop` releases it on every exit path.
+    crate::hotkey::arm_cancel(&app);
+
     log::info!("▶ begin recording (sid={new_sid})");
     pill::show(&app);
     pill::emit_state(&app, PillState::Listening, None);
@@ -93,6 +98,9 @@ pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
         ctx.recording.store(false, Ordering::SeqCst);
         ctx.pipeline_active.store(false, Ordering::SeqCst);
         *ctx.started_at.lock() = None;
+        // Release the global Escape grab — this exit path bypasses
+        // `PipelineGuard` because we never reach the async pipeline.
+        crate::hotkey::disarm_cancel(&app);
         pill::emit_state(
             &app,
             PillState::Error,
@@ -121,9 +129,10 @@ pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
         .unwrap_or(false);
 
     let app_for_pill = app.clone();
+    let app_for_guard = app.clone();
 
     tauri::async_runtime::spawn(async move {
-        let _pipeline_guard = PipelineGuard::new(&ctx, my_sid);
+        let _pipeline_guard = PipelineGuard::new(app_for_guard, &ctx, my_sid);
 
         let wav_result = ctx.audio.stop_and_encode();
 
@@ -425,15 +434,17 @@ pub fn cancel<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
     }
 }
 
-struct PipelineGuard {
+struct PipelineGuard<R: Runtime> {
+    app: AppHandle<R>,
     flag: Arc<AtomicBool>,
     session_id: Arc<AtomicU64>,
     sid: u64,
 }
 
-impl PipelineGuard {
-    fn new(ctx: &SessionCtx, sid: u64) -> Self {
+impl<R: Runtime> PipelineGuard<R> {
+    fn new(app: AppHandle<R>, ctx: &SessionCtx, sid: u64) -> Self {
         Self {
+            app,
             flag: ctx.pipeline_active.clone(),
             session_id: ctx.session_id.clone(),
             sid,
@@ -441,10 +452,16 @@ impl PipelineGuard {
     }
 }
 
-impl Drop for PipelineGuard {
+impl<R: Runtime> Drop for PipelineGuard<R> {
     fn drop(&mut self) {
+        // Only the guard for the still-current session clears the flag;
+        // a stale guard from a superseded sid leaves a fresh session's
+        // state alone. The cancel-hotkey disarm is gated on the same
+        // check so a re-armed grab from a fresh session isn't pulled
+        // out from under it.
         if self.session_id.load(Ordering::SeqCst) == self.sid {
             self.flag.store(false, Ordering::SeqCst);
+            crate::hotkey::disarm_cancel(&self.app);
         }
     }
 }

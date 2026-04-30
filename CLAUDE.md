@@ -22,8 +22,8 @@ This file is the canonical project reference. The README that used to live at th
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `hotkey` | `Cmd+Ctrl+Space` | Hardcoded — `settings::load` rewrites any other persisted value back to this on every launch. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
-| `cancel_hotkey` | `Escape` | Aborts the in-flight session. |
+| `hotkey` | `Cmd+Alt+Period` (⌘⌥.) | Hardcoded — `settings::load` rewrites any other persisted value back to this on every launch. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
+| `cancel_hotkey` | `Escape` | Aborts the in-flight session. The OS grab is acquired only while a session is active (`hotkey::arm_cancel` at `session::begin_recording`, `hotkey::disarm_cancel` from `PipelineGuard::drop`) so Escape works normally in every other app when Vox isn't dictating. |
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
 | `dictation_enabled` | `true` | Master kill-switch from the tray popover. |
@@ -62,7 +62,7 @@ Each mode contributes:
 ## Permissions
 
 - **Microphone** — required, prompted lazily inside the onboarding wizard via `AVCaptureDevice.requestAccessForMediaType`. The non-prompting `authorizationStatusForMediaType:` is used everywhere else (so the tray icon doesn't trigger a TCC prompt at launch).
-- **Accessibility** — **no longer required** for the dictation pipeline. It is still optionally used by the modifier-only chord hotkey path (`mac_chord.rs`, `CGEventTap`), but the default `Cmd+Ctrl+Space` shortcut does not need it.
+- **Accessibility** — **not required** for the default pipeline. The `Cmd+Alt+Period` (⌘⌥.) shortcut goes through Carbon `RegisterEventHotKey`, which doesn't need a TCC grant. Accessibility is only needed if the user picks a modifier-only chord PTT in Settings (routed through `mac_chord.rs`, `CGEventTap`).
 
 ## Repository layout
 
@@ -202,7 +202,7 @@ VOX_LOG=debug npm run tauri dev
 
 `tauri dev` produces an unbundled binary at `src-tauri/target/debug/vox` whose code signature changes on every rebuild. macOS TCC keys grants by signature, so chord-hotkey users may see "Vox is in the Accessibility list but `AXIsProcessTrusted()=false`". `./scripts/dev-bundle.sh` builds a proper `.app` whose identity is stable; use that for any work that touches Accessibility.
 
-The default `Cmd+Ctrl+Space` shortcut sidesteps this entirely — it goes through the Carbon `RegisterEventHotKey` path which doesn't require Accessibility.
+The default `Cmd+Alt+Period` shortcut sidesteps this entirely — it goes through the Carbon `RegisterEventHotKey` path which doesn't require Accessibility. Only users who configure a modifier-only chord PTT in Settings hit the dev-mode signature-rotation issue; for them, `./scripts/dev-bundle.sh` builds a proper `.app` whose identity is stable.
 
 ## Settings tabs
 

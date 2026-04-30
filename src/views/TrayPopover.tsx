@@ -119,7 +119,7 @@ export default function TrayPopoverView() {
   }
 
   return (
-    <div class="liquid-glass flex h-screen w-screen flex-col overflow-hidden rounded-[14px] text-[13px] text-[var(--color-ink)]">
+    <div class="liquid-glass-window flex h-screen w-screen flex-col overflow-hidden rounded-[14px] text-[13px] text-[var(--color-ink)]">
       <Show
         when={loaded() && s()}
         fallback={
@@ -537,19 +537,12 @@ function ago(tsSeconds: number): string {
 
 function hotkeyLabel(k: string): string {
   switch (k) {
-    case "AltRight":
-      return "⌥";
-    case "AltLeft":
-      return "⌥L";
     case "F13":
       return "F13";
     case "F14":
       return "F14";
     case "F15":
       return "F15";
-    case "CommandOrControl+Shift+Space":
-    case "Cmd+Shift+Space":
-      return "⌘⇧Space";
     case "Alt+M":
       return "⌥M";
     case "Alt+Shift+M":

@@ -4,15 +4,13 @@
 //! of acting as press-and-hold; the dispatch reads the current pref each time.
 //!
 //! Fallback policy:
-//! - **Chord PTT configs never fall back to a key.** If the user picked a
-//!   modifier-only chord and it can't install (typically: Accessibility not
-//!   granted), we surface the error verbatim. Substituting an unrelated key
-//!   would be confusing — the user might not even have it on their keyboard.
-//! - **Key PTT configs walk `KEY_PTT_FALLBACKS`** if the chosen key fails to
-//!   bind. `tauri-plugin-global-shortcut` silently fails for keys missing
-//!   from its Carbon scancode map (notably bare `AltRight`), so the chain is
-//!   our only signal to the user that something went wrong.
-//! - **Cancel / mode-cycle** are discrete events; chords don't apply.
+//! - **Push-to-talk has no fallback.** The configured spec is the only
+//!   thing tried — chord-first on macOS, then a single key bind. The key
+//!   is currently hardcoded to `Cmd+Alt+Period` and has no UI picker, so
+//!   substituting an unrelated key would silently swap behaviour with no
+//!   way to communicate the swap. If the bind fails we surface the error.
+//! - **Cancel / mode-cycle** walk a small fallback list and persist any
+//!   substitution back to settings; their pickers are visible in the UI.
 
 use std::sync::Mutex;
 
@@ -27,15 +25,6 @@ use crate::mac_chord::{self, ChordHandle};
 use crate::session::{self, SessionCtx};
 use crate::settings::{self, HotkeyPurpose};
 
-/// Consulted only when the user picked a key (not a chord) and it failed
-/// to bind. See the module-level docs.
-const KEY_PTT_FALLBACKS: &[&str] = &[
-    "CommandOrControl+Shift+Space",
-    "CommandOrControl+Shift+Semicolon",
-    "F13",
-    "F14",
-    "F15",
-];
 const CANCEL_FALLBACKS: &[&str] = &["Escape"];
 const MODE_CYCLE_FALLBACKS: &[&str] =
     &["Alt+M", "Alt+Shift+M", "CommandOrControl+Shift+M"];
@@ -76,11 +65,27 @@ pub struct ActiveHotkeyState {
     pub push_to_talk: Mutex<ActiveHotkey>,
     pub cancel: Mutex<ActiveHotkey>,
     pub mode_cycle: Mutex<ActiveHotkey>,
+    /// Cached cancel binding. The cancel hotkey (default `Escape`) is
+    /// only registered with the OS while a dictation session is active —
+    /// otherwise pressing Escape in any other app would be swallowed by
+    /// our global grab and never reach the focused window. We resolve
+    /// the binding once at `register()` time (so we know which key
+    /// actually works on this machine), immediately release the OS
+    /// grab, and stash the spec here for `arm_cancel` / `disarm_cancel`
+    /// to flip on/off at session boundaries.
+    pub cancel_armed: Mutex<Option<CancelArm>>,
     /// Owns the `CGEventTap`-backed chord listener. Re-register drops
     /// the prior handle BEFORE installing the new one so two taps
     /// never compete.
     #[cfg(target_os = "macos")]
     pub chord: Mutex<Option<ChordHandle>>,
+}
+
+/// Resolved cancel binding kept in `ActiveHotkeyState` for arm/disarm
+/// to consult.
+pub struct CancelArm {
+    pub shortcut: Shortcut,
+    pub ctx: SessionCtx,
 }
 
 impl ActiveHotkeyState {
@@ -109,19 +114,13 @@ impl ActiveHotkeyState {
 
 fn shortcut_from_key(id: &str) -> Option<Shortcut> {
     match id {
-        "AltRight" => Some(Shortcut::new(None, Code::AltRight)),
-        "AltLeft" => Some(Shortcut::new(None, Code::AltLeft)),
         "F13" => Some(Shortcut::new(None, Code::F13)),
         "F14" => Some(Shortcut::new(None, Code::F14)),
         "F15" => Some(Shortcut::new(None, Code::F15)),
         "Escape" | "Esc" => Some(Shortcut::new(None, Code::Escape)),
-        "CommandOrControl+Shift+Space" | "Cmd+Shift+Space" => Some(Shortcut::new(
-            Some(Modifiers::META | Modifiers::SHIFT),
-            Code::Space,
-        )),
-        "CommandOrControl+Shift+Semicolon" | "Cmd+Shift+;" => Some(Shortcut::new(
-            Some(Modifiers::META | Modifiers::SHIFT),
-            Code::Semicolon,
+        "Cmd+Alt+Period" => Some(Shortcut::new(
+            Some(Modifiers::META | Modifiers::ALT),
+            Code::Period,
         )),
         "Alt+M" => Some(Shortcut::new(Some(Modifiers::ALT), Code::KeyM)),
         "Alt+Shift+M" => Some(Shortcut::new(
@@ -297,17 +296,34 @@ pub fn register<R: Runtime>(
             if Some(sc) == ptt_bound_sc {
                 return Err(format!("'{key}' collides with push-to-talk; not registering"));
             }
-            let app_handle = app.clone();
-            let ctx_clone = ctx.clone();
-            gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
-                if let ShortcutState::Pressed = event.state() {
-                    session::cancel(app_handle.clone(), ctx_clone.clone());
-                }
-            })
-            .map_err(|e| e.to_string())
+            // Probe with a no-op handler. We unregister immediately
+            // below — the real arming happens in `arm_cancel` at
+            // session start. The bind walk only exists here to surface
+            // fallbacks and validation errors during launch.
+            gs.register(sc).map_err(|e| e.to_string())
         },
     );
     let cancel_bound_sc = shortcut_from_key(&cancel_active.bound);
+    // Release the OS grab immediately. Without this the cancel hotkey
+    // (default `Escape`) would intercept the key in every other app for
+    // the entire lifetime of Vox, even with no dictation in flight.
+    if let Some(sc) = cancel_bound_sc {
+        let _ = gs.unregister(sc);
+        if let Some(state) = app.try_state::<ActiveHotkeyState>() {
+            if let Ok(mut g) = state.cancel_armed.lock() {
+                *g = Some(CancelArm {
+                    shortcut: sc,
+                    ctx: ctx.clone(),
+                });
+            }
+        }
+    } else if let Some(state) = app.try_state::<ActiveHotkeyState>() {
+        // Probe failed — make sure no stale spec from a previous
+        // register() can re-arm later.
+        if let Ok(mut g) = state.cancel_armed.lock() {
+            *g = None;
+        }
+    }
 
     let mode_active = bind_discrete(
         app,
@@ -371,7 +387,89 @@ pub fn register<R: Runtime>(
         ));
     }
 
+    // If the user reconfigures hotkeys mid-dictation, the
+    // `unregister_all()` at the top wiped the cancel grab we'd put down
+    // in `arm_cancel`. Re-arm so Escape still cancels the in-flight
+    // session.
+    if ctx.is_pipeline_active() {
+        arm_cancel(app);
+    }
+
     Ok(ptt_active.bound)
+}
+
+/// Acquire the OS grab on the cancel hotkey. Called from
+/// `session::begin_recording` so Escape only redirects to Vox while a
+/// dictation session is in flight.
+///
+/// Deferred onto the tokio runtime to escape Carbon's
+/// `RegisterEventHotKey` re-entrancy: the PTT handler runs inside the
+/// Carbon event dispatcher on the main thread, and registering a fresh
+/// hotkey from inside that dispatcher froze the app. Posting the work
+/// back to a worker lets the current hotkey event finish unwinding
+/// before the new shortcut is bound.
+pub fn arm_cancel<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(state) = app.try_state::<ActiveHotkeyState>() else {
+            return;
+        };
+        let armed = match state.cancel_armed.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(arm) = armed.as_ref() else {
+            return;
+        };
+        let sc = arm.shortcut;
+        let ctx_clone = arm.ctx.clone();
+        drop(armed);
+
+        let gs = app.global_shortcut();
+        if gs.is_registered(sc) {
+            return;
+        }
+
+        let app_handle = app.clone();
+        if let Err(e) = gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
+            if let ShortcutState::Pressed = event.state() {
+                session::cancel(app_handle.clone(), ctx_clone.clone());
+            }
+        }) {
+            log::warn!("arm_cancel: failed to register cancel shortcut: {e}");
+        }
+    });
+}
+
+/// Release the OS grab on the cancel hotkey so Escape works normally
+/// in every other app. Called when the dictation pipeline ends (any
+/// terminal state: Done, Canceled, Error, audio-start failure).
+///
+/// Deferred for the same Carbon re-entrancy reason as `arm_cancel` —
+/// `gs.unregister` ultimately calls `UnregisterEventHotKey`, which we
+/// must not invoke from inside another hotkey's event dispatch.
+pub fn disarm_cancel<R: Runtime>(app: &AppHandle<R>) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some(state) = app.try_state::<ActiveHotkeyState>() else {
+            return;
+        };
+        let armed = match state.cancel_armed.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        let Some(arm) = armed.as_ref() else {
+            return;
+        };
+        let sc = arm.shortcut;
+        drop(armed);
+
+        let gs = app.global_shortcut();
+        if !gs.is_registered(sc) {
+            return;
+        }
+        let _ = gs.unregister(sc);
+    });
 }
 
 fn display_bound(a: &ActiveHotkey) -> String {
@@ -390,8 +488,10 @@ fn nonempty(s: &str) -> &str {
     }
 }
 
-/// PTT bind: chord path first (macOS only) — never falls back to a key.
-/// Otherwise walks `KEY_PTT_FALLBACKS` via the standard shortcut plugin.
+/// PTT bind: chord path first (macOS only), otherwise a single key bind
+/// via the standard shortcut plugin. No fallback walk — the picker is
+/// hardcoded and we'd rather surface the explicit error than smuggle in
+/// an unrelated key.
 fn register_push_to_talk<R: Runtime>(
     app: &AppHandle<R>,
     preferred: &str,
@@ -434,96 +534,60 @@ fn register_push_to_talk<R: Runtime>(
         }
     }
 
-    let mut candidates: Vec<String> = vec![preferred.to_string()];
-    for f in KEY_PTT_FALLBACKS {
-        if !candidates.iter().any(|c| c == f) {
-            candidates.push((*f).to_string());
-        }
-    }
-
-    let mut error_chain: Vec<String> = Vec::new();
-    let mut primary_error: Option<String> = None;
-
-    for (idx, key) in candidates.iter().enumerate() {
-        let is_primary = idx == 0;
-        let Some(sc) = shortcut_from_key(key) else {
-            let msg = format!("'{key}': unrecognised shortcut id");
-            if is_primary {
-                primary_error = Some(msg.clone());
-            }
-            error_chain.push(msg);
-            continue;
+    let Some(sc) = shortcut_from_key(preferred) else {
+        let msg = format!("'{preferred}': unrecognised shortcut id");
+        log::error!("push-to-talk: {msg}");
+        return ActiveHotkey {
+            configured: preferred.to_string(),
+            bound: String::new(),
+            fell_back: false,
+            mechanism: String::new(),
+            error: Some(msg.clone()),
+            error_chain: vec![msg],
         };
-        let app_handle = app.clone();
-        let ctx_clone = ctx.clone();
-        let r = gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
-            let prefs = settings::prefs(&app_handle);
-            match (prefs.hands_free_enabled, event.state()) {
-                (true, ShortcutState::Pressed) => {
-                    if ctx_clone.is_recording() {
-                        session::end_recording(app_handle.clone(), ctx_clone.clone());
-                    } else {
-                        session::begin_recording(app_handle.clone(), &ctx_clone);
-                    }
+    };
+
+    let app_handle = app.clone();
+    let ctx_clone = ctx.clone();
+    match gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
+        let prefs = settings::prefs(&app_handle);
+        match (prefs.hands_free_enabled, event.state()) {
+            (true, ShortcutState::Pressed) => {
+                if ctx_clone.is_recording() {
+                    session::end_recording(app_handle.clone(), ctx_clone.clone());
+                } else {
+                    session::begin_recording(app_handle.clone(), &ctx_clone);
                 }
-                (false, ShortcutState::Pressed) => {
-                    session::begin_recording(app_handle.clone(), &ctx_clone)
-                }
-                (false, ShortcutState::Released) => {
-                    session::end_recording(app_handle.clone(), ctx_clone.clone())
-                }
-                _ => {}
             }
-        });
-        match r {
-            Ok(()) => {
-                let fell_back = idx > 0;
-                if fell_back {
-                    log::error!(
-                        "push-to-talk: configured key '{preferred}' could not \
-                         be bound; using fallback key '{key}'. Errors: {}",
-                        error_chain.join("; ")
-                    );
-                    if let Err(e) = settings::set_hotkey_field(
-                        app,
-                        HotkeyPurpose::PushToTalk,
-                        key,
-                    ) {
-                        log::warn!(
-                            "could not persist resolved push-to-talk hotkey: {e}"
-                        );
-                    }
-                }
-                return ActiveHotkey {
-                    configured: preferred.to_string(),
-                    bound: key.clone(),
-                    fell_back,
-                    mechanism: "shortcut".to_string(),
-                    error: primary_error,
-                    error_chain,
-                };
+            (false, ShortcutState::Pressed) => {
+                session::begin_recording(app_handle.clone(), &ctx_clone)
             }
-            Err(e) => {
-                let msg = format!("'{key}': {e}");
-                if is_primary {
-                    primary_error = Some(msg.clone());
-                }
-                error_chain.push(msg);
+            (false, ShortcutState::Released) => {
+                session::end_recording(app_handle.clone(), ctx_clone.clone())
+            }
+            _ => {}
+        }
+    }) {
+        Ok(()) => ActiveHotkey {
+            configured: preferred.to_string(),
+            bound: preferred.to_string(),
+            fell_back: false,
+            mechanism: "shortcut".to_string(),
+            error: None,
+            error_chain: Vec::new(),
+        },
+        Err(e) => {
+            let msg = format!("'{preferred}': {e}");
+            log::error!("push-to-talk: bind failed — {msg}");
+            ActiveHotkey {
+                configured: preferred.to_string(),
+                bound: String::new(),
+                fell_back: false,
+                mechanism: String::new(),
+                error: Some(msg.clone()),
+                error_chain: vec![msg],
             }
         }
-    }
-
-    log::error!(
-        "push-to-talk: NO key shortcut could be bound. Tried: {}",
-        error_chain.join("; ")
-    );
-    ActiveHotkey {
-        configured: preferred.to_string(),
-        bound: String::new(),
-        fell_back: false,
-        mechanism: String::new(),
-        error: primary_error.or_else(|| error_chain.first().cloned()),
-        error_chain,
     }
 }
 

@@ -50,7 +50,11 @@ const KEYRING_ACCOUNT_LEGACY_GROQ: &str = "groq";
 const KEYRING_ACCOUNT_LEGACY_ANTHROPIC: &str = "anthropic";
 
 fn default_hotkey() -> String {
-    "Cmd+Ctrl+Space".to_string()
+    // ⌘⌥. — Cmd + Option + Period. Bound via Carbon
+    // `RegisterEventHotKey` through `tauri-plugin-global-shortcut`, so
+    // it doesn't need Accessibility. Period is the unshifted glyph
+    // of its key, so no Shift collapsing is needed at display time.
+    "Cmd+Alt+Period".to_string()
 }
 fn default_cancel_hotkey() -> String {
     "Escape".to_string()
