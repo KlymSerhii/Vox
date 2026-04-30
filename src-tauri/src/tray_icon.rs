@@ -149,8 +149,9 @@ fn update_tooltip<R: Runtime>(app: &AppHandle<R>, tip: &str) -> tauri::Result<()
 ///   from the research) sampled at ~30 FPS so the alpha curve stays
 ///   smooth.
 /// - **Processing**: 1500 ms cycle (~0.66 Hz, one revolution every
-///   1.5 s) sampled at ~12 FPS — fast enough to read as motion but not
-///   so fast it competes with the cursor blink.
+///   1.5 s) sampled at ~30 FPS. The previous 12 FPS sampling stepped
+///   the gap ~20° per frame, which combined with the formerly-hard
+///   gap edges read as a flickering ring rather than smooth rotation.
 fn spawn_anim_loop<R: Runtime>(app: AppHandle<R>) {
     let inner = Arc::clone(inner());
     let start = Instant::now();
@@ -159,7 +160,7 @@ fn spawn_anim_loop<R: Runtime>(app: AppHandle<R>) {
             let cur = TrayState::from_u8(inner.state.load(Ordering::SeqCst));
             let (period_ms, frame_ms): (u64, u64) = match cur {
                 TrayState::Recording => (1000, 33),
-                TrayState::Processing => (1500, 83),
+                TrayState::Processing => (1500, 33),
                 _ => {
                     // Settle on a non-animating frame so the icon doesn't
                     // freeze mid-cycle.

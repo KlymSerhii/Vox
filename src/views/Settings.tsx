@@ -537,7 +537,7 @@ function SegmentedControl<T extends string>(props: {
               role="radio"
               aria-checked={active()}
               onClick={() => props.onChange(o.value)}
-              class="rounded-[6px] px-3 py-[3px] text-[12px] font-medium transition-all"
+              class="rounded-[6px] px-3 py-[3px] text-[12px] font-medium leading-[16px] transition-all"
               classList={{
                 "text-[var(--color-ink)]": active(),
                 "text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]":
@@ -547,7 +547,13 @@ function SegmentedControl<T extends string>(props: {
                 active()
                   ? {
                       background: "var(--color-surface-raised)",
-                      "box-shadow": "var(--glass-shadow-stack-sm)",
+                      // Contained shadow: a 1px inset highlight + a 1px
+                      // hairline drop. The full glass-shadow-stack-sm
+                      // (which has a 22px outer blur) was leaking past
+                      // the pill's 2px bottom padding and reading as
+                      // asymmetric padding on the active segment.
+                      "box-shadow":
+                        "inset 0 1px 0 var(--glass-highlight), 0 1px 1px var(--glass-shadow-contact)",
                     }
                   : {}
               }

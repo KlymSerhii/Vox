@@ -43,11 +43,11 @@ import { VoxLogo } from "../components/VoxLogo";
 
 type PolishChoice = "apple-fm" | "gemma-local";
 
-type Step = 0 | 1 | 2 | 3 | 4;
+type Step = 0 | 1 | 2 | 3;
 
-const STEP_COUNT = 5;
-const LAST_STEP: Step = 4;
-const MODELS_STEP: Step = 3;
+const STEP_COUNT = 4;
+const LAST_STEP: Step = 3;
+const MODELS_STEP: Step = 2;
 
 /** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a glyph
  *  string ("⌥⇧V", "F13"). Bare `AltRight`/`AltLeft` map to `⌥`.
@@ -213,9 +213,6 @@ export default function OnboardingView() {
               }}
             />
           </Show>
-          <Show when={step() === 2}>
-            <AccessibilityStep granted={perms().accessibility} />
-          </Show>
           <Show when={step() === MODELS_STEP}>
             <DownloadStep
               s={s()}
@@ -364,30 +361,6 @@ function MicStep(props: { granted: boolean; onAllow: () => void }) {
         Allow microphone
       </button>
       <PermStatus granted={props.granted} grantedLabel="Granted" pendingLabel="Waiting…" />
-    </div>
-  );
-}
-
-function AccessibilityStep(props: { granted: boolean }) {
-  return (
-    <div class="flex flex-col items-center gap-5 text-center">
-      <h2 class="text-[20px] font-semibold">Let Vox type for you.</h2>
-      <p class="max-w-[400px] text-[13px] text-[var(--color-ink-mute)]">
-        Vox needs Accessibility to send the finished text to the app you're
-        using.
-      </p>
-      <button
-        type="button"
-        onClick={() => openAccessibilitySettings()}
-        class="rounded-[8px] bg-[var(--color-control)] px-4 py-2 text-[13px] hover:bg-[var(--color-control-hover)]"
-      >
-        Open System Settings
-      </button>
-      <PermStatus
-        granted={props.granted}
-        grantedLabel="Granted — restart Vox after adding it"
-        pendingLabel="Waiting (polling every 2s)…"
-      />
     </div>
   );
 }

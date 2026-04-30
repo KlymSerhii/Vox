@@ -378,6 +378,13 @@ pub fn processing(w: i32, phase: f32) -> Vec<u8> {
     let gap_center = phase * TAU - PI;
     let gap_half = FRAC_PI_4;
 
+    // Soft fade across the angular gap edges. Without this, pixels at
+    // the leading/trailing edge of the gap snap fully on or fully off
+    // each frame as the gap rotates past them — which reads as a
+    // "blinking" ring at any practical framerate. ~0.09 rad ≈ 5° of
+    // softness on each side gives a visibly smooth wipe.
+    let edge_softness: f32 = 0.09;
+
     let r_in = (r - stroke).max(0.0);
     let xmin = (cx - r - 1.0).floor() as i32;
     let xmax = (cx + r + 1.0).ceil() as i32;
@@ -394,21 +401,28 @@ pub fn processing(w: i32, phase: f32) -> Vec<u8> {
                 continue;
             }
 
-            // Inside the gap wedge? Skip.
+            // Angular distance to the gap centre, wrapped to [0, PI].
             let mut delta = (dy.atan2(dx) - gap_center).abs();
             if delta > PI {
                 delta = TAU - delta;
             }
-            if delta < gap_half {
+            // Smooth-step across the gap edge: 0 inside the gap,
+            // 1 outside, linear in between.
+            let edge_lo = gap_half - edge_softness;
+            let edge_hi = gap_half + edge_softness;
+            let gap_factor = ((delta - edge_lo) / (edge_hi - edge_lo))
+                .clamp(0.0, 1.0);
+            if gap_factor <= 0.0 {
                 continue;
             }
 
-            let a = if d <= r && d >= r_in {
-                220
+            let radial = if d <= r && d >= r_in {
+                1.0
             } else {
                 let edge_dist = if d > r { d - r } else { r_in - d };
-                ((1.0 - edge_dist).clamp(0.0, 1.0) * 220.0) as u8
+                (1.0 - edge_dist).clamp(0.0, 1.0)
             };
+            let a = (radial * gap_factor * 220.0) as u8;
             put(&mut rgba, x, y, w, a);
         }
     }
