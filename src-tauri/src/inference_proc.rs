@@ -5,8 +5,12 @@
 //! download-and-extract half. This module owns everything that
 //! happens AFTER the binary is on disk:
 //!
-//! 1. `spawn` the binary as a child in its own process group / Job
-//!    Object so a parent SIGKILL still tears down the child.
+//! 1. `spawn` the binary as a child. On Windows we assign it to a
+//!    Job Object with `KILL_ON_JOB_CLOSE` so a parent SIGKILL still
+//!    tears down the child. On macOS there is no equivalent — the
+//!    child gets reparented to launchd and survives indefinitely
+//!    after a force-kill of Vox; `reap_orphans_at_startup` (step 5)
+//!    is the load-bearing safety net for that case.
 //! 2. Health-poll `GET /health` with backoff until ready.
 //! 3. Hand a `RunningServer { port, api_key }` to the engine layer
 //!    (`engines::gemma_http`) so it can talk to the server.
@@ -30,7 +34,7 @@ use std::time::{Duration, Instant};
 use command_group::AsyncCommandGroup;
 use parking_lot::Mutex;
 use rand::Rng;
-use sysinfo::{ProcessesToUpdate, Signal};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, UpdateKind};
 use tauri::{AppHandle, Manager, Runtime};
 
 use crate::inference_server;
@@ -284,10 +288,15 @@ async fn spawn<R: Runtime>(
 
     // `group_spawn()` puts the child in its own process group on
     // Unix and assigns it to a Job Object on Windows with the
-    // KILL_ON_JOB_CLOSE flag — so a kernel-level guarantee prevents
-    // the child from outliving us. `kill_on_drop` (Tokio's vanilla
-    // mechanism) only fires on graceful Drop and would leak a child
-    // if the parent crashed.
+    // KILL_ON_JOB_CLOSE flag. The Job Object is a kernel-level
+    // guarantee that the child can't outlive us on Windows. On
+    // macOS the process group is just for signal grouping — there
+    // is no equivalent of Linux's `PR_SET_PDEATHSIG`, so a parent
+    // SIGKILL still leaks the child to launchd. The startup orphan
+    // reaper (`reap_orphans_at_startup`) cleans up after that.
+    // `kill_on_drop` (Tokio's vanilla mechanism) is strictly weaker
+    // — it only fires on graceful Drop and would leak a child if
+    // the parent crashed even on Windows.
     let mut child = cmd
         .group_spawn()
         .map_err(|e| anyhow::anyhow!("spawn llama-server: {e}"))?;
@@ -418,8 +427,18 @@ pub fn reap_orphans_at_startup<R: Runtime>(app: &AppHandle<R>) {
     let needle = s.inference_api_key.as_str();
 
     let mut sys = sysinfo::System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
+    // The bare `refresh_processes` in sysinfo 0.32 does NOT populate
+    // `Process::cmd()` — its default `ProcessRefreshKind` covers
+    // memory/cpu/disk/exe only. Without explicitly opting in to
+    // `with_cmd`, the api-key match below silently never fires and
+    // every orphan survives every launch.
+    sys.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::new().with_cmd(UpdateKind::Always),
+    );
 
+    let mut seen = 0usize;
     let mut killed = 0usize;
     for (pid, proc_) in sys.processes() {
         // Cheap pre-filter on the executable name to avoid string
@@ -428,6 +447,7 @@ pub fn reap_orphans_at_startup<R: Runtime>(app: &AppHandle<R>) {
         if !name.contains("llama-server") {
             continue;
         }
+        seen += 1;
         let cmd_has_token = proc_
             .cmd()
             .iter()
@@ -439,21 +459,28 @@ pub fn reap_orphans_at_startup<R: Runtime>(app: &AppHandle<R>) {
         if pid.as_u32() == std::process::id() {
             continue;
         }
-        // SIGTERM first; if a stuck child needs SIGKILL, the OS will
-        // hand it out on the next cycle when its parent dies.
-        if proc_.kill_with(Signal::Term).unwrap_or(false) {
+        // SIGKILL, not SIGTERM: these are orphans of a dead parent
+        // (PPID=1), so there is no in-flight session to drain and no
+        // graceful shutdown to honour. SIGKILL is uncatchable, so
+        // this can't wedge on a llama-server build that ignores
+        // SIGTERM.
+        if proc_.kill_with(Signal::Kill).unwrap_or(false) {
             log::info!(
                 "reaped orphan llama-server pid={} cmd={:?}",
                 pid.as_u32(),
                 proc_.cmd()
             );
             killed += 1;
+        } else {
+            log::warn!("orphan llama-server pid={} could not be killed", pid.as_u32());
         }
     }
-    if killed == 0 {
-        log::debug!("orphan reaper: no stale llama-server instances found");
+    if seen == 0 {
+        log::debug!("orphan reaper: no llama-server processes on the box");
     } else {
-        log::info!("orphan reaper: killed {killed} stale llama-server instance(s)");
+        log::info!(
+            "orphan reaper: killed {killed}/{seen} llama-server instance(s)"
+        );
     }
 }
 

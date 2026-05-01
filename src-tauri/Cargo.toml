@@ -75,11 +75,14 @@ num_cpus = "1"
 # Heavy native STT engine — see `local-engines` feature above.
 whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
 # Out-of-process Gemma polishing dependencies.
-# `command-group` gives us cross-platform "kill-on-parent-exit" semantics:
-# `setpgid(0,0)` on Unix and Windows Job Objects with
-# `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. Tokio's `kill_on_drop` only
-# handles graceful Drop — it doesn't kill the child if the parent itself
-# crashes.
+# `command-group` puts the child in its own process group on Unix and
+# assigns it to a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+# The Job Object is a true kernel-level kill-on-parent-exit guarantee on
+# Windows. On macOS `setpgid(0,0)` is just signal grouping — there is no
+# `PR_SET_PDEATHSIG` equivalent, so a parent SIGKILL still leaks the child
+# to launchd; `inference_proc::reap_orphans_at_startup` cleans those up on
+# the next launch by matching `--api-key` against our persisted token.
+# Tokio's `kill_on_drop` is strictly weaker — graceful Drop only.
 command-group = { version = "5", features = ["with-tokio"] }
 # Archive extraction for the downloaded `llama-server` artifacts.
 # macOS releases ship as .tar.gz, Windows as .zip.
