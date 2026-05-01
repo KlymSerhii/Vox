@@ -5,9 +5,10 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, WebviewUrl};
 
 pub const LABEL: &str = "pill";
-// Slimmer pill — about half the previous footprint. The webview leaves
-// a small slack around the visible element so the soft drop shadow can
-// fade into transparency instead of clipping flush at the window edge.
+// The window is sized larger than the visible pill (116×26) so glow
+// effects on Done/Warning states have room to fall off. The main drop
+// shadow is drawn by the OS (`hasShadow=YES`) outside the window,
+// following the rounded alpha of the pill content.
 pub const WIDTH: f64 = 144.0;
 pub const HEIGHT: f64 = 36.0;
 const BOTTOM_MARGIN: f64 = 96.0;
@@ -54,7 +55,11 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .minimizable(false)
         .decorations(false)
         .transparent(true)
-        .shadow(false)
+        // OS shadow follows the rounded alpha of the pill content — the
+        // CSS `box-shadow` was producing a rectangular halo clipped to
+        // the NSWindow bounds (same trap documented for
+        // `.liquid-glass-window`).
+        .shadow(true)
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)

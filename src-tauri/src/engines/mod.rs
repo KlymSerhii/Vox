@@ -130,6 +130,18 @@ impl Registry {
         guard.llm.insert(key, engine.clone());
         Some(engine)
     }
+
+    /// Drop any cached engine instance keyed on `model_id`. Used by
+    /// `models::delete_model` so a cached Whisper context releases its
+    /// mmap on the about-to-be-deleted file — without this the OS keeps
+    /// the inode alive (disk space stays reserved) until the user
+    /// quits Vox.
+    pub fn drop_for_model(&self, model_id: &str) {
+        let suffix = format!("::{model_id}");
+        let mut guard = self.inner.lock();
+        guard.stt.retain(|k, _| !k.ends_with(&suffix));
+        guard.llm.retain(|k, _| !k.ends_with(&suffix));
+    }
 }
 
 /// Fire-and-forget pre-warm. Idempotent — `WhisperLocalEngine::prewarm`'s

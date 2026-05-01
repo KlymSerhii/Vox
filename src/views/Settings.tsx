@@ -1074,8 +1074,12 @@ function ModelsTab(props: {
     await cancelDownload(id);
   }
 
+  // ModelRow gates the destructive call behind an inline two-step
+  // confirm — the native browser `window.confirm()` was silently
+  // returning false inside Tauri's WKWebView, so the previous
+  // `if (!confirm(...)) return` short-circuited every time and the
+  // delete never fired.
   async function remove(id: string) {
-    if (!confirm(`Delete the cached model ${id}?`)) return;
     try {
       await deleteModel(id);
     } catch (e) {
@@ -1592,6 +1596,28 @@ function ModelRow(props: {
   const ramMb = () => props.m.descriptor.ram_peak_mb;
   const blurb = () => modelBlurb(props.m.descriptor.id);
 
+  // Inline two-step confirm. Replaces a native `window.confirm()` that
+  // was silently returning false in Tauri's WKWebView so the delete
+  // never fired.
+  const [confirming, setConfirming] = createSignal(false);
+  let dismissTimer: ReturnType<typeof setTimeout> | undefined;
+  function armConfirm() {
+    setConfirming(true);
+    if (dismissTimer) clearTimeout(dismissTimer);
+    dismissTimer = setTimeout(() => setConfirming(false), 5000);
+  }
+  function cancelConfirm() {
+    setConfirming(false);
+    if (dismissTimer) clearTimeout(dismissTimer);
+  }
+  function commitDelete() {
+    cancelConfirm();
+    props.onDelete();
+  }
+  onCleanup(() => {
+    if (dismissTimer) clearTimeout(dismissTimer);
+  });
+
   return (
     <div class="liquid-card mb-3 rounded-[10px] p-4 ring-1 ring-[var(--color-border)]">
       <div class="flex items-start justify-between gap-3">
@@ -1615,7 +1641,7 @@ function ModelRow(props: {
           </div>
         </div>
         <div class="flex items-center gap-2">
-          <Show when={props.m.installed && !props.isActive}>
+          <Show when={props.m.installed && !props.isActive && !confirming()}>
             <button
               type="button"
               class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent)]"
@@ -1642,12 +1668,32 @@ function ModelRow(props: {
               Cancel
             </button>
           </Show>
-          <Show when={props.m.installed}>
+          <Show when={props.m.installed && !confirming()}>
             <button
               type="button"
               class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
-              onClick={props.onDelete}
+              onClick={armConfirm}
               title="Delete cached model"
+            >
+              Delete
+            </button>
+          </Show>
+          <Show when={props.m.installed && confirming()}>
+            <span class="text-[11px] text-[var(--color-ink-mute)]">
+              Free ~{sizeMb()} MB?
+            </span>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
+              onClick={cancelConfirm}
+            >
+              Keep
+            </button>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-danger)] px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"
+              onClick={commitDelete}
+              title="Permanently delete the cached file"
             >
               Delete
             </button>

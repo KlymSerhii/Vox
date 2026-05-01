@@ -537,6 +537,19 @@ fn append_to_lock(lock_path: &Path, id: &str, sha: &str) -> std::io::Result<()> 
 pub fn delete_model<R: Runtime>(app: &AppHandle<R>, id: &str) -> anyhow::Result<()> {
     let d = descriptor_for(id)
         .ok_or_else(|| anyhow::anyhow!("unknown model id: {id}"))?;
+
+    // Release any process holding the file open before unlinking.
+    // macOS keeps the inode (and disk bytes) alive until the last
+    // handle closes, so a bare `remove_dir_all` while Whisper has the
+    // GGML mmap'd or `llama-server` is serving the GGUF would silently
+    // leave the user's disk space reserved.
+    if let Some(registry) = app.try_state::<crate::engines::Registry>() {
+        registry.drop_for_model(id);
+    }
+    if matches!(d.kind, ModelKind::Llm) {
+        crate::inference_proc::shutdown_if_using(app, id);
+    }
+
     let root = root_dir(app);
     let dir = model_dir(&root, d);
     if dir.exists() {

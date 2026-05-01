@@ -508,6 +508,35 @@ pub fn shutdown_managed<R: Runtime>(app: &AppHandle<R>) {
     });
 }
 
+/// Tear down the managed server iff it is currently serving `model_id`.
+/// Called from `models::delete_model` so deleting an LLM that
+/// `llama-server` has open actually frees the disk space — on macOS an
+/// `unlink` against an open inode keeps the bytes reserved until the
+/// last handle closes. Returns `true` if a matching server was killed.
+pub fn shutdown_if_using<R: Runtime>(app: &AppHandle<R>, model_id: &str) -> bool {
+    let st = match app.try_state::<ServerState>() {
+        Some(s) => s,
+        None => return false,
+    };
+    let taken = {
+        let mut guard = st.handle.lock();
+        match guard.as_ref() {
+            Some(h) if h.model_id == model_id => guard.take(),
+            _ => None,
+        }
+    };
+    let Some(mut h) = taken else { return false };
+    log::info!(
+        "stopping inference server pid={:?} so model {model_id} can be removed",
+        h.child.id()
+    );
+    let _ = h.child.start_kill();
+    let _ = tauri::async_runtime::block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), h.child.wait()).await
+    });
+    true
+}
+
 /// Conditionally pre-warm the inference server in the background so the
 /// first polish doesn't pay the ~5-10 s cold spawn + GGUF-load cost on
 /// top of the actual roundtrip. No-op when:

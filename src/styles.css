@@ -71,13 +71,13 @@
     0 28px 64px var(--glass-shadow);
   --glass-shadow-stack-sm: inset 0 1px 0 var(--glass-highlight),
     0 1px 2px var(--glass-shadow-contact), 0 6px 16px var(--glass-shadow-soft);
-  /* Pill-specific shadow. The deep 28px blur from the regular stack
-   * paints a visible dark cloud around the floating pill on light
-   * wallpapers; this lighter stack keeps a crisp rim + a near-contact
-   * shadow only. */
+  /* Pill-specific shadow. CSS outer drop shadows get hard-clipped to
+   * the NSWindow's rectangular bounds and read as a dark halo around
+   * the rounded pill — same trap as `.liquid-glass-window`. The pill
+   * window owns its drop shadow via `hasShadow=YES`, which follows the
+   * rounded alpha. We keep only inset rim cues here. */
   --glass-shadow-pill: inset 0 1px 0 var(--glass-highlight),
-    0 1px 2px var(--glass-shadow-contact), 0 4px 12px var(--glass-shadow-soft),
-    0 12px 28px var(--glass-shadow-soft);
+    inset 0 -1px 0 var(--glass-edge-bottom);
 }
 
 /* Light theme. Tailwind 4's `@theme` only accepts static defaults, so
