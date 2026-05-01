@@ -166,6 +166,17 @@ export async function setStreamingPillEnabled(enabled: boolean): Promise<void> {
   await invoke("set_streaming_pill_enabled", { enabled });
 }
 
+/// Push measured content dimensions (logical px) up to the Rust side
+/// so the pill window resizes to fit wrapped streaming text. Each
+/// side is independently optional — pass only what changed. Called by
+/// `Pill.tsx`'s ResizeObserver; Rust clamps each side before applying.
+export async function pillResize(opts: {
+  width?: number;
+  height?: number;
+}): Promise<void> {
+  await invoke("pill_resize", { args: opts });
+}
+
 export async function setAppearance(
   appearance: "light" | "dark",
 ): Promise<void> {

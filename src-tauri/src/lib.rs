@@ -63,6 +63,7 @@ pub fn run() {
             commands::request_microphone,
             commands::show_pill,
             commands::hide_pill,
+            commands::pill_resize,
             commands::replay_onboarding,
             commands::finish_onboarding,
             commands::show_tray_popover,

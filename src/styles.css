@@ -271,6 +271,18 @@ body.translucent {
   animation: pill-shimmer 1.6s linear infinite;
 }
 
+/* Inline blinking cursor at the trailing end of streaming text.
+ * Steps animation (no easing) gives the hard on/off look of a real
+ * terminal caret rather than a fade — easier to read at 2px wide. */
+@keyframes streaming-caret-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.streaming-caret {
+  animation: streaming-caret-blink 1.05s steps(1, end) infinite;
+}
+
 .animate-pulse-mic {
   animation: pulse-mic 1.2s ease-in-out infinite;
 }
@@ -293,7 +305,8 @@ body.translucent {
   .animate-spinner,
   .animate-pill-in,
   .animate-flash-done,
-  .pill-shimmer {
+  .pill-shimmer,
+  .streaming-caret {
     animation: none !important;
   }
 

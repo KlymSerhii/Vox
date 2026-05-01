@@ -1063,12 +1063,6 @@ async fn run_pipeline(
         return;
     }
 
-    // Snap the pill back to its compact width before set_stage emits
-    // the Done state so the success treatment renders at 144px.
-    if stream_to_pill() {
-        pill::set_wide(&app, false);
-    }
-
     let warning_flag = polish_warning.is_some();
     let entry = CompletedEntry {
         session_id: id,
@@ -1086,6 +1080,13 @@ async fn run_pipeline(
             // Legacy event keeps the existing tray-popover RECENT
             // logic working for any consumer that hasn't migrated.
             let _ = app.emit("transcripts:changed", transcripts::snapshot());
+
+            // Snap the pill back to its compact width before set_stage
+            // emits the Done state so the success treatment renders
+            // at 144px.
+            if stream_to_pill() {
+                pill::set_wide(&app, false);
+            }
 
             match polish_warning {
                 Some(msg) => {
@@ -1111,6 +1112,9 @@ async fn run_pipeline(
         Ok(Err(e)) => {
             log::error!("copy failed (sid={id}): {e}");
             *session.error.lock() = Some(e);
+            if stream_to_pill() {
+                pill::set_wide(&app, false);
+            }
             manager.set_stage(
                 &app,
                 id,
@@ -1121,6 +1125,9 @@ async fn run_pipeline(
         }
         Err(e) => {
             log::error!("copy task panicked (sid={id}): {e}");
+            if stream_to_pill() {
+                pill::set_wide(&app, false);
+            }
             manager.set_stage(
                 &app,
                 id,

@@ -428,6 +428,7 @@ impl GemmaHttpEngine {
         transcript: &str,
         on_chunk: &ChunkCallback,
     ) -> anyhow::Result<String> {
+        let started = Instant::now();
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
         let max_tokens = dynamic_max_tokens(transcript.len());
 
@@ -471,6 +472,10 @@ impl GemmaHttpEngine {
         let mut acc = String::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
+        // One-shot TTFT log so a slow prompt-eval stage shows up in
+        // the timeline alongside the existing total-time log. Set the
+        // first time content lands in `acc`.
+        let mut first_chunk_at: Option<Instant> = None;
 
         while let Some(next) = stream.next().await {
             let bytes = next.map_err(|e| anyhow::anyhow!("stream read: {e}"))?;
@@ -502,6 +507,14 @@ impl GemmaHttpEngine {
                         return Ok(acc.trim().to_string());
                     }
                     on_chunk(&acc);
+                    if first_chunk_at.is_none() && !acc.is_empty() {
+                        first_chunk_at = Some(Instant::now());
+                        log::debug!(
+                            "gemma-http: first polish chunk at {} ms (acc={} chars)",
+                            started.elapsed().as_millis(),
+                            acc.len(),
+                        );
+                    }
                 }
             }
         }

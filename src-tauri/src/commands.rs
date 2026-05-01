@@ -389,6 +389,22 @@ pub fn hide_pill<R: Runtime>(app: AppHandle<R>) {
     pill::hide(&app);
 }
 
+/// Frontend-driven size update used by the streaming pill's
+/// ResizeObserver. Width and height are independently optional —
+/// the frontend reports whichever dimension actually changed so
+/// the OS window only moves when it has to. Rust clamps each side
+/// to its allowed range before applying.
+#[derive(serde::Deserialize)]
+pub struct PillResizeArgs {
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+}
+
+#[tauri::command]
+pub fn pill_resize<R: Runtime>(app: AppHandle<R>, args: PillResizeArgs) {
+    pill::set_size(&app, args.width, args.height);
+}
+
 #[tauri::command]
 pub fn replay_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     onboarding::show(&app).map_err(|e| e.to_string())

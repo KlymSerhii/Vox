@@ -239,13 +239,25 @@ pub fn emit_polish_stream<R: Runtime>(app: &AppHandle<R>, sid: u64, text: String
 
 /// Wide width when streaming text is showing. Capped to (screen_w - 64)
 /// so the pill never bleeds off-screen on small displays.
-const WIDE_WIDTH_MAX: f64 = 640.0;
+const WIDE_WIDTH_MAX: f64 = 760.0;
 const WIDE_WIDTH_MIN: f64 = 144.0;
+/// Floor for the streaming-mode pill once content-driven width feedback
+/// kicks in. Below this we revert to the pure compact silhouette via
+/// `set_wide(false)`. Tuned so a ~5-word phrase ("Hello world.") still
+/// feels like a pill rather than a snug-against-the-text box.
+pub const WIDE_WIDTH_MIN_DYNAMIC: f64 = 240.0;
+/// Caps for content-driven height growth during streaming. `HEIGHT` is
+/// the compact single-line frame; `HEIGHT_MAX` keeps long polishes from
+/// taking over the screen — the inner div scrolls beyond that.
+pub const HEIGHT_MAX: f64 = 240.0;
 
-/// Resize the pill window. `wide=true` widens to a streaming-friendly
-/// frame (up to 640px or screen_w - 64); `wide=false` snaps back to
-/// the compact 144px. Repositions afterwards so the pill stays
-/// horizontally centred.
+/// Resize the pill window. `wide=true` enters streaming mode at the
+/// dynamic floor (240 px); the frontend's ResizeObserver then drives
+/// width up via `set_size` as the streamed text grows. `wide=false`
+/// snaps back to the compact 144 px. Repositions afterwards so the
+/// pill stays horizontally centred AND bottom-anchored so vertical
+/// growth grows upward from the dock area instead of pushing the
+/// bottom edge down.
 pub fn set_wide<R: Runtime>(app: &AppHandle<R>, wide: bool) {
     let Some(win) = app.get_webview_window(LABEL) else { return };
 
@@ -264,23 +276,112 @@ pub fn set_wide<R: Runtime>(app: &AppHandle<R>, wide: bool) {
     });
 
     let target_w = if wide {
+        // Start small — the frontend will push the actual content size
+        // back via `set_size` as soon as the first chunk renders. This
+        // way short polishes never widen past their text and only long
+        // ones grow to the cap.
         let screen_cap = frame.map(|(_, _, w, _)| (w - 64.0).max(WIDE_WIDTH_MIN));
         match screen_cap {
-            Some(cap) => WIDE_WIDTH_MAX.min(cap),
-            None => WIDE_WIDTH_MAX,
+            Some(cap) => WIDE_WIDTH_MIN_DYNAMIC.min(cap),
+            None => WIDE_WIDTH_MIN_DYNAMIC,
         }
     } else {
         WIDTH
     };
 
+    // Snapping non-wide always resets height to the compact frame so
+    // the Done/Error/Canceled labels render at the original silhouette.
+    let target_h = HEIGHT;
+
+    apply_size(&win, frame, target_w, target_h);
+}
+
+/// Set the pill's height while keeping the current width unchanged.
+/// Convenience wrapper around `set_size` for callers that only care
+/// about height; new code should prefer `set_size` directly. Kept on
+/// the public surface so external callers (or future code) can opt
+/// for the height-only path without repeating the `None` plumbing.
+#[allow(dead_code)]
+pub fn set_height<R: Runtime>(app: &AppHandle<R>, height: f64) {
+    set_size(app, None, Some(height));
+}
+
+/// Frontend-driven width and/or height update used by the streaming
+/// pill's ResizeObserver. Each side is independently optional —
+/// pass `None` to preserve the current value. Width is clamped to the
+/// streaming-mode dynamic range plus the screen-width safety cap;
+/// height to the [HEIGHT, HEIGHT_MAX] band. Bottom-anchored so the
+/// dock edge stays put as the pill grows upward.
+pub fn set_size<R: Runtime>(
+    app: &AppHandle<R>,
+    width: Option<f64>,
+    height: Option<f64>,
+) {
+    if width.is_none() && height.is_none() {
+        return;
+    }
+    let Some(win) = app.get_webview_window(LABEL) else { return };
+    let frame = active_screen_logical_frame(&win).or_else(|| {
+        win.primary_monitor().ok().flatten().map(|m| {
+            let scale = m.scale_factor();
+            let s = m.size();
+            let p = m.position();
+            (
+                p.x as f64 / scale,
+                p.y as f64 / scale,
+                s.width as f64 / scale,
+                s.height as f64 / scale,
+            )
+        })
+    });
+
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let cur_size = win.inner_size().ok();
+    let cur_w = cur_size
+        .as_ref()
+        .map(|s| s.width as f64 / scale)
+        .unwrap_or(WIDTH);
+    let cur_h = cur_size
+        .map(|s| s.height as f64 / scale)
+        .unwrap_or(HEIGHT);
+
+    let target_w = match width {
+        Some(w) => {
+            let screen_cap =
+                frame.map(|(_, _, fw, _)| (fw - 64.0).max(WIDE_WIDTH_MIN_DYNAMIC));
+            let upper = match screen_cap {
+                Some(cap) => WIDE_WIDTH_MAX.min(cap),
+                None => WIDE_WIDTH_MAX,
+            };
+            w.clamp(WIDE_WIDTH_MIN_DYNAMIC, upper)
+        }
+        None => cur_w,
+    };
+
+    let target_h = match height {
+        Some(h) => h.clamp(HEIGHT, HEIGHT_MAX),
+        None => cur_h,
+    };
+
+    apply_size(&win, frame, target_w, target_h);
+}
+
+fn apply_size<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+    frame: Option<(f64, f64, f64, f64)>,
+    target_w: f64,
+    target_h: f64,
+) {
     if let Some((mx, my, mw, mh)) = frame {
         let x = mx + (mw - target_w) / 2.0;
-        let y = my + mh - HEIGHT - BOTTOM_MARGIN;
-        let _ = win.set_size(LogicalSize::new(target_w, HEIGHT));
+        // Bottom-anchored: the pill's bottom edge stays at the same Y so
+        // height growth pushes the top edge up rather than the bottom
+        // edge down (which would clip into the dock area).
+        let y = my + mh - target_h - BOTTOM_MARGIN;
+        let _ = win.set_size(LogicalSize::new(target_w, target_h));
         let _ = win.set_position(LogicalPosition::new(x, y));
     } else {
-        // Fallback: just resize, let reposition take care of it next time.
-        let _ = win.set_size(LogicalSize::new(target_w, HEIGHT));
+        let _ = win.set_size(LogicalSize::new(target_w, target_h));
     }
 }
 

@@ -192,12 +192,29 @@ impl LlmEngine for AppleFmEngine {
         // snapshot so we can return it as the final value.
         let last_snapshot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let stash = last_snapshot.clone();
+        // One-shot TTFT log: the Swift bridge runs on a dispatch queue,
+        // so the closure fires across threads. Wrap the Option in an
+        // Arc<Mutex> so the first non-empty snapshot logs once and
+        // every later snapshot skips the branch.
+        let first_chunk_at: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let first_slot = first_chunk_at.clone();
 
         let bridged_cb: Box<dyn Fn(&str) + Send + Sync + 'static> =
             Box::new(move |s: &str| {
                 {
                     let mut g = stash.lock();
                     *g = s.to_string();
+                }
+                if !s.is_empty() {
+                    let mut slot = first_slot.lock();
+                    if slot.is_none() {
+                        *slot = Some(Instant::now());
+                        log::debug!(
+                            "apple-fm: first polish chunk at {} ms (acc={} chars)",
+                            started.elapsed().as_millis(),
+                            s.len(),
+                        );
+                    }
                 }
                 on_chunk(s);
             });
