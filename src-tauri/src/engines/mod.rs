@@ -16,15 +16,31 @@ pub mod gemma_http;
 pub mod none;
 pub mod whisper_local;
 
+/// Optional callback fired by an STT engine as it produces partial
+/// segments during decode. `text` is the **cumulative** transcript so
+/// far (engines must accumulate inside the impl, not pass deltas).
+/// Called from whatever thread the engine is running decode on — keep
+/// the closure cheap and `Send + Sync + 'static`.
+pub type SegmentCallback = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
+/// Optional callback fired by an LLM engine as polish tokens stream in.
+/// `text` is the **cumulative** polished output so far (engines
+/// accumulate deltas internally). Same threading rules as
+/// [`SegmentCallback`].
+pub type ChunkCallback = Box<dyn Fn(&str) + Send + Sync + 'static>;
+
 #[async_trait::async_trait]
 pub trait SttEngine: Send + Sync {
     /// `wav` is 16 kHz mono PCM-16 (the shape `audio::stop_and_encode`
     /// produces). `language` is a Whisper code or `None` for auto.
+    /// `on_segment` (if Some) receives cumulative transcript text as
+    /// segments arrive — used by the streaming pill.
     async fn transcribe(
         &self,
         wav: &[u8],
         language: Option<&str>,
         dictionary: &[String],
+        on_segment: Option<SegmentCallback>,
     ) -> anyhow::Result<String>;
 
     #[allow(dead_code)]
@@ -49,6 +65,23 @@ pub trait LlmEngine: Send + Sync {
         system_prompt: &str,
         dictionary: &[String],
     ) -> anyhow::Result<String>;
+
+    /// Streaming variant of `cleanup` — fires `on_chunk` repeatedly with
+    /// the cumulative output so far while the polish runs, then
+    /// resolves with the final cleaned text. Default impl falls back
+    /// to non-streaming `cleanup` and emits a single chunk on success
+    /// so callers always get at least one cumulative-text update.
+    async fn cleanup_stream(
+        &self,
+        transcript: &str,
+        system_prompt: &str,
+        dictionary: &[String],
+        on_chunk: ChunkCallback,
+    ) -> anyhow::Result<String> {
+        let out = self.cleanup(transcript, system_prompt, dictionary).await?;
+        on_chunk(&out);
+        Ok(out)
+    }
 
     fn id(&self) -> &'static str;
     #[allow(dead_code)]

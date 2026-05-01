@@ -21,10 +21,12 @@ mod tray;
 mod tray_glyphs;
 mod tray_icon;
 
+use std::sync::Arc;
+
 use tauri::Manager;
 
 use crate::audio::AudioHandle;
-use crate::session::SessionCtx;
+use crate::session::SessionManager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -48,6 +50,7 @@ pub fn run() {
             commands::set_dictation_enabled,
             commands::set_hands_free_enabled,
             commands::set_polishing_enabled,
+            commands::set_streaming_pill_enabled,
             commands::set_appearance,
             commands::copy_text,
             commands::get_recent_transcripts,
@@ -93,6 +96,8 @@ pub fn run() {
             commands::get_active_hotkey,
             commands::diagnose_hotkeys,
             commands::reveal_dev_binary_path,
+            commands::cancel_session,
+            commands::sessions_snapshot,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]
@@ -103,8 +108,8 @@ pub fn run() {
             let app_handle = app.handle();
 
             let audio = AudioHandle::spawn();
-            let ctx = SessionCtx::new(audio);
-            app.manage(ctx.clone());
+            let manager = Arc::new(SessionManager::new(audio));
+            app.manage(manager.clone());
 
             // Register hotkey state BEFORE hotkey::register so per-purpose
             // snapshots are ready for IPC handlers from the first call.
@@ -131,7 +136,7 @@ pub fn run() {
                 &s.hotkey,
                 &s.cancel_hotkey,
                 &s.mode_cycle_hotkey,
-                ctx.clone(),
+                manager.clone(),
             ) {
                 Ok(resolved) => log::info!("push-to-talk bound to {resolved}"),
                 Err(e) => log::error!(

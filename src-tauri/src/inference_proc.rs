@@ -277,6 +277,15 @@ async fn spawn<R: Runtime>(
         .arg("--jinja")
         // Web UI is dead weight for a desktop sidecar.
         .arg("--no-webui")
+        // Parallel sessions: up to MAX_CONCURRENT_SESSIONS - 1 polish
+        // calls can run concurrently while the foreground recording is
+        // active. `--parallel 2` reserves slots in llama-server for
+        // those background polishes; without it the second concurrent
+        // request would queue serially behind the first and the
+        // last-finished-wins clipboard semantic would degenerate to
+        // last-started-wins.
+        .arg("--parallel")
+        .arg("2")
         .arg("--api-key")
         .arg(&api_key);
 

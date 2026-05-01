@@ -33,6 +33,8 @@ const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
 
 const KEY_APPEARANCE: &str = "appearance";
 
+pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
+
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
@@ -92,6 +94,9 @@ fn default_auto_suggest_modes() -> bool {
 fn default_appearance() -> String {
     "dark".into()
 }
+fn default_streaming_pill_enabled() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -141,6 +146,12 @@ pub struct Settings {
     #[serde(default = "default_appearance")]
     pub appearance: String,
 
+    /// Show transcription / polish text streaming inside the pill after
+    /// the hotkey is released. When false, only the existing
+    /// stage labels are shown (matching the pre-streaming build).
+    #[serde(default = "default_streaming_pill_enabled")]
+    pub streaming_pill_enabled: bool,
+
     /// Token passed to `llama-server` as `--api-key`; generated lazily
     /// on first spawn and reused so the orphan reaper can identify
     /// stale children. Empty = not yet generated.
@@ -169,6 +180,7 @@ impl Default for Settings {
             mode_cycle_hotkey: default_mode_cycle_hotkey(),
             auto_suggest_modes: default_auto_suggest_modes(),
             appearance: default_appearance(),
+            streaming_pill_enabled: default_streaming_pill_enabled(),
             inference_api_key: String::new(),
         }
     }
@@ -312,6 +324,9 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         _ => default_appearance(),
     };
 
+    let streaming_pill_enabled =
+        get_bool(KEY_STREAMING_PILL_ENABLED, default_streaming_pill_enabled());
+
     let inference_api_key = get_str(KEY_INFERENCE_API_KEY).unwrap_or_default();
 
     // Scrub legacy cloud-era keys + Keychain entries on first local-only launch.
@@ -354,6 +369,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         mode_cycle_hotkey,
         auto_suggest_modes,
         appearance,
+        streaming_pill_enabled,
         inference_api_key,
     }
 }
@@ -398,6 +414,8 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     let appearance = if settings.appearance == "light" { "light" } else { "dark" };
     s(KEY_APPEARANCE, appearance);
 
+    b(KEY_STREAMING_PILL_ENABLED, settings.streaming_pill_enabled);
+
     s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
 
     // Drop legacy keys defensively in case a downgraded build re-introduced them.
@@ -440,6 +458,13 @@ pub struct Prefs {
 
     pub active_mode_id: String,
     pub auto_suggest_modes: bool,
+
+    /// Mirror of `Settings::streaming_pill_enabled`; the pipeline reads
+    /// from a fresh `settings::load` to guarantee the value is current
+    /// at the moment streaming begins, but `Prefs` carries it too so
+    /// callers that already hold a `Prefs` don't need a second load.
+    #[allow(dead_code)]
+    pub streaming_pill_enabled: bool,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
@@ -456,6 +481,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         polishing_enabled: s.polishing_enabled,
         active_mode_id: s.active_mode_id,
         auto_suggest_modes: s.auto_suggest_modes,
+        streaming_pill_enabled: s.streaming_pill_enabled,
     }
 }
 
@@ -493,4 +519,30 @@ pub enum HotkeyPurpose {
     PushToTalk,
     Cancel,
     ModeCycle,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn streaming_pill_enabled_defaults_to_true() {
+        let s = Settings::default();
+        assert!(s.streaming_pill_enabled);
+    }
+
+    #[test]
+    fn streaming_pill_enabled_roundtrips_through_serde() {
+        let mut s = Settings::default();
+        s.streaming_pill_enabled = false;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(!restored.streaming_pill_enabled);
+
+        // And verify the default kicks in when the field is absent —
+        // older installs upgrading to this build must opt in by default.
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert!(restored.streaming_pill_enabled);
+    }
 }

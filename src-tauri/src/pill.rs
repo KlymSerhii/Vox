@@ -22,6 +22,13 @@ pub enum PillState {
     Done,
     Error,
     Canceled,
+    /// Surface for the parallel-sessions saturated case (4th attempt
+    /// while 3 are in flight). Paired with a `pill:toast` event
+    /// carrying the message + auto-hide ms. Constructed solely via
+    /// the toast path; the `Saturated` arm in the tray-state match
+    /// covers the variant for exhaustiveness.
+    #[allow(dead_code)]
+    Saturated,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -35,6 +42,33 @@ pub struct PillStatePayload {
     /// a successful polish — the user has no idea their cleanup was
     /// skipped.
     pub warning: bool,
+    /// Count of background (non-foreground) in-flight sessions.
+    /// Skipped when zero so single-session payloads stay byte-identical
+    /// to the pre-parallel build.
+    #[serde(skip_serializing_if = "is_zero", default)]
+    pub background_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PillToastPayload {
+    pub message: String,
+    pub ms: u32,
+}
+
+/// Cumulative streaming text payload — `text` is the FULL accumulated
+/// transcript / polish so far, not a delta. The frontend's rate limiter
+/// reveals chars/sec smoothly. `final_` flips true on the last chunk so
+/// the UI flushes to the full text immediately, skipping the limiter.
+#[derive(Debug, Clone, Serialize)]
+pub struct StreamPayload {
+    pub session_id: u64,
+    pub text: String,
+    #[serde(rename = "final")]
+    pub final_: bool,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,19 +138,41 @@ pub fn hide<R: Runtime>(app: &AppHandle<R>) {
 }
 
 pub fn emit_state<R: Runtime>(app: &AppHandle<R>, state: PillState, message: Option<String>) {
-    emit_state_inner(app, state, message, false);
+    emit_state_inner(app, state, message, false, 0);
 }
 
 /// Same as [`emit_state`] but flags the payload with `warning=true`. Use
 /// for `Done` states where the clipboard write succeeded but a soft
 /// step (e.g. LLM polish) was skipped, so the frontend can swap the
 /// green-success treatment for an amber warning treatment.
+#[allow(dead_code)]
 pub fn emit_state_warning<R: Runtime>(
     app: &AppHandle<R>,
     state: PillState,
     message: Option<String>,
 ) {
-    emit_state_inner(app, state, message, true);
+    emit_state_inner(app, state, message, true, 0);
+}
+
+/// Variant that carries a non-zero background-session count for the
+/// pill's queue badge. Used by SessionManager::set_stage when there
+/// are background pipelines running.
+pub fn emit_state_with_bg<R: Runtime>(
+    app: &AppHandle<R>,
+    state: PillState,
+    message: Option<String>,
+    background_count: u32,
+) {
+    emit_state_inner(app, state, message, false, background_count);
+}
+
+pub fn emit_state_warning_with_bg<R: Runtime>(
+    app: &AppHandle<R>,
+    state: PillState,
+    message: Option<String>,
+    background_count: u32,
+) {
+    emit_state_inner(app, state, message, true, background_count);
 }
 
 fn emit_state_inner<R: Runtime>(
@@ -124,26 +180,108 @@ fn emit_state_inner<R: Runtime>(
     state: PillState,
     message: Option<String>,
     warning: bool,
+    background_count: u32,
 ) {
     // Errors are interactive (dismissable); everything else stays click-through.
     let click_through = !matches!(state, PillState::Error);
     if let Some(win) = app.get_webview_window(LABEL) {
         let _ = win.set_ignore_cursor_events(click_through);
     }
-    let payload = PillStatePayload { state, message, warning };
+    let payload = PillStatePayload {
+        state,
+        message,
+        warning,
+        background_count,
+    };
     let _ = app.emit_to(LABEL, "pill:state", payload);
 
     let tray_state = match state {
         PillState::Listening => crate::tray_icon::TrayState::Recording,
         PillState::Transcribing | PillState::Polishing => crate::tray_icon::TrayState::Processing,
-        PillState::Error => crate::tray_icon::TrayState::Error,
+        PillState::Error | PillState::Saturated => crate::tray_icon::TrayState::Error,
         PillState::Done | PillState::Canceled => crate::tray_icon::TrayState::Idle,
     };
     crate::tray_icon::set_state(app, tray_state);
 }
 
+/// Emit a transient toast on the pill window. The frontend listens
+/// for `pill:toast`, displays the message for `ms`, then expects the
+/// caller to hide the pill (or the pill auto-hides via `hide_after`).
+pub fn emit_toast<R: Runtime>(app: &AppHandle<R>, message: String, ms: u32) {
+    let payload = PillToastPayload {
+        message: message.clone(),
+        ms,
+    };
+    let _ = app.emit_to(LABEL, "pill:toast", payload);
+    // Schedule auto-hide so the toast isn't sticky.
+    hide_after_ms(app, ms.into());
+}
+
 pub fn emit_audio_level<R: Runtime>(app: &AppHandle<R>, level: f32) {
     let _ = app.emit_to(LABEL, "pill:audio_level", AudioLevelPayload { level });
+}
+
+/// Emit a transcript stream chunk for `session_id`. `text` is the
+/// cumulative transcript so far (Whisper segments concatenated by
+/// the engine). `final_` flips true on the last chunk.
+pub fn emit_transcript_stream<R: Runtime>(app: &AppHandle<R>, sid: u64, text: String, final_: bool) {
+    let payload = StreamPayload { session_id: sid, text, final_ };
+    let _ = app.emit_to(LABEL, "pill:transcript_stream", payload);
+}
+
+/// Emit a polish stream chunk for `session_id`. `text` is the
+/// cumulative polished output so far (deltas accumulated by the
+/// engine). `final_` flips true on the last chunk.
+pub fn emit_polish_stream<R: Runtime>(app: &AppHandle<R>, sid: u64, text: String, final_: bool) {
+    let payload = StreamPayload { session_id: sid, text, final_ };
+    let _ = app.emit_to(LABEL, "pill:polish_stream", payload);
+}
+
+/// Wide width when streaming text is showing. Capped to (screen_w - 64)
+/// so the pill never bleeds off-screen on small displays.
+const WIDE_WIDTH_MAX: f64 = 640.0;
+const WIDE_WIDTH_MIN: f64 = 144.0;
+
+/// Resize the pill window. `wide=true` widens to a streaming-friendly
+/// frame (up to 640px or screen_w - 64); `wide=false` snaps back to
+/// the compact 144px. Repositions afterwards so the pill stays
+/// horizontally centred.
+pub fn set_wide<R: Runtime>(app: &AppHandle<R>, wide: bool) {
+    let Some(win) = app.get_webview_window(LABEL) else { return };
+
+    let frame = active_screen_logical_frame(&win).or_else(|| {
+        win.primary_monitor().ok().flatten().map(|m| {
+            let scale = m.scale_factor();
+            let s = m.size();
+            let p = m.position();
+            (
+                p.x as f64 / scale,
+                p.y as f64 / scale,
+                s.width as f64 / scale,
+                s.height as f64 / scale,
+            )
+        })
+    });
+
+    let target_w = if wide {
+        let screen_cap = frame.map(|(_, _, w, _)| (w - 64.0).max(WIDE_WIDTH_MIN));
+        match screen_cap {
+            Some(cap) => WIDE_WIDTH_MAX.min(cap),
+            None => WIDE_WIDTH_MAX,
+        }
+    } else {
+        WIDTH
+    };
+
+    if let Some((mx, my, mw, mh)) = frame {
+        let x = mx + (mw - target_w) / 2.0;
+        let y = my + mh - HEIGHT - BOTTOM_MARGIN;
+        let _ = win.set_size(LogicalSize::new(target_w, HEIGHT));
+        let _ = win.set_position(LogicalPosition::new(x, y));
+    } else {
+        // Fallback: just resize, let reposition take care of it next time.
+        let _ = win.set_size(LogicalSize::new(target_w, HEIGHT));
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,6 +321,17 @@ pub fn emit_mode_suggestion<R: Runtime>(
 
 pub fn hide_after<R: Runtime>(app: &Arc<AppHandle<R>>, ms: u64) {
     let app_clone = Arc::clone(app);
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        hide(&app_clone);
+    });
+}
+
+/// Convenience that takes the AppHandle by value and clones the
+/// underlying handle internally — saves the caller a `Arc::new` wrap
+/// for one-off auto-hide schedules.
+pub fn hide_after_ms<R: Runtime>(app: &AppHandle<R>, ms: u64) {
+    let app_clone = app.clone();
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_millis(ms)).await;
         hide(&app_clone);

@@ -1,13 +1,16 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Webview, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::hotkey::{ActiveHotkey, ActiveHotkeyState};
 use crate::modes::{self, VoiceMode};
+use crate::session::SessionManager;
 use crate::settings::HotkeyPurpose;
+use crate::transcripts::SessionsSnapshot;
 use crate::{
-    frontmost, inference_proc, inference_server, models, onboarding, pill, session, settings,
-    transcripts,
+    frontmost, inference_proc, inference_server, models, onboarding, pill, settings, transcripts,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,13 +87,13 @@ pub fn set_settings(
     }
 
     if hotkeys_changed {
-        if let Some(ctx) = app.try_state::<session::SessionCtx>() {
+        if let Some(mgr) = app.try_state::<Arc<SessionManager>>() {
             match crate::hotkey::register(
                 &app,
                 &settings.hotkey,
                 &settings.cancel_hotkey,
                 &settings.mode_cycle_hotkey,
-                (*ctx).clone(),
+                mgr.inner().clone(),
             ) {
                 Ok(resolved) => log::info!("hotkeys re-bound after settings save: {resolved}"),
                 Err(e) => log::error!(
@@ -100,7 +103,7 @@ pub fn set_settings(
             }
         } else {
             log::warn!(
-                "hotkeys changed but SessionCtx is not in app state; \
+                "hotkeys changed but SessionManager is not in app state; \
                  binding will pick up new values on next launch."
             );
         }
@@ -187,6 +190,20 @@ pub fn set_polishing_enabled<R: Runtime>(
         inference_proc::drop_managed(&app);
     }
 
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_streaming_pill_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    s.streaming_pill_enabled = enabled;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
     if let Err(e) = app.emit("settings:changed", &s) {
         log::warn!("failed to emit settings:changed: {e}");
     }
@@ -810,4 +827,32 @@ pub fn diagnose_hotkeys<R: Runtime>(app: AppHandle<R>) -> DiagnoseHotkeys {
         None => Vec::new(),
     };
     DiagnoseHotkeys { entries }
+}
+
+/// Cancel the specified in-flight session. Wired to the popover X
+/// button. Background sessions can ONLY be cancelled this way; the
+/// Escape hotkey targets the foreground recording (see
+/// `SessionManager::cancel_foreground`).
+#[tauri::command]
+pub fn cancel_session(app: AppHandle<Wry>, session_id: u64) -> Result<(), String> {
+    let mgr = match app.try_state::<Arc<SessionManager>>() {
+        Some(m) => m.inner().clone(),
+        None => return Err("session manager not initialised".into()),
+    };
+    mgr.cancel_session(session_id, &app);
+    Ok(())
+}
+
+/// Snapshot of in-flight + recent sessions for the tray popover. The
+/// popover subscribes to `sessions:changed` for live updates and uses
+/// this for first-load.
+#[tauri::command]
+pub fn sessions_snapshot(app: AppHandle<Wry>) -> SessionsSnapshot {
+    match app.try_state::<Arc<SessionManager>>() {
+        Some(m) => m.inner().snapshot(),
+        None => SessionsSnapshot {
+            in_progress: Vec::new(),
+            recent: transcripts::snapshot_completed(),
+        },
+    }
 }

@@ -1,496 +1,1157 @@
 //! Orchestrates the dictation pipeline: mic capture → STT → optional LLM
 //! cleanup → clipboard. STT/LLM engines come from the per-app
 //! `engines::Registry`; both are lazy-loaded and kept warm.
+//!
+//! Parallel sessions: `SessionManager` allows up to
+//! [`MAX_CONCURRENT_SESSIONS`] in-flight pipelines. Only ONE recording is
+//! active at any moment (cpal mic capture is single-instance hardware) —
+//! "parallel" means a NEW recording can start while previous sessions are
+//! still in their post-recording (transcribe / polish) stages. The pill
+//! always shows the foreground (most-recent recording) session; older
+//! ones live in the tray popover's IN PROGRESS list. Last-finished-wins
+//! on the clipboard.
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime, Wry};
+use tokio::sync::Notify;
 
 use crate::audio::AudioHandle;
 use crate::engines::Registry;
-use crate::modes::{self, ModeStore, VoiceMode};
+use crate::modes::{self, CaseStyle, ModeStore, PunctuationStyle, VoiceMode};
 use crate::pill::{self, PillState};
-use crate::{inject, settings, transcripts};
+use crate::transcripts::{self, CompletedEntry, InProgressEntry, SessionsSnapshot};
+use crate::{inject, settings};
 
 const MAX_RECORD_SECS: u64 = 30 * 60;
 const MIN_RECORD_MS: u128 = 300;
 const SILENCE_PEAK_THRESHOLD: f32 = 0.003;
 
-#[derive(Clone)]
-pub struct SessionCtx {
-    pub audio: AudioHandle,
-    pub recording: Arc<AtomicBool>,
-    pub session_id: Arc<AtomicU64>,
-    started_at: Arc<Mutex<Option<Instant>>>,
-    canceled: Arc<AtomicBool>,
-    pipeline_active: Arc<AtomicBool>,
+/// Maximum simultaneous in-flight pipelines (one active recording plus
+/// up to two background polish/transcribe tasks). Hard cap — UI shows an
+/// amber toast when a 4th attempt is made and refuses to start it.
+pub const MAX_CONCURRENT_SESSIONS: usize = 3;
+
+/// How long a finalised session sticks around in the manager's map so
+/// the popover briefly shows its terminal stage before it folds into
+/// "RECENT".
+const TERMINAL_LINGER_MS: u64 = 1500;
+
+/// Toast duration for the saturated state.
+const SATURATED_TOAST_MS: u32 = 1500;
+
+pub type SessionId = u64;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Stage {
+    Listening,
+    Transcribing,
+    Polishing,
+    Done,
+    Error,
+    Canceled,
 }
 
-impl SessionCtx {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModeSnapshot {
+    pub id: String,
+    pub name: String,
+    pub icon: String,
+    pub system_prompt: String,
+    pub punctuation: PunctuationStyle,
+    pub case: CaseStyle,
+    pub max_length_chars: Option<usize>,
+    pub dictionary: Vec<String>,
+}
+
+impl ModeSnapshot {
+    fn from_voice_mode(m: &VoiceMode) -> Self {
+        Self {
+            id: m.id.clone(),
+            name: m.name.clone(),
+            icon: m.icon.clone(),
+            system_prompt: m.system_prompt.clone(),
+            punctuation: m.punctuation.clone(),
+            case: m.case.clone(),
+            max_length_chars: m.max_length_chars,
+            dictionary: m.dictionary.clone(),
+        }
+    }
+
+    fn fallback() -> Self {
+        Self {
+            id: "general".into(),
+            name: "General".into(),
+            icon: "💬".into(),
+            system_prompt: String::new(),
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: None,
+            dictionary: Vec::new(),
+        }
+    }
+
+    fn apply_post_processing(&self, text: &str) -> String {
+        // Snapshot-typed post-processing — delegates to the shared
+        // free function in `modes` so the rule set lives in exactly
+        // one place. The snapshot still owns its own copies of the
+        // fields so a mid-session edit to the underlying mode can't
+        // change post-processing for an in-flight pipeline.
+        modes::apply_post_processing(
+            &self.case,
+            &self.punctuation,
+            self.max_length_chars,
+            text,
+        )
+    }
+}
+
+/// Per-session live state. `SessionState`s are kept in
+/// `SessionManager::sessions` while in flight, and removed on a delay
+/// after they reach a terminal `Stage` so the popover shows the
+/// terminal label briefly before the row finalises into "RECENT".
+pub struct SessionState {
+    pub id: SessionId,
+    pub stage: Mutex<Stage>,
+    pub mode: ModeSnapshot,
+    pub polishing_enabled: bool,
+    pub stt_engine_id: String,
+    pub stt_model_id: String,
+    pub llm_engine_id: String,
+    pub llm_model_id: String,
+    pub language: String,
+    pub dictionary: Vec<String>,
+    pub cancel: Arc<AtomicBool>,
+    pub started_at: Instant,
+    pub started_at_unix: i64,
+    pub transcript: Mutex<Option<String>>,
+    pub result: Mutex<Option<String>>,
+    pub error: Mutex<Option<String>>,
+    pub warning: Mutex<bool>,
+    /// Flips to `true` when the pipeline reaches any terminal state
+    /// (Done, Error, Canceled, audio-too-short bail). Read by the
+    /// max-record guard task to short-circuit its 30-min sleep so the
+    /// guard's Arc<SessionManager> + Arc<SessionState> + AppHandle
+    /// captures drop within ~one tick of session completion instead of
+    /// being held for the full half-hour.
+    pub completed: AtomicBool,
+    /// Async wake-up source paired with `completed` so the guard task
+    /// can `select!` between sleep and completion without polling.
+    /// Notified exactly once when `completed` is first set to true.
+    pub completion: Arc<Notify>,
+}
+
+impl SessionState {
+    pub fn is_canceled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    /// Mark the session pipeline as finished and wake any waiter
+    /// (currently the max-record guard task). Idempotent — multiple
+    /// callers in different terminal paths are safe.
+    pub fn mark_completed(&self) {
+        if !self.completed.swap(true, Ordering::SeqCst) {
+            self.completion.notify_waiters();
+        }
+    }
+
+    fn current_stage(&self) -> Stage {
+        *self.stage.lock()
+    }
+
+    fn snapshot_in_progress(&self) -> InProgressEntry {
+        InProgressEntry {
+            session_id: self.id,
+            stage: *self.stage.lock(),
+            mode_id: self.mode.id.clone(),
+            mode_name: self.mode.name.clone(),
+            mode_icon: self.mode.icon.clone(),
+            started_at: self.started_at_unix,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub enum BeginOutcome {
+    Started(SessionId),
+    Saturated { in_flight: usize },
+    DictationDisabled,
+    AlreadyRecording,
+    AudioError(String),
+}
+
+pub struct SessionManager {
+    pub audio: AudioHandle,
+    pub sessions: Mutex<BTreeMap<SessionId, Arc<SessionState>>>,
+    next_id: AtomicU64,
+    active_recording: Mutex<Option<SessionId>>,
+    /// Tracks which session owns the pill UI right now. Set on
+    /// `begin` and replaced (not cleared) by the next begin — survives
+    /// the end-of-recording → transcribe/polish handoff so the pill's
+    /// "Transcribing.." stage label still flows from the right session.
+    /// Streaming pill events are filtered through this same gate so
+    /// background sessions never blast text into the foreground pill.
+    pill_owner: Mutex<Option<SessionId>>,
+    pub max_concurrent: usize,
+    /// Serialises clipboard writes so two pipelines finishing at the
+    /// same moment don't interleave their `Clipboard::set_text` calls.
+    /// "Last-finished-wins" still holds — whichever lock acquisition
+    /// runs second writes last.
+    clipboard_lock: Mutex<()>,
+}
+
+impl SessionManager {
     pub fn new(audio: AudioHandle) -> Self {
         Self {
             audio,
-            recording: Arc::new(AtomicBool::new(false)),
-            session_id: Arc::new(AtomicU64::new(0)),
-            started_at: Arc::new(Mutex::new(None)),
-            canceled: Arc::new(AtomicBool::new(false)),
-            pipeline_active: Arc::new(AtomicBool::new(false)),
+            sessions: Mutex::new(BTreeMap::new()),
+            next_id: AtomicU64::new(0),
+            active_recording: Mutex::new(None),
+            pill_owner: Mutex::new(None),
+            max_concurrent: MAX_CONCURRENT_SESSIONS,
+            clipboard_lock: Mutex::new(()),
         }
+    }
+
+    /// True when `id` is the session whose state changes should drive
+    /// the pill UI right now. Streaming events use the same predicate.
+    pub fn owns_pill_emit(&self, id: SessionId) -> bool {
+        *self.pill_owner.lock() == Some(id)
+    }
+
+    pub fn foreground_id(&self) -> Option<SessionId> {
+        *self.active_recording.lock()
     }
 
     pub fn is_recording(&self) -> bool {
-        self.recording.load(Ordering::SeqCst)
+        self.active_recording.lock().is_some()
     }
 
-    pub fn is_canceled(&self) -> bool {
-        self.canceled.load(Ordering::SeqCst)
+    #[allow(dead_code)]
+    pub fn pipeline_in_flight_count(&self) -> usize {
+        self.sessions.lock().len()
     }
 
-    pub fn is_pipeline_active(&self) -> bool {
-        self.pipeline_active.load(Ordering::SeqCst)
-    }
-}
-
-pub fn begin_recording<R: Runtime>(app: AppHandle<R>, ctx: &SessionCtx) {
-    let prefs = settings::prefs(&app);
-    if !prefs.dictation_enabled {
-        log::info!("dictation is disabled; hotkey press ignored");
-        return;
-    }
-
-    if ctx.recording.swap(true, Ordering::SeqCst) {
-        log::debug!("begin_recording called while already recording; ignored");
-        return;
+    /// True iff there's any session that hasn't reached a terminal
+    /// stage yet. Used by the mode-cycle hide-after to avoid hiding
+    /// the pill while a session is still active.
+    pub fn has_active_pipeline(&self) -> bool {
+        let map = self.sessions.lock();
+        map.values().any(|s| {
+            !matches!(
+                s.current_stage(),
+                Stage::Done | Stage::Error | Stage::Canceled
+            )
+        })
     }
 
-    let new_sid = ctx.session_id.fetch_add(1, Ordering::SeqCst) + 1;
-    ctx.canceled.store(false, Ordering::SeqCst);
-    ctx.pipeline_active.store(true, Ordering::SeqCst);
-    *ctx.started_at.lock() = Some(Instant::now());
-
-    // Acquire the global Escape grab now (and not at app launch) so
-    // Escape only short-circuits to Vox while a dictation session is in
-    // flight. `PipelineGuard::drop` releases it on every exit path.
-    crate::hotkey::arm_cancel(&app);
-
-    log::info!("▶ begin recording (sid={new_sid})");
-    pill::show(&app);
-    pill::emit_state(&app, PillState::Listening, None);
-
-    if let Some(mode) = app
-        .try_state::<Arc<ModeStore>>()
-        .map(|s| s.inner().clone())
-        .and_then(|s| s.get(&prefs.active_mode_id).or_else(|| s.get("general")))
-    {
-        pill::emit_active_mode(&app, &mode);
-    }
-    pill::emit_mode_suggestion(&app, None);
-
-    if prefs.auto_suggest_modes {
-        spawn_suggestion_probe(app.clone(), prefs.active_mode_id.clone());
-    }
-
-    if let Err(e) = ctx.audio.start() {
-        log::error!("failed to start audio: {e}");
-        ctx.recording.store(false, Ordering::SeqCst);
-        ctx.pipeline_active.store(false, Ordering::SeqCst);
-        *ctx.started_at.lock() = None;
-        // Release the global Escape grab — this exit path bypasses
-        // `PipelineGuard` because we never reach the async pipeline.
-        crate::hotkey::disarm_cancel(&app);
-        pill::emit_state(
-            &app,
-            PillState::Error,
-            Some("No mic access — grant in System Settings.".into()),
-        );
-        let app_arc = Arc::new(app.clone());
-        pill::hide_after(&app_arc, 3000);
-        return;
-    }
-
-    spawn_max_record_guard(app.clone(), ctx.clone(), MAX_RECORD_SECS);
-    spawn_audio_level_sampler(app, ctx.clone());
-}
-
-pub fn end_recording<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
-    if !ctx.recording.swap(false, Ordering::SeqCst) {
-        log::debug!("end_recording called without an active recording; ignored");
-        return;
-    }
-    let started = ctx.started_at.lock().take();
-    let my_sid = ctx.session_id.load(Ordering::SeqCst);
-    log::info!("■ end recording (sid={my_sid})");
-
-    let too_short = started
-        .map(|t| t.elapsed().as_millis() < MIN_RECORD_MS)
-        .unwrap_or(false);
-
-    let app_for_pill = app.clone();
-    let app_for_guard = app.clone();
-
-    tauri::async_runtime::spawn(async move {
-        let _pipeline_guard = PipelineGuard::new(app_for_guard, &ctx, my_sid);
-
-        let wav_result = ctx.audio.stop_and_encode();
-
-        let stale = || ctx.session_id.load(Ordering::SeqCst) != my_sid;
-
-        if ctx.is_canceled() {
-            log::info!("session {my_sid} canceled; discarding audio");
-            pill::emit_state(&app_for_pill, PillState::Canceled, None);
-            hide_after_session(&app_for_pill, &ctx, my_sid, 600);
-            return;
+    pub fn snapshot(&self) -> SessionsSnapshot {
+        let in_progress: Vec<InProgressEntry> = {
+            let map = self.sessions.lock();
+            // Show oldest-first so the order in the popover matches
+            // the natural "earlier → later" reading direction.
+            map.values().map(|s| s.snapshot_in_progress()).collect()
+        };
+        SessionsSnapshot {
+            in_progress,
+            recent: transcripts::snapshot_completed(),
         }
-        if stale() {
-            log::info!("session {my_sid} superseded; abandoning silently");
-            return;
+    }
+
+    /// Begin a new recording. Returns the outcome — successful starts
+    /// register the session, arm the cancel grab, show the pill, and
+    /// kick off audio + level sampler tasks.
+    pub fn begin(self: &Arc<Self>, app: &AppHandle<Wry>) -> BeginOutcome {
+        let prefs = settings::prefs(app);
+        if !prefs.dictation_enabled {
+            log::info!("dictation is disabled; hotkey press ignored");
+            return BeginOutcome::DictationDisabled;
         }
 
-        if too_short {
-            log::info!("recording too short (<{MIN_RECORD_MS} ms), skipping");
-            pill::hide(&app_for_pill);
-            return;
-        }
-
-        let wav = match wav_result {
-            Ok(w) => w,
-            Err(e) => {
-                log::error!("audio stop/encode failed: {e}");
-                pill::emit_state(
-                    &app_for_pill,
-                    PillState::Error,
-                    Some("Audio error.".into()),
+        // Saturation check: total in-flight (including any active
+        // recording) must be < max_concurrent before we start a new one.
+        // The 4th attempt is rejected.
+        {
+            let map = self.sessions.lock();
+            if map.len() >= self.max_concurrent {
+                let in_flight = map.len();
+                log::info!(
+                    "session: saturated ({in_flight}/{}) — rejecting new session",
+                    self.max_concurrent
                 );
-                hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
-                return;
+                return BeginOutcome::Saturated { in_flight };
             }
-        };
-
-        if wav.len() < 44 + 16_000 * 2 / 4 {
-            log::info!("recording too short ({} bytes), skipping STT", wav.len());
-            pill::hide(&app_for_pill);
-            return;
         }
 
-        if wav_peak_pcm16(&wav) < SILENCE_PEAK_THRESHOLD {
-            log::info!("silent buffer; skipping STT");
-            pill::emit_state(
-                &app_for_pill,
-                PillState::Error,
-                Some("No audio detected — check your mic.".into()),
-            );
-            hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
-            return;
+        // The hardware-mic constraint: only one session may be
+        // recording at any moment. If a recording is already in
+        // flight, the PTT closure should call end_recording instead;
+        // returning here is the race-loser case.
+        let mut active = self.active_recording.lock();
+        if active.is_some() {
+            log::debug!("begin called while a recording is already active; ignored");
+            return BeginOutcome::AlreadyRecording;
         }
 
-        // Snapshot prefs ONCE per utterance — engines, mode, language and
-        // dictionary all derive from this read. Adding a second
-        // `settings::prefs` call below would let a mid-flight mode switch
-        // pin a different prompt to a transcript recorded under the old mode.
-        let prefs = settings::prefs(&app_for_pill);
+        let new_sid = self.next_id.fetch_add(1, Ordering::SeqCst) + 1;
 
-        let app_wry: AppHandle<Wry> = match try_into_wry(&app_for_pill) {
-            Some(a) => a,
-            None => {
-                log::error!("session: not running on Wry — engine registry unavailable");
-                pill::emit_state(
-                    &app_for_pill,
-                    PillState::Error,
-                    Some("Internal error.".into()),
-                );
-                hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
-                return;
-            }
-        };
+        // Snapshot mode at session start. Subsequent mode switches
+        // never affect the in-flight transcript.
+        let active_mode = resolve_active_mode(app, &prefs.active_mode_id);
+        let mode_snap = active_mode
+            .as_ref()
+            .map(ModeSnapshot::from_voice_mode)
+            .unwrap_or_else(ModeSnapshot::fallback);
 
-        let registry = match app_wry.try_state::<Registry>() {
-            Some(r) => r.inner().clone(),
-            None => {
-                log::error!("engine registry missing — onboarding never finished?");
-                pill::emit_state(
-                    &app_for_pill,
-                    PillState::Error,
-                    Some("Engines not initialised — restart Vox.".into()),
-                );
-                hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
-                return;
-            }
-        };
+        let session = Arc::new(SessionState {
+            id: new_sid,
+            stage: Mutex::new(Stage::Listening),
+            mode: mode_snap,
+            polishing_enabled: prefs.polishing_enabled,
+            stt_engine_id: prefs.stt_engine.clone(),
+            stt_model_id: prefs.stt_model_id.clone(),
+            llm_engine_id: if prefs.polishing_enabled {
+                prefs.llm_engine.clone()
+            } else {
+                "none".into()
+            },
+            llm_model_id: prefs.llm_model_id.clone(),
+            language: prefs.language.clone(),
+            dictionary: prefs.dictionary.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+            started_at_unix: chrono::Utc::now().timestamp(),
+            transcript: Mutex::new(None),
+            result: Mutex::new(None),
+            error: Mutex::new(None),
+            warning: Mutex::new(false),
+            completed: AtomicBool::new(false),
+            completion: Arc::new(Notify::new()),
+        });
 
-        let stt_engine = match registry.stt(&app_wry, &prefs.stt_engine, &prefs.stt_model_id) {
-            Some(e) => e,
-            None => {
-                pill::emit_state(
-                    &app_for_pill,
-                    PillState::Error,
-                    Some("STT engine not configured. Open Settings → Models.".into()),
-                );
-                hide_after_session(&app_for_pill, &ctx, my_sid, 3000);
-                return;
-            }
-        };
+        // Insert into map BEFORE starting audio so the saturation
+        // check is monotonic and the snapshot shows the new session
+        // immediately. If audio fails we'll remove + reset below.
+        self.sessions.lock().insert(new_sid, session.clone());
+        *active = Some(new_sid);
+        // Take ownership of the pill — replaces any previous session
+        // whose pipeline is still running in the background, so the
+        // pill always tracks the newest recording.
+        *self.pill_owner.lock() = Some(new_sid);
+        drop(active);
 
-        let llm_engine = if prefs.polishing_enabled {
-            registry.llm(&app_wry, &prefs.llm_engine, &prefs.llm_model_id)
-        } else {
-            registry.llm(&app_wry, "none", "")
-        };
+        // Arm the OS Escape grab now (and not at app launch) so
+        // Escape only short-circuits to Vox while a dictation session
+        // is in flight. The disarm fires from end_recording's drop
+        // path or from cancel.
+        crate::hotkey::arm_cancel(app);
 
-        let active_mode = resolve_active_mode(&app_wry, &prefs.active_mode_id);
+        log::info!("▶ begin recording (sid={new_sid})");
+        pill::show(app);
+        pill::emit_state(app, PillState::Listening, None);
+        emit_sessions_changed(app, self);
+
         if let Some(m) = active_mode.as_ref() {
-            pill::emit_active_mode(&app_for_pill, m);
+            pill::emit_active_mode(app, m);
+        }
+        pill::emit_mode_suggestion(app, None);
+
+        if prefs.auto_suggest_modes {
+            spawn_suggestion_probe(app.clone(), prefs.active_mode_id.clone());
         }
 
-        pill::emit_state(&app_for_pill, PillState::Transcribing, None);
+        if let Err(e) = self.audio.start() {
+            log::error!("failed to start audio: {e}");
+            // Roll back: remove session, clear active_recording, and
+            // tear down the cancel grab so Escape works in other apps.
+            self.sessions.lock().remove(&new_sid);
+            *self.active_recording.lock() = None;
+            // Roll back pill ownership too if it's still pointing at
+            // this session, otherwise leave whatever caller previously
+            // claimed it intact.
+            {
+                let mut owner = self.pill_owner.lock();
+                if *owner == Some(new_sid) {
+                    *owner = None;
+                }
+            }
+            crate::hotkey::disarm_cancel(app);
+            pill::emit_state(
+                app,
+                PillState::Error,
+                Some("No mic access — grant in System Settings.".into()),
+            );
+            let app_arc = Arc::new(app.clone());
+            pill::hide_after(&app_arc, 3000);
+            emit_sessions_changed(app, self);
+            return BeginOutcome::AudioError(e.to_string());
+        }
 
-        let language = (prefs.language != "auto").then_some(prefs.language.as_str());
+        spawn_max_record_guard(app.clone(), self.clone(), session.clone(), MAX_RECORD_SECS);
+        spawn_audio_level_sampler(app.clone(), self.clone(), session.clone());
 
-        let transcript = {
-            let stt_fut = stt_engine.transcribe(&wav, language, &prefs.dictionary);
-            tokio::select! {
-                biased;
-                () = wait_for_cancel(&ctx, my_sid) => {
-                    log::info!("STT canceled / superseded; dropping request");
-                    if ctx.is_canceled() && !stale() {
-                        pill::emit_state(&app_for_pill, PillState::Canceled, None);
-                        hide_after_session(&app_for_pill, &ctx, my_sid, 600);
+        BeginOutcome::Started(new_sid)
+    }
+
+    /// Called when the PTT hotkey toggles off (or hands-free fires
+    /// the second press). Stops audio for the active recording and
+    /// dispatches the post-recording pipeline as a tokio task. The
+    /// next `begin` may run while this pipeline is still running.
+    pub fn end_recording(self: &Arc<Self>, app: AppHandle<Wry>) {
+        let sid = match self.active_recording.lock().take() {
+            Some(s) => s,
+            None => {
+                log::debug!("end_recording called without an active recording; ignored");
+                return;
+            }
+        };
+
+        // Disarm Escape grab the moment recording stops; another
+        // session may still be running but its cancel uses the
+        // popover X (no global key grab). The next begin re-arms.
+        crate::hotkey::disarm_cancel(&app);
+
+        let session = match self.sessions.lock().get(&sid).cloned() {
+            Some(s) => s,
+            None => {
+                log::warn!("end_recording: session {sid} missing from map");
+                return;
+            }
+        };
+
+        let started = session.started_at;
+        let too_short = started.elapsed().as_millis() < MIN_RECORD_MS;
+        log::info!("■ end recording (sid={sid})");
+
+        let manager = self.clone();
+        let app_clone = app.clone();
+
+        tauri::async_runtime::spawn(async move {
+            let wav_result: Result<Option<Vec<u8>>, String> = if too_short {
+                // Drain the audio buffer regardless so the next start()
+                // reaches `Some(cap)`-less state cleanly.
+                let _ = manager.audio.stop_and_encode();
+                Ok(None)
+            } else {
+                match manager.audio.stop_and_encode() {
+                    Ok(buf) => Ok(Some(buf)),
+                    Err(e) => Err(format!("{e}")),
+                }
+            };
+
+            run_pipeline(app_clone, manager, session, wav_result).await;
+        });
+    }
+
+    /// Cancel whichever session is the current foreground recording.
+    /// Mapped to the Escape hotkey while a recording is in flight.
+    pub fn cancel_foreground(self: &Arc<Self>, app: &AppHandle<Wry>) {
+        let sid = match *self.active_recording.lock() {
+            Some(s) => s,
+            None => {
+                // No active recording — but a session may still be
+                // polishing in the background. Fall back to cancelling
+                // any in-flight session so Escape isn't a no-op.
+                let last = self
+                    .sessions
+                    .lock()
+                    .values()
+                    .map(|s| s.id)
+                    .max();
+                match last {
+                    Some(s) => s,
+                    None => {
+                        log::debug!("cancel_foreground: no in-flight sessions");
+                        return;
                     }
+                }
+            }
+        };
+        self.cancel_session(sid, app);
+    }
+
+    /// Cancel a specific session (popover X / cancel hotkey path).
+    pub fn cancel_session(self: &Arc<Self>, id: SessionId, app: &AppHandle<Wry>) {
+        let session = match self.sessions.lock().get(&id).cloned() {
+            Some(s) => s,
+            None => {
+                log::debug!("cancel_session({id}): not found (already finalized?)");
+                return;
+            }
+        };
+        session.cancel.store(true, Ordering::SeqCst);
+
+        // If this is the foreground recording, tear down the audio
+        // capture and the Escape grab. The pipeline task picks up the
+        // cancel flag and emits Canceled.
+        let was_foreground = {
+            let mut active = self.active_recording.lock();
+            if active.as_ref() == Some(&id) {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        };
+
+        if was_foreground {
+            // Drain the audio buffer so cpal's input stream is freed.
+            let _ = self.audio.stop_and_encode();
+            crate::hotkey::disarm_cancel(app);
+            // Snap the pill back to compact in case streaming widened it.
+            pill::set_wide(app, false);
+            pill::emit_state(app, PillState::Canceled, None);
+            let app_arc = Arc::new(app.clone());
+            pill::hide_after(&app_arc, 600);
+        }
+
+        self.set_stage(app, id, Stage::Canceled, None, false);
+    }
+
+    /// Update a session's stage and emit pill state (only for the
+    /// foreground session) plus a sessions:changed snapshot.
+    pub fn set_stage<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+        id: SessionId,
+        stage: Stage,
+        message: Option<String>,
+        warning: bool,
+    ) {
+        let session_present = {
+            let map = self.sessions.lock();
+            match map.get(&id) {
+                Some(s) => {
+                    *s.stage.lock() = stage;
+                    if warning {
+                        *s.warning.lock() = true;
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        if !session_present {
+            return;
+        }
+
+        // Hold the pill_owner lock for the full read → decide → emit
+        // span. Without this a concurrent begin() could replace the
+        // owner between the check and the emit and we'd publish a
+        // Done/Error pill state that overwrites the new session's
+        // pill. The emit itself is just a Tauri event publish (cheap),
+        // and the only thing the lock protects is a single Option<u64>,
+        // so holding it across the emit is the simpler and safer path
+        // than racing two sub-operations.
+        {
+            let owner_guard = self.pill_owner.lock();
+            let owner_snapshot: Option<SessionId> = *owner_guard;
+            let is_owner = owner_snapshot == Some(id);
+            if is_owner {
+                // This session owns the pill UI right now — drive both
+                // the visible state and the background-count badge from
+                // it. pill_owner persists across the end-of-recording
+                // → polish boundary so the pill follows the most-recent
+                // recording through its full lifecycle.
+                let pill_state = match stage {
+                    Stage::Listening => Some(PillState::Listening),
+                    Stage::Transcribing => Some(PillState::Transcribing),
+                    Stage::Polishing => Some(PillState::Polishing),
+                    Stage::Done => Some(PillState::Done),
+                    Stage::Error => Some(PillState::Error),
+                    Stage::Canceled => Some(PillState::Canceled),
+                };
+                if let Some(s) = pill_state {
+                    let bg = self.background_count_excluding_pill_owner_locked(owner_snapshot);
+                    if warning {
+                        pill::emit_state_warning_with_bg(app, s, message.clone(), bg);
+                    } else {
+                        pill::emit_state_with_bg(app, s, message.clone(), bg);
+                    }
+                }
+            } else {
+                // Background session — refresh the pill's background-count
+                // badge so the user sees the queue grow/shrink. Only
+                // re-emit when there's a foreground pill owner, otherwise
+                // there's no pill to badge.
+                if let Some(owner_id) = owner_snapshot {
+                    if let Some(owner) = self.sessions.lock().get(&owner_id).cloned() {
+                        let owner_pill = match owner.current_stage() {
+                            Stage::Listening => PillState::Listening,
+                            Stage::Transcribing => PillState::Transcribing,
+                            Stage::Polishing => PillState::Polishing,
+                            Stage::Done => PillState::Done,
+                            Stage::Error => PillState::Error,
+                            Stage::Canceled => PillState::Canceled,
+                        };
+                        let bg = self
+                            .background_count_excluding_pill_owner_locked(owner_snapshot);
+                        pill::emit_state_with_bg(app, owner_pill, None, bg);
+                    }
+                }
+            }
+            drop(owner_guard);
+        }
+
+        emit_sessions_changed(app, self);
+
+        // Schedule terminal-state cleanup so the popover briefly
+        // shows the terminal stage before the row folds away.
+        if matches!(stage, Stage::Done | Stage::Error | Stage::Canceled) {
+            // Wake the max-record guard so it drops its captured
+            // Arc<SessionManager> + Arc<SessionState> + AppHandle
+            // immediately instead of holding them for the rest of
+            // the 30-minute safety cap. Look up the session under
+            // the same lock cycle the cleanup uses.
+            if let Some(s) = self.sessions.lock().get(&id).cloned() {
+                s.mark_completed();
+            }
+            // Release pill ownership so the next begin() doesn't
+            // inherit a stale pointer; the cleanup task will also
+            // remove the session from the map after the linger.
+            {
+                let mut owner = self.pill_owner.lock();
+                if *owner == Some(id) {
+                    *owner = None;
+                }
+            }
+            self.spawn_terminal_cleanup(app, id);
+        }
+    }
+
+    /// Background-session count for the pill's queue badge.
+    /// Counts every in-flight session except the current pill owner —
+    /// matches the user-visible "this many other sessions are queued
+    /// behind the one you're watching" mental model.
+    #[allow(dead_code)]
+    fn background_count_excluding_pill_owner(&self) -> u32 {
+        let owner = *self.pill_owner.lock();
+        self.background_count_excluding_pill_owner_locked(owner)
+    }
+
+    /// Same as [`background_count_excluding_pill_owner`] but the
+    /// caller passes the owner snapshot — used inside `set_stage`
+    /// where the pill_owner lock is already held. Calling the public
+    /// helper would re-lock and deadlock with the held guard.
+    fn background_count_excluding_pill_owner_locked(
+        &self,
+        owner: Option<SessionId>,
+    ) -> u32 {
+        let map = self.sessions.lock();
+        let total = map.len();
+        let bg = if let Some(owner_id) = owner {
+            if map.contains_key(&owner_id) {
+                total.saturating_sub(1)
+            } else {
+                total
+            }
+        } else {
+            total
+        };
+        bg as u32
+    }
+
+    fn spawn_terminal_cleanup<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+        id: SessionId,
+    ) {
+        let manager = self.clone();
+        let app_handle = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(TERMINAL_LINGER_MS)).await;
+            let removed = manager.sessions.lock().remove(&id);
+            if removed.is_some() {
+                emit_sessions_changed(&app_handle, &manager);
+            }
+        });
+    }
+
+    /// Last-finished-wins clipboard write, serialised across pipelines.
+    pub fn write_clipboard<R: Runtime>(
+        self: &Arc<Self>,
+        _app: &AppHandle<R>,
+        _id: SessionId,
+        text: &str,
+    ) -> Result<(), String> {
+        let _g = self.clipboard_lock.lock();
+        inject::copy_to_clipboard(text).map_err(|e| e.to_string())
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_canceled<R: Runtime>(self: &Arc<Self>, app: &AppHandle<R>, id: SessionId) {
+        self.set_stage(app, id, Stage::Canceled, None, false);
+    }
+}
+
+fn emit_sessions_changed<R: Runtime>(app: &AppHandle<R>, manager: &SessionManager) {
+    let snap = manager.snapshot();
+    let _ = app.emit("sessions:changed", &snap);
+}
+
+/// Pipeline body. Lifted out of the old `end_recording` async block —
+/// reads everything from the per-session snapshot rather than the
+/// global settings store, so a mid-flight settings change cannot pin
+/// a different prompt to a transcript that's already been recorded.
+async fn run_pipeline(
+    app: AppHandle<Wry>,
+    manager: Arc<SessionManager>,
+    session: Arc<SessionState>,
+    wav_result: Result<Option<Vec<u8>>, String>,
+) {
+    let id = session.id;
+
+    // Guard so the cancel grab disarm + map cleanup happens on every
+    // exit path. We use an explicit RAII guard rather than scattering
+    // returns because there are many bail-out points.
+    //
+    // Drop also signals pipeline completion to the max-record guard
+    // task so it can drop its captured Arcs immediately. This covers
+    // paths that skip set_stage entirely (silent / empty-buffer
+    // skips).
+    struct PipelineGuard {
+        finalised: bool,
+        session: Arc<SessionState>,
+    }
+    impl PipelineGuard {
+        fn new(session: Arc<SessionState>) -> Self {
+            Self { finalised: false, session }
+        }
+        fn finalise(&mut self) {
+            self.finalised = true;
+        }
+    }
+    impl Drop for PipelineGuard {
+        fn drop(&mut self) {
+            // Idempotent — set_stage's terminal-state path may have
+            // already marked completion. Either order is fine.
+            self.session.mark_completed();
+        }
+    }
+    let mut _guard = PipelineGuard::new(session.clone());
+
+    if session.is_canceled() {
+        log::info!("session {id} canceled before pipeline ran");
+        manager.set_stage(&app, id, Stage::Canceled, None, false);
+        _guard.finalise();
+        return;
+    }
+
+    let wav = match wav_result {
+        Ok(Some(buf)) => buf,
+        Ok(None) => {
+            log::info!("session {id} too short, skipping STT");
+            // Silent skip: pill goes back to hidden.
+            pill::hide(&app);
+            manager.sessions.lock().remove(&id);
+            emit_sessions_changed(&app, &manager);
+            _guard.finalise();
+            return;
+        }
+        Err(e) => {
+            log::error!("audio stop/encode failed: {e}");
+            *session.error.lock() = Some(e);
+            manager.set_stage(
+                &app,
+                id,
+                Stage::Error,
+                Some("Audio error.".into()),
+                false,
+            );
+            _guard.finalise();
+            return;
+        }
+    };
+
+    if wav.len() < 44 + 16_000 * 2 / 4 {
+        log::info!("recording too short ({} bytes), skipping STT", wav.len());
+        pill::hide(&app);
+        manager.sessions.lock().remove(&id);
+        emit_sessions_changed(&app, &manager);
+        _guard.finalise();
+        return;
+    }
+
+    if wav_peak_pcm16(&wav) < SILENCE_PEAK_THRESHOLD {
+        log::info!("session {id} silent buffer; skipping STT");
+        manager.set_stage(
+            &app,
+            id,
+            Stage::Error,
+            Some("No audio detected — check your mic.".into()),
+            false,
+        );
+        _guard.finalise();
+        return;
+    }
+
+    let registry = match app.try_state::<Registry>() {
+        Some(r) => r.inner().clone(),
+        None => {
+            log::error!("engine registry missing — onboarding never finished?");
+            manager.set_stage(
+                &app,
+                id,
+                Stage::Error,
+                Some("Engines not initialised — restart Vox.".into()),
+                false,
+            );
+            _guard.finalise();
+            return;
+        }
+    };
+
+    let stt_engine = match registry.stt(&app, &session.stt_engine_id, &session.stt_model_id) {
+        Some(e) => e,
+        None => {
+            manager.set_stage(
+                &app,
+                id,
+                Stage::Error,
+                Some("STT engine not configured. Open Settings → Models.".into()),
+                false,
+            );
+            _guard.finalise();
+            return;
+        }
+    };
+
+    let llm_engine = if session.polishing_enabled {
+        registry.llm(&app, &session.llm_engine_id, &session.llm_model_id)
+    } else {
+        registry.llm(&app, "none", "")
+    };
+
+    // Streaming mode is opt-in (Settings → General + tray popover).
+    // We capture the user setting once so a mid-pipeline toggle doesn't
+    // flip the rate-limit / pill-resize behaviour mid-utterance — but
+    // the pill-owner check is recomputed at every emit site below, so
+    // a session that loses ownership (e.g. a newer recording started)
+    // stops painting into someone else's pill mid-stream.
+    let streaming_enabled = settings::load(&app).streaming_pill_enabled;
+    let owns_pill = manager.owns_pill_emit(id);
+    // Closure used at every emit site so an in-flight session that
+    // gets pre-empted by a newer recording stops writing to the pill.
+    // `streaming_enabled` is the user toggle, `owns_pill_emit(id)` is
+    // the live ownership predicate.
+    let stream_to_pill = || streaming_enabled && manager.owns_pill_emit(id);
+
+    // Widen the pill before we start emitting cumulative segment text
+    // so the layout grow doesn't kick in while the first words appear.
+    if stream_to_pill() {
+        pill::set_wide(&app, true);
+    }
+
+    manager.set_stage(&app, id, Stage::Transcribing, None, false);
+
+    let language: Option<&str> = if session.language != "auto" {
+        Some(session.language.as_str())
+    } else {
+        None
+    };
+
+    let stt_callback: Option<crate::engines::SegmentCallback> = if stream_to_pill() {
+        let app_for_cb = app.clone();
+        let sid = id;
+        // Re-check ownership inside the callback because Whisper
+        // segments can keep arriving after a newer session has stolen
+        // the pill — without this gate the partials would render in
+        // the new session's pill.
+        let manager_for_cb = manager.clone();
+        Some(Box::new(move |text: &str| {
+            if !manager_for_cb.owns_pill_emit(sid) {
+                return;
+            }
+            pill::emit_transcript_stream(&app_for_cb, sid, text.to_string(), false);
+        }))
+    } else {
+        None
+    };
+
+    let transcript = {
+        let stt_fut =
+            stt_engine.transcribe(&wav, language, &session.dictionary, stt_callback);
+        tokio::select! {
+            biased;
+            () = wait_for_cancel(session.clone()) => {
+                log::info!("STT canceled; dropping request (sid={id})");
+                if stream_to_pill() {
+                    pill::set_wide(&app, false);
+                }
+                manager.set_stage(&app, id, Stage::Canceled, None, false);
+                _guard.finalise();
+                return;
+            }
+            result = stt_fut => match result {
+                Ok(text) if !text.trim().is_empty() => text,
+                Ok(_) => {
+                    log::info!("empty transcript, nothing to copy (sid={id})");
+                    if stream_to_pill() {
+                        pill::set_wide(&app, false);
+                    }
+                    pill::hide(&app);
+                    manager.sessions.lock().remove(&id);
+                    emit_sessions_changed(&app, &manager);
+                    _guard.finalise();
                     return;
                 }
-                result = stt_fut => match result {
-                    Ok(text) if !text.trim().is_empty() => text,
-                    Ok(_) => {
-                        log::info!("empty transcript, nothing to copy");
-                        pill::hide(&app_for_pill);
-                        return;
+                Err(e) => {
+                    log::error!("STT failed (sid={id}): {e}");
+                    if stream_to_pill() {
+                        pill::set_wide(&app, false);
                     }
-                    Err(e) => {
-                        log::error!("STT failed: {e}");
-                        pill::emit_state(
-                            &app_for_pill,
-                            PillState::Error,
-                            Some(friendly_stt_error(&e, &prefs.stt_engine)),
-                        );
-                        hide_after_session(&app_for_pill, &ctx, my_sid, 3000);
-                        return;
-                    }
+                    *session.error.lock() = Some(format!("{e}"));
+                    manager.set_stage(
+                        &app,
+                        id,
+                        Stage::Error,
+                        Some(friendly_stt_error(&e, &session.stt_engine_id)),
+                        false,
+                    );
+                    _guard.finalise();
+                    return;
                 }
             }
-        };
-
-        if ctx.is_canceled() || stale() {
-            log::info!("post-STT cancel/supersede; aborting before LLM");
-            if ctx.is_canceled() && !stale() {
-                pill::emit_state(&app_for_pill, PillState::Canceled, None);
-                hide_after_session(&app_for_pill, &ctx, my_sid, 600);
-            }
-            return;
         }
+    };
 
-        let (mode_system_prompt, merged_dictionary) = match active_mode.as_ref() {
-            Some(m) => (m.system_prompt.clone(), merge_dictionaries(&prefs.dictionary, &m.dictionary)),
-            None => (String::new(), prefs.dictionary.clone()),
-        };
+    *session.transcript.lock() = Some(transcript.clone());
 
-        // Carries a user-facing reason when polish was attempted but
-        // we substituted the raw transcript. Propagated to the Done
-        // pill so the user sees an amber warning instead of a silent
-        // green check.
-        let mut polish_warning: Option<&'static str> = None;
+    // Final cumulative transcript — flushes the pill's rate limiter.
+    if stream_to_pill() {
+        pill::emit_transcript_stream(&app, id, transcript.clone(), true);
+    }
 
-        let cleaned = match llm_engine {
-            Some(engine) if engine.id() != "none" => {
-                pill::emit_state(&app_for_pill, PillState::Polishing, None);
-                let llm_fut = engine.cleanup(
-                    &transcript,
-                    &mode_system_prompt,
-                    &merged_dictionary,
-                );
-                tokio::select! {
-                    biased;
-                    () = wait_for_cancel(&ctx, my_sid) => {
-                        log::info!("LLM canceled / superseded; dropping request");
-                        if ctx.is_canceled() && !stale() {
-                            pill::emit_state(&app_for_pill, PillState::Canceled, None);
-                            hide_after_session(&app_for_pill, &ctx, my_sid, 600);
-                        }
-                        return;
-                    }
-                    result = llm_fut => match result {
-                        Ok(t) if !t.trim().is_empty() => t,
-                        Ok(_) => {
-                            log::info!(
-                                "LLM polish returned empty content; falling back to raw transcript"
-                            );
-                            // Short pill copy. The differentiation between
-                            // "empty" and "failed" lives in the log; the
-                            // user-facing surface only needs to flag that
-                            // the raw transcript was copied as fallback.
-                            polish_warning = Some("Raw copy");
-                            transcript.clone()
-                        }
-                        Err(e) => {
-                            log::warn!("LLM cleanup failed: {e}; falling back to raw transcript");
-                            polish_warning = Some("Raw copy");
-                            transcript.clone()
-                        }
-                    }
-                }
-            }
-            _ => transcript.clone(),
-        };
-
-        let cleaned = match active_mode.as_ref() {
-            Some(m) => m.apply_post_processing(&cleaned),
-            None => cleaned,
-        };
-
-        if ctx.is_canceled() || stale() {
-            log::info!("post-LLM cancel/supersede; aborting before copy");
-            if ctx.is_canceled() && !stale() {
-                pill::emit_state(&app_for_pill, PillState::Canceled, None);
-                hide_after_session(&app_for_pill, &ctx, my_sid, 600);
-            }
-            return;
+    if session.is_canceled() {
+        log::info!("post-STT cancel (sid={id})");
+        if stream_to_pill() {
+            pill::set_wide(&app, false);
         }
-
-        log::info!("copying {} chars (sid={my_sid})", cleaned.len());
-
-        transcripts::push(&cleaned);
-        if let Err(e) = app_for_pill.emit("transcripts:changed", transcripts::snapshot()) {
-            log::warn!("failed to emit transcripts:changed: {e}");
-        }
-
-        let t = cleaned.clone();
-        let copy_result =
-            tauri::async_runtime::spawn_blocking(move || inject::copy_to_clipboard(&t)).await;
-
-        if ctx.is_canceled() || stale() {
-            return;
-        }
-
-        match copy_result {
-            Ok(Ok(())) => {
-                match polish_warning {
-                    // Soft-fail: clipboard has the raw transcript. Hold
-                    // longer so the user can read why polish was skipped.
-                    Some(msg) => {
-                        pill::emit_state_warning(
-                            &app_for_pill,
-                            PillState::Done,
-                            Some(msg.into()),
-                        );
-                        hide_after_session(&app_for_pill, &ctx, my_sid, 3500);
-                    }
-                    None => {
-                        // Short success copy — the slim pill (~116px wide)
-                        // can't hold a sentence, and the user just performed
-                        // the action so we don't need to remind them about
-                        // the paste step.
-                        pill::emit_state(
-                            &app_for_pill,
-                            PillState::Done,
-                            Some("Copied".into()),
-                        );
-                        hide_after_session(&app_for_pill, &ctx, my_sid, 1800);
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                log::error!("copy failed: {e}");
-                pill::emit_state(
-                    &app_for_pill,
-                    PillState::Error,
-                    Some("Copy failed.".into()),
-                );
-                hide_after_session(&app_for_pill, &ctx, my_sid, 3000);
-            }
-            Err(e) => {
-                log::error!("copy task panicked: {e}");
-                pill::emit_state(&app_for_pill, PillState::Error, Some("Copy failed.".into()));
-                hide_after_session(&app_for_pill, &ctx, my_sid, 2500);
-            }
-        }
-    });
-}
-
-pub fn cancel<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
-    if !ctx.is_pipeline_active() {
-        log::debug!("cancel: no active pipeline; ignoring");
+        manager.set_stage(&app, id, Stage::Canceled, None, false);
+        _guard.finalise();
         return;
     }
 
-    ctx.canceled.store(true, Ordering::SeqCst);
+    let mode_system_prompt = session.mode.system_prompt.clone();
+    let merged_dictionary = merge_dictionaries(&session.dictionary, &session.mode.dictionary);
 
-    if ctx.recording.load(Ordering::SeqCst) {
-        end_recording(app, ctx);
-    } else {
-        pill::emit_state(&app, PillState::Canceled, None);
+    let mut polish_warning: Option<&'static str> = None;
+    let polish_engine_active = llm_engine
+        .as_ref()
+        .map(|e| e.id() != "none")
+        .unwrap_or(false);
+
+    let cleaned = match llm_engine {
+        Some(engine) if engine.id() != "none" => {
+            manager.set_stage(&app, id, Stage::Polishing, None, false);
+            let llm_fut: std::pin::Pin<
+                Box<dyn std::future::Future<Output = anyhow::Result<String>> + Send>,
+            > = if stream_to_pill() {
+                let app_for_cb = app.clone();
+                let sid = id;
+                // Same ownership re-check as the STT segment callback:
+                // a polish chunk arriving after a newer session stole
+                // the pill must NOT paint into the new pill.
+                let manager_for_cb = manager.clone();
+                let cb: crate::engines::ChunkCallback = Box::new(move |text: &str| {
+                    if !manager_for_cb.owns_pill_emit(sid) {
+                        return;
+                    }
+                    pill::emit_polish_stream(&app_for_cb, sid, text.to_string(), false);
+                });
+                let engine = engine.clone();
+                let sys = mode_system_prompt.clone();
+                let dict = merged_dictionary.clone();
+                let t = transcript.clone();
+                Box::pin(async move {
+                    engine.cleanup_stream(&t, &sys, &dict, cb).await
+                })
+            } else {
+                let engine = engine.clone();
+                let sys = mode_system_prompt.clone();
+                let dict = merged_dictionary.clone();
+                let t = transcript.clone();
+                Box::pin(async move { engine.cleanup(&t, &sys, &dict).await })
+            };
+            tokio::select! {
+                biased;
+                () = wait_for_cancel(session.clone()) => {
+                    log::info!("LLM canceled (sid={id})");
+                    if stream_to_pill() {
+                        pill::set_wide(&app, false);
+                    }
+                    manager.set_stage(&app, id, Stage::Canceled, None, false);
+                    _guard.finalise();
+                    return;
+                }
+                result = llm_fut => match result {
+                    Ok(t) if !t.trim().is_empty() => t,
+                    Ok(_) => {
+                        log::info!(
+                            "LLM polish returned empty content; falling back to raw transcript (sid={id})"
+                        );
+                        polish_warning = Some("Raw copy");
+                        // Fail-open: push the raw transcript into the
+                        // pill's polish slot so the partial polish UI
+                        // collapses to the unmodified text we're about
+                        // to copy.
+                        if stream_to_pill() {
+                            pill::emit_polish_stream(&app, id, transcript.clone(), true);
+                        }
+                        transcript.clone()
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "LLM cleanup failed (sid={id}): {e}; falling back to raw transcript"
+                        );
+                        polish_warning = Some("Raw copy");
+                        if stream_to_pill() {
+                            pill::emit_polish_stream(&app, id, transcript.clone(), true);
+                        }
+                        transcript.clone()
+                    }
+                }
+            }
+        }
+        _ => transcript.clone(),
+    };
+
+    let cleaned = session.mode.apply_post_processing(&cleaned);
+
+    // Final polish stream flush — emit so the rate limiter snaps to
+    // the post-processed text immediately. Skip when polish is off
+    // (we already emitted the final transcript stream above) or on
+    // the fail-open paths (which already flushed the raw transcript).
+    if stream_to_pill() && polish_warning.is_none() && polish_engine_active {
+        pill::emit_polish_stream(&app, id, cleaned.clone(), true);
+    }
+
+    if session.is_canceled() {
+        log::info!("post-LLM cancel (sid={id})");
+        if stream_to_pill() {
+            pill::set_wide(&app, false);
+        }
+        manager.set_stage(&app, id, Stage::Canceled, None, false);
+        _guard.finalise();
+        return;
+    }
+
+    log::info!("copying {} chars (sid={id})", cleaned.len());
+
+    *session.result.lock() = Some(cleaned.clone());
+
+    let copy_text = cleaned.clone();
+    let manager_for_copy = manager.clone();
+    let app_for_copy = app.clone();
+    let copy_result = tauri::async_runtime::spawn_blocking(move || {
+        manager_for_copy.write_clipboard(&app_for_copy, id, &copy_text)
+    })
+    .await;
+
+    if session.is_canceled() {
+        if stream_to_pill() {
+            pill::set_wide(&app, false);
+        }
+        manager.set_stage(&app, id, Stage::Canceled, None, false);
+        _guard.finalise();
+        return;
+    }
+
+    // Snap the pill back to its compact width before set_stage emits
+    // the Done state so the success treatment renders at 144px.
+    if stream_to_pill() {
+        pill::set_wide(&app, false);
+    }
+
+    let warning_flag = polish_warning.is_some();
+    let entry = CompletedEntry {
+        session_id: id,
+        ts: chrono::Utc::now().timestamp(),
+        text: cleaned.clone(),
+        mode_id: session.mode.id.clone(),
+        stage: Stage::Done,
+        warning: warning_flag,
+        error_message: None,
+    };
+
+    match copy_result {
+        Ok(Ok(())) => {
+            transcripts::push_completed(entry);
+            // Legacy event keeps the existing tray-popover RECENT
+            // logic working for any consumer that hasn't migrated.
+            let _ = app.emit("transcripts:changed", transcripts::snapshot());
+
+            match polish_warning {
+                Some(msg) => {
+                    manager.set_stage(
+                        &app,
+                        id,
+                        Stage::Done,
+                        Some(msg.into()),
+                        true,
+                    );
+                }
+                None => {
+                    manager.set_stage(
+                        &app,
+                        id,
+                        Stage::Done,
+                        Some("Copied".into()),
+                        false,
+                    );
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            log::error!("copy failed (sid={id}): {e}");
+            *session.error.lock() = Some(e);
+            manager.set_stage(
+                &app,
+                id,
+                Stage::Error,
+                Some("Copy failed.".into()),
+                false,
+            );
+        }
+        Err(e) => {
+            log::error!("copy task panicked (sid={id}): {e}");
+            manager.set_stage(
+                &app,
+                id,
+                Stage::Error,
+                Some("Copy failed.".into()),
+                false,
+            );
+        }
+    }
+
+    // Auto-hide the pill after a Done state if this session owned the
+    // pill at any point in the pipeline (it just released ownership in
+    // set_stage right before the Done emission). The `owns_pill` flag
+    // captured up at the start of run_pipeline is the right anchor —
+    // foreground_id() has been None ever since end_recording cleared it.
+    if owns_pill {
         let app_arc = Arc::new(app.clone());
-        pill::hide_after(&app_arc, 600);
+        let hide_ms = if warning_flag { 3500 } else { 1800 };
+        pill::hide_after(&app_arc, hide_ms);
     }
+
+    _guard.finalise();
 }
 
-struct PipelineGuard<R: Runtime> {
-    app: AppHandle<R>,
-    flag: Arc<AtomicBool>,
-    session_id: Arc<AtomicU64>,
-    sid: u64,
-}
-
-impl<R: Runtime> PipelineGuard<R> {
-    fn new(app: AppHandle<R>, ctx: &SessionCtx, sid: u64) -> Self {
-        Self {
-            app,
-            flag: ctx.pipeline_active.clone(),
-            session_id: ctx.session_id.clone(),
-            sid,
-        }
-    }
-}
-
-impl<R: Runtime> Drop for PipelineGuard<R> {
-    fn drop(&mut self) {
-        // Only the guard for the still-current session clears the flag;
-        // a stale guard from a superseded sid leaves a fresh session's
-        // state alone. The cancel-hotkey disarm is gated on the same
-        // check so a re-armed grab from a fresh session isn't pulled
-        // out from under it.
-        if self.session_id.load(Ordering::SeqCst) == self.sid {
-            self.flag.store(false, Ordering::SeqCst);
-            crate::hotkey::disarm_cancel(&self.app);
-        }
-    }
-}
-
-async fn wait_for_cancel(ctx: &SessionCtx, my_sid: u64) {
+async fn wait_for_cancel(session: Arc<SessionState>) {
     loop {
-        if ctx.session_id.load(Ordering::SeqCst) != my_sid
-            || ctx.canceled.load(Ordering::SeqCst)
-        {
+        if session.cancel.load(Ordering::SeqCst) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-}
-
-fn hide_after_session<R: Runtime>(
-    app: &AppHandle<R>,
-    ctx: &SessionCtx,
-    sid: u64,
-    ms: u64,
-) {
-    let app_clone = app.clone();
-    let session_id = ctx.session_id.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-        if session_id.load(Ordering::SeqCst) == sid {
-            pill::hide(&app_clone);
-        }
-    });
 }
 
 fn wav_peak_pcm16(wav: &[u8]) -> f32 {
@@ -517,48 +1178,67 @@ fn friendly_stt_error(e: &anyhow::Error, _engine_id: &str) -> String {
     }
 }
 
-fn spawn_max_record_guard<R: Runtime>(
-    app: AppHandle<R>,
-    ctx: SessionCtx,
+fn spawn_max_record_guard(
+    app: AppHandle<Wry>,
+    manager: Arc<SessionManager>,
+    session: Arc<SessionState>,
     max_secs: u64,
 ) {
-    let sid = ctx.session_id.load(Ordering::SeqCst);
+    let id = session.id;
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(max_secs)).await;
-        if ctx.session_id.load(Ordering::SeqCst) == sid
-            && ctx.recording.load(Ordering::SeqCst)
-        {
-            log::warn!("recording exceeded {max_secs}s safety cap — auto-stopping");
-            end_recording(app, ctx);
+        // Race the safety-cap sleep against pipeline completion. The
+        // pipeline notifies on every terminal exit (set_stage + the
+        // few bail-out paths that bypass it), so a typical 5-30s
+        // session drops the guard's captured Arcs immediately rather
+        // than holding them for the full 30 minutes. The select races
+        // a sleep and the Notify; whichever wakes first wins.
+        let completion = session.completion.clone();
+        // Fast-path: completion already happened before the spawn was
+        // scheduled. Notify::notified() against a notify_waiters()
+        // that already fired would block forever; the AtomicBool
+        // covers that gap.
+        if session.completed.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = completion.notified() => {
+                // Pipeline finished before the cap; nothing to do.
+            }
+            _ = tokio::time::sleep(Duration::from_secs(max_secs)) => {
+                // Only auto-stop if this session is still the active
+                // recording (a subsequent recording wouldn't have
+                // replaced it because mic capture is single-instance).
+                if manager.foreground_id() == Some(id) {
+                    log::warn!(
+                        "recording exceeded {max_secs}s safety cap — auto-stopping (sid={id})"
+                    );
+                    manager.end_recording(app);
+                }
+            }
         }
     });
 }
 
-fn spawn_audio_level_sampler<R: Runtime>(app: AppHandle<R>, ctx: SessionCtx) {
-    let sid = ctx.session_id.load(Ordering::SeqCst);
-    let audio = ctx.audio.clone();
+fn spawn_audio_level_sampler(
+    app: AppHandle<Wry>,
+    manager: Arc<SessionManager>,
+    session: Arc<SessionState>,
+) {
+    let id = session.id;
+    let audio = manager.audio.clone();
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             ticker.tick().await;
-            if ctx.session_id.load(Ordering::SeqCst) != sid
-                || !ctx.recording.load(Ordering::SeqCst)
-            {
+            if manager.foreground_id() != Some(id) {
                 break;
             }
             let level = audio.current_rms();
             pill::emit_audio_level(&app, level);
         }
     });
-}
-
-/// Downcast a generic `AppHandle<R>` to the production `Wry` runtime.
-/// Returns `None` for non-Wry runtimes (only relevant for headless tests).
-fn try_into_wry<R: Runtime>(app: &AppHandle<R>) -> Option<AppHandle<Wry>> {
-    use std::any::Any;
-    let any: &dyn Any = app as &dyn Any;
-    any.downcast_ref::<AppHandle<Wry>>().cloned()
 }
 
 fn resolve_active_mode<R: Runtime>(app: &AppHandle<R>, id: &str) -> Option<VoiceMode> {
@@ -597,4 +1277,309 @@ fn merge_dictionaries(global: &[String], mode: &[String]) -> Vec<String> {
                 .then(|| trimmed.to_string())
         })
         .collect()
+}
+
+const SATURATED_TOAST_MS_PUB: u32 = SATURATED_TOAST_MS;
+
+/// Helper for the hotkey layer: emit a saturated toast through the pill.
+pub fn emit_saturated_toast<R: Runtime>(app: &AppHandle<R>, in_flight: usize, max: usize) {
+    pill::show(app);
+    let msg = format!("Too many in flight ({in_flight}/{max})");
+    pill::emit_toast(app, msg, SATURATED_TOAST_MS_PUB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_manager() -> Arc<SessionManager> {
+        let audio = AudioHandle::spawn();
+        Arc::new(SessionManager::new(audio))
+    }
+
+    fn fresh_session(id: SessionId) -> Arc<SessionState> {
+        Arc::new(SessionState {
+            id,
+            stage: Mutex::new(Stage::Listening),
+            mode: ModeSnapshot::fallback(),
+            polishing_enabled: false,
+            stt_engine_id: "whisper-local".into(),
+            stt_model_id: "test".into(),
+            llm_engine_id: "none".into(),
+            llm_model_id: "test".into(),
+            language: "auto".into(),
+            dictionary: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            started_at: Instant::now(),
+            started_at_unix: 0,
+            transcript: Mutex::new(None),
+            result: Mutex::new(None),
+            error: Mutex::new(None),
+            warning: Mutex::new(false),
+            completed: AtomicBool::new(false),
+            completion: Arc::new(Notify::new()),
+        })
+    }
+
+    #[test]
+    fn manager_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Arc<SessionManager>>();
+    }
+
+    #[test]
+    fn begin_increments_id_and_inserts() {
+        let mgr = fresh_manager();
+        // Direct manipulation: simulate begin's bookkeeping without
+        // an AppHandle. We're validating the in-memory shape, not
+        // the IPC side-effects.
+        let s1 = fresh_session(1);
+        mgr.sessions.lock().insert(s1.id, s1);
+        let s2 = fresh_session(2);
+        mgr.sessions.lock().insert(s2.id, s2);
+        assert_eq!(mgr.pipeline_in_flight_count(), 2);
+        let snap = mgr.snapshot();
+        assert_eq!(snap.in_progress.len(), 2);
+        assert_eq!(snap.in_progress[0].session_id, 1);
+        assert_eq!(snap.in_progress[1].session_id, 2);
+    }
+
+    #[test]
+    fn begin_rejects_when_saturated() {
+        let mgr = fresh_manager();
+        for i in 1..=MAX_CONCURRENT_SESSIONS as u64 {
+            mgr.sessions.lock().insert(i, fresh_session(i));
+        }
+        assert_eq!(mgr.pipeline_in_flight_count(), MAX_CONCURRENT_SESSIONS);
+        // The saturation predicate that begin() uses:
+        let saturated = mgr.sessions.lock().len() >= mgr.max_concurrent;
+        assert!(saturated, "manager should reject 4th session at the cap");
+    }
+
+    #[test]
+    fn cancel_foreground_marks_only_active_recording() {
+        let mgr = fresh_manager();
+        let s1 = fresh_session(1);
+        let s2 = fresh_session(2);
+        mgr.sessions.lock().insert(s1.id, s1.clone());
+        mgr.sessions.lock().insert(s2.id, s2.clone());
+        *mgr.active_recording.lock() = Some(2);
+
+        // Simulate the cancel_foreground flow's session.cancel.store
+        // step (without an AppHandle). We assert that only the
+        // foreground session's flag is set.
+        let target = *mgr.active_recording.lock();
+        if let Some(id) = target {
+            if let Some(s) = mgr.sessions.lock().get(&id).cloned() {
+                s.cancel.store(true, Ordering::SeqCst);
+            }
+        }
+        assert!(!s1.cancel.load(Ordering::SeqCst));
+        assert!(s2.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn cancel_session_targets_specific_id() {
+        let mgr = fresh_manager();
+        let s1 = fresh_session(1);
+        let s2 = fresh_session(2);
+        let s3 = fresh_session(3);
+        mgr.sessions.lock().insert(s1.id, s1.clone());
+        mgr.sessions.lock().insert(s2.id, s2.clone());
+        mgr.sessions.lock().insert(s3.id, s3.clone());
+
+        // Mirror the cancel_session predicate without an AppHandle.
+        let target = 2;
+        if let Some(s) = mgr.sessions.lock().get(&target).cloned() {
+            s.cancel.store(true, Ordering::SeqCst);
+        }
+        assert!(!s1.cancel.load(Ordering::SeqCst));
+        assert!(s2.cancel.load(Ordering::SeqCst));
+        assert!(!s3.cancel.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn active_recording_clears_on_end_recording() {
+        let mgr = fresh_manager();
+        *mgr.active_recording.lock() = Some(7);
+        assert_eq!(mgr.foreground_id(), Some(7));
+        // end_recording's first step is to .take() the active_recording slot.
+        let taken = mgr.active_recording.lock().take();
+        assert_eq!(taken, Some(7));
+        assert_eq!(mgr.foreground_id(), None);
+    }
+
+    #[test]
+    fn snapshot_includes_recent_completed() {
+        let mgr = fresh_manager();
+        // The snapshot's `recent` field should mirror
+        // transcripts::snapshot_completed() — push one and verify.
+        let entry = CompletedEntry {
+            session_id: 99,
+            ts: 1,
+            text: "hello".into(),
+            mode_id: "general".into(),
+            stage: Stage::Done,
+            warning: false,
+            error_message: None,
+        };
+        transcripts::push_completed(entry);
+        let snap = mgr.snapshot();
+        // Don't assert exact length: the ring buffer is process-wide
+        // and other tests may have populated it. Just verify our
+        // entry made it into the recent list.
+        assert!(snap.recent.iter().any(|e| e.session_id == 99));
+    }
+
+    #[test]
+    fn mode_snapshot_post_processing_lower_case() {
+        let snap = ModeSnapshot {
+            id: "x".into(),
+            name: "x".into(),
+            icon: "x".into(),
+            system_prompt: String::new(),
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Lower,
+            max_length_chars: None,
+            dictionary: Vec::new(),
+        };
+        assert_eq!(snap.apply_post_processing("Hello WORLD"), "hello world");
+    }
+
+    #[test]
+    fn mode_snapshot_post_processing_truncates() {
+        // ModeSnapshot now delegates to modes::apply_post_processing,
+        // which uses the sentence-boundary-aware truncate_to_cap (cap
+        // is the OUTPUT char count, including a trailing ellipsis when
+        // the source has no sentence boundary to cut at).
+        let snap = ModeSnapshot {
+            id: "x".into(),
+            name: "x".into(),
+            icon: "x".into(),
+            system_prompt: String::new(),
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: Some(5),
+            dictionary: Vec::new(),
+        };
+        let out = snap.apply_post_processing("abcdefghij");
+        assert!(out.chars().count() <= 5, "output {out:?} exceeds cap of 5");
+        assert!(out.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn mode_snapshot_post_processing_truncates_at_sentence_boundary() {
+        // Sentence boundary fits inside the cap → cut there cleanly,
+        // no ellipsis. Mirrors the modes::truncate_to_cap test path.
+        let snap = ModeSnapshot {
+            id: "x".into(),
+            name: "x".into(),
+            icon: "x".into(),
+            system_prompt: String::new(),
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: Some(20),
+            dictionary: Vec::new(),
+        };
+        let out = snap.apply_post_processing("Hello world. This is a longer second sentence.");
+        assert_eq!(out, "Hello world.");
+    }
+
+    #[test]
+    fn pill_owner_steal_blocks_old_session_emits() {
+        // Regression guard for the streaming-bleed bug: when session B
+        // begins while session A's pipeline is still polishing, A's
+        // emit-time `owns_pill_emit(A.id)` must flip to false the
+        // moment B claims the pill_owner slot. The pipeline reads this
+        // predicate at every emit site so the bleed is impossible.
+        let mgr = fresh_manager();
+        let a = fresh_session(1);
+        let b = fresh_session(2);
+        mgr.sessions.lock().insert(a.id, a.clone());
+
+        // Session A claims the pill (mirrors the begin() path).
+        *mgr.pill_owner.lock() = Some(a.id);
+        assert!(mgr.owns_pill_emit(a.id));
+        assert!(!mgr.owns_pill_emit(b.id));
+
+        // Session B begins → steals the pill_owner slot.
+        mgr.sessions.lock().insert(b.id, b.clone());
+        *mgr.pill_owner.lock() = Some(b.id);
+
+        // Now any in-flight emit from A is gated off, B's are gated on.
+        assert!(!mgr.owns_pill_emit(a.id));
+        assert!(mgr.owns_pill_emit(b.id));
+
+        // After B finalises and releases ownership, neither session
+        // should drive the pill (no stale pointer for the next begin).
+        *mgr.pill_owner.lock() = None;
+        assert!(!mgr.owns_pill_emit(a.id));
+        assert!(!mgr.owns_pill_emit(b.id));
+    }
+
+    #[test]
+    fn max_record_guard_drops_after_session_complete() {
+        // The max-record guard captures Arc<SessionState>; without
+        // the completion-Notify wakeup it would hold the Arc for the
+        // full 30-min cap. We mark_completed() before the guard's
+        // sleep elapses and assert the guard's strong reference is
+        // released within a tick.
+        let session = fresh_session(42);
+        let strong_before = Arc::strong_count(&session);
+
+        // Spin up a worker that waits on the same Notify the guard
+        // would. We assert the wait-and-drop sequence in lockstep
+        // with the production guard, without needing a tokio runtime
+        // for a 30-minute sleep.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("tokio rt");
+        let session_for_block = session.clone();
+        rt.block_on(async move {
+            let captured = session_for_block.clone();
+            let completion = captured.completion.clone();
+            // captured is moved into the spawned task — mirrors the
+            // production guard which captures the Arc by move.
+            let task = tokio::spawn(async move {
+                if captured.completed.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = completion.notified() => {}
+                    _ = tokio::time::sleep(Duration::from_secs(60)) => {
+                        panic!("guard slept to deadline; mark_completed never woke it");
+                    }
+                }
+            });
+
+            // Signal completion before the guard's sleep elapses.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            session_for_block.mark_completed();
+            task.await.expect("guard task must complete");
+        });
+
+        // After the spawned task drops its Arc, only `session` itself
+        // holds the strong reference — strong_count must return to
+        // its starting value.
+        assert_eq!(
+            Arc::strong_count(&session),
+            strong_before,
+            "guard task must drop its Arc<SessionState> when completion fires"
+        );
+    }
+
+    #[test]
+    fn mark_completed_is_idempotent() {
+        // Multiple terminal paths in run_pipeline can both call
+        // mark_completed (e.g. set_stage's terminal block plus the
+        // PipelineGuard's Drop). The second call must not panic the
+        // Notify nor double-fire waiters.
+        let s = fresh_session(1);
+        s.mark_completed();
+        s.mark_completed();
+        s.mark_completed();
+        assert!(s.completed.load(Ordering::SeqCst));
+    }
 }

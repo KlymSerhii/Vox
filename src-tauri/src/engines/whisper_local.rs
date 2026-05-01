@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tauri::{AppHandle, Wry};
 
-use crate::engines::SttEngine;
+use crate::engines::{SegmentCallback, SttEngine};
 use crate::models::{self, ModelKind};
 
 #[cfg(feature = "local-engines")]
@@ -63,6 +63,7 @@ impl SttEngine for WhisperLocalEngine {
         wav: &[u8],
         language: Option<&str>,
         dictionary: &[String],
+        on_segment: Option<SegmentCallback>,
     ) -> anyhow::Result<String> {
         let path = self.cache_path().ok_or_else(|| self.fallback_error())?;
 
@@ -110,6 +111,23 @@ impl SttEngine for WhisperLocalEngine {
                     params.set_initial_prompt(&prompt);
                 }
 
+                // Hook the streaming callback if the caller asked for one.
+                // whisper-rs's safe wrapper accumulates `n_new` segments
+                // each invocation and hands us their decoded text — we
+                // append to a shared accumulator and pass the cumulative
+                // string up to the user closure.
+                if let Some(cb) = on_segment {
+                    let acc = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+                    let acc_for_cb = acc.clone();
+                    params.set_segment_callback_safe_lossy(
+                        move |seg: whisper_rs::SegmentCallbackData| {
+                            let mut g = acc_for_cb.lock();
+                            g.push_str(&seg.text);
+                            cb(g.as_str());
+                        },
+                    );
+                }
+
                 state
                     .full(params, &pcm)
                     .map_err(|e| anyhow::anyhow!("whisper run: {e}"))?;
@@ -131,7 +149,7 @@ impl SttEngine for WhisperLocalEngine {
 
         #[cfg(not(feature = "local-engines"))]
         {
-            let _ = (path, model_id, lang, dict, wav_owned);
+            let _ = (path, model_id, lang, dict, wav_owned, on_segment);
             Err(anyhow::anyhow!(
                 "whisper-local engine compiled out — rebuild with --features local-engines"
             ))

@@ -172,7 +172,8 @@ unsafe impl Sync for ChordHandle {}
 /// task instead.
 ///
 /// `Send + 'static` (not `Sync`) so callers can capture `AppHandle` /
-/// `SessionCtx`, both of which contain non-`Sync` `mpsc::Sender`s.
+/// `Arc<SessionManager>`, both of which contain non-`Sync` interior
+/// state (the audio handle's `mpsc::Sender`).
 pub fn install(
     spec: ChordSpec,
     on_press: impl Fn() + Send + 'static,

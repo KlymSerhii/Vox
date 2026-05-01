@@ -22,6 +22,10 @@ export interface Settings {
   mode_cycle_hotkey: string;
   auto_suggest_modes: boolean;
   appearance: "light" | "dark";
+  /// Show the transcript / polish text streaming inside the pill after
+  /// the hotkey is released. Default true; tray popover + Settings →
+  /// General both flip it.
+  streaming_pill_enabled: boolean;
   /// Token identifying our `llama-server` children for orphan reaping.
   /// Not a secret (server is loopback-only).
   inference_api_key: string;
@@ -61,6 +65,38 @@ export interface UpdateCheckResult {
 export interface RecentTranscript {
   ts: number;
   text: string;
+}
+
+export type Stage =
+  | "listening"
+  | "transcribing"
+  | "polishing"
+  | "done"
+  | "error"
+  | "canceled";
+
+export interface InProgressEntry {
+  session_id: number;
+  stage: Stage;
+  mode_id: string;
+  mode_name: string;
+  mode_icon: string;
+  started_at: number;
+}
+
+export interface CompletedEntry {
+  session_id: number;
+  ts: number;
+  text: string;
+  mode_id: string;
+  stage: Stage;
+  warning: boolean;
+  error_message: string | null;
+}
+
+export interface SessionsSnapshot {
+  in_progress: InProgressEntry[];
+  recent: CompletedEntry[];
 }
 
 export interface PermissionStatus {
@@ -124,6 +160,10 @@ export async function setHandsFreeEnabled(enabled: boolean): Promise<void> {
 
 export async function setPolishingEnabled(enabled: boolean): Promise<void> {
   await invoke("set_polishing_enabled", { enabled });
+}
+
+export async function setStreamingPillEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_streaming_pill_enabled", { enabled });
 }
 
 export async function setAppearance(
@@ -337,6 +377,51 @@ export async function onTranscriptsChanged(
   cb: (rec: RecentTranscript[]) => void,
 ): Promise<UnlistenFn> {
   return listen<RecentTranscript[]>("transcripts:changed", (e) => cb(e.payload));
+}
+
+export async function cancelSession(sessionId: number): Promise<void> {
+  await invoke("cancel_session", { sessionId });
+}
+
+export async function sessionsSnapshot(): Promise<SessionsSnapshot> {
+  return invoke<SessionsSnapshot>("sessions_snapshot");
+}
+
+export async function onSessionsChanged(
+  cb: (p: SessionsSnapshot) => void,
+): Promise<UnlistenFn> {
+  return listen<SessionsSnapshot>("sessions:changed", (e) => cb(e.payload));
+}
+
+export async function onPillToast(
+  cb: (p: { message: string; ms: number }) => void,
+): Promise<UnlistenFn> {
+  return listen<{ message: string; ms: number }>("pill:toast", (e) =>
+    cb(e.payload),
+  );
+}
+
+/**
+ * Cumulative streaming text — `text` is the full transcript (or polish)
+ * so far, NOT a delta. The pill rate-limits visible chars/sec; `final`
+ * tells the UI to flush instantly.
+ */
+export interface StreamPayload {
+  session_id: number;
+  text: string;
+  final: boolean;
+}
+
+export async function onPillTranscriptStream(
+  cb: (p: StreamPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<StreamPayload>("pill:transcript_stream", (e) => cb(e.payload));
+}
+
+export async function onPillPolishStream(
+  cb: (p: StreamPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<StreamPayload>("pill:polish_stream", (e) => cb(e.payload));
 }
 
 export async function listModes(): Promise<VoiceMode[]> {

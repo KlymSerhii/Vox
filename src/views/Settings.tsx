@@ -688,6 +688,20 @@ function GeneralTab(props: {
         </Row>
       </Card>
 
+      <SectionHeader title="Streaming pill" />
+      <Card>
+        <Row
+          label="Show streaming pill"
+          hint="See the transcript appear live in the pill after you release the hotkey."
+          last
+        >
+          <Toggle
+            checked={props.s.streaming_pill_enabled}
+            onChange={(v) => props.update({ streaming_pill_enabled: v })}
+          />
+        </Row>
+      </Card>
+
       <SectionHeader title="Startup" />
       <Card>
         <Row

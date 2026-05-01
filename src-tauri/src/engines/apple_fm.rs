@@ -16,8 +16,12 @@
 
 use std::time::Instant;
 
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
 use crate::engines::apple_fm_bridge;
-use crate::engines::LlmEngine;
+use crate::engines::{ChunkCallback, LlmEngine};
 
 // Apple's on-device Foundation Model is a ~3B model tuned for short
 // rewrites. It does NOT follow long bulleted instruction lists as
@@ -146,6 +150,82 @@ impl LlmEngine for AppleFmEngine {
                 Err(anyhow::anyhow!("apple-fm: {e}"))
             }
             Err(e) => Err(anyhow::anyhow!("apple-fm spawn_blocking: {e}")),
+        }
+    }
+
+    async fn cleanup_stream(
+        &self,
+        transcript: &str,
+        system_prompt: &str,
+        dictionary: &[String],
+        on_chunk: ChunkCallback,
+    ) -> anyhow::Result<String> {
+        let trimmed = transcript.trim();
+        if trimmed.split_whitespace().count() < 2 {
+            return Ok(trimmed.to_string());
+        }
+
+        match apple_fm_bridge::availability() {
+            apple_fm_bridge::AvailabilityCode::Available => {}
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Apple Intelligence unavailable: {}",
+                    availability_message(other)
+                ));
+            }
+        }
+
+        let started = Instant::now();
+        let max_tokens = dynamic_max_tokens(trimmed.len());
+        let system = build_system_prompt(system_prompt, dictionary);
+        let transcript_owned = trimmed.to_string();
+
+        log::info!(
+            "apple-fm: streaming-polish {} chars, system_prompt={} chars, max_tokens={}",
+            trimmed.len(),
+            system.len(),
+            max_tokens
+        );
+
+        // The Swift bridge fires the cumulative-partial callback on its
+        // own internal serial queue; we forward and stash the latest
+        // snapshot so we can return it as the final value.
+        let last_snapshot: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let stash = last_snapshot.clone();
+
+        let bridged_cb: Box<dyn Fn(&str) + Send + Sync + 'static> =
+            Box::new(move |s: &str| {
+                {
+                    let mut g = stash.lock();
+                    *g = s.to_string();
+                }
+                on_chunk(s);
+            });
+
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            apple_fm_bridge::polish_stream_blocking(
+                &system,
+                &transcript_owned,
+                max_tokens,
+                TIMEOUT_SECS,
+                bridged_cb,
+            )
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                let final_text = last_snapshot.lock().clone();
+                log::info!(
+                    "apple-fm: streamed polish {}→{} chars in {} ms",
+                    trimmed.len(),
+                    final_text.len(),
+                    started.elapsed().as_millis()
+                );
+                Ok(final_text)
+            }
+            Ok(Err(e)) => Err(anyhow::anyhow!("apple-fm stream: {e}")),
+            Err(e) => Err(anyhow::anyhow!("apple-fm stream spawn_blocking: {e}")),
         }
     }
 

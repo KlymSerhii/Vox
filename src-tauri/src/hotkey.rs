@@ -12,6 +12,7 @@
 //! - **Cancel / mode-cycle** walk a small fallback list and persist any
 //!   substitution back to settings; their pickers are visible in the UI.
 
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::Serialize;
@@ -22,7 +23,7 @@ use tauri_plugin_global_shortcut::{
 
 #[cfg(target_os = "macos")]
 use crate::mac_chord::{self, ChordHandle};
-use crate::session::{self, SessionCtx};
+use crate::session::{self, BeginOutcome, SessionManager, MAX_CONCURRENT_SESSIONS};
 use crate::settings::{self, HotkeyPurpose};
 
 const CANCEL_FALLBACKS: &[&str] = &["Escape"];
@@ -85,7 +86,7 @@ pub struct ActiveHotkeyState {
 /// to consult.
 pub struct CancelArm {
     pub shortcut: Shortcut,
-    pub ctx: SessionCtx,
+    pub manager: Arc<SessionManager>,
 }
 
 impl ActiveHotkeyState {
@@ -260,7 +261,7 @@ pub fn register<R: Runtime>(
     preferred: &str,
     cancel_preferred: &str,
     mode_cycle_preferred: &str,
-    ctx: SessionCtx,
+    manager: Arc<SessionManager>,
 ) -> Result<String, String> {
     let gs = app.global_shortcut();
     let _ = gs.unregister_all();
@@ -283,7 +284,8 @@ pub fn register<R: Runtime>(
         log::info!("hotkey: AXIsProcessTrusted={}", unsafe { AXIsProcessTrusted() });
     }
 
-    let ptt_active: ActiveHotkey = register_push_to_talk(app, preferred, gs, ctx.clone());
+    let ptt_active: ActiveHotkey =
+        register_push_to_talk(app, preferred, gs, manager.clone());
     let ptt_bound_sc = shortcut_from_key(&ptt_active.bound);
 
     let cancel_active = bind_discrete(
@@ -313,7 +315,7 @@ pub fn register<R: Runtime>(
             if let Ok(mut g) = state.cancel_armed.lock() {
                 *g = Some(CancelArm {
                     shortcut: sc,
-                    ctx: ctx.clone(),
+                    manager: manager.clone(),
                 });
             }
         }
@@ -391,7 +393,7 @@ pub fn register<R: Runtime>(
     // `unregister_all()` at the top wiped the cancel grab we'd put down
     // in `arm_cancel`. Re-arm so Escape still cancels the in-flight
     // session.
-    if ctx.is_pipeline_active() {
+    if manager.is_recording() {
         arm_cancel(app);
     }
 
@@ -422,7 +424,7 @@ pub fn arm_cancel<R: Runtime>(app: &AppHandle<R>) {
             return;
         };
         let sc = arm.shortcut;
-        let ctx_clone = arm.ctx.clone();
+        let manager = arm.manager.clone();
         drop(armed);
 
         let gs = app.global_shortcut();
@@ -430,10 +432,15 @@ pub fn arm_cancel<R: Runtime>(app: &AppHandle<R>) {
             return;
         }
 
+        // The cancel hotkey is bound only on the Wry runtime — downcast
+        // here so the inner closure can hand the typed AppHandle to
+        // SessionManager::cancel_foreground.
         let app_handle = app.clone();
         if let Err(e) = gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
             if let ShortcutState::Pressed = event.state() {
-                session::cancel(app_handle.clone(), ctx_clone.clone());
+                if let Some(wry_app) = try_into_wry(&app_handle) {
+                    manager.cancel_foreground(&wry_app);
+                }
             }
         }) {
             log::warn!("arm_cancel: failed to register cancel shortcut: {e}");
@@ -496,7 +503,7 @@ fn register_push_to_talk<R: Runtime>(
     app: &AppHandle<R>,
     preferred: &str,
     gs: &tauri_plugin_global_shortcut::GlobalShortcut<R>,
-    ctx: SessionCtx,
+    manager: Arc<SessionManager>,
 ) -> ActiveHotkey {
     if preferred.is_empty() {
         return ActiveHotkey::empty("");
@@ -504,7 +511,7 @@ fn register_push_to_talk<R: Runtime>(
 
     #[cfg(target_os = "macos")]
     if let Some(spec) = mac_chord::try_parse_chord(preferred) {
-        match install_chord(app, spec, ctx) {
+        match install_chord(app, spec, manager.clone()) {
             Ok(()) => {
                 log::error!("push-to-talk: chord '{preferred}' installed via CGEventTap");
                 return ActiveHotkey {
@@ -548,22 +555,29 @@ fn register_push_to_talk<R: Runtime>(
     };
 
     let app_handle = app.clone();
-    let ctx_clone = ctx.clone();
+    let manager_press = manager.clone();
+    let manager_release = manager.clone();
     match gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
         let prefs = settings::prefs(&app_handle);
         match (prefs.hands_free_enabled, event.state()) {
             (true, ShortcutState::Pressed) => {
-                if ctx_clone.is_recording() {
-                    session::end_recording(app_handle.clone(), ctx_clone.clone());
-                } else {
-                    session::begin_recording(app_handle.clone(), &ctx_clone);
+                if let Some(wry_app) = try_into_wry(&app_handle) {
+                    if manager_press.foreground_id().is_some() {
+                        manager_press.end_recording(wry_app);
+                    } else {
+                        handle_begin(&wry_app, &manager_press);
+                    }
                 }
             }
             (false, ShortcutState::Pressed) => {
-                session::begin_recording(app_handle.clone(), &ctx_clone)
+                if let Some(wry_app) = try_into_wry(&app_handle) {
+                    handle_begin(&wry_app, &manager_press);
+                }
             }
             (false, ShortcutState::Released) => {
-                session::end_recording(app_handle.clone(), ctx_clone.clone())
+                if let Some(wry_app) = try_into_wry(&app_handle) {
+                    manager_release.end_recording(wry_app);
+                }
             }
             _ => {}
         }
@@ -589,6 +603,62 @@ fn register_push_to_talk<R: Runtime>(
             }
         }
     }
+}
+
+/// Shared handler for the PTT-press path that needs to begin a new
+/// session. Translates BeginOutcome variants into the appropriate
+/// pill / log effects. Lives next to the bind sites so each
+/// platform's hotkey closure can call into one place.
+fn handle_begin(app: &tauri::AppHandle<tauri::Wry>, manager: &Arc<SessionManager>) {
+    match manager.begin(app) {
+        BeginOutcome::Started(_) => {
+            // begin already showed the pill, emitted Listening, and
+            // armed the cancel grab.
+        }
+        BeginOutcome::Saturated { in_flight } => {
+            log::info!(
+                "ptt: refusing new session — {in_flight}/{MAX_CONCURRENT_SESSIONS} already in flight"
+            );
+            session::emit_saturated_toast(app, in_flight, MAX_CONCURRENT_SESSIONS);
+        }
+        BeginOutcome::DictationDisabled => {
+            // No-op — the master kill-switch is in effect; logged inside begin().
+        }
+        BeginOutcome::AlreadyRecording => {
+            // Race-loser path: another caller raced us in. Silently ignore.
+        }
+        BeginOutcome::AudioError(_) => {
+            // begin already emitted the friendly pill error and
+            // scheduled an auto-hide.
+        }
+    }
+}
+
+/// Downcast a generic AppHandle to the Wry runtime so the hotkey
+/// closures can hand a typed handle to SessionManager (the manager
+/// is registered as a Wry-typed app state).
+///
+/// In this binary the downcast is **always an identity** — every
+/// hotkey site is reached with `R = Wry` because `tauri::Builder`
+/// in `lib.rs::run` is itself Wry-only. We keep the `R: Runtime`
+/// generic signature on the surrounding `register` / `arm_cancel`
+/// / `register_push_to_talk` chain because:
+///   1. `tauri-plugin-global-shortcut`'s `on_shortcut` callback is
+///      handed an `&AppHandle<R>` parameterised on the same runtime
+///      the plugin was constructed with — there is no Wry-only
+///      shortcut variant to call instead.
+///   2. The `mac_chord` chord-listener path also flows through here
+///      from a `tauri::Manager`-bound generic `R`.
+/// Tightening to `R = Wry` would require either a custom shortcut
+/// plugin or duplicating every register-* helper for Wry-typed
+/// AppHandles, neither of which earns its complexity. A
+/// `debug_assert!` at startup would also be wrong — `Any::is` on a
+/// non-Wry handle would silently return None just like the failing
+/// downcast we already handle.
+fn try_into_wry<R: Runtime>(app: &AppHandle<R>) -> Option<AppHandle<tauri::Wry>> {
+    use std::any::Any;
+    let any: &dyn Any = app as &dyn Any;
+    any.downcast_ref::<AppHandle<tauri::Wry>>().cloned()
 }
 
 /// Single actionable sentence shown in Settings / pill / tray. Assume the
@@ -620,28 +690,32 @@ fn friendly_chord_error(e: &mac_chord::ChordError) -> String {
 fn install_chord<R: Runtime>(
     app: &AppHandle<R>,
     spec: mac_chord::ChordSpec,
-    ctx: SessionCtx,
+    manager: Arc<SessionManager>,
 ) -> Result<(), mac_chord::ChordError> {
     let app_press = app.clone();
-    let ctx_press = ctx.clone();
+    let manager_press = manager.clone();
     let app_release = app.clone();
-    let ctx_release = ctx.clone();
+    let manager_release = manager.clone();
     let handle = mac_chord::install(
         spec,
         move || {
-            if settings::prefs(&app_press).hands_free_enabled {
-                if ctx_press.is_recording() {
-                    session::end_recording(app_press.clone(), ctx_press.clone());
+            if let Some(wry_app) = try_into_wry(&app_press) {
+                if settings::prefs(&app_press).hands_free_enabled {
+                    if manager_press.foreground_id().is_some() {
+                        manager_press.end_recording(wry_app);
+                    } else {
+                        handle_begin(&wry_app, &manager_press);
+                    }
                 } else {
-                    session::begin_recording(app_press.clone(), &ctx_press);
+                    handle_begin(&wry_app, &manager_press);
                 }
-            } else {
-                session::begin_recording(app_press.clone(), &ctx_press);
             }
         },
         move || {
             if !settings::prefs(&app_release).hands_free_enabled {
-                session::end_recording(app_release.clone(), ctx_release.clone());
+                if let Some(wry_app) = try_into_wry(&app_release) {
+                    manager_release.end_recording(wry_app);
+                }
             }
         },
     )?;
@@ -678,8 +752,8 @@ fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(800)).await;
-            if let Some(ctx) = app_clone.try_state::<SessionCtx>() {
-                if ctx.is_recording() || ctx.is_pipeline_active() {
+            if let Some(mgr) = app_clone.try_state::<Arc<SessionManager>>() {
+                if mgr.is_recording() || mgr.has_active_pipeline() {
                     return;
                 }
             }

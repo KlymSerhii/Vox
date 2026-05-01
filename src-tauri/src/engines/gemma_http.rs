@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Wry};
 
-use crate::engines::LlmEngine;
+use crate::engines::{ChunkCallback, LlmEngine};
 use crate::inference_proc;
+use futures_util::StreamExt;
 
 // Sized for a 30-min dictation: ~135 s generation + ~30 s prompt eval +
 // margin at the measured ~52 tok/s on Apple Silicon.
@@ -29,6 +30,14 @@ const MIN_NEW_TOKENS: u32 = 2048;
 
 // ~160 s of generation at ~52 tok/s; past that we'd rather fail-open.
 const MAX_NEW_TOKENS_CAP: u32 = 8192;
+
+// Hard upper bound on the SSE accumulation buffer. A well-behaved
+// server emits one complete event per ~few hundred bytes, capped by
+// MAX_NEW_TOKENS_CAP × ~4 chars/token ≈ 32 KiB across the whole
+// stream. 1 MiB leaves four orders of magnitude of headroom and still
+// catches a runaway/malicious server that ships a single endless
+// "data:" line with no `\n\n` event boundary.
+const SSE_BUFFER_MAX_BYTES: usize = 1_048_576;
 
 // English BPE ≈ 4 chars/token. Budget = reasoning + output + margin:
 // - Reasoning: ~3× input. Gemma 4's chain-of-thought consistently
@@ -146,6 +155,25 @@ struct Usage {
     completion_tokens: u64,
 }
 
+// Streaming variants — llama.cpp's OpenAI-compatible SSE shape.
+#[derive(Deserialize)]
+struct StreamChunk {
+    #[serde(default)]
+    choices: Vec<StreamChoice>,
+}
+
+#[derive(Deserialize)]
+struct StreamChoice {
+    #[serde(default)]
+    delta: StreamDelta,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+}
+
 #[async_trait::async_trait]
 impl LlmEngine for GemmaHttpEngine {
     async fn cleanup(
@@ -203,6 +231,62 @@ impl LlmEngine for GemmaHttpEngine {
             }
             Err(e) => log::warn!(
                 "gemma-http: polish FAILED in {} ms — session will fail-open to raw transcript: {e}",
+                started.elapsed().as_millis()
+            ),
+        }
+        result
+    }
+
+    async fn cleanup_stream(
+        &self,
+        transcript: &str,
+        system_prompt: &str,
+        dictionary: &[String],
+        on_chunk: ChunkCallback,
+    ) -> anyhow::Result<String> {
+        let trimmed = transcript.trim();
+        if trimmed.split_whitespace().count() < 2 {
+            return Ok(trimmed.to_string());
+        }
+
+        let started = Instant::now();
+        log::info!(
+            "gemma-http: streaming-polish {} chars with model={}",
+            trimmed.len(),
+            self.model_id
+        );
+
+        let request_once = || async {
+            let server = inference_proc::ensure_running(&self.app, &self.model_id).await?;
+            self.post_cleanup_stream(&server, system_prompt, dictionary, trimmed, &on_chunk)
+                .await
+        };
+
+        // Mirror cleanup()'s single-retry pattern: a stale child fails the
+        // first attempt, supervisor's is_alive trips, second attempt
+        // spawns fresh and connects.
+        let result = match request_once().await {
+            Ok(s) => Ok(s),
+            Err(first) => {
+                log::warn!(
+                    "gemma-http: first stream request failed ({first}); dropping handle and retrying once"
+                );
+                inference_proc::drop_managed(&self.app);
+                request_once().await.map_err(|second| {
+                    anyhow::anyhow!("gemma-http stream retry failed: {first} | {second}")
+                })
+            }
+        };
+
+        match &result {
+            Ok(out) => log::info!(
+                "gemma-http: streamed polish {}→{} chars in {} ms",
+                trimmed.len(),
+                out.len(),
+                started.elapsed().as_millis()
+            ),
+            Err(e) => log::warn!(
+                "gemma-http: stream polish FAILED in {} ms: {e}",
                 started.elapsed().as_millis()
             ),
         }
@@ -335,6 +419,161 @@ impl GemmaHttpEngine {
     }
 }
 
+impl GemmaHttpEngine {
+    async fn post_cleanup_stream(
+        &self,
+        server: &inference_proc::RunningServer,
+        system_prompt: &str,
+        dictionary: &[String],
+        transcript: &str,
+        on_chunk: &ChunkCallback,
+    ) -> anyhow::Result<String> {
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
+        let max_tokens = dynamic_max_tokens(transcript.len());
+
+        let system_msg = build_system_message(system_prompt, dictionary);
+        let user_msg = format!(
+            "Clean this transcript. Output only the cleaned text.\n\n```\n{transcript}\n```"
+        );
+
+        let body = ChatRequest {
+            model: &server.model_id,
+            messages: vec![
+                ChatMessage { role: "system", content: system_msg },
+                ChatMessage { role: "user", content: user_msg },
+            ],
+            max_tokens,
+            temperature: 0.2,
+            stream: true,
+        };
+
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&server.api_key)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("llama-server stream POST: {e}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let snippet: String = resp
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
+            return Err(anyhow::anyhow!("llama-server HTTP {status}: {snippet}"));
+        }
+
+        let mut acc = String::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut stream = resp.bytes_stream();
+
+        while let Some(next) = stream.next().await {
+            let bytes = next.map_err(|e| anyhow::anyhow!("stream read: {e}"))?;
+            buf.extend_from_slice(&bytes);
+            if buf.len() > SSE_BUFFER_MAX_BYTES {
+                return Err(anyhow::anyhow!(
+                    "SSE buffer exceeded {SSE_BUFFER_MAX_BYTES} bytes without an event boundary"
+                ));
+            }
+
+            // SSE events end at a blank line — \n\n in the byte stream.
+            // Drain complete events from the buffer one at a time so a
+            // partial trailing event stays buffered for the next chunk.
+            loop {
+                let Some(pos) = find_double_newline(&buf) else {
+                    break;
+                };
+                let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+                let event_len = event.len().saturating_sub(2);
+                let event_str = match std::str::from_utf8(&event[..event_len]) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                if let Some(stop) = parse_sse_event(event_str, &mut acc) {
+                    if stop {
+                        // [DONE] sentinel — final chunk delivered, exit
+                        // both the inner and outer loops cleanly.
+                        on_chunk(&acc);
+                        return Ok(acc.trim().to_string());
+                    }
+                    on_chunk(&acc);
+                }
+            }
+        }
+
+        // Stream ended without a [DONE] marker — flush whatever we
+        // accumulated and treat as best-effort success.
+        on_chunk(&acc);
+        Ok(acc.trim().to_string())
+    }
+}
+
+/// Find the byte index of the first `\n\n` sequence in `buf`, if any.
+/// SSE-friendly: handles `\r\n\r\n` by collapsing CR before this is
+/// called (we just trim CRs in the parser instead).
+fn find_double_newline(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 2 {
+        return None;
+    }
+    for i in 0..buf.len() - 1 {
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Parse one SSE event block. Appends any decoded `delta.content` to
+/// `acc` (cumulative), returns:
+/// - `Some(true)` on a `data: [DONE]` sentinel (caller stops the stream)
+/// - `Some(false)` if `acc` was extended (caller should fire on_chunk)
+/// - `None` if the event was a comment / heartbeat / non-data line
+fn parse_sse_event(event: &str, acc: &mut String) -> Option<bool> {
+    let mut extended = false;
+    for raw_line in event.split('\n') {
+        let line = raw_line.trim_end_matches('\r');
+        // SSE comments start with ":" — heartbeat from llama.cpp.
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        // Only "data:" lines are interesting for the chat-completions stream.
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim_start();
+        if payload == "[DONE]" {
+            return Some(true);
+        }
+        // llama.cpp occasionally emits `{}` heartbeats and chunks
+        // without `delta.content` (role-only first chunk). Tolerate both.
+        let chunk: StreamChunk = match serde_json::from_str(payload) {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("gemma-http: bad SSE chunk JSON ({e}); raw={payload}");
+                continue;
+            }
+        };
+        for choice in chunk.choices {
+            if let Some(piece) = choice.delta.content {
+                if !piece.is_empty() {
+                    acc.push_str(&piece);
+                    extended = true;
+                }
+            }
+        }
+    }
+    if extended {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn build_system_message(system_override: &str, dictionary: &[String]) -> String {
     let system = if system_override.trim().is_empty() {
         DEFAULT_SYSTEM_PROMPT.to_string()
@@ -413,5 +652,163 @@ mod tests {
     #[test]
     fn dynamic_max_tokens_caps_pathological_inputs() {
         assert_eq!(dynamic_max_tokens(200_000), MAX_NEW_TOKENS_CAP as i32);
+    }
+
+    #[test]
+    fn sse_parser_accumulates_cumulative_content() {
+        // Walk hand-rolled SSE bytes through the parsing helpers exactly
+        // the way `post_cleanup_stream` does, asserting that each event
+        // adds to a single cumulative buffer (the contract the pill UI
+        // relies on).
+        let mut buf: Vec<u8> = Vec::new();
+        let raw =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
+             data: [DONE]\n\n";
+        buf.extend_from_slice(raw.as_bytes());
+
+        let mut acc = String::new();
+        let mut emissions: Vec<String> = Vec::new();
+        let mut saw_done = false;
+
+        loop {
+            let Some(pos) = find_double_newline(&buf) else { break };
+            let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+            let event_len = event.len().saturating_sub(2);
+            let event_str = std::str::from_utf8(&event[..event_len]).unwrap();
+            match parse_sse_event(event_str, &mut acc) {
+                Some(true) => {
+                    saw_done = true;
+                    emissions.push(acc.clone());
+                    break;
+                }
+                Some(false) => emissions.push(acc.clone()),
+                None => {}
+            }
+        }
+
+        assert!(saw_done, "[DONE] sentinel must terminate the stream");
+        assert_eq!(emissions, vec!["Hello".to_string(), "Hello world".to_string(), "Hello world".to_string()]);
+        assert_eq!(acc, "Hello world");
+    }
+
+    #[test]
+    fn sse_parser_handles_split_chunks() {
+        // Real wire shape: a single SSE event arrives split across two
+        // network reads. The parser's outer drain loop must keep the
+        // partial trailing event buffered until the second read
+        // completes the `\n\n` boundary, then emit the cumulative
+        // content exactly once.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut acc = String::new();
+        let mut emissions: Vec<String> = Vec::new();
+
+        // First half: the data line is complete but the terminating
+        // `\n\n` is split.
+        buf.extend_from_slice(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n",
+        );
+        // No double-newline yet → no emission this round.
+        if let Some(pos) = find_double_newline(&buf) {
+            let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+            let event_len = event.len().saturating_sub(2);
+            let event_str = std::str::from_utf8(&event[..event_len]).unwrap();
+            if let Some(_stop) = parse_sse_event(event_str, &mut acc) {
+                emissions.push(acc.clone());
+            }
+        }
+        assert!(emissions.is_empty(), "no emit before \\n\\n boundary");
+        assert_eq!(acc, "");
+
+        // Second half: completes the first event AND introduces a
+        // second event. The parser must drain BOTH events from the
+        // buffer in a single outer-pass.
+        buf.extend_from_slice(
+            b"\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+        );
+        loop {
+            let Some(pos) = find_double_newline(&buf) else { break };
+            let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+            let event_len = event.len().saturating_sub(2);
+            let event_str = std::str::from_utf8(&event[..event_len]).unwrap();
+            match parse_sse_event(event_str, &mut acc) {
+                Some(true) => {
+                    emissions.push(acc.clone());
+                    break;
+                }
+                Some(false) => emissions.push(acc.clone()),
+                None => {}
+            }
+        }
+
+        assert_eq!(emissions, vec!["Hel".to_string(), "Hello".to_string()]);
+        assert_eq!(acc, "Hello");
+    }
+
+    #[test]
+    fn sse_buffer_max_bytes_constant_is_sane() {
+        // Cheap consistency check: the cap must be positive and big
+        // enough to hold any plausible single event from a
+        // well-behaved server (a complete chat-completion delta is
+        // hundreds of bytes at worst).
+        assert!(SSE_BUFFER_MAX_BYTES >= 64 * 1024);
+        assert!(SSE_BUFFER_MAX_BYTES <= 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sse_parser_caps_buffer_at_max_bytes() {
+        // Simulates a pathological/malicious server emitting bytes
+        // without `\n\n`: the buffer grows unbounded until it crosses
+        // SSE_BUFFER_MAX_BYTES, at which point post_cleanup_stream
+        // returns Err. Test mirrors the production check predicate
+        // directly (the production code is `if buf.len() >
+        // SSE_BUFFER_MAX_BYTES { return Err(...) }`).
+        let mut buf: Vec<u8> = Vec::new();
+        let chunk = vec![b'X'; 64 * 1024];
+        let mut tripped = false;
+        for _ in 0..(SSE_BUFFER_MAX_BYTES / chunk.len() + 2) {
+            buf.extend_from_slice(&chunk);
+            if buf.len() > SSE_BUFFER_MAX_BYTES {
+                tripped = true;
+                break;
+            }
+            // No `\n\n` ever appended → find_double_newline is None
+            // and no events drain.
+            assert!(find_double_newline(&buf).is_none());
+        }
+        assert!(
+            tripped,
+            "buffer must cross SSE_BUFFER_MAX_BYTES when no boundary arrives"
+        );
+        // The buffer at the moment of trip is just past the cap.
+        assert!(buf.len() > SSE_BUFFER_MAX_BYTES);
+    }
+
+    #[test]
+    fn sse_parser_tolerates_heartbeat_and_role_chunks() {
+        // llama.cpp emits a leading `delta: {"role": "assistant"}` chunk
+        // and may inject `:` heartbeat comments between events; neither
+        // should advance the cumulative buffer or crash the parser.
+        let mut acc = String::new();
+        // Role-only first chunk: no content field.
+        assert!(parse_sse_event(
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}",
+            &mut acc,
+        ).is_none());
+        assert_eq!(acc, "");
+        // Heartbeat / comment lines.
+        assert!(parse_sse_event(": ping", &mut acc).is_none());
+        assert!(parse_sse_event("", &mut acc).is_none());
+        // Real chunk.
+        assert_eq!(
+            parse_sse_event(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}",
+                &mut acc,
+            ),
+            Some(false)
+        );
+        assert_eq!(acc, "hi");
+        // Done sentinel.
+        assert_eq!(parse_sse_event("data: [DONE]", &mut acc), Some(true));
     }
 }

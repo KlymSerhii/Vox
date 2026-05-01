@@ -1,20 +1,26 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
+  cancelSession,
   closeTrayPopover,
   copyText,
   getPublicSettings,
-  getRecentTranscripts,
   listModes,
+  onSessionsChanged,
   onSettingsChanged,
   onTranscriptsChanged,
   openSettingsWindow,
   quitApp,
+  sessionsSnapshot,
   setActiveMode,
   setAppearance,
   setHandsFreeEnabled,
   setPolishingEnabled,
+  setStreamingPillEnabled,
+  type InProgressEntry,
   type RecentTranscript,
+  type SessionsSnapshot,
   type Settings,
+  type Stage,
   type VoiceMode,
 } from "../lib/ipc";
 
@@ -22,23 +28,39 @@ export default function TrayPopoverView() {
   const [loaded, setLoaded] = createSignal(false);
   const [s, setS] = createSignal<Settings | null>(null);
   const [recents, setRecents] = createSignal<RecentTranscript[]>([]);
+  const [inProgress, setInProgress] = createSignal<InProgressEntry[]>([]);
   const [copyFlash, setCopyFlash] = createSignal<number | null>(null);
   const [modes, setModes] = createSignal<VoiceMode[]>([]);
   const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
 
   let unlistenSettings: (() => void) | null = null;
   let unlistenTranscripts: (() => void) | null = null;
+  let unlistenSessions: (() => void) | null = null;
+
+  function applySnapshot(snap: SessionsSnapshot) {
+    setInProgress(snap.in_progress);
+    // The popover renders the legacy "RECENT" list from `recents` for
+    // back-compat with the old transcripts:changed event, but we
+    // also project sessions:changed.recent into the same shape so
+    // both pathways converge on the same UI.
+    setRecents(
+      snap.recent.map((e) => ({
+        ts: e.ts,
+        text: e.text,
+      })),
+    );
+  }
 
   onMount(async () => {
     document.body.classList.add("translucent");
     try {
-      const [settings, rec, list] = await Promise.all([
+      const [settings, snap, list] = await Promise.all([
         getPublicSettings(),
-        getRecentTranscripts(),
+        sessionsSnapshot(),
         listModes(),
       ]);
       setS(settings);
-      setRecents(rec);
+      applySnapshot(snap);
       setModes(list);
     } finally {
       setLoaded(true);
@@ -50,9 +72,10 @@ export default function TrayPopoverView() {
     // fire while the popover is hidden.
     unlistenSettings = await onSettingsChanged(setS);
     unlistenTranscripts = await onTranscriptsChanged(setRecents);
+    unlistenSessions = await onSessionsChanged(applySnapshot);
 
     window.addEventListener("focus", () => {
-      void getRecentTranscripts().then(setRecents);
+      void sessionsSnapshot().then(applySnapshot);
     });
 
     document.addEventListener("keydown", (e) => {
@@ -63,6 +86,7 @@ export default function TrayPopoverView() {
   onCleanup(() => {
     unlistenSettings?.();
     unlistenTranscripts?.();
+    unlistenSessions?.();
   });
 
   async function pickMode(id: string) {
@@ -99,6 +123,13 @@ export default function TrayPopoverView() {
       llm_engine: v ? "gemma-local" : "none",
     });
     await setPolishingEnabled(v);
+  }
+
+  async function toggleStreamingPill(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, streaming_pill_enabled: v });
+    await setStreamingPillEnabled(v);
   }
 
   async function copyRecent(idx: number, text: string) {
@@ -195,6 +226,23 @@ export default function TrayPopoverView() {
               </div>
             </div>
 
+            <div class="border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Streaming pill
+                  </span>
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    See the transcript appear live before it's copied.
+                  </span>
+                </div>
+                <Toggle
+                  checked={st().streaming_pill_enabled}
+                  onChange={(v) => void toggleStreamingPill(v)}
+                />
+              </div>
+            </div>
+
             <div class="relative border-b border-[var(--color-border)] px-4 py-3">
               <div class="flex items-center justify-between gap-3">
                 <div class="flex min-w-0 flex-col">
@@ -269,6 +317,22 @@ export default function TrayPopoverView() {
             </div>
 
             <div class="flex-1 overflow-y-auto scrollbar-thin px-2 py-2">
+              <Show when={inProgress().length > 0}>
+                <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-violet,#a78bfa)]">
+                  In progress
+                </div>
+                <For each={inProgress()}>
+                  {(entry) => (
+                    <InProgressRow
+                      entry={entry}
+                      onCancel={() => {
+                        void cancelSession(entry.session_id);
+                      }}
+                    />
+                  )}
+                </For>
+                <div class="mb-2 mt-2 h-px bg-[var(--color-border)]" />
+              </Show>
               <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
                 Recent (cleared on quit)
               </div>
@@ -364,6 +428,95 @@ function StatusDot(props: { tone: "ok" | "off" }) {
       class="inline-block h-2 w-2 rounded-full"
       style={{ background: color }}
     />
+  );
+}
+
+function stageLabel(stage: Stage): string {
+  switch (stage) {
+    case "listening":
+      return "Listening…";
+    case "transcribing":
+      return "Transcribing…";
+    case "polishing":
+      return "Polishing…";
+    case "done":
+      return "Done";
+    case "error":
+      return "Error";
+    case "canceled":
+      return "Canceled";
+    default:
+      return "…";
+  }
+}
+
+function InProgressRow(props: {
+  entry: InProgressEntry;
+  onCancel: () => void;
+}) {
+  return (
+    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
+      <span aria-hidden="true" class="text-[14px] leading-none">
+        {props.entry.mode_icon}
+      </span>
+      <Spinner />
+      <span
+        class="pill-shimmer flex-1 truncate text-[12px] font-medium leading-none"
+        style={{
+          "--shimmer-base": "var(--color-ink-mute)",
+          "--shimmer-tint": "var(--color-violet, #a78bfa)",
+          "letter-spacing": "0.01em",
+        }}
+      >
+        {stageLabel(props.entry.stage)}
+      </span>
+      <span class="shrink-0 text-[11px] text-[var(--color-ink-faint)]">
+        {props.entry.mode_name}
+      </span>
+      <button
+        type="button"
+        class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
+        title="Cancel session"
+        aria-label="Cancel session"
+        onClick={(e) => {
+          e.stopPropagation();
+          props.onCancel();
+        }}
+      >
+        <svg
+          width="14"
+          height="14"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <line x1="6" y1="6" x2="18" y2="18" />
+          <line x1="6" y1="18" x2="18" y2="6" />
+        </svg>
+      </button>
+    </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <svg
+      class="animate-spin"
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="var(--color-violet, #a78bfa)"
+      stroke-width="2.5"
+      stroke-linecap="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3a9 9 0 1 0 9 9" />
+    </svg>
   );
 }
 

@@ -61,25 +61,51 @@ pub struct VoiceMode {
 }
 
 impl VoiceMode {
+    /// Convenience wrapper used by tests and any future caller that
+    /// holds a VoiceMode directly. The runtime pipeline doesn't reach
+    /// this — it post-processes through `session::ModeSnapshot` so a
+    /// mid-session edit to the underlying mode can't change the
+    /// in-flight transcript. Both paths converge on
+    /// [`apply_post_processing`].
+    #[allow(dead_code)]
     pub fn apply_post_processing(&self, text: &str) -> String {
-        let mut out = text.to_string();
-
-        match self.case {
-            CaseStyle::Title => out = title_case(&out),
-            CaseStyle::Lower => out = out.to_lowercase(),
-            CaseStyle::Sentence | CaseStyle::AsSpoken => {}
-        }
-
-        if matches!(self.punctuation, PunctuationStyle::None) {
-            out = strip_terminal_punctuation(&out);
-        }
-
-        if let Some(cap) = self.max_length_chars {
-            out = truncate_to_cap(&out, cap);
-        }
-
-        out
+        apply_post_processing(
+            &self.case,
+            &self.punctuation,
+            self.max_length_chars,
+            text,
+        )
     }
+}
+
+/// Free-function form of post-processing. Both `VoiceMode` and
+/// `ModeSnapshot` (in `session.rs`) call into here so the rules are
+/// defined exactly once. The case / punctuation / max-length args are
+/// taken by ref so callers can pass borrowed copies of the snapshot
+/// fields without cloning.
+pub fn apply_post_processing(
+    case: &CaseStyle,
+    punctuation: &PunctuationStyle,
+    max_length_chars: Option<usize>,
+    text: &str,
+) -> String {
+    let mut out = text.to_string();
+
+    match case {
+        CaseStyle::Title => out = title_case(&out),
+        CaseStyle::Lower => out = out.to_lowercase(),
+        CaseStyle::Sentence | CaseStyle::AsSpoken => {}
+    }
+
+    if matches!(punctuation, PunctuationStyle::None) {
+        out = strip_terminal_punctuation(&out);
+    }
+
+    if let Some(cap) = max_length_chars {
+        out = truncate_to_cap(&out, cap);
+    }
+
+    out
 }
 
 pub fn builtins() -> Vec<VoiceMode> {

@@ -166,6 +166,155 @@ public func vox_apple_fm_polish_blocking(
 #endif
 }
 
+// Streaming variant — fires `onChunk` with cumulative partials as the
+// session yields them, then signals completion. Blocks the calling
+// pthread on a DispatchSemaphore (callers run from `spawn_blocking`).
+//
+// The `streamResponse(to:)` API on macOS 26 yields partial snapshots of
+// the in-progress response. For a String-typed session each yielded
+// element is a partial string we forward straight to Rust. We stringify
+// via `String(describing:)` defensively so this still compiles if the
+// SDK changes the partial wrapper shape between betas.
+//
+// Use-after-free safety on timeout: if the deadline fires while the
+// detached Task is still iterating the stream, the Rust caller will
+// reclaim its `StreamCtx` Box on return — but the Task is still alive
+// and could call `onChunk` against freed memory. We guard with an
+// NSLock-protected `done` flag plus a brief drain window:
+//   1. Inside the for-await loop, re-check `done` under the lock and
+//      return without firing onChunk if it's been set.
+//   2. The timeout path acquires the lock, sets `done = true`, calls
+//      `task.cancel()`, then drops the lock and sleeps ~50 ms to let
+//      any in-flight invocation finish unwinding.
+// After the drain window the contract is: no further onChunk callback
+// can be entered, so Rust's Box::from_raw is safe to reclaim.
+@_cdecl("vox_apple_fm_polish_stream")
+public func vox_apple_fm_polish_stream(
+    _ systemPromptPtr: UnsafePointer<CChar>?,
+    _ transcriptPtr: UnsafePointer<CChar>?,
+    _ maxTokens: Int32,
+    _ timeoutSecs: UInt32,
+    _ userData: UnsafeMutableRawPointer?,
+    _ onChunk: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>) -> Void,
+    _ onDone: @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> Void
+) -> Int32 {
+#if canImport(FoundationModels)
+    guard #available(macOS 26.0, *) else {
+        ErrorSlot.shared.set("Apple Intelligence requires macOS 26 or later")
+        return 1
+    }
+    guard let sp = systemPromptPtr, let tp = transcriptPtr else {
+        ErrorSlot.shared.set("null pointer for prompt or transcript")
+        return 2
+    }
+
+    let systemPrompt = String(cString: sp)
+    let transcript = String(cString: tp)
+    let semaphore = DispatchSemaphore(value: 0)
+    nonisolated(unsafe) var finalResult: Result<String, Error>? = nil
+
+    // Lifetime gate for the detached Task. `done` flips to true when
+    // EITHER the task finishes naturally OR the timeout path fires.
+    // Both the chunk-loop and the timeout path consult this flag under
+    // the lock so the trampoline never fires after the Rust caller
+    // reclaims the StreamCtx.
+    let doneLock = NSLock()
+    nonisolated(unsafe) var done = false
+
+    let task = Task.detached {
+        do {
+            let session = LanguageModelSession {
+                systemPrompt
+            }
+            let options = GenerationOptions(
+                temperature: 0.2,
+                maximumResponseTokens: Int(maxTokens)
+            )
+            let userMessage =
+                "Clean this transcript. Output only the cleaned text.\n\n```\n\(transcript)\n```"
+
+            // The session yields cumulative snapshots; we coerce each
+            // element to a String defensively so a beta-SDK shape
+            // change doesn't break compilation.
+            var lastSnapshot = ""
+            let stream = session.streamResponse(to: userMessage, options: options)
+            for try await partial in stream {
+                // Cooperative cancellation check — fires when the
+                // timeout path called task.cancel().
+                if Task.isCancelled { break }
+                let snapshot = String(describing: partial)
+                if snapshot != lastSnapshot {
+                    lastSnapshot = snapshot
+                    // Hold the lock across the trampoline call so a
+                    // racing timeout-path setter cannot mark `done`
+                    // while we're mid-callback. The timeout path's
+                    // post-cancel drain sleep covers any callback
+                    // already entered before `done` was set.
+                    doneLock.lock()
+                    if done {
+                        doneLock.unlock()
+                        break
+                    }
+                    snapshot.withCString { ptr in
+                        onChunk(userData, ptr)
+                    }
+                    doneLock.unlock()
+                }
+            }
+            finalResult = .success(lastSnapshot)
+        } catch {
+            finalResult = .failure(error)
+        }
+        // Mark done before signaling so a timeout racing the natural
+        // completion sees `done == true` and skips its cancel/drain.
+        doneLock.lock()
+        done = true
+        doneLock.unlock()
+        semaphore.signal()
+    }
+
+    let deadline = DispatchTime.now() + .seconds(Int(timeoutSecs))
+    if semaphore.wait(timeout: deadline) == .timedOut {
+        // Acquire the lock to suppress further chunk emissions, cancel
+        // the task, then drain briefly so any callback in-flight at the
+        // moment we acquired the lock has time to unwind. Rust's
+        // Box::from_raw on return is then safe.
+        doneLock.lock()
+        done = true
+        doneLock.unlock()
+        task.cancel()
+        // 50 ms drain window. The chunk-loop only holds the lock for
+        // the duration of one onChunk invocation (a few µs), so this
+        // is generous; if Apple's framework ever blocks inside the
+        // trampoline for longer, bump this number.
+        Thread.sleep(forTimeInterval: 0.05)
+        ErrorSlot.shared.set("Apple Intelligence stream polish timed out after \(timeoutSecs)s")
+        onDone(userData, nil)
+        return 3
+    }
+
+    switch finalResult {
+    case .some(.success(let content)):
+        content.withCString { ptr in
+            onDone(userData, ptr)
+        }
+        return 0
+    case .some(.failure(let error)):
+        ErrorSlot.shared.set("\(error)")
+        onDone(userData, nil)
+        return 4
+    case .none:
+        ErrorSlot.shared.set("internal: Apple Intelligence stream task did not signal")
+        onDone(userData, nil)
+        return 5
+    }
+#else
+    ErrorSlot.shared.set("Foundation Models framework not available in this build")
+    _ = (systemPromptPtr, transcriptPtr, maxTokens, timeoutSecs, userData, onChunk, onDone)
+    return 6
+#endif
+}
+
 @_cdecl("vox_apple_fm_take_last_error")
 public func vox_apple_fm_take_last_error() -> UnsafeMutablePointer<CChar>? {
     if let msg = ErrorSlot.shared.take() {
