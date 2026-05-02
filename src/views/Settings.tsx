@@ -2947,7 +2947,7 @@ function modelBlurb(id: string): string | null {
       return "Multilingual. Best accuracy on long or noisy dictations.";
     case "gemma-4-e2b-q4_k_m":
       return "Snappy cleanup. Punctuation and capitalisation; light filler-word removal.";
-    case "gemma-4-e4b-q4_k_m":
+    case "gemma-4-e4b-q5_k_m":
       return "Balanced. Reliable filler-word removal and natural sentence flow.";
     case "gemma-4-26b-a4b-q4_k_m":
       return "Slowest. Best at preserving your voice and intent over long dictations.";

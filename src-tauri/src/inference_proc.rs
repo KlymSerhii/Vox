@@ -256,9 +256,9 @@ async fn spawn<R: Runtime>(
         //   margin.
         //
         // KV cache cost on Gemma 4 E4B at fp16: ~5 GB at 16k.
-        // Combined with the ~5 GB model weights this peaks around
-        // 11 GB — fits easily on the 16 GB+ machines the
-        // recommender targets for E4B. E2B's per-layer KV is
+        // Combined with the ~5.8 GB Q5_K_M model weights this
+        // peaks around 11 GB — fits easily on the 16 GB+ machines
+        // the recommender targets for E4B. E2B's per-layer KV is
         // smaller, so the same flag is safe on the 12 GB tier.
         .arg("-c")
         .arg("16384")

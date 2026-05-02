@@ -110,6 +110,10 @@ pub const CATALOG: &[ModelDescriptor] = &[
     },
     // Gemma 4 MatFormer entries are sourced from bartowski; see
     // file-level docs for why Unsloth's conversion crashes.
+    //
+    // ram_peak_mb covers model weights + a 16k-context KV cache at fp16
+    // (the llama-server default for Gemma engines). Numbers are
+    // conservative round-ups.
     ModelDescriptor {
         id: "gemma-4-e2b-q4_k_m",
         kind: ModelKind::Llm,
@@ -118,18 +122,20 @@ pub const CATALOG: &[ModelDescriptor] = &[
         sha256: None,
         url: "https://huggingface.co/bartowski/google_gemma-4-E2B-it-GGUF/resolve/main/google_gemma-4-E2B-it-Q4_K_M.gguf",
         engine: "gemma-local",
-        ram_peak_mb: 4000,
+        // ~3.5 GB weights + smaller-than-E4B fp16 KV at 16k.
+        ram_peak_mb: 7000,
         tier: "small",
     },
     ModelDescriptor {
-        id: "gemma-4-e4b-q4_k_m",
+        id: "gemma-4-e4b-q5_k_m",
         kind: ModelKind::Llm,
-        name: "Gemma 4 E4B (Q4_K_M) — Balanced",
-        size_bytes: 5_405_167_904,
+        name: "Gemma 4 E4B (Q5_K_M) — Balanced",
+        size_bytes: 5_820_881_184,
         sha256: None,
-        url: "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q4_K_M.gguf",
+        url: "https://huggingface.co/bartowski/google_gemma-4-E4B-it-GGUF/resolve/main/google_gemma-4-E4B-it-Q5_K_M.gguf",
         engine: "gemma-local",
-        ram_peak_mb: 6000,
+        // ~5.8 GB weights + ~5 GB fp16 KV at 16k (see inference_proc.rs).
+        ram_peak_mb: 11000,
         tier: "balanced",
     },
     ModelDescriptor {
@@ -140,7 +146,8 @@ pub const CATALOG: &[ModelDescriptor] = &[
         sha256: None,
         url: "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-GGUF/resolve/main/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf",
         engine: "gemma-local",
-        ram_peak_mb: 19000,
+        // ~16.9 GB weights + ~5–6 GB fp16 KV at 16k.
+        ram_peak_mb: 23000,
         tier: "quality",
     },
 ];
@@ -588,7 +595,7 @@ pub fn recommended_llm_model_id() -> &'static str {
     match recommend_tier() {
         "quality" => "gemma-4-26b-a4b-q4_k_m",
         "small" => "gemma-4-e2b-q4_k_m",
-        _ => "gemma-4-e4b-q4_k_m",
+        _ => "gemma-4-e4b-q5_k_m",
     }
 }
 
@@ -596,7 +603,7 @@ pub fn recommended_llm_model_id() -> &'static str {
 /// retired from the catalog (a dangling reference `descriptor_for`
 /// can't resolve) or known to crash the bundled `llama.cpp`.
 pub fn is_known_broken_llm_id(id: &str) -> bool {
-    matches!(id, "phi-4-mini-q4_k_m")
+    matches!(id, "phi-4-mini-q4_k_m" | "gemma-4-e4b-q4_k_m")
 }
 
 #[cfg(test)]
