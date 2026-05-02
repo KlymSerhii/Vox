@@ -25,6 +25,20 @@
    * identity. */
   --color-on-accent: #16161a;
   --color-violet: #b49bff;
+  /* Cyan reserved for the Transcribing stage caret + glow. Lives next
+   * to teal/violet so the pipeline's three processing colours
+   * (recording coral, transcribing cyan, polishing violet) form a
+   * coherent palette. */
+  --color-cyan: #5BD6E0;
+  /* Caret + dot glows are theme-tokenised so the cyan/violet halos
+   * stay on-hue across light and dark surfaces. The dark-mode rgbas
+   * sit at slightly higher alpha because the surrounding pill glass
+   * eats more of the bloom; the light-mode redeclarations below
+   * pull them down a touch and shift the hue darker so the glow
+   * doesn't hot-spot against the cream pill background. */
+  --caret-glow-cyan: rgba(91, 214, 224, 0.55);
+  --caret-glow-violet: rgba(180, 155, 255, 0.55);
+  --polishing-dot-glow: rgba(180, 155, 255, 0.6);
   --color-danger: #ff6b6b;
   --color-success: #4ade80;
   --color-warning: #fbbf24;
@@ -94,6 +108,19 @@
    * pure white so the buttons feel designed rather than clinical. */
   --color-on-accent: #fff4e8;
   --color-violet: #8a6dff;
+  /* Light-mode cyan: deeper to keep contrast against the cream pill
+   * surface. Matches the design system's pattern of pulling each
+   * accent towards a darker shade for the light theme. */
+  --color-cyan: #0AB5C2;
+  /* Light-mode glows: derived from the deeper cyan/violet hues above
+   * with a slight alpha drop so the bloom reads as a soft halo
+   * against the cream pill surface instead of a hot ring. The dot
+   * glow stays a touch hotter (0.55) than the caret glow because the
+   * dot's own paint is small enough that the halo carries most of
+   * the visual weight. */
+  --caret-glow-cyan: rgba(10, 181, 194, 0.50);
+  --caret-glow-violet: rgba(138, 109, 255, 0.48);
+  --polishing-dot-glow: rgba(138, 109, 255, 0.55);
   --color-danger: #e5484d;
   --color-success: #22a06b;
   --color-warning: #d9870f;
@@ -281,6 +308,27 @@ body.translucent {
 
 .streaming-caret {
   animation: streaming-caret-blink 1.05s steps(1, end) infinite;
+  /* Soft outer glow keyed to the active stage tint via a CSS variable
+   * so the cyan/violet caret each carries its own halo. Inline styles
+   * on the caret element set `--caret-glow` to either
+   * `var(--caret-glow-cyan)` or `var(--caret-glow-violet)` per-state,
+   * which themselves pick up theme-aware rgbas from the root. The
+   * fallback below covers the (unlikely) case where the inline
+   * variable isn't set yet — defaulting to the cyan token keeps the
+   * fallback theme-aware too. */
+  box-shadow: 0 0 6px var(--caret-glow, var(--caret-glow-cyan));
+}
+
+/* Pulsing violet dot that anchors the persistent "Polishing…" label
+ * row. Gentle 1.4s opacity sine — fast enough to read as alive,
+ * slow enough not to distract from the streaming text below. */
+@keyframes polishing-dot-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.polishing-dot {
+  animation: polishing-dot-pulse 1.4s ease-in-out infinite;
 }
 
 .animate-pulse-mic {
@@ -306,8 +354,28 @@ body.translucent {
   .animate-pill-in,
   .animate-flash-done,
   .pill-shimmer,
-  .streaming-caret {
+  .streaming-caret,
+  .polishing-dot {
     animation: none !important;
+  }
+
+  /* Caret stays visible (solid) when the blink is suppressed —
+   * without forcing opacity:1 it would freeze at whatever frame the
+   * keyframes happened to be on. */
+  .streaming-caret {
+    opacity: 1 !important;
+  }
+
+  /* Frozen pulse settles at full intensity rather than mid-fade so the
+   * dot still reads as the active indicator. */
+  .polishing-dot {
+    opacity: 1 !important;
+  }
+
+  /* Polishing label row crossfade snaps to instant when the user has
+   * opted into reduced motion. */
+  .polishing-label-row {
+    transition: none !important;
   }
 
   .pill-shimmer {

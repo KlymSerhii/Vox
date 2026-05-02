@@ -34,6 +34,27 @@ pub enum AudioError {
 enum Command {
     Start(Sender<Result<(), AudioError>>),
     StopAndEncode(Sender<Result<Vec<u8>, AudioError>>),
+    /// Returns a `(wav_bytes, pcm_secs)` snapshot of the current capture
+    /// buffer WITHOUT stopping the stream. The WAV is the same shape
+    /// `stop_and_encode` produces (16 kHz mono PCM-16) so it can flow
+    /// straight into [`crate::engines::SttEngine::transcribe`]. Used by
+    /// the speculative streaming decoder
+    /// (`session.rs::spawn_speculative_decoder`) so we can run partial
+    /// Whisper passes while the user is still talking. Returns
+    /// `Ok(None)` when no capture is currently active.
+    SnapshotWav(Sender<Result<Option<SnapshotWav>, AudioError>>),
+}
+
+/// Snapshot output for [`AudioHandle::snapshot_wav`].
+#[derive(Debug, Clone)]
+pub struct SnapshotWav {
+    /// 16 kHz mono PCM-16 WAV (header + body), ready for Whisper.
+    pub wav: Vec<u8>,
+    /// Captured-and-resampled audio length in seconds. The speculative
+    /// decoder uses this to apply the "minimum N seconds before first
+    /// decode / minimum delta before next" thresholds without having to
+    /// re-parse the WAV header.
+    pub duration_secs: f32,
 }
 
 #[derive(Clone)]
@@ -67,6 +88,21 @@ impl AudioHandle {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
             .send(Command::StopAndEncode(reply_tx))
+            .map_err(|_| AudioError::ThreadDied)?;
+        reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
+    }
+
+    /// Take a non-destructive snapshot of the in-progress capture
+    /// buffer, downmixed to mono and resampled to 16 kHz, encoded as a
+    /// 16 kHz mono PCM-16 WAV (the same shape `stop_and_encode`
+    /// produces). The capture stream keeps running so subsequent
+    /// snapshots will see additional samples. Returns `Ok(None)` if no
+    /// capture is active. Used by the speculative streaming decoder to
+    /// pre-emptively run Whisper while the user is still speaking.
+    pub fn snapshot_wav(&self) -> Result<Option<SnapshotWav>, AudioError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Command::SnapshotWav(reply_tx))
             .map_err(|_| AudioError::ThreadDied)?;
         reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
     }
@@ -114,6 +150,24 @@ fn audio_thread(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
                 rms_bits.store(0, Ordering::Relaxed);
                 let raw = cap.samples.lock().clone();
                 let _ = reply.send(postprocess_to_wav(&raw, cap.input_sr, cap.input_channels));
+            }
+            Command::SnapshotWav(reply) => {
+                let Some(cap) = active.as_ref() else {
+                    let _ = reply.send(Ok(None));
+                    continue;
+                };
+                let raw = cap.samples.lock().clone();
+                let pcm =
+                    postprocess_to_pcm_mono_16k(&raw, cap.input_sr, cap.input_channels);
+                let duration_secs = pcm.len() as f32 / TARGET_SR as f32;
+                match encode_wav_pcm16(&pcm, TARGET_SR) {
+                    Ok(wav) => {
+                        let _ = reply.send(Ok(Some(SnapshotWav { wav, duration_secs })));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
         }
     }
@@ -217,19 +271,26 @@ fn postprocess_to_wav(
     input_sr: u32,
     input_channels: u16,
 ) -> Result<Vec<u8>, AudioError> {
+    let resampled = postprocess_to_pcm_mono_16k(raw, input_sr, input_channels);
+    encode_wav_pcm16(&resampled, TARGET_SR)
+}
+
+/// Same downmix + linear-resample pipeline as [`postprocess_to_wav`] but
+/// returns the raw 16 kHz mono PCM `Vec<f32>` straight to the caller —
+/// used by the speculative streaming decoder so we don't pay for a WAV
+/// roundtrip on every snapshot.
+fn postprocess_to_pcm_mono_16k(raw: &[f32], input_sr: u32, input_channels: u16) -> Vec<f32> {
     let mono = if input_channels <= 1 {
         raw.to_vec()
     } else {
         downmix_to_mono(raw, input_channels as usize)
     };
 
-    let resampled = if input_sr == TARGET_SR {
+    if input_sr == TARGET_SR {
         mono
     } else {
         linear_resample(&mono, input_sr, TARGET_SR)
-    };
-
-    encode_wav_pcm16(&resampled, TARGET_SR)
+    }
 }
 
 fn downmix_to_mono(interleaved: &[f32], channels: usize) -> Vec<f32> {

@@ -81,67 +81,8 @@ impl SttEngine for WhisperLocalEngine {
                 let ctx = ctx_cell.get_or_try_init::<_, anyhow::Error>(|| {
                     load_context_blocking(&model_id, &path)
                 })?;
-
                 let pcm = decode_wav_to_f32_mono_16k(&wav_owned)?;
-
-                let mut state = ctx
-                    .lock()
-                    .create_state()
-                    .map_err(|e| anyhow::anyhow!("whisper state: {e}"))?;
-
-                let mut params =
-                    whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
-                        best_of: 1,
-                    });
-                params.set_n_threads(num_cpus::get_physical().max(1) as i32);
-                params.set_temperature(0.0);
-                params.set_no_context(true);
-                params.set_print_progress(false);
-                params.set_print_realtime(false);
-                params.set_print_special(false);
-                params.set_print_timestamps(false);
-                if let Some(l) = lang.as_deref().filter(|l| *l != "auto") {
-                    params.set_language(Some(l));
-                }
-                let prompt;
-                let cleaned: Vec<&str> =
-                    dict.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-                if !cleaned.is_empty() {
-                    prompt = cleaned.join(", ");
-                    params.set_initial_prompt(&prompt);
-                }
-
-                // Hook the streaming callback if the caller asked for one.
-                // whisper-rs's safe wrapper accumulates `n_new` segments
-                // each invocation and hands us their decoded text — we
-                // append to a shared accumulator and pass the cumulative
-                // string up to the user closure.
-                if let Some(cb) = on_segment {
-                    let acc = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
-                    let acc_for_cb = acc.clone();
-                    params.set_segment_callback_safe_lossy(
-                        move |seg: whisper_rs::SegmentCallbackData| {
-                            let mut g = acc_for_cb.lock();
-                            g.push_str(&seg.text);
-                            cb(g.as_str());
-                        },
-                    );
-                }
-
-                state
-                    .full(params, &pcm)
-                    .map_err(|e| anyhow::anyhow!("whisper run: {e}"))?;
-
-                let mut out = String::new();
-                for i in 0..state.full_n_segments() {
-                    if let Some(seg) = state.get_segment(i) {
-                        match seg.to_str_lossy() {
-                            Ok(s) => out.push_str(s.as_ref()),
-                            Err(e) => log::warn!("whisper segment {i}: {e}"),
-                        }
-                    }
-                }
-                Ok(out.trim().to_string())
+                run_whisper_full(ctx, &pcm, lang.as_deref(), &dict, on_segment)
             })
             .await
             .map_err(|e| anyhow::anyhow!("whisper-local task panicked: {e}"))?
@@ -221,4 +162,79 @@ fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
             .map(|s| s.map_err(|e| anyhow::anyhow!("wav sample: {e}")))
             .collect(),
     }
+}
+
+/// Shared body of every whisper-rs `state.full()` we run — both the
+/// final authoritative pass (from [`SttEngine::transcribe`]) and the
+/// speculative streaming passes (which also reach this through the
+/// same `SttEngine::transcribe` entry point) use this. Caller is
+/// responsible for spawning onto a blocking task; this function blocks
+/// for the full decode. Callers must serialise concurrent invocations
+/// on the same `Arc<Mutex<WhisperContext>>` — `state.full` mutates a
+/// fresh `WhisperState` each call but the underlying context's KV
+/// caches are not safe to drive in parallel.
+#[cfg(feature = "local-engines")]
+fn run_whisper_full(
+    ctx: &Arc<Mutex<whisper_rs::WhisperContext>>,
+    pcm: &[f32],
+    lang: Option<&str>,
+    dict: &[String],
+    on_segment: Option<SegmentCallback>,
+) -> anyhow::Result<String> {
+    let mut state = ctx
+        .lock()
+        .create_state()
+        .map_err(|e| anyhow::anyhow!("whisper state: {e}"))?;
+
+    let mut params = whisper_rs::FullParams::new(whisper_rs::SamplingStrategy::Greedy {
+        best_of: 1,
+    });
+    params.set_n_threads(num_cpus::get_physical().max(1) as i32);
+    params.set_temperature(0.0);
+    params.set_no_context(true);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_special(false);
+    params.set_print_timestamps(false);
+    if let Some(l) = lang.filter(|l| *l != "auto") {
+        params.set_language(Some(l));
+    }
+    let prompt;
+    let cleaned: Vec<&str> = dict.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if !cleaned.is_empty() {
+        prompt = cleaned.join(", ");
+        params.set_initial_prompt(&prompt);
+    }
+
+    // Hook the streaming callback if the caller asked for one.
+    // whisper-rs's safe wrapper accumulates `n_new` segments
+    // each invocation and hands us their decoded text — we
+    // append to a shared accumulator and pass the cumulative
+    // string up to the user closure.
+    if let Some(cb) = on_segment {
+        let acc = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let acc_for_cb = acc.clone();
+        params.set_segment_callback_safe_lossy(
+            move |seg: whisper_rs::SegmentCallbackData| {
+                let mut g = acc_for_cb.lock();
+                g.push_str(&seg.text);
+                cb(g.as_str());
+            },
+        );
+    }
+
+    state
+        .full(params, pcm)
+        .map_err(|e| anyhow::anyhow!("whisper run: {e}"))?;
+
+    let mut out = String::new();
+    for i in 0..state.full_n_segments() {
+        if let Some(seg) = state.get_segment(i) {
+            match seg.to_str_lossy() {
+                Ok(s) => out.push_str(s.as_ref()),
+                Err(e) => log::warn!("whisper segment {i}: {e}"),
+            }
+        }
+    }
+    Ok(out.trim().to_string())
 }

@@ -243,16 +243,18 @@ const WIDE_WIDTH_MAX: f64 = 760.0;
 const WIDE_WIDTH_MIN: f64 = 144.0;
 /// Floor for the streaming-mode pill once content-driven width feedback
 /// kicks in. Below this we revert to the pure compact silhouette via
-/// `set_wide(false)`. Tuned so a ~5-word phrase ("Hello world.") still
-/// feels like a pill rather than a snug-against-the-text box.
-pub const WIDE_WIDTH_MIN_DYNAMIC: f64 = 240.0;
+/// `set_wide(false)`. Raised from 240 → 360 to match the frontend's
+/// new W_MIN floor (`Pill.tsx`); the buffer covers WINDOW_PADDING_W
+/// (16 px) so a 360-px content min-width round-trips through the IPC
+/// without the Rust clamp dropping it below the pill's content floor.
+pub const WIDE_WIDTH_MIN_DYNAMIC: f64 = 360.0;
 /// Caps for content-driven height growth during streaming. `HEIGHT` is
 /// the compact single-line frame; `HEIGHT_MAX` keeps long polishes from
 /// taking over the screen — the inner div scrolls beyond that.
 pub const HEIGHT_MAX: f64 = 240.0;
 
 /// Resize the pill window. `wide=true` enters streaming mode at the
-/// dynamic floor (240 px); the frontend's ResizeObserver then drives
+/// dynamic floor (360 px); the frontend's ResizeObserver then drives
 /// width up via `set_size` as the streamed text grows. `wide=false`
 /// snaps back to the compact 144 px. Repositions afterwards so the
 /// pill stays horizontally centred AND bottom-anchored so vertical
@@ -345,14 +347,33 @@ pub fn set_size<R: Runtime>(
         .map(|s| s.height as f64 / scale)
         .unwrap_or(HEIGHT);
 
+    // Below-floor escape hatch: the streaming pill's frontend asks
+    // for compact dimensions (~132 x 46 px) when transitioning out of
+    // streaming so the Done/Error/Canceled labels don't render at the
+    // streamed width while we wait for the next `set_wide(false)` IPC
+    // to arrive. Detect that here and route through the compact path —
+    // otherwise we'd just clamp those values back up to the dynamic
+    // floor and visibly leave the pill wide for ~150 ms.
+    if let Some(w) = width {
+        if w < WIDE_WIDTH_MIN_DYNAMIC {
+            apply_size(&win, frame, WIDTH, HEIGHT);
+            return;
+        }
+    }
+
     let target_w = match width {
         Some(w) => {
-            let screen_cap =
-                frame.map(|(_, _, fw, _)| (fw - 64.0).max(WIDE_WIDTH_MIN_DYNAMIC));
+            let screen_cap = frame.map(|(_, _, fw, _)| fw - 64.0);
             let upper = match screen_cap {
                 Some(cap) => WIDE_WIDTH_MAX.min(cap),
                 None => WIDE_WIDTH_MAX,
             };
+            // Defensive: on a tiny logical display (or split-screen)
+            // `screen_w - 64` can drop below WIDE_WIDTH_MIN_DYNAMIC,
+            // which would invert the clamp bounds and panic. Bumping
+            // `upper` up to the floor first keeps `clamp` well-formed
+            // and yields the floor itself in that pathological case.
+            let upper = upper.max(WIDE_WIDTH_MIN_DYNAMIC);
             w.clamp(WIDE_WIDTH_MIN_DYNAMIC, upper)
         }
         None => cur_w,

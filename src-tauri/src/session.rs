@@ -23,6 +23,7 @@ use tokio::sync::Notify;
 
 use crate::audio::AudioHandle;
 use crate::engines::Registry;
+use crate::mac_power;
 use crate::modes::{self, CaseStyle, ModeStore, PunctuationStyle, VoiceMode};
 use crate::pill::{self, PillState};
 use crate::transcripts::{self, CompletedEntry, InProgressEntry, SessionsSnapshot};
@@ -145,6 +146,22 @@ pub struct SessionState {
     /// can `select!` between sleep and completion without polling.
     /// Notified exactly once when `completed` is first set to true.
     pub completion: Arc<Notify>,
+    /// Held by the speculative streaming decoder while it has a
+    /// `whisper_rs::WhisperState::full` call in flight. The
+    /// authoritative final pass in `run_pipeline` acquires this lock
+    /// before its own decode so the two passes never share a
+    /// `WhisperContext` at the same time. (Whisper-rs's `WhisperState`
+    /// is per-call but the underlying context is not safe to drive
+    /// concurrently from multiple states.) Also serves as the gate the
+    /// final pass waits on to "absorb" an in-flight speculative pass
+    /// rather than killing it mid-decode.
+    pub speculative_decode: Arc<tokio::sync::Mutex<()>>,
+    /// Snapshot of the user's `streaming_pill_enabled` setting at
+    /// session-begin time. Captured once so the speculative decoder
+    /// and the final pipeline pass cannot disagree if the user toggles
+    /// the setting mid-utterance. Both sites read this field instead
+    /// of re-loading settings.
+    pub streaming_enabled: bool,
 }
 
 impl SessionState {
@@ -333,6 +350,8 @@ impl SessionManager {
             warning: Mutex::new(false),
             completed: AtomicBool::new(false),
             completion: Arc::new(Notify::new()),
+            speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
+            streaming_enabled: settings::load(app).streaming_pill_enabled,
         });
 
         // Insert into map BEFORE starting audio so the saturation
@@ -395,6 +414,7 @@ impl SessionManager {
 
         spawn_max_record_guard(app.clone(), self.clone(), session.clone(), MAX_RECORD_SECS);
         spawn_audio_level_sampler(app.clone(), self.clone(), session.clone());
+        spawn_speculative_decoder(app.clone(), self.clone(), session.clone());
 
         BeginOutcome::Started(new_sid)
     }
@@ -829,12 +849,14 @@ async fn run_pipeline(
     };
 
     // Streaming mode is opt-in (Settings → General + tray popover).
-    // We capture the user setting once so a mid-pipeline toggle doesn't
-    // flip the rate-limit / pill-resize behaviour mid-utterance — but
-    // the pill-owner check is recomputed at every emit site below, so
-    // a session that loses ownership (e.g. a newer recording started)
-    // stops painting into someone else's pill mid-stream.
-    let streaming_enabled = settings::load(&app).streaming_pill_enabled;
+    // The setting was captured once at session-begin time on
+    // `SessionState::streaming_enabled` so the speculative decoder
+    // task and the final pipeline pass can't disagree if the user
+    // toggles the toggle mid-utterance. The pill-owner check is
+    // recomputed at every emit site below, so a session that loses
+    // ownership (e.g. a newer recording started) stops painting into
+    // someone else's pill mid-stream.
+    let streaming_enabled = session.streaming_enabled;
     let owns_pill = manager.owns_pill_emit(id);
     // Closure used at every emit site so an in-flight session that
     // gets pre-empted by a newer recording stops writing to the pill.
@@ -875,8 +897,33 @@ async fn run_pipeline(
     };
 
     let transcript = {
-        let stt_fut =
-            stt_engine.transcribe(&wav, language, &session.dictionary, stt_callback);
+        // Block on any in-flight speculative decode before starting
+        // the authoritative pass — both share the same WhisperContext
+        // and `WhisperState::full` is not safe to drive concurrently.
+        // Awaiting the lock here is what realises the speculative
+        // savings: the speculative pass already chewed through ~all of
+        // the audio captured before the user released the hotkey, so
+        // by the time this `lock()` returns the only audio still to
+        // decode here is whatever was captured between the last
+        // speculative snapshot and end-of-recording.
+        let speculative_lock = session.speculative_decode.clone();
+        let dict = session.dictionary.clone();
+        let stt_engine_for_call = stt_engine.clone();
+        let session_for_cancel = session.clone();
+        let language_owned: Option<String> = language.map(|s| s.to_string());
+        let wav_for_stt = wav;
+        let stt_fut = async move {
+            let _g = tokio::select! {
+                biased;
+                () = wait_for_cancel(session_for_cancel.clone()) => {
+                    return Err(anyhow::anyhow!("canceled before final STT could start"));
+                }
+                guard = speculative_lock.lock_owned() => guard,
+            };
+            stt_engine_for_call
+                .transcribe(&wav_for_stt, language_owned.as_deref(), &dict, stt_callback)
+                .await
+        };
         tokio::select! {
             biased;
             () = wait_for_cancel(session.clone()) => {
@@ -1227,6 +1274,247 @@ fn spawn_max_record_guard(
     });
 }
 
+/// Pre-emptively decode the in-progress capture buffer while the user
+/// is still speaking. Throttling rules:
+///   * Don't start the first speculative pass until the buffer holds at
+///     least [`SPEC_MIN_FIRST_SECS`] of audio (otherwise we burn cycles
+///     on a tiny utterance the user is about to release the hotkey on).
+///   * Each subsequent pass needs the buffer to have grown by at least
+///     [`SPEC_MIN_DELTA_SECS`] vs the snapshot the previous pass started
+///     from.
+///   * Only one Whisper decode runs at a time; while one is in flight
+///     the next iteration just polls. We don't queue — when the
+///     in-flight pass finishes we re-evaluate against the *current*
+///     buffer (so we always work on the latest data, not stale).
+///   * Stops as soon as the recording ends (`foreground_id() != Some(id)`)
+///     or the session is canceled. The final authoritative pass in
+///     `run_pipeline` will run independently against the final buffer.
+///
+/// Cancel semantics: whisper-rs's `state.full()` is a synchronous,
+/// uninterruptible call. When the user hits Escape mid-decode the loop
+/// can't kill the in-flight pass — but the segment callback re-checks
+/// `owns_pill_emit(id)` every fire (which has already flipped to false
+/// by the time the cancel reaches us), so no partials leak. When the
+/// blocking decode returns naturally, the next iteration sees
+/// `is_canceled()` and bails. Worst case: ~one decode of CPU stays warm
+/// after Escape. The pipeline's *final* pass is gated on the cancel
+/// flag separately so cancel does not pay for a redundant final run.
+fn spawn_speculative_decoder(
+    app: AppHandle<Wry>,
+    manager: Arc<SessionManager>,
+    session: Arc<SessionState>,
+) {
+    /// Don't speculate on anything shorter than this — small utterances
+    /// finalise faster than a speculative pass would complete anyway.
+    const SPEC_MIN_FIRST_SECS: f32 = 2.0;
+    /// Minimum new audio (vs the last snapshot we decoded) before we
+    /// kick off another speculative pass.
+    const SPEC_MIN_DELTA_SECS: f32 = 1.5;
+    /// Polling cadence — small enough that cancel/stop reacts within
+    /// ~one tick, large enough that we don't pin a CPU.
+    const SPEC_POLL_MS: u64 = 100;
+    /// Only run speculative decoding for whisper-local. Other STT
+    /// engines either don't exist yet or wouldn't benefit from this
+    /// shape of pre-emptive call.
+    const ELIGIBLE_STT_ENGINE: &str = "whisper-local";
+
+    if session.stt_engine_id != ELIGIBLE_STT_ENGINE {
+        return;
+    }
+
+    // Battery-aware bail: speculative decoding runs full Whisper passes
+    // on a 1.5s cadence while the user is still speaking, which is
+    // measurable battery drain on laptops on the unplugged path. When
+    // the Mac is unplugged we fall back to the original "decode entirely
+    // after hotkey release" behaviour. AC adapter, UPS, and any desktop
+    // (no battery at all) keep the streaming pass. Single check at
+    // task-start is sufficient — session lifetime is short and a user
+    // (un)plugging mid-utterance is a non-event.
+    if mac_power::on_battery() {
+        log::info!("speculative decode skipped: on battery");
+        return;
+    }
+
+    let id = session.id;
+    let audio = manager.audio.clone();
+
+    tauri::async_runtime::spawn(async move {
+        let mut last_decoded_secs: f32 = 0.0;
+        // Read from the session-scoped snapshot rather than re-loading
+        // settings here — both this task and `run_pipeline`'s final
+        // pass must agree on the same value, and a settings reload
+        // after a mid-utterance toggle would cause them to diverge.
+        let streaming_enabled_at_begin = session.streaming_enabled;
+        let mut ticker = tokio::time::interval(Duration::from_millis(SPEC_POLL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+
+            // Stop conditions: recording ended (the active_recording
+            // slot was cleared by `end_recording`/`cancel_session`) or
+            // the session was canceled. Either way bail — the final
+            // pass will run on its own.
+            if manager.foreground_id() != Some(id) || session.is_canceled() {
+                log::debug!("speculative: stop signal (sid={id})");
+                return;
+            }
+
+            // The audio handle's `snapshot_wav` is synchronous (it
+            // round-trips through a std mpsc to the audio thread), so
+            // we hop onto a blocking task to avoid pinning a tokio
+            // worker. The work itself is cheap — buffer clone + WAV
+            // encode — typically sub-millisecond, but `recv()` is a
+            // blocking call so we shouldn't run it on a runtime worker.
+            let audio_for_snap = audio.clone();
+            let snap_result = tokio::task::spawn_blocking(move || {
+                audio_for_snap.snapshot_wav()
+            })
+            .await;
+            let snap = match snap_result {
+                Ok(Ok(Some(s))) => s,
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => {
+                    log::warn!("speculative: snapshot_wav failed (sid={id}): {e}");
+                    return;
+                }
+                Err(e) => {
+                    log::warn!("speculative: snapshot task panicked (sid={id}): {e}");
+                    return;
+                }
+            };
+
+            let delta = snap.duration_secs - last_decoded_secs;
+            let need = if last_decoded_secs == 0.0 {
+                SPEC_MIN_FIRST_SECS
+            } else {
+                SPEC_MIN_DELTA_SECS
+            };
+            if delta < need {
+                continue;
+            }
+
+            // Pull the engine through the registry. It's almost
+            // certainly cached by `prewarm_stt_in_background`, but if
+            // not the first call here will trigger a load the same
+            // way the final pass would.
+            let registry = match app.try_state::<Registry>() {
+                Some(r) => r.inner().clone(),
+                None => return,
+            };
+            let stt_engine = match registry.stt(&app, &session.stt_engine_id, &session.stt_model_id)
+            {
+                Some(e) => e,
+                None => {
+                    // Engine not configured — let the final pass
+                    // surface the error.
+                    return;
+                }
+            };
+
+            let language: Option<String> = if session.language != "auto" {
+                Some(session.language.clone())
+            } else {
+                None
+            };
+            let dictionary = session.dictionary.clone();
+
+            // Fire only if streaming-pill emits are wanted by the user.
+            // The optimisation is independent of the UI flag — even with
+            // streaming disabled the speculative pass primes Whisper's
+            // model cache and saves wall-clock for the final pass —
+            // BUT the only thing the speculative pass produces is the
+            // segment-callback stream, which is exactly the data we'd
+            // be discarding if streaming is off. So we still run the
+            // pass to keep the cache warm, just without a callback.
+            let app_for_cb = app.clone();
+            let manager_for_cb = manager.clone();
+            let session_for_cb = session.clone();
+            let stt_callback: Option<crate::engines::SegmentCallback> =
+                if streaming_enabled_at_begin {
+                    Some(Box::new(move |text: &str| {
+                        // Re-check ownership inside the callback so a
+                        // newer recording stealing the pill doesn't see
+                        // partials from this older session. Also bail
+                        // on cancel: whisper-rs's `state.full` is
+                        // uninterruptible, so once Escape is pressed
+                        // the in-flight pass keeps firing segments
+                        // until it returns naturally — without this
+                        // gate it would paint partials into a pill the
+                        // user has already dismissed.
+                        if !manager_for_cb.owns_pill_emit(id)
+                            || session_for_cb.is_canceled()
+                        {
+                            return;
+                        }
+                        // `final=false` — the final pass emits the
+                        // authoritative cumulative text with `final=true`
+                        // when it completes.
+                        pill::emit_transcript_stream(
+                            &app_for_cb,
+                            id,
+                            text.to_string(),
+                            false,
+                        );
+                    }))
+                } else {
+                    None
+                };
+
+            // The pill was widened by `run_pipeline`'s session-begin
+            // path; the speculative task no longer drives UI state to
+            // avoid racing two `set_wide(true)` calls (one from this
+            // task before it took the speculative lock, one from
+            // `run_pipeline` itself). Emits below still flow through
+            // `pill::emit_transcript_stream`, which is purely a data
+            // event and does not move the OS window.
+
+            // Acquire the speculative lock. The final pass holds this
+            // same mutex while it runs, so a hotkey-release that fires
+            // mid-speculation won't race two whisper decodes against
+            // the same WhisperContext. If the session has been
+            // canceled while we waited, bail out before doing the
+            // expensive call.
+            let guard = session.speculative_decode.clone().lock_owned().await;
+            if manager.foreground_id() != Some(id) || session.is_canceled() {
+                drop(guard);
+                return;
+            }
+
+            log::debug!(
+                "speculative: decoding {:.1}s (sid={id})",
+                snap.duration_secs
+            );
+            let started = Instant::now();
+            let lang_ref = language.as_deref();
+            let result = stt_engine
+                .transcribe(&snap.wav, lang_ref, &dictionary, stt_callback)
+                .await;
+            drop(guard);
+
+            match result {
+                Ok(text) => {
+                    log::debug!(
+                        "speculative: decoded {:.1}s in {} ms → {} chars (sid={id})",
+                        snap.duration_secs,
+                        started.elapsed().as_millis(),
+                        text.len()
+                    );
+                    last_decoded_secs = snap.duration_secs;
+                }
+                Err(e) => {
+                    // Fail-open: the final pass will retry the same
+                    // engine call against the full buffer. We log a
+                    // warning and keep iterating in case a transient
+                    // error clears.
+                    log::warn!("speculative: decode failed (sid={id}): {e}");
+                    last_decoded_secs = snap.duration_secs;
+                }
+            }
+        }
+    });
+}
+
 fn spawn_audio_level_sampler(
     app: AppHandle<Wry>,
     manager: Arc<SessionManager>,
@@ -1325,6 +1613,8 @@ mod tests {
             warning: Mutex::new(false),
             completed: AtomicBool::new(false),
             completion: Arc::new(Notify::new()),
+            speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
+            streaming_enabled: false,
         })
     }
 

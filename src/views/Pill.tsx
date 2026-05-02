@@ -95,6 +95,62 @@ export default function PillView() {
   let revealTimer: number | null = null;
   let revealStartedAt = 0;
   let revealStartLen = 0;
+  // Per-tick reveal rate. Defaults to REVEAL_CHARS_PER_SEC; on a final
+  // transcript chunk with very little tail left to reveal, we drop the
+  // rate so the post-stop animation still takes ≥ 2s instead of
+  // snapping the last word in. Reset on every startReveal() call so
+  // the slowdown only affects the stretch we explicitly slowed for.
+  let revealRate = REVEAL_CHARS_PER_SEC;
+  // Slow-reveal book-keeping. When the stage flips listening → transcribing
+  // we kick a deliberately slow reveal sized so the *currently
+  // accumulated* speculative transcript takes exactly TRANSCRIPT_HOLD_MS
+  // to surface (the brief: "smoothly reveal during the first two
+  // seconds"). After either the 2 s window elapses OR `targetText`
+  // grows past the snapshot, the ticker rebases itself back to
+  // REVEAL_CHARS_PER_SEC so any further incoming chars (whisper-final
+  // tail, late polishing setup) don't inherit the slow rate.
+  // `slowRevealActive` gates the rebase logic so it only fires once
+  // per slow window — a non-slow `startReveal` clears the flag.
+  let slowRevealActive = false;
+  let slowRevealInitialTargetLen = 0;
+  // Transcript hold: when set to a future performance.now() timestamp,
+  // the pill keeps rendering as "transcribing" even if the backend
+  // has already flipped the stage to "polishing". Used to enforce a
+  // ≥ 2s minimum visible-transcript window after the user releases
+  // the hotkey, so the existing speculative text doesn't pop and then
+  // freeze into polishing instantly. A scheduled timer flips the
+  // signal back to null at expiry to trigger the re-render.
+  const [transcriptHoldUntil, setTranscriptHoldUntil] = createSignal<
+    number | null
+  >(null);
+  let transcriptHoldTimer: number | null = null;
+
+  /// Length of the post-final transcript hold. Picked so the user has
+  /// a beat to read the final text before the polishing stage takes
+  /// the slot — short enough to not feel like the app is hung when
+  /// polish is fast.
+  const TRANSCRIPT_HOLD_MS = 2000;
+
+  function clearTranscriptHold() {
+    if (transcriptHoldTimer !== null) {
+      clearTimeout(transcriptHoldTimer);
+      transcriptHoldTimer = null;
+    }
+    setTranscriptHoldUntil(null);
+  }
+
+  function scheduleTranscriptHold(durationMs: number) {
+    if (transcriptHoldTimer !== null) {
+      clearTimeout(transcriptHoldTimer);
+      transcriptHoldTimer = null;
+    }
+    const ms = Math.max(0, durationMs);
+    setTranscriptHoldUntil(performance.now() + ms);
+    transcriptHoldTimer = window.setTimeout(() => {
+      transcriptHoldTimer = null;
+      setTranscriptHoldUntil(null);
+    }, ms);
+  }
 
   function stopReveal() {
     if (revealTimer !== null) {
@@ -108,15 +164,36 @@ export default function PillView() {
     setStreamingText(targetText);
   }
 
-  function startReveal(initialVisibleLen: number) {
+  function startReveal(initialVisibleLen: number, rate?: number) {
     stopReveal();
     revealStartedAt = performance.now();
     revealStartLen = initialVisibleLen;
+    revealRate = rate && rate > 0 ? rate : REVEAL_CHARS_PER_SEC;
+    // A bare startReveal (no explicit rate) is the default-rate path —
+    // make sure we're not still flagged as "in the slow 2s window"
+    // from an earlier transcript-final slowdown.
+    if (!rate || rate >= REVEAL_CHARS_PER_SEC) {
+      slowRevealActive = false;
+    }
     revealTimer = window.setInterval(() => {
+      // Slow-reveal exit: once the 2 s window elapses OR the backend
+      // has buffered more chars than we slowed for, rebase so the
+      // remaining work runs at the default rate. Done by setting a
+      // new origin (revealStartedAt / revealStartLen) and bumping
+      // revealRate back up; the existing allowed-length math just
+      // continues from there with no jump.
+      if (slowRevealActive) {
+        const elapsed = performance.now() - revealStartedAt;
+        const grew = targetText.length > slowRevealInitialTargetLen;
+        if (elapsed >= TRANSCRIPT_HOLD_MS || grew) {
+          revealStartLen = streamingText().length;
+          revealStartedAt = performance.now();
+          revealRate = REVEAL_CHARS_PER_SEC;
+          slowRevealActive = false;
+        }
+      }
       const elapsedSec = (performance.now() - revealStartedAt) / 1000;
-      const allowedLen = Math.floor(
-        revealStartLen + REVEAL_CHARS_PER_SEC * elapsedSec,
-      );
+      const allowedLen = Math.floor(revealStartLen + revealRate * elapsedSec);
       const cap = Math.min(allowedLen, targetText.length);
       const cur = streamingText();
       if (cap > cur.length) {
@@ -159,12 +236,77 @@ export default function PillView() {
         setStreamingText(payload.text);
         revealStartLen = payload.text.length;
       }
+      // Restart the reveal at the default rate. The slowed rate
+      // computed for a transcript-final tail must NOT bleed across
+      // into the polish stream — the polish's targetText is typically
+      // much longer than the residual transcript tail, so inheriting
+      // the slow rate would visibly lag the polish reveal. Resetting
+      // `revealStartedAt` here also prevents the elapsed-time term
+      // from compounding across the mode flip and snap-revealing the
+      // first polish chunk.
+      clearTranscriptHold();
+      stopReveal();
     }
 
     targetText = payload.text;
 
     if (payload.final) {
-      flushReveal();
+      // Polish stream finals still snap immediately — the polishing UI
+      // already paced the reveal, and a polish snap reads as "done"
+      // intentionally. Only the transcript stream gets the smoothing
+      // treatment, because the speculative decoder typically delivers
+      // ~all of the text before the user releases the hotkey, leaving
+      // a tiny tail that the legacy flush would pop in jarringly.
+      if (mode !== "transcript") {
+        clearTranscriptHold();
+        flushReveal();
+        return;
+      }
+
+      const remainingChars = Math.max(
+        0,
+        targetText.length - streamingText().length,
+      );
+      if (remainingChars === 0) {
+        // Visible text already caught up before the final chunk
+        // arrived — nothing to animate. Still hold the transcript
+        // view for ≥ TRANSCRIPT_HOLD_MS so the user has a beat to
+        // read the result before the polishing UI overlays.
+        stopReveal();
+        scheduleTranscriptHold(TRANSCRIPT_HOLD_MS);
+        return;
+      }
+      const naturalCompletionSec = remainingChars / REVEAL_CHARS_PER_SEC;
+      const targetCompletionSec = Math.max(
+        TRANSCRIPT_HOLD_MS / 1000,
+        naturalCompletionSec,
+      );
+      // Slow the rate ONLY when the natural rate would finish under
+      // the minimum; otherwise leave it at the default. Either way,
+      // schedule the hold so the polishing UI doesn't sneak in even
+      // if the rate is unchanged (a long tail that finishes in 3s
+      // shouldn't leave a 1s gap before polishing visibly takes
+      // over — the hold matches the actual reveal duration).
+      const slowedRate = remainingChars / targetCompletionSec;
+      // The transcript-final tail manages its own pacing — clear the
+      // listening→transcribing slow-reveal flag so the ticker doesn't
+      // try to rebase out of *this* slowdown the moment elapsed
+      // crosses TRANSCRIPT_HOLD_MS.
+      slowRevealActive = false;
+      startReveal(streamingText().length, slowedRate);
+      scheduleTranscriptHold(targetCompletionSec * 1000);
+      return;
+    }
+
+    // Defer the visible reveal until the user releases the hotkey.
+    // Speculative Whisper output keeps streaming during `listening` for
+    // the CPU win, but we don't show it — the brief: "I want that
+    // initial transcription to be revealed smoothly during the first
+    // two seconds" *after* the user finishes speaking. When the
+    // pill:state listener fires `listening → transcribing` it will
+    // kick the deliberate slow reveal that consumes whatever's piled
+    // up in `targetText`.
+    if (state() === "listening") {
       return;
     }
 
@@ -179,6 +321,9 @@ export default function PillView() {
     setStreamingMode(null);
     targetText = "";
     currentSessionId = null;
+    slowRevealActive = false;
+    slowRevealInitialTargetLen = 0;
+    clearTranscriptHold();
   }
 
   let unlisten: UnlistenFn[] = [];
@@ -213,6 +358,7 @@ export default function PillView() {
 
     unlisten.push(
       await listen<PillStatePayload>("pill:state", (e) => {
+        const prevState = state();
         setState(e.payload.state);
         setMessage(e.payload.message ?? null);
         setWarning(e.payload.warning ?? false);
@@ -221,6 +367,47 @@ export default function PillView() {
         // streaming buffers from a stale session that finalised.
         if (e.payload.state === "listening") {
           clearStreaming();
+        }
+        // Listening → transcribing is the moment we promised the user
+        // the speculative buffer would surface. If anything's piled
+        // up in targetText (the typical case for utterances long
+        // enough that whisper produced ≥ 1 chunk before hotkey
+        // release), kick a deliberately slow reveal sized so the
+        // current snapshot lands in TRANSCRIPT_HOLD_MS. The pacing
+        // floor is REVEAL_CHARS_PER_SEC so a trivially short snapshot
+        // (3 chars) doesn't inch out at 1.5 cps. The hold pins the
+        // polishing UI for the same window so the body doesn't get
+        // overlaid mid-reveal.
+        if (
+          prevState === "listening" &&
+          e.payload.state === "transcribing" &&
+          !reducedMotion() &&
+          targetText.length > 0 &&
+          revealTimer === null
+        ) {
+          // idealRate is "deliver every accumulated char inside the 2 s
+          // hold window". For typical speculative buffers (a sentence
+          // or two, ~50–300 chars) that lands BELOW REVEAL_CHARS_PER_SEC
+          // and we genuinely want the slow walk. For trivially-short
+          // buffers ("Hi.", 3 chars → 1.5 cps) it would crawl, so we
+          // FLOOR at REVEAL_CHARS_PER_SEC so the snapshot snaps in at
+          // the normal rate (~16 ms here) and the user sees the text
+          // immediately rather than animating one letter every 670 ms.
+          // Long buffers (>360 chars) exceed REVEAL_CHARS_PER_SEC
+          // naturally and reveal in <2 s — the rebase logic below ends
+          // the slow window the moment the snapshot is fully on screen.
+          const idealRate =
+            targetText.length / (TRANSCRIPT_HOLD_MS / 1000);
+          const slowedRate = Math.max(idealRate, REVEAL_CHARS_PER_SEC);
+          slowRevealActive = true;
+          slowRevealInitialTargetLen = targetText.length;
+          startReveal(streamingText().length, slowedRate);
+          // startReveal() clears slowRevealActive when the rate is at
+          // or above default; restore the flag so the ticker still
+          // does its time-based rebase even if the floor kicked in
+          // (we still want the "after 2 s, switch back" semantics).
+          slowRevealActive = true;
+          scheduleTranscriptHold(TRANSCRIPT_HOLD_MS);
         }
         if (
           e.payload.state === "done" ||
@@ -277,6 +464,7 @@ export default function PillView() {
       clearTimeout(toastTimer);
     }
     stopReveal();
+    clearTranscriptHold();
     teardownResizeObserver();
     if (reducedMotionMql && reducedMotionListener) {
       reducedMotionMql.removeEventListener("change", reducedMotionListener);
@@ -288,8 +476,32 @@ export default function PillView() {
   const isDone = () => state() === "done";
   const isDoneWarning = () => isDone() && warning();
   const isDoneSuccess = () => isDone() && !warning();
+  // Active hold check: still active iff the deadline is in the future.
+  // The scheduled timer flips the signal back to null on expiry, so
+  // this becomes a cheap reactive read for downstream gating.
+  const isTranscriptHoldActive = () => {
+    const until = transcriptHoldUntil();
+    if (until === null) return false;
+    return performance.now() < until;
+  };
+  // `effectiveState()` is `state()` everywhere EXCEPT during the
+  // post-final transcript hold: while the hold is active we keep
+  // reporting "transcribing" even if the backend already advanced
+  // to "polishing", so the pill UI doesn't pop into the polishing
+  // treatment before the user has had ≥ TRANSCRIPT_HOLD_MS to read
+  // the final transcript text. The polish stream itself can still
+  // arrive in the background (it'll be applied to targetText), but
+  // every UI predicate that gates on "are we polishing?" funnels
+  // through this memo so the visual transition is delayed in lockstep.
+  const effectiveState = createMemo<PillState>(() => {
+    if (state() === "polishing" && isTranscriptHoldActive()) {
+      return "transcribing";
+    }
+    return state();
+  });
   const isProcessing = () =>
-    state() === "transcribing" || state() === "polishing";
+    effectiveState() === "transcribing" ||
+    effectiveState() === "polishing";
   const isSaturated = () => state() === "saturated";
   const isStreaming = () =>
     isProcessing() && streamingMode() !== null && streamingText().length > 0;
@@ -298,20 +510,31 @@ export default function PillView() {
   // (TTFT — model is processing the prompt). Without this signal the
   // pill goes static for 1–3 s and reads as "frozen". We use it to
   // shimmer the visible transcript text in the polish tint so the user
-  // sees the model is actively chewing on what they just said.
+  // sees the model is actively chewing on what they just said. Gated
+  // on `effectiveState()` so the transcript hold suppresses the
+  // shimmer for the same window it suppresses the polishing label.
   const isWaitingForPolish = () =>
-    state() === "polishing" &&
+    effectiveState() === "polishing" &&
     streamingMode() === "transcript" &&
     streamingText().length > 0;
 
   // Listening swaps the meter to warm coral so the brand color earns
   // its keep at the one moment the device is recording. DESIGN.md §5.4.
+  // Keys on `effectiveState()` so the post-final transcript hold keeps
+  // the cyan tint instead of popping to violet the instant the
+  // backend flips the stage.
   const meterColor = createMemo(() => {
-    switch (state()) {
+    switch (effectiveState()) {
       case "listening":
         return "var(--color-coral)";
       case "transcribing":
-        return "var(--color-accent)";
+        // Cyan matches the streaming caret tint for the same pipeline
+        // stage — previously this returned --color-accent (teal),
+        // which drifted from the cyan caret + glow used in
+        // StreamingText. Same stage, same colour. The Waveform path
+        // for the listening state continues to receive coral, so this
+        // change is scoped to the transcribing label colour only.
+        return "var(--color-cyan)";
       case "polishing":
         return "var(--color-violet)";
       default:
@@ -328,8 +551,12 @@ export default function PillView() {
   let pillRef: HTMLDivElement | undefined;
   let resizeObserver: ResizeObserver | null = null;
   let resizeRaf: number | null = null;
-  let lastReportedWidth = 144;
-  let lastReportedHeight = 36;
+  // null sentinel = "no size reported yet" so the very first observer
+  // emit always wins the change check. Replaces the previous magic
+  // 144/36 placeholder, which leaked the compact-pill dimensions into
+  // the dedup logic.
+  let lastReportedWidth: number | null = null;
+  let lastReportedHeight: number | null = null;
   // Window outer frame is 16 px wider and 10 px taller than the
   // visible pill so the OS drop shadow + 1 px rim have room to fall
   // off. Mirror that here when reporting back so Rust resizes to the
@@ -338,8 +565,105 @@ export default function PillView() {
   const WINDOW_PADDING_H = 10;
   const STREAM_GROW_ENABLED = () => isStreaming() || isWaitingForPolish();
 
+  // ─── Dynamic width-floor lerp ──────────────────────────────────────
+  // Couples width to height so a tall, narrow pill never happens. As
+  // the streaming content grows in height, the pill's *minimum* width
+  // ramps up via an ease-out curve, forcing the box to widen rather
+  // than balloon vertically. `fit-content` still allows the natural
+  // width to exceed the floor when content needs more.
+  //
+  // H_min/H_max bracket the ramp; H_max should track HEIGHT_MAX in
+  // pill.rs (240). W_min is raised from the previous 224 px hard
+  // floor — single-line streaming feels intentional at 360 px instead
+  // of cramped. W_max keeps the existing 720 px ceiling.
+  const H_MIN = 64;
+  const H_MAX = 240;
+  const W_MIN = 360;
+  const W_MAX = 720;
+  // 12 px quantisation grid + 12 px grow / 32 px shrink hysteresis
+  // bands stop the floor from chasing every sub-pixel content nudge
+  // (each one would otherwise round-trip to Rust as a window resize).
+  const FLOOR_GRID = 12;
+  const FLOOR_GROW_TRIGGER = 12;
+  const FLOOR_SHRINK_TRIGGER = 32;
+  // Sustain time before a shrink commits. Measured in ms via
+  // performance.now() at the rAF callback; a sub-32 px content
+  // height drop has to persist this long before the floor steps down.
+  const FLOOR_SHRINK_SUSTAIN_MS = 250;
+  // Signal so the floor lives inside the same reactive style object
+  // SolidJS rebuilds on every state change — writing to `pillRef.style.minWidth`
+  // imperatively would be clobbered the next time any other style key
+  // (e.g. box-shadow flipping on Done) flagged the parent for re-render.
+  // 0 is the sentinel "not yet applied" — the parent style attribute's
+  // own `min-width` rule wins until the observer raises this above 0.
+  const [dynamicMinWidth, setDynamicMinWidth] = createSignal(0);
+  let lastAppliedFloor = 0;
+  let pendingShrinkFloor: number | null = null;
+  let pendingShrinkSince = 0;
+
+  function computeWidthFloor(measuredH: number): number {
+    const rawT = (measuredH - H_MIN) / (H_MAX - H_MIN);
+    const t = Math.max(0, Math.min(1, rawT));
+    // Ease-out: 1 - (1 - t)^2 — fast initial widening so even slight
+    // overflow past H_MIN (≈single line) starts opening the box.
+    const tEased = 1 - (1 - t) * (1 - t);
+    const floor = W_MIN + (W_MAX - W_MIN) * tEased;
+    return Math.round(floor / FLOOR_GRID) * FLOOR_GRID;
+  }
+
+  function applyDynamicWidthFloor(measuredH: number) {
+    if (!pillRef) return;
+    const candidate = computeWidthFloor(measuredH);
+    const delta = candidate - lastAppliedFloor;
+    if (delta === 0) return;
+    if (delta >= FLOOR_GROW_TRIGGER) {
+      // Grow path commits immediately — content already overflowed,
+      // any wait would visibly lag the wrap.
+      pendingShrinkFloor = null;
+      lastAppliedFloor = candidate;
+      setDynamicMinWidth(candidate);
+      return;
+    }
+    if (delta > 0) {
+      // Within the dead-band — ignore so we don't churn IPC.
+      pendingShrinkFloor = null;
+      return;
+    }
+    // delta < 0: candidate floor is smaller than what we've applied.
+    // Only commit shrinks that exceed the wider band AND have been
+    // sustained for FLOOR_SHRINK_SUSTAIN_MS — protects against a
+    // momentary content height dip yanking the floor down only to
+    // immediately bounce back.
+    if (-delta < FLOOR_SHRINK_TRIGGER) {
+      pendingShrinkFloor = null;
+      return;
+    }
+    const now = performance.now();
+    if (pendingShrinkFloor !== candidate) {
+      pendingShrinkFloor = candidate;
+      pendingShrinkSince = now;
+      return;
+    }
+    if (now - pendingShrinkSince < FLOOR_SHRINK_SUSTAIN_MS) {
+      return;
+    }
+    lastAppliedFloor = candidate;
+    pendingShrinkFloor = null;
+    setDynamicMinWidth(candidate);
+  }
+
+  function resetDynamicWidthFloor() {
+    lastAppliedFloor = 0;
+    pendingShrinkFloor = null;
+    pendingShrinkSince = 0;
+    setDynamicMinWidth(0);
+  }
+
   function reportPillSize(contentW: number, contentH: number) {
-    const targetW = Math.max(240, Math.ceil(contentW + WINDOW_PADDING_W));
+    // Lower bound matches the Rust WIDE_WIDTH_MIN_DYNAMIC (W_MIN px).
+    // Anything below would be clamped up by Rust anyway and just
+    // produce an extra IPC round-trip.
+    const targetW = Math.max(W_MIN, Math.ceil(contentW + WINDOW_PADDING_W));
     const targetH = Math.max(36, Math.ceil(contentH + WINDOW_PADDING_H));
     // Round to 4 px to soak up sub-pixel jitter from the browser's
     // layout pass — without this the IPC fires on every keystroke.
@@ -369,6 +693,10 @@ export default function PillView() {
         resizeRaf = null;
         const last = entries[entries.length - 1];
         if (!last) return;
+        // Update the dynamic width floor BEFORE reporting size up so
+        // the very next layout pass — which the floor change kicks
+        // off — gets reported instead of the pre-floor measurement.
+        applyDynamicWidthFloor(last.contentRect.height);
         reportPillSize(last.contentRect.width, last.contentRect.height);
       });
     });
@@ -384,20 +712,42 @@ export default function PillView() {
       cancelAnimationFrame(resizeRaf);
       resizeRaf = null;
     }
-    // Reset cached dimensions so the next streaming session reports
-    // fresh measurements rather than skipping due to "no change".
-    lastReportedWidth = 144;
-    lastReportedHeight = 36;
+    // Reset cached dimensions to the null sentinel so the next
+    // streaming session reports fresh measurements rather than
+    // skipping due to "no change".
+    lastReportedWidth = null;
+    lastReportedHeight = null;
+    resetDynamicWidthFloor();
   }
 
   // Toggle the observer with the streaming lifecycle so we don't push
   // height updates for the compact Listening/Done states (Rust handles
   // those via set_wide).
+  let wasStreaming = false;
   createEffect(() => {
-    if (STREAM_GROW_ENABLED()) {
+    const streamingNow = STREAM_GROW_ENABLED();
+    if (streamingNow) {
+      wasStreaming = true;
       setupResizeObserver();
     } else {
       teardownResizeObserver();
+      if (wasStreaming) {
+        wasStreaming = false;
+        // Pre-empt the Rust-side `set_wide(false)` IPC: terminal
+        // states (Done/Error/Canceled) still render the wide pill for
+        // ~150 ms after streaming ends because the state event and
+        // the resize event arrive at the webview through different
+        // async paths. A compact-dim pillResize request is intercepted
+        // by Rust's `set_size` (below-floor escape hatch) and routed
+        // straight to the compact silhouette so the TerminalLine
+        // renders at 144x36 instead of centred in a 600 px box.
+        const COMPACT_W = 116 + WINDOW_PADDING_W;
+        const COMPACT_H = 36 + WINDOW_PADDING_H;
+        void pillResize({
+          width: COMPACT_W,
+          height: COMPACT_H,
+        }).catch(() => {});
+      }
     }
   });
 
@@ -405,20 +755,47 @@ export default function PillView() {
     <div class="flex h-screen w-screen items-center justify-center bg-transparent">
       <div
         ref={(el) => (pillRef = el)}
-        class="animate-pill-in pointer-events-none relative flex min-h-[26px] items-center justify-center rounded-[14px] px-3 py-1.5 transition-[width,box-shadow,padding,border-radius] duration-200 ease-out"
+        class="animate-pill-in pointer-events-none relative flex min-h-[26px] items-center rounded-[14px] px-3 py-1.5 transition-[width,box-shadow,padding,border-radius] duration-200 ease-out"
         style={{
+          // Stack the persistent Polishing label above the streaming
+          // body during polishing — replaces the prior absolute-position
+          // hack + topInset coupling. Other states stay row-centered.
+          // Gated on `effectiveState()` so the column flip is delayed
+          // through the transcript hold, matching the rest of the
+          // polishing-UI predicates.
+          "flex-direction":
+            effectiveState() === "polishing" ? "column" : "row",
+          "justify-content":
+            effectiveState() === "polishing" ? "flex-start" : "center",
+          "align-items":
+            effectiveState() === "polishing" ? "stretch" : "center",
           // Compact pill sits at 116 px. While streaming we use
           // `fit-content` so the pill div sizes itself to the actual
-          // text width; min/max clamp the box at a 224 px floor
-          // (~5 words still feels pill-shaped) and a 720 px ceiling
-          // (matches WIDE_WIDTH_MAX − 40 px so the pill div can fully
-          // fill the OS window's interior at the cap). The
+          // text width; min/max clamp the box at a 360 px floor
+          // (single-line streaming feels intentional) and a 720 px
+          // ceiling (matches WIDE_WIDTH_MAX − 40 px so the pill div
+          // can fully fill the OS window's interior at the cap). The
           // ResizeObserver above watches `pillRef.contentRect.width`
           // and pushes that back to Rust so the OS window grows in
-          // lockstep.
+          // lockstep, and also drives the dynamic min-width lerp so
+          // tall content forces the box wider rather than narrower.
           width: STREAM_GROW_ENABLED() ? "fit-content" : "116px",
-          "min-width": STREAM_GROW_ENABLED() ? "224px" : "116px",
-          "max-width": STREAM_GROW_ENABLED() ? "720px" : "116px",
+          // Streaming uses the floor signal so the ResizeObserver-driven
+          // width-floor lerp survives Solid re-renders triggered by
+          // unrelated style changes (e.g. box-shadow flipping on Done).
+          // 0 sentinel = floor untouched, fall back to the static W_MIN.
+          "min-width": STREAM_GROW_ENABLED()
+            ? `${Math.max(W_MIN, dynamicMinWidth())}px`
+            : "116px",
+          "max-width": STREAM_GROW_ENABLED() ? `${W_MAX}px` : "116px",
+          // Clip streaming-mode children to the rounded boundary.
+          // Without this, tall pills painted square corners because
+          // StreamingText / ShimmerWord painted past the rim radius.
+          // Restricted to streaming mode so the QueueDot (which
+          // anchors at right:-3px in compact mode) stays visible —
+          // box-shadow / inner-rim glows live OUTSIDE the box and
+          // are unaffected either way.
+          overflow: STREAM_GROW_ENABLED() ? "hidden" : "visible",
           // Multi-line streaming makes a pure pill (border-radius:
           // 9999px) look squashed at the corners — soften to a 14 px
           // rounded rect when wide and let the compact mode keep its
@@ -443,11 +820,32 @@ export default function PillView() {
           <Waveform levels={levels()} color={meterColor()} />
         </Show>
 
-        <Show when={isProcessing() && !isStreaming()}>
-          <ShimmerWord
-            text={state() === "transcribing" ? "Transcribing" : "Polishing"}
-            tint={meterColor()}
-          />
+        {/* Persistent "Polishing…" indicator. Stays visible for the
+            entire polishing stage — including while body text streams
+            below it — so the user has a stable signal that polishing
+            is still happening even when the caret is bouncing along
+            new tokens. Gated on `effectiveState()` so the post-final
+            transcript hold suppresses the row in lockstep with the
+            rest of the polishing UI; the inner opacity transition
+            still handles the 180ms crossfade as the stage flips. */}
+        <Show when={effectiveState() === "polishing"}>
+          <PolishingLabelRow visible={effectiveState() === "polishing"} />
+        </Show>
+
+        {/* Non-streaming processing fallback: if we're transcribing or
+            polishing but no streamed text has arrived yet, the
+            existing ShimmerWord label stands in. We hide it during
+            polishing because the explicit label row above already
+            communicates the stage; the ShimmerWord stays for the
+            transcribing pre-stream gap. */}
+        <Show
+          when={
+            isProcessing() &&
+            !isStreaming() &&
+            effectiveState() !== "polishing"
+          }
+        >
+          <ShimmerWord text="Transcribing" tint={meterColor()} />
         </Show>
 
         <Show when={isStreaming()}>
@@ -455,6 +853,10 @@ export default function PillView() {
             text={streamingText()}
             mode={streamingMode() ?? "transcript"}
             waitingForPolish={isWaitingForPolish()}
+            transcribingStreaming={
+              effectiveState() === "transcribing" &&
+              streamingMode() === "transcript"
+            }
           />
         </Show>
 
@@ -549,20 +951,58 @@ function edgeEnvelope(i: number, n: number): number {
 /// the parent pill window grows in lockstep via the ResizeObserver
 /// hook in PillView.
 ///
-/// Three visual states share this slot:
-///   1. Transcript streaming: teal caret blinking after the text.
-///   2. Waiting for polish:   `pill-shimmer` sweep over the visible
-///      transcript so the gap between transcription final and the
-///      LLM's first token reads as active processing instead of a
-///      frozen pill.
-///   3. Polish streaming:     violet caret, plain ink text.
+/// Four visual states share this slot:
+///   1. Transcript streaming: cyan caret + glow blinking after text,
+///      and a continuous cyan `pill-shimmer` sweep across the body
+///      itself so the active transcription reads as alive — not just
+///      the trailing caret. (Brief: "I want to always see this cyan
+///      shimmer, which goes from left to right during transcription,
+///      in addition to the existing caret".)
+///   2. Waiting for polish:   `pill-shimmer` sweep recolours to
+///      violet — the transcript freeze between final-transcript and
+///      the LLM's first token gets the polish tint so the gap reads
+///      as active processing instead of a frozen pill.
+///   3. Polish streaming:     violet caret + glow, plain ink text.
+///   4. (Reduced motion):     CSS overrides drop the shimmer
+///      animation and hand the body back a solid ink colour, and the
+///      caret freezes solid. This file doesn't need to branch on it —
+///      the shimmer/caret CSS classes both opt out under
+///      prefers-reduced-motion.
 function StreamingText(props: {
   text: string;
   mode: "transcript" | "polish";
   waitingForPolish: boolean;
+  /// True while we are actively in the `transcribing` stage with a
+  /// transcript stream still flowing (i.e. *before* the polish stream
+  /// starts). Drives the cyan body shimmer. Mutually exclusive with
+  /// `waitingForPolish` by construction in the parent (waitingForPolish
+  /// requires `effectiveState === "polishing"`, transcribingStreaming
+  /// requires `effectiveState === "transcribing"`).
+  transcribingStreaming: boolean;
 }) {
-  const tint = () =>
-    props.mode === "polish" ? "var(--color-violet)" : "var(--color-accent)";
+  // Caret colour: violet during the polish stage (and during the
+  // transcript→polish handoff via `waitingForPolish`), cyan during the
+  // active transcribing stage. Cyan was specifically called out by
+  // design so the transcribing stage no longer reuses the teal accent.
+  const caretColor = () =>
+    props.mode === "polish" ? "var(--color-violet)" : "var(--color-cyan)";
+  // Glow points at the theme-aware token so light vs dark themes pick
+  // up rgbas tuned for each surface — the previous hardcoded rgba
+  // strings produced an off-hue ring on the cream pill in light mode.
+  const caretGlow = () =>
+    props.mode === "polish"
+      ? "var(--caret-glow-violet)"
+      : "var(--caret-glow-cyan)";
+  // Body shimmer recolours per state: violet for the polish-gap (the
+  // existing behaviour), cyan whenever the transcription stream is
+  // actively flowing (the new behaviour for Fix 2). Anything else
+  // (no shimmer applied) leaves these as inert custom-prop fallbacks.
+  const shimmerActive = () =>
+    props.waitingForPolish || props.transcribingStreaming;
+  const shimmerTint = () =>
+    props.waitingForPolish
+      ? "var(--color-violet)"
+      : "var(--color-cyan)";
   return (
     <div
       class="flex w-full select-none items-start"
@@ -576,7 +1016,7 @@ function StreamingText(props: {
     >
       <span
         class="text-[11px] font-medium"
-        classList={{ "pill-shimmer": props.waitingForPolish }}
+        classList={{ "pill-shimmer": shimmerActive() }}
         style={{
           color: "var(--color-ink)",
           "letter-spacing": "0.005em",
@@ -584,40 +1024,103 @@ function StreamingText(props: {
           // 1.4 line-height at 11px text yields ~15px per line; a
           // 5-line polish lands in ~75px of pill height.
           "line-height": "1.4",
-          // Wrap on word boundaries; break absurdly long tokens so a
-          // pasted URL doesn't escape the right rim.
-          "white-space": "normal",
+          // pre-wrap (not normal) so LLM-polished text that contains
+          // \n\n paragraphs, numbered lists, or bullet points keeps
+          // its line breaks instead of collapsing to a single visual
+          // line. Wrapping behaviour stays the same — soft wrap at
+          // word boundaries, with `word-break: break-word` to break
+          // absurdly long tokens (pasted URLs) before they escape
+          // the right rim. The pill's ResizeObserver picks up the
+          // new height naturally as multi-line content expands and
+          // pushes a `pill_resize` to grow the OS window in lockstep.
+          "white-space": "pre-wrap",
           "word-break": "break-word",
           padding: "2px 0",
           width: "100%",
           transition: "color 180ms ease-out",
-          // Drive shimmer ink -> violet -> ink for the polish-gap so
-          // the active indicator wears the polish tint.
+          // Shimmer ramp: ink -> tint -> ink. Tint flips to cyan
+          // during transcription streaming and violet during the
+          // polish-gap, so the band visibly carries the stage colour.
           "--shimmer-base": "var(--color-ink)",
-          "--shimmer-tint": "var(--color-violet)",
+          "--shimmer-tint": shimmerTint(),
         }}
       >
         {props.text || " "}
         {/* Inline blinking caret stays attached to the trailing
             character so on multi-line wraps it sits at the end of
             the last line. Hidden during the polish-gap shimmer
-            because the shimmer itself is the activity indicator. */}
+            because the shimmer itself is the activity indicator —
+            but stays VISIBLE during transcribing-streaming shimmer,
+            since the caret marks where the next token will land. */}
         <Show when={!props.waitingForPolish}>
           <span
             class="streaming-caret"
             aria-hidden="true"
             style={{
-              "background-color": tint(),
+              "background-color": caretColor(),
               "margin-left": "2px",
               "margin-right": "1px",
               "vertical-align": "text-bottom",
               display: "inline-block",
               width: "2px",
-              height: "0.95em",
+              height: "16px",
               "border-radius": "1px",
+              // CSS class .streaming-caret reads --caret-glow for
+              // its box-shadow, so flipping the variable per-state
+              // gets us the cyan/violet halo without animation forks.
+              "--caret-glow": caretGlow(),
             }}
           />
         </Show>
+      </span>
+    </div>
+  );
+}
+
+/// Persistent "Polishing…" label row. Sits in normal flow above the
+/// streaming body when the parent pill is in column layout (gated on
+/// `state() === "polishing"`). Visible for the whole polishing stage;
+/// crossfades in/out via CSS opacity transition.
+function PolishingLabelRow(props: { visible: boolean }) {
+  return (
+    <div
+      class="polishing-label-row pointer-events-none"
+      style={{
+        display: "flex",
+        "align-items": "center",
+        gap: "6px",
+        // 4 px gap to the streaming body underneath, per design spec.
+        "margin-bottom": "4px",
+        opacity: props.visible ? 1 : 0,
+        transition: "opacity 180ms ease-out",
+      }}
+      aria-hidden="true"
+    >
+      <span
+        class="polishing-dot"
+        style={{
+          width: "6px",
+          height: "6px",
+          "border-radius": "9999px",
+          background: "var(--color-violet)",
+          // Theme-aware halo via the --polishing-dot-glow token so the
+          // light/dark themes each get a hue + alpha tuned for their
+          // pill surface — replaces the previously hardcoded rgba.
+          "box-shadow": "0 0 8px var(--polishing-dot-glow)",
+          display: "inline-block",
+        }}
+      />
+      <span
+        style={{
+          "font-size": "10.5px",
+          "font-weight": 600,
+          "letter-spacing": "0.04em",
+          color: "var(--color-violet)",
+          opacity: 0.85,
+          "line-height": "1",
+        }}
+      >
+        Polishing…
       </span>
     </div>
   );

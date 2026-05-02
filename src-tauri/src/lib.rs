@@ -10,6 +10,7 @@ mod inject;
 mod mac_chord;
 #[cfg(target_os = "macos")]
 mod mac_perm;
+mod mac_power;
 mod models;
 mod modes;
 mod onboarding;
