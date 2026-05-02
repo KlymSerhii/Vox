@@ -9,6 +9,7 @@ impl LlmEngine for NoOpEngine {
         transcript: &str,
         _system_prompt: &str,
         _dictionary: &[String],
+        _enable_thinking: bool,
     ) -> anyhow::Result<String> {
         Ok(transcript.trim().to_string())
     }

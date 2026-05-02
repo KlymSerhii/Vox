@@ -26,6 +26,10 @@ export interface Settings {
   /// the hotkey is released. Default true; tray popover + Settings →
   /// General both flip it.
   streaming_pill_enabled: boolean;
+  /// Let Gemma reason silently before polishing. Only affects
+  /// `gemma-local`; ignored by Apple Intelligence and the no-op engine.
+  /// Default false.
+  enable_thinking: boolean;
   /// Token identifying our `llama-server` children for orphan reaping.
   /// Not a secret (server is loopback-only).
   inference_api_key: string;
@@ -49,6 +53,9 @@ export interface VoiceMode {
   punctuation: PunctuationStyle;
   case: CaseStyle;
   max_length_chars?: number | null;
+  /// Tri-state: `null`/missing inherits the global `enable_thinking`,
+  /// `true`/`false` overrides it. Only affects `gemma-local`.
+  enable_thinking?: boolean | null;
   auto_triggers: AutoTrigger[];
   built_in: boolean;
   created_at: number;
@@ -164,6 +171,10 @@ export async function setPolishingEnabled(enabled: boolean): Promise<void> {
 
 export async function setStreamingPillEnabled(enabled: boolean): Promise<void> {
   await invoke("set_streaming_pill_enabled", { enabled });
+}
+
+export async function setEnableThinking(enabled: boolean): Promise<void> {
+  await invoke("set_enable_thinking", { enabled });
 }
 
 /// Push measured content dimensions (logical px) up to the Rust side

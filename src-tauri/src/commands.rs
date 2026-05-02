@@ -211,6 +211,23 @@ pub fn set_streaming_pill_enabled<R: Runtime>(
 }
 
 #[tauri::command]
+pub fn set_enable_thinking<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    if s.enable_thinking == enabled {
+        return Ok(());
+    }
+    s.enable_thinking = enabled;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn set_appearance<R: Runtime>(
     app: AppHandle<R>,
     appearance: String,

@@ -114,6 +114,13 @@ struct ChatRequest<'a> {
     max_tokens: i32,
     temperature: f32,
     stream: bool,
+    /// Per-request OpenAI-compatible field that llama.cpp (b8953+)
+    /// forwards into Jinja chat-template rendering. Gemma 4's template
+    /// reads `enable_thinking` from here; omitted entirely when the
+    /// caller didn't ask for it so the server's default chat-template
+    /// behaviour is preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +188,7 @@ impl LlmEngine for GemmaHttpEngine {
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
+        enable_thinking: bool,
     ) -> anyhow::Result<String> {
         let trimmed = transcript.trim();
         if trimmed.split_whitespace().count() < 2 {
@@ -189,14 +197,15 @@ impl LlmEngine for GemmaHttpEngine {
 
         let started = Instant::now();
         log::info!(
-            "gemma-http: polishing {} chars with model={}",
+            "gemma-http: polishing {} chars with model={} (thinking={})",
             trimmed.len(),
-            self.model_id
+            self.model_id,
+            enable_thinking,
         );
 
         let request_once = || async {
             let server = inference_proc::ensure_running(&self.app, &self.model_id).await?;
-            self.post_cleanup(&server, system_prompt, dictionary, trimmed).await
+            self.post_cleanup(&server, system_prompt, dictionary, trimmed, enable_thinking).await
         };
 
         // One retry: a stale child (post-assert / OOM-kill) fails first,
@@ -242,6 +251,7 @@ impl LlmEngine for GemmaHttpEngine {
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
+        enable_thinking: bool,
         on_chunk: ChunkCallback,
     ) -> anyhow::Result<String> {
         let trimmed = transcript.trim();
@@ -251,15 +261,23 @@ impl LlmEngine for GemmaHttpEngine {
 
         let started = Instant::now();
         log::info!(
-            "gemma-http: streaming-polish {} chars with model={}",
+            "gemma-http: streaming-polish {} chars with model={} (thinking={})",
             trimmed.len(),
-            self.model_id
+            self.model_id,
+            enable_thinking,
         );
 
         let request_once = || async {
             let server = inference_proc::ensure_running(&self.app, &self.model_id).await?;
-            self.post_cleanup_stream(&server, system_prompt, dictionary, trimmed, &on_chunk)
-                .await
+            self.post_cleanup_stream(
+                &server,
+                system_prompt,
+                dictionary,
+                trimmed,
+                enable_thinking,
+                &on_chunk,
+            )
+            .await
         };
 
         // Mirror cleanup()'s single-retry pattern: a stale child fails the
@@ -314,6 +332,7 @@ impl GemmaHttpEngine {
         system_prompt: &str,
         dictionary: &[String],
         transcript: &str,
+        enable_thinking: bool,
     ) -> anyhow::Result<String> {
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
         let max_tokens = dynamic_max_tokens(transcript.len());
@@ -326,9 +345,10 @@ impl GemmaHttpEngine {
         );
 
         log::debug!(
-            "gemma-http: request → model={}, max_tokens={}, temp=0.2, system_chars={}, user_chars={}",
+            "gemma-http: request → model={}, max_tokens={}, temp=0.2, thinking={}, system_chars={}, user_chars={}",
             server.model_id,
             max_tokens,
+            enable_thinking,
             system_msg.len(),
             user_msg.len(),
         );
@@ -345,6 +365,9 @@ impl GemmaHttpEngine {
             // Cleanup is editing, not generation — keep it deterministic.
             temperature: 0.2,
             stream: false,
+            chat_template_kwargs: Some(serde_json::json!({
+                "enable_thinking": enable_thinking,
+            })),
         };
 
         let resp = self
@@ -426,6 +449,7 @@ impl GemmaHttpEngine {
         system_prompt: &str,
         dictionary: &[String],
         transcript: &str,
+        enable_thinking: bool,
         on_chunk: &ChunkCallback,
     ) -> anyhow::Result<String> {
         let started = Instant::now();
@@ -446,6 +470,9 @@ impl GemmaHttpEngine {
             max_tokens,
             temperature: 0.2,
             stream: true,
+            chat_template_kwargs: Some(serde_json::json!({
+                "enable_thinking": enable_thinking,
+            })),
         };
 
         let resp = self

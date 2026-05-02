@@ -162,6 +162,8 @@ pub struct SessionState {
     /// the setting mid-utterance. Both sites read this field instead
     /// of re-loading settings.
     pub streaming_enabled: bool,
+    /// Resolved at session start: per-mode override falls back to the global `Settings` value.
+    pub enable_thinking: bool,
 }
 
 impl SessionState {
@@ -326,6 +328,14 @@ impl SessionManager {
             .map(ModeSnapshot::from_voice_mode)
             .unwrap_or_else(ModeSnapshot::fallback);
 
+        // Per-session resolved chain-of-thought toggle: mode override
+        // wins over the global setting; `None` (the default for every
+        // built-in mode) inherits.
+        let enable_thinking = active_mode
+            .as_ref()
+            .and_then(|m| m.enable_thinking)
+            .unwrap_or(prefs.enable_thinking);
+
         let session = Arc::new(SessionState {
             id: new_sid,
             stage: Mutex::new(Stage::Listening),
@@ -352,6 +362,7 @@ impl SessionManager {
             completion: Arc::new(Notify::new()),
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: settings::load(app).streaming_pill_enabled,
+            enable_thinking,
         });
 
         // Insert into map BEFORE starting audio so the saturation
@@ -1016,15 +1027,17 @@ async fn run_pipeline(
                 let sys = mode_system_prompt.clone();
                 let dict = merged_dictionary.clone();
                 let t = transcript.clone();
+                let thinking = session.enable_thinking;
                 Box::pin(async move {
-                    engine.cleanup_stream(&t, &sys, &dict, cb).await
+                    engine.cleanup_stream(&t, &sys, &dict, thinking, cb).await
                 })
             } else {
                 let engine = engine.clone();
                 let sys = mode_system_prompt.clone();
                 let dict = merged_dictionary.clone();
                 let t = transcript.clone();
-                Box::pin(async move { engine.cleanup(&t, &sys, &dict).await })
+                let thinking = session.enable_thinking;
+                Box::pin(async move { engine.cleanup(&t, &sys, &dict, thinking).await })
             };
             tokio::select! {
                 biased;
@@ -1615,6 +1628,7 @@ mod tests {
             completion: Arc::new(Notify::new()),
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: false,
+            enable_thinking: false,
         })
     }
 

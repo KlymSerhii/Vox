@@ -13,6 +13,7 @@ import {
   sessionsSnapshot,
   setActiveMode,
   setAppearance,
+  setEnableThinking,
   setHandsFreeEnabled,
   setPolishingEnabled,
   setStreamingPillEnabled,
@@ -132,6 +133,13 @@ export default function TrayPopoverView() {
     await setStreamingPillEnabled(v);
   }
 
+  async function toggleEnableThinking(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, enable_thinking: v });
+    await setEnableThinking(v);
+  }
+
   async function copyRecent(idx: number, text: string) {
     try {
       await copyText(text);
@@ -224,6 +232,26 @@ export default function TrayPopoverView() {
                   onChange={togglePolishing}
                 />
               </div>
+              <Show
+                when={
+                  st().polishing_enabled && st().llm_engine === "gemma-local"
+                }
+              >
+                <div class="mt-3 flex items-center justify-between gap-3 pl-6">
+                  <div class="flex min-w-0 flex-col">
+                    <span class="text-[12px] font-medium text-[var(--color-ink)]">
+                      Thinking
+                    </span>
+                    <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                      Reason silently before polishing.
+                    </span>
+                  </div>
+                  <Toggle
+                    checked={st().enable_thinking}
+                    onChange={(v) => void toggleEnableThinking(v)}
+                  />
+                </div>
+              </Show>
             </div>
 
             <div class="border-b border-[var(--color-border)] px-4 py-3">

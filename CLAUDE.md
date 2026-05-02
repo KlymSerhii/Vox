@@ -30,6 +30,7 @@ This file is the canonical project reference. The README that used to live at th
 | `stt_engine` / `stt_model_id` | `whisper-local` / tier-recommended | Auto-tier via `recommend_tier`. |
 | `llm_engine` / `llm_model_id` | `gemma-local` / tier-recommended on disk; onboarding flips to `apple-fm` when `apple_fm_availability` reports `available` | `apple-fm` ignores the `llm_model_id` field but we still keep a tier-matched Gemma id there so a later switch in Settings doesn't have to re-pick one. |
 | `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
+| `enable_thinking` | `false` | Gemma 4 only. When on, Gemma reasons silently before producing the polished output (slower, can improve quality on complex inputs). Sent as `chat_template_kwargs: {"enable_thinking": true}` per request. Apple Intelligence has no equivalent knob and ignores the value. |
 | `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. |
 | `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
@@ -58,6 +59,7 @@ Each mode contributes:
 - `system_prompt` — given to the cleanup engine.
 - `dictionary` — merged with the global `dictionary` and pushed into both the STT bias prompt and the cleanup prompt.
 - `punctuation` / `case` / `max_length_chars` — applied as post-processing after the LLM step.
+- `enable_thinking: bool | null` — overrides the global `enable_thinking` setting for this mode. `null` (the default for every built-in) inherits the global value; `true`/`false` pins it. Only the Gemma engine reads this; Apple Intelligence and the no-op engine ignore it.
 
 ## Permissions
 

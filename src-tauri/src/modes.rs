@@ -52,6 +52,11 @@ pub struct VoiceMode {
     pub case: CaseStyle,
     #[serde(default)]
     pub max_length_chars: Option<usize>,
+    /// Per-mode override of the global `Settings::enable_thinking`. None
+    /// (the JSON field is omitted) means inherit the global; Some(b)
+    /// pins the value for this mode regardless of the global toggle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_thinking: Option<bool>,
     #[serde(default)]
     pub auto_triggers: Vec<AutoTrigger>,
     #[serde(default)]
@@ -121,6 +126,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             punctuation: PunctuationStyle::Standard,
             case: CaseStyle::Sentence,
             max_length_chars: None,
+            enable_thinking: None,
             auto_triggers: vec![],
             built_in: true,
             created_at: now,
@@ -136,6 +142,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             punctuation: PunctuationStyle::Aggressive,
             case: CaseStyle::Sentence,
             max_length_chars: None,
+            enable_thinking: None,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.apple.mail".into()),
@@ -168,6 +175,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             punctuation: PunctuationStyle::Minimal,
             case: CaseStyle::Sentence,
             max_length_chars: Some(280),
+            enable_thinking: None,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.tinyspeck.slackmacgap".into()),
@@ -200,6 +208,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             punctuation: PunctuationStyle::Standard,
             case: CaseStyle::Sentence,
             max_length_chars: None,
+            enable_thinking: None,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.microsoft.VSCode".into()),
@@ -232,6 +241,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             punctuation: PunctuationStyle::Aggressive,
             case: CaseStyle::Sentence,
             max_length_chars: None,
+            enable_thinking: None,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.apple.Notes".into()),
@@ -1016,6 +1026,7 @@ mod tests {
             punctuation: PunctuationStyle::None,
             case: CaseStyle::Lower,
             max_length_chars: None,
+            enable_thinking: None,
             auto_triggers: vec![],
             built_in: false,
             created_at: 0,
@@ -1037,6 +1048,7 @@ mod tests {
             punctuation: PunctuationStyle::Standard,
             case: CaseStyle::Title,
             max_length_chars: None,
+            enable_thinking: None,
             auto_triggers: vec![],
             built_in: false,
             created_at: 0,

@@ -35,6 +35,8 @@ const KEY_APPEARANCE: &str = "appearance";
 
 pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
 
+const KEY_ENABLE_THINKING: &str = "enable_thinking";
+
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
@@ -152,6 +154,15 @@ pub struct Settings {
     #[serde(default = "default_streaming_pill_enabled")]
     pub streaming_pill_enabled: bool,
 
+    /// Gemma 4 only. When true, the engine sends
+    /// `chat_template_kwargs: { enable_thinking: true }` per request so
+    /// the model emits a chain-of-thought pre-amble before the polished
+    /// output. Off by default — Vox is a low-latency dictation tool, not
+    /// a reasoning task. Per-Voice-Mode can override (see
+    /// `modes::VoiceMode::enable_thinking`).
+    #[serde(default)]
+    pub enable_thinking: bool,
+
     /// Token passed to `llama-server` as `--api-key`; generated lazily
     /// on first spawn and reused so the orphan reaper can identify
     /// stale children. Empty = not yet generated.
@@ -181,6 +192,7 @@ impl Default for Settings {
             auto_suggest_modes: default_auto_suggest_modes(),
             appearance: default_appearance(),
             streaming_pill_enabled: default_streaming_pill_enabled(),
+            enable_thinking: false,
             inference_api_key: String::new(),
         }
     }
@@ -327,6 +339,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let streaming_pill_enabled =
         get_bool(KEY_STREAMING_PILL_ENABLED, default_streaming_pill_enabled());
 
+    let enable_thinking = get_bool(KEY_ENABLE_THINKING, false);
+
     let inference_api_key = get_str(KEY_INFERENCE_API_KEY).unwrap_or_default();
 
     // Scrub legacy cloud-era keys + Keychain entries on first local-only launch.
@@ -370,6 +384,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         auto_suggest_modes,
         appearance,
         streaming_pill_enabled,
+        enable_thinking,
         inference_api_key,
     }
 }
@@ -415,6 +430,7 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     s(KEY_APPEARANCE, appearance);
 
     b(KEY_STREAMING_PILL_ENABLED, settings.streaming_pill_enabled);
+    b(KEY_ENABLE_THINKING, settings.enable_thinking);
 
     s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
 
@@ -465,6 +481,11 @@ pub struct Prefs {
     /// callers that already hold a `Prefs` don't need a second load.
     #[allow(dead_code)]
     pub streaming_pill_enabled: bool,
+
+    /// Mirror of `Settings::enable_thinking`. Per-Voice-Mode override
+    /// (`VoiceMode::enable_thinking: Option<bool>`) takes precedence at
+    /// session-begin time; this value is the global fallback.
+    pub enable_thinking: bool,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
@@ -482,6 +503,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         active_mode_id: s.active_mode_id,
         auto_suggest_modes: s.auto_suggest_modes,
         streaming_pill_enabled: s.streaming_pill_enabled,
+        enable_thinking: s.enable_thinking,
     }
 }
 

@@ -52,6 +52,7 @@ pub fn run() {
             commands::set_hands_free_enabled,
             commands::set_polishing_enabled,
             commands::set_streaming_pill_enabled,
+            commands::set_enable_thinking,
             commands::set_appearance,
             commands::copy_text,
             commands::get_recent_transcripts,

@@ -1214,13 +1214,31 @@ function ModelsTab(props: {
         <Row
           label="Clean up each transcript"
           hint="Fix punctuation, drop filler words, and apply the active Voice Mode."
-          last
+          last={
+            !(props.s.polishing_enabled && props.s.llm_engine === "gemma-local")
+          }
         >
           <Toggle
             checked={props.s.polishing_enabled}
             onChange={(v) => setPolishing(v)}
           />
         </Row>
+        <Show
+          when={
+            props.s.polishing_enabled && props.s.llm_engine === "gemma-local"
+          }
+        >
+          <Row
+            label="Thinking"
+            hint="Let Gemma reason silently before polishing. Slower, but can improve grammar on tricky inputs. Off by default."
+            last
+          >
+            <Toggle
+              checked={props.s.enable_thinking}
+              onChange={(v) => props.update({ enable_thinking: v })}
+            />
+          </Row>
+        </Show>
       </Card>
       <Show when={props.s.polishing_enabled}>
         <SectionHeader
@@ -1972,6 +1990,7 @@ function ModesTab(props: {
         {(m) => (
           <ModeEditor
             mode={m()}
+            llmEngine={props.s.llm_engine}
             onCancel={() => setEditing(null)}
             onSave={onSaveDraft}
           />
@@ -2160,6 +2179,7 @@ function MenuItem(props: {
 
 function ModeEditor(props: {
   mode: VoiceMode;
+  llmEngine: string;
   onCancel: () => void;
   onSave: (m: VoiceMode) => void;
 }) {
@@ -2276,6 +2296,42 @@ function ModeEditor(props: {
                 cleaned text."
               </p>
             </div>
+          </Card>
+
+          <Card>
+            <Row
+              label="Thinking"
+              hint={
+                "Override the global Thinking setting for this mode. Only applies when polishing with Gemma." +
+                (props.llmEngine !== "gemma-local"
+                  ? " (No effect — current polishing engine isn't Gemma.)"
+                  : "")
+              }
+              last
+            >
+              <select
+                class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={props.llmEngine !== "gemma-local"}
+                value={
+                  draft().enable_thinking === true
+                    ? "on"
+                    : draft().enable_thinking === false
+                      ? "off"
+                      : "inherit"
+                }
+                onChange={(e) => {
+                  const v = e.currentTarget.value;
+                  patch({
+                    enable_thinking:
+                      v === "on" ? true : v === "off" ? false : null,
+                  });
+                }}
+              >
+                <option value="inherit">Inherit from settings</option>
+                <option value="on">Always on</option>
+                <option value="off">Always off</option>
+              </select>
+            </Row>
           </Card>
 
           <Card>

@@ -59,11 +59,15 @@ pub trait SttEngine: Send + Sync {
 
 #[async_trait::async_trait]
 pub trait LlmEngine: Send + Sync {
+    /// `enable_thinking` is the resolved per-session value (mode override
+    /// > global setting). Engines that have no thinking-mode equivalent
+    /// (Apple Intelligence, the no-op engine) ignore it.
     async fn cleanup(
         &self,
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
+        enable_thinking: bool,
     ) -> anyhow::Result<String>;
 
     /// Streaming variant of `cleanup` — fires `on_chunk` repeatedly with
@@ -76,9 +80,12 @@ pub trait LlmEngine: Send + Sync {
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
+        enable_thinking: bool,
         on_chunk: ChunkCallback,
     ) -> anyhow::Result<String> {
-        let out = self.cleanup(transcript, system_prompt, dictionary).await?;
+        let out = self
+            .cleanup(transcript, system_prompt, dictionary, enable_thinking)
+            .await?;
         on_chunk(&out);
         Ok(out)
     }

@@ -86,6 +86,9 @@ impl LlmEngine for AppleFmEngine {
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
+        // Apple's Foundation Model has no chain-of-thought toggle; the
+        // value is accepted to satisfy the trait contract and ignored.
+        _enable_thinking: bool,
     ) -> anyhow::Result<String> {
         let trimmed = transcript.trim();
         if trimmed.split_whitespace().count() < 2 {
@@ -158,6 +161,8 @@ impl LlmEngine for AppleFmEngine {
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
+        // Apple's Foundation Model has no chain-of-thought toggle.
+        _enable_thinking: bool,
         on_chunk: ChunkCallback,
     ) -> anyhow::Result<String> {
         let trimmed = transcript.trim();
