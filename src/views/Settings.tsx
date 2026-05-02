@@ -2945,7 +2945,7 @@ function modelBlurb(id: string): string | null {
       return "Multilingual. Sharp accuracy with near-realtime turnaround.";
     case "whisper-large-v3-q5_0":
       return "Multilingual. Best accuracy on long or noisy dictations.";
-    case "gemma-4-e2b-q4_k_m":
+    case "gemma-4-e2b-q5_k_m":
       return "Snappy cleanup. Punctuation and capitalisation; light filler-word removal.";
     case "gemma-4-e4b-q5_k_m":
       return "Balanced. Reliable filler-word removal and natural sentence flow.";
