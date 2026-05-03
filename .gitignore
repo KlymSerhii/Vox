@@ -18,6 +18,10 @@ Cargo.lock.bak
 # Tauri generated
 src-tauri/gen/
 
+# Swift Package Manager
+.build/
+.swiftpm/
+
 # Editor / OS
 .DS_Store
 .vscode/*

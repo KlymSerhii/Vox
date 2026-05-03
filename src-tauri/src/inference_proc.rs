@@ -37,6 +37,7 @@ use rand::Rng;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, UpdateKind};
 use tauri::{AppHandle, Manager, Runtime};
 
+use crate::engines::gemma_http::DEFAULT_SYSTEM_PROMPT;
 use crate::inference_server;
 use crate::models::{self, ModelKind};
 use crate::settings;
@@ -286,6 +287,14 @@ async fn spawn<R: Runtime>(
         // last-started-wins.
         .arg("--parallel")
         .arg("2")
+        .arg("--flash-attn")
+        .arg("on")
+        .arg("--cache-type-k")
+        .arg("q8_0")
+        .arg("--cache-type-v")
+        .arg("q8_0")
+        .arg("--cache-reuse")
+        .arg("256")
         .arg("--api-key")
         .arg(&api_key);
 
@@ -575,17 +584,55 @@ pub fn prewarm_in_background<R: Runtime>(app: &AppHandle<R>) {
         let started = std::time::Instant::now();
         log::info!("inference: pre-warming (model={warm_model_id})");
         match ensure_running(&warm_handle, &warm_model_id).await {
-            Ok(server) => log::info!(
-                "inference: pre-warm complete on port {} in {} ms",
-                server.port,
-                started.elapsed().as_millis()
-            ),
+            Ok(server) => {
+                log::info!(
+                    "inference: pre-warm complete on port {} in {} ms",
+                    server.port,
+                    started.elapsed().as_millis()
+                );
+                warmup_completion(&server).await;
+            }
             Err(e) => log::info!(
                 "inference: pre-warm skipped after {} ms: {e}",
                 started.elapsed().as_millis()
             ),
         }
     });
+}
+
+// Fire a one-token chat completion against the freshly spawned server.
+// The /health probe only confirms the HTTP listener is up — the Metal
+// kernels and KV cache aren't paid for until the first real inference,
+// which would otherwise burden the user-facing TTFT by 1.5-3 s. A
+// single warmup request JIT-compiles the kernels and primes caches,
+// shifting that cost into the launch-time pre-warm window.
+async fn warmup_completion(server: &RunningServer) {
+    let started = Instant::now();
+    let url = format!("http://{HOST}:{}/v1/chat/completions", server.port);
+    let body = serde_json::json!({
+        "model": &server.model_id,
+        "messages": [
+            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+            {"role": "user", "content": "warmup"}
+        ],
+        "max_tokens": 1,
+        "stream": false,
+        "cache_prompt": true,
+    });
+    let client = reqwest::Client::new();
+    let req = client
+        .post(&url)
+        .bearer_auth(&server.api_key)
+        .json(&body)
+        .send();
+    match tokio::time::timeout(Duration::from_secs(30), req).await {
+        Ok(Ok(resp)) => {
+            let _ = resp.bytes().await;
+            log::info!("inference: warmup OK in {:?}", started.elapsed());
+        }
+        Ok(Err(err)) => log::warn!("inference: warmup failed: {err:?}"),
+        Err(err) => log::warn!("inference: warmup failed: {err:?}"),
+    }
 }
 
 /// Force a respawn on the next polish call. Used by the

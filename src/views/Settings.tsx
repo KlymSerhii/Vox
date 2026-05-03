@@ -37,6 +37,8 @@ import {
   onModelProgress,
   onSettingsChanged,
   openAccessibilitySettings,
+  parakeetAvailability,
+  parakeetSupportsLanguage,
   replayOnboarding,
   resetDefaultModes,
   restartInferenceServer,
@@ -52,6 +54,7 @@ import {
   type HotkeyDiagnostic,
   type InferenceServerStatus,
   type ModelStatus,
+  type ParakeetAvailability,
   type PunctuationStyle,
   type Settings,
   type UpdateCheckResult,
@@ -1103,6 +1106,9 @@ function ModelsTab(props: {
   }
 
   const [appleFm, setAppleFm] = createSignal<AppleFmAvailability | null>(null);
+  const [parakeet, setParakeet] = createSignal<ParakeetAvailability | null>(
+    null,
+  );
 
   async function refreshAppleFm() {
     try {
@@ -1112,12 +1118,40 @@ function ModelsTab(props: {
     }
   }
 
+  async function refreshParakeet() {
+    try {
+      setParakeet(await parakeetAvailability());
+    } catch (e) {
+      console.warn("parakeetAvailability:", e);
+    }
+  }
+
   onMount(() => {
     refreshAppleFm();
+    refreshParakeet();
   });
 
-  function setActiveStt(modelId: string) {
-    props.update({ stt_engine: "whisper-local", stt_model_id: modelId });
+  // Switching to a model from a different STT engine flips both fields
+  // in one update so session.rs always sees a consistent (engine, model)
+  // pair — otherwise a transient mismatch would route the next session
+  // to the wrong engine.
+  function setActiveStt(engine: string, modelId: string) {
+    props.update({ stt_engine: engine, stt_model_id: modelId });
+  }
+
+  // One-shot upgrade path: download Parakeet (if not already on disk)
+  // and flip the engine. The Use button on the Parakeet model row
+  // handles the post-download switch; this just kicks the download.
+  async function tryParakeet() {
+    const target = sttModels().find(
+      (m) => m.descriptor.id === "parakeet-tdt-0.6b-v3",
+    );
+    if (!target) return;
+    if (target.installed) {
+      setActiveStt("parakeet-local", target.descriptor.id);
+      return;
+    }
+    await startDownload(target.descriptor.id);
   }
 
   function setActiveLlm(modelId: string) {
@@ -1170,11 +1204,42 @@ function ModelsTab(props: {
     llmModels().find((m) => m.descriptor.id === props.s.llm_model_id),
   );
 
+  // Partition the STT catalog by engine so the two engine cards can
+  // each render only their own model rows.
+  const parakeetModels = createMemo(() =>
+    sttModels().filter((m) => m.descriptor.engine === "parakeet-local"),
+  );
+  const whisperModels = createMemo(() =>
+    sttModels().filter((m) => m.descriptor.engine === "whisper-local"),
+  );
+
+  // The "Try Parakeet" upgrade prompt only fires when (a) the user
+  // hasn't dismissed it, (b) Parakeet is actually available on this
+  // Mac, (c) the user is currently on Whisper, and (d) their active
+  // language sits inside Parakeet's 25-language coverage. "auto"
+  // qualifies — Parakeet handles auto-detect across the supported set.
+  const showTryParakeet = createMemo(() => {
+    if (props.s.try_parakeet_dismissed) return false;
+    if (props.s.stt_engine !== "whisper-local") return false;
+    if (!parakeet()?.available) return false;
+    const lang = props.s.language;
+    if (lang === "auto") return true;
+    return parakeetSupportsLanguage(lang);
+  });
+
+  function dismissTryParakeet() {
+    props.update({ try_parakeet_dismissed: true });
+  }
+
   return (
     <>
       <SectionHeader
         title="Speech recognition"
-        hint="Local · Whisper"
+        hint={
+          props.s.stt_engine === "parakeet-local"
+            ? "Local · Parakeet"
+            : "Local · Whisper"
+        }
       />
       <Card>
         <Row
@@ -1191,20 +1256,98 @@ function ModelsTab(props: {
           </StaticValue>
         </Row>
       </Card>
-      <For each={sttModels()}>
-        {(m) => (
-          <ModelRow
-            m={m}
-            isActive={props.s.stt_model_id === m.descriptor.id}
-            progress={progress()[m.descriptor.id]}
-            downloading={downloading().has(m.descriptor.id)}
-            onUse={() => setActiveStt(m.descriptor.id)}
-            onDownload={() => startDownload(m.descriptor.id)}
-            onCancel={() => cancel(m.descriptor.id)}
-            onDelete={() => remove(m.descriptor.id)}
-          />
+
+      <Show when={showTryParakeet()}>
+        <div class="mb-3 flex items-start justify-between gap-3 rounded-[10px] bg-[var(--color-accent-soft)] p-3 ring-1 ring-[var(--color-accent)]/40">
+          <div class="flex-1 text-[12px] text-[var(--color-ink)]">
+            <span class="font-medium">Try Parakeet</span> — typically
+            5-10× faster on your language. Runs on the Apple Neural
+            Engine.
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
+              onClick={tryParakeet}
+            >
+              Switch to Parakeet
+            </button>
+            <button
+              type="button"
+              aria-label="Dismiss"
+              title="Dismiss"
+              class="grid h-6 w-6 place-items-center rounded-[6px] text-[14px] leading-none text-[var(--color-ink-mute)] hover:bg-[var(--color-control-hover)] hover:text-[var(--color-ink)]"
+              onClick={dismissTryParakeet}
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      </Show>
+
+      <Show when={parakeet()}>
+        {(pa) => (
+          <SttEngineCard
+            title="Parakeet (NVIDIA)"
+            subtitle="NVIDIA Parakeet TDT 0.6B v3 — multilingual, 25 languages, ANE-accelerated."
+            recommendation="Recommended for English and European languages."
+            engineId="parakeet-local"
+            isActive={props.s.stt_engine === "parakeet-local"}
+            available={pa().available}
+            unavailableReason={pa().reason}
+            note="Custom dictionary biasing isn't supported on Parakeet in this version. Switch to Whisper if you rely on the Dictionary tab for technical vocabulary."
+          >
+            <For each={parakeetModels()}>
+              {(m) => (
+                <ModelRow
+                  m={m}
+                  isActive={
+                    props.s.stt_engine === "parakeet-local"
+                    && props.s.stt_model_id === m.descriptor.id
+                  }
+                  progress={progress()[m.descriptor.id]}
+                  downloading={downloading().has(m.descriptor.id)}
+                  onUse={() =>
+                    setActiveStt("parakeet-local", m.descriptor.id)
+                  }
+                  onDownload={() => startDownload(m.descriptor.id)}
+                  onCancel={() => cancel(m.descriptor.id)}
+                  onDelete={() => remove(m.descriptor.id)}
+                />
+              )}
+            </For>
+          </SttEngineCard>
         )}
-      </For>
+      </Show>
+
+      <SttEngineCard
+        title="Whisper (OpenAI)"
+        subtitle="OpenAI Whisper — universal multilingual coverage, broader language support."
+        recommendation="Recommended for languages outside Parakeet's 25-language set."
+        engineId="whisper-local"
+        isActive={props.s.stt_engine === "whisper-local"}
+        available={true}
+        unavailableReason={null}
+        note={null}
+      >
+        <For each={whisperModels()}>
+          {(m) => (
+            <ModelRow
+              m={m}
+              isActive={
+                props.s.stt_engine === "whisper-local"
+                && props.s.stt_model_id === m.descriptor.id
+              }
+              progress={progress()[m.descriptor.id]}
+              downloading={downloading().has(m.descriptor.id)}
+              onUse={() => setActiveStt("whisper-local", m.descriptor.id)}
+              onDownload={() => startDownload(m.descriptor.id)}
+              onCancel={() => cancel(m.descriptor.id)}
+              onDelete={() => remove(m.descriptor.id)}
+            />
+          )}
+        </For>
+      </SttEngineCard>
 
       <SectionHeader
         title="Transcript polishing"
@@ -1300,6 +1443,73 @@ function ModelsTab(props: {
         </Show>
       </Show>
     </>
+  );
+}
+
+// Wraps a group of STT model rows under a labeled card with the engine
+// name, description, and (when applicable) a disabled-reason banner +
+// a one-line caveat note. Mirrors the visual hierarchy of the Apple
+// FM / Gemma cards on the LLM side so the two sections feel
+// symmetrical.
+function SttEngineCard(props: {
+  title: string;
+  subtitle: string;
+  recommendation: string;
+  engineId: "parakeet-local" | "whisper-local";
+  isActive: boolean;
+  /** When false, the card is rendered disabled and the body (model
+   *  rows) is hidden. */
+  available: boolean;
+  unavailableReason: string | null;
+  /** Optional caveat shown beneath the engine description. */
+  note: string | null;
+  children: any;
+}) {
+  return (
+    <div
+      class="mb-3 rounded-[14px] bg-[var(--color-surface-raised)] p-3 ring-1 ring-[var(--color-border)]"
+      classList={{ "opacity-60": !props.available }}
+      aria-disabled={!props.available}
+    >
+      <div class="flex items-start justify-between gap-3">
+        <div class="flex-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-[13px] font-medium text-[var(--color-ink)]">
+              {props.title}
+            </span>
+            <Show when={props.isActive && props.available}>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Active
+              </span>
+            </Show>
+            <Show when={!props.available}>
+              <span class="rounded-full bg-[var(--color-ink-faint)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-ink-mute)]">
+                Unavailable
+              </span>
+            </Show>
+          </div>
+          <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
+            {props.subtitle}
+          </p>
+          <p class="mt-0.5 text-[11px] text-[var(--color-ink-faint)]">
+            {props.recommendation}
+          </p>
+          <Show when={!props.available && props.unavailableReason}>
+            <p class="mt-1 text-[11px] text-[var(--color-danger)]">
+              {props.unavailableReason}
+            </p>
+          </Show>
+          <Show when={props.note && props.available}>
+            <p class="mt-2 rounded-[6px] bg-[var(--color-ink-faint)]/10 px-2 py-1 text-[11px] text-[var(--color-ink-mute)]">
+              Note: {props.note}
+            </p>
+          </Show>
+        </div>
+      </div>
+      <Show when={props.available}>
+        <div class="mt-3">{props.children}</div>
+      </Show>
+    </div>
   );
 }
 
@@ -2928,6 +3138,66 @@ function AboutTab() {
           )}
         </Show>
       </Card>
+
+      <SectionHeader title="Open-source attributions" />
+      <Card>
+        <div class="flex flex-col gap-3 px-4 py-3 text-[12px] leading-[1.55] text-[var(--color-ink-mute)]">
+          <p>
+            Speech recognition powered by{" "}
+            <a
+              href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"
+              target="_blank"
+              rel="noopener"
+              class="text-[var(--color-accent)] hover:underline"
+            >
+              NVIDIA Parakeet-TDT-0.6B-v3
+            </a>{" "}
+            (CC-BY-4.0). CoreML conversion by{" "}
+            <a
+              href="https://github.com/FluidInference/FluidAudio"
+              target="_blank"
+              rel="noopener"
+              class="text-[var(--color-accent)] hover:underline"
+            >
+              FluidInference
+            </a>{" "}
+            (Apache-2.0).
+          </p>
+          <p>
+            Whisper by{" "}
+            <a
+              href="https://github.com/openai/whisper"
+              target="_blank"
+              rel="noopener"
+              class="text-[var(--color-accent)] hover:underline"
+            >
+              OpenAI
+            </a>{" "}
+            (MIT). Inference via{" "}
+            <a
+              href="https://github.com/ggerganov/whisper.cpp"
+              target="_blank"
+              rel="noopener"
+              class="text-[var(--color-accent)] hover:underline"
+            >
+              whisper.cpp
+            </a>{" "}
+            (MIT).
+          </p>
+          <p>
+            Polishing engines: Apple Foundation Models (system) and{" "}
+            <a
+              href="https://ai.google.dev/gemma"
+              target="_blank"
+              rel="noopener"
+              class="text-[var(--color-accent)] hover:underline"
+            >
+              Gemma
+            </a>{" "}
+            by Google (Gemma terms).
+          </p>
+        </div>
+      </Card>
     </>
   );
 }
@@ -2937,6 +3207,8 @@ function AboutTab() {
 // numbers (those already live in the metadata row underneath).
 function modelBlurb(id: string): string | null {
   switch (id) {
+    case "parakeet-tdt-0.6b-v3":
+      return "Multilingual (25 languages). Streams transcripts straight onto the Apple Neural Engine.";
     case "whisper-tiny-en-q5_1":
       return "Fastest. English-only. Good for short notes; misses uncommon words.";
     case "whisper-small-en-q5_1":

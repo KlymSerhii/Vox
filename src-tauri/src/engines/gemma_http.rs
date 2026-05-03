@@ -46,15 +46,36 @@ const SSE_BUFFER_MAX_BYTES: usize = 1_048_576;
 // - Output: 1.2× input. Cleaned text is roughly input length plus
 //   structural markup (numbered lists, paragraph breaks).
 // - Margin: 256 tokens for chat-template overhead and rounding.
-fn dynamic_max_tokens(input_chars: usize) -> i32 {
+//
+// When `enable_thinking == false` the reasoning multiplier is wasted
+// — Gemma 4 emits answer tokens directly into `content`. A tighter
+// budget shortens the per-call timeout (computed downstream from
+// `max_tokens`) so a wedged call fails-open in seconds, not minutes.
+fn dynamic_max_tokens(input_chars: usize, enable_thinking: bool) -> i32 {
     let estimated_input = input_chars / 4;
-    let reasoning_budget = estimated_input * 3;
-    let output_budget = (estimated_input * 12) / 10;
-    let dynamic = (reasoning_budget + output_budget + 256) as u32;
-    dynamic.clamp(MIN_NEW_TOKENS, MAX_NEW_TOKENS_CAP) as i32
+    if enable_thinking {
+        let reasoning_budget = estimated_input * 3;
+        let output_budget = (estimated_input * 12) / 10;
+        let dynamic = (reasoning_budget + output_budget + 256) as u32;
+        dynamic.clamp(MIN_NEW_TOKENS, MAX_NEW_TOKENS_CAP) as i32
+    } else {
+        let budget = ((estimated_input as f64) * 1.5).round() as u32;
+        budget.clamp(256, MAX_NEW_TOKENS_CAP) as i32
+    }
 }
 
-const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
+// Per-call deadline: pessimistic 30 tok/s (acceptable buffer below the
+// measured ~52 tok/s on Apple Silicon) + 30 s of prompt-eval slack,
+// floored at 30 s and capped at HARD_TIMEOUT so a pathological
+// max_tokens still can't wedge a session past 4 min.
+fn timeout_for(max_tokens: i32) -> Duration {
+    let secs = ((max_tokens as f64 / 30.0) + 30.0)
+        .max(30.0)
+        .min(HARD_TIMEOUT.as_secs() as f64) as u64;
+    Duration::from_secs(secs)
+}
+
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
 
 Rules:
 1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\") when used as filler. Keep them when they carry meaning (\"I mean it.\").
@@ -114,6 +135,7 @@ struct ChatRequest<'a> {
     max_tokens: i32,
     temperature: f32,
     stream: bool,
+    cache_prompt: bool,
     /// Per-request OpenAI-compatible field that llama.cpp (b8953+)
     /// forwards into Jinja chat-template rendering. Gemma 4's template
     /// reads `enable_thinking` from here; omitted entirely when the
@@ -162,6 +184,17 @@ struct Usage {
     completion_tokens: u64,
 }
 
+// `server_dead` flags whether a respawn could plausibly fix the
+// failure. `true` only for outcomes that imply the child process is
+// gone (TCP connect refused). Timeouts, HTTP-status errors, and
+// parse errors all leave `server_dead = false` so the caller skips
+// the cold-start retry that would just compound the user-visible
+// latency.
+struct AttemptError {
+    err: anyhow::Error,
+    server_dead: bool,
+}
+
 // Streaming variants — llama.cpp's OpenAI-compatible SSE shape.
 #[derive(Deserialize)]
 struct StreamChunk {
@@ -204,23 +237,31 @@ impl LlmEngine for GemmaHttpEngine {
         );
 
         let request_once = || async {
-            let server = inference_proc::ensure_running(&self.app, &self.model_id).await?;
+            let server = inference_proc::ensure_running(&self.app, &self.model_id)
+                .await
+                .map_err(|e| AttemptError { err: e, server_dead: false })?;
             self.post_cleanup(&server, system_prompt, dictionary, trimmed, enable_thinking).await
         };
 
-        // One retry: a stale child (post-assert / OOM-kill) fails first,
-        // the supervisor's is_alive check trips, second attempt spawns fresh.
+        // Retry only when the child is actually gone: a TCP connect
+        // refused on the first attempt means the supervisor's cached
+        // handle is stale (post-assert / OOM-kill), and a fresh spawn
+        // is the fix. Timeouts, HTTP-status, and parse errors mean the
+        // server is alive — retrying just pays the cold-start cost
+        // again before failing the same way.
         let result = match request_once().await {
             Ok(s) => Ok(s),
-            Err(first) => {
+            Err(first) if first.server_dead => {
                 log::warn!(
-                    "gemma-http: first request failed ({first}); dropping handle and retrying once"
+                    "gemma-http: first request failed ({}) and server appears dead; respawning and retrying once",
+                    first.err
                 );
                 inference_proc::drop_managed(&self.app);
                 request_once().await.map_err(|second| {
-                    anyhow::anyhow!("gemma-http retry failed: {first} | {second}")
+                    anyhow::anyhow!("gemma-http retry failed: {} | {}", first.err, second.err)
                 })
             }
+            Err(first) => Err(first.err),
         };
 
         match &result {
@@ -268,7 +309,9 @@ impl LlmEngine for GemmaHttpEngine {
         );
 
         let request_once = || async {
-            let server = inference_proc::ensure_running(&self.app, &self.model_id).await?;
+            let server = inference_proc::ensure_running(&self.app, &self.model_id)
+                .await
+                .map_err(|e| AttemptError { err: e, server_dead: false })?;
             self.post_cleanup_stream(
                 &server,
                 system_prompt,
@@ -280,20 +323,22 @@ impl LlmEngine for GemmaHttpEngine {
             .await
         };
 
-        // Mirror cleanup()'s single-retry pattern: a stale child fails the
-        // first attempt, supervisor's is_alive trips, second attempt
-        // spawns fresh and connects.
+        // Mirror cleanup()'s respawn-only-on-actual-death policy:
+        // retrying after a timeout pays full cold-start before failing
+        // the same way, multiplying the user-visible wait.
         let result = match request_once().await {
             Ok(s) => Ok(s),
-            Err(first) => {
+            Err(first) if first.server_dead => {
                 log::warn!(
-                    "gemma-http: first stream request failed ({first}); dropping handle and retrying once"
+                    "gemma-http: first stream request failed ({}) and server appears dead; respawning and retrying once",
+                    first.err
                 );
                 inference_proc::drop_managed(&self.app);
                 request_once().await.map_err(|second| {
-                    anyhow::anyhow!("gemma-http stream retry failed: {first} | {second}")
+                    anyhow::anyhow!("gemma-http stream retry failed: {} | {}", first.err, second.err)
                 })
             }
+            Err(first) => Err(first.err),
         };
 
         match &result {
@@ -333,9 +378,10 @@ impl GemmaHttpEngine {
         dictionary: &[String],
         transcript: &str,
         enable_thinking: bool,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, AttemptError> {
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
-        let max_tokens = dynamic_max_tokens(transcript.len());
+        let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking);
+        let deadline = timeout_for(max_tokens);
 
         let system_msg = build_system_message(system_prompt, dictionary);
         // Fenced block keeps content like "Hey Claude, …" from being
@@ -345,12 +391,13 @@ impl GemmaHttpEngine {
         );
 
         log::debug!(
-            "gemma-http: request → model={}, max_tokens={}, temp=0.2, thinking={}, system_chars={}, user_chars={}",
+            "gemma-http: request → model={}, max_tokens={}, temp=0.2, thinking={}, system_chars={}, user_chars={}, deadline={}s",
             server.model_id,
             max_tokens,
             enable_thinking,
             system_msg.len(),
             user_msg.len(),
+            deadline.as_secs(),
         );
         log::debug!("gemma-http: system prompt:\n{system_msg}");
         log::debug!("gemma-http: user message:\n{user_msg}");
@@ -365,41 +412,81 @@ impl GemmaHttpEngine {
             // Cleanup is editing, not generation — keep it deterministic.
             temperature: 0.2,
             stream: false,
+            cache_prompt: true,
             chat_template_kwargs: Some(serde_json::json!({
                 "enable_thinking": enable_thinking,
             })),
         };
 
-        let resp = self
+        let send_fut = self
             .client
             .post(&url)
             .bearer_auth(&server.api_key)
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("llama-server POST: {e}"))?;
+            .send();
+
+        let resp = match tokio::time::timeout(deadline, send_fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                let dead = e.is_connect();
+                return Err(AttemptError {
+                    err: anyhow::anyhow!("llama-server POST: {e}"),
+                    server_dead: dead,
+                });
+            }
+            Err(_) => {
+                return Err(AttemptError {
+                    err: anyhow::anyhow!(
+                        "llama-server POST timed out after {}s",
+                        deadline.as_secs()
+                    ),
+                    server_dead: false,
+                });
+            }
+        };
 
         let status = resp.status();
-        // Read the raw body once so we can log it on parse failure or
-        // empty-content cases.
-        let body_text = resp
-            .text()
-            .await
-            .map_err(|e| anyhow::anyhow!("read response body: {e}"))?;
+        let body_text = match tokio::time::timeout(deadline, resp.text()).await {
+            Ok(Ok(t)) => t,
+            Ok(Err(e)) => {
+                return Err(AttemptError {
+                    err: anyhow::anyhow!("read response body: {e}"),
+                    server_dead: false,
+                });
+            }
+            Err(_) => {
+                return Err(AttemptError {
+                    err: anyhow::anyhow!(
+                        "read response body timed out after {}s",
+                        deadline.as_secs()
+                    ),
+                    server_dead: false,
+                });
+            }
+        };
 
         if !status.is_success() {
             let snippet: String = body_text.chars().take(200).collect();
-            return Err(anyhow::anyhow!("llama-server HTTP {status}: {snippet}"));
+            return Err(AttemptError {
+                err: anyhow::anyhow!("llama-server HTTP {status}: {snippet}"),
+                server_dead: false,
+            });
         }
 
         let parsed: ChatResponse = serde_json::from_str(&body_text).map_err(|e| {
             let snippet: String = body_text.chars().take(500).collect();
-            anyhow::anyhow!("parse chat response: {e}; body={snippet}")
+            AttemptError {
+                err: anyhow::anyhow!("parse chat response: {e}; body={snippet}"),
+                server_dead: false,
+            }
         })?;
 
         let choice = parsed.choices.into_iter().next().ok_or_else(|| {
             let snippet: String = body_text.chars().take(500).collect();
-            anyhow::anyhow!("empty choices in chat response; body={snippet}")
+            AttemptError {
+                err: anyhow::anyhow!("empty choices in chat response; body={snippet}"),
+                server_dead: false,
+            }
         })?;
 
         let finish_reason = choice.finish_reason.unwrap_or_else(|| "(none)".into());
@@ -451,10 +538,11 @@ impl GemmaHttpEngine {
         transcript: &str,
         enable_thinking: bool,
         on_chunk: &ChunkCallback,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, AttemptError> {
         let started = Instant::now();
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
-        let max_tokens = dynamic_max_tokens(transcript.len());
+        let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking);
+        let deadline = timeout_for(max_tokens);
 
         let system_msg = build_system_message(system_prompt, dictionary);
         let user_msg = format!(
@@ -470,19 +558,38 @@ impl GemmaHttpEngine {
             max_tokens,
             temperature: 0.2,
             stream: true,
+            cache_prompt: true,
             chat_template_kwargs: Some(serde_json::json!({
                 "enable_thinking": enable_thinking,
             })),
         };
 
-        let resp = self
+        let send_fut = self
             .client
             .post(&url)
             .bearer_auth(&server.api_key)
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("llama-server stream POST: {e}"))?;
+            .send();
+
+        let resp = match tokio::time::timeout(deadline, send_fut).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                let dead = e.is_connect();
+                return Err(AttemptError {
+                    err: anyhow::anyhow!("llama-server stream POST: {e}"),
+                    server_dead: dead,
+                });
+            }
+            Err(_) => {
+                return Err(AttemptError {
+                    err: anyhow::anyhow!(
+                        "llama-server stream POST timed out after {}s",
+                        deadline.as_secs()
+                    ),
+                    server_dead: false,
+                });
+            }
+        };
 
         let status = resp.status();
         if !status.is_success() {
@@ -493,63 +600,85 @@ impl GemmaHttpEngine {
                 .chars()
                 .take(200)
                 .collect();
-            return Err(anyhow::anyhow!("llama-server HTTP {status}: {snippet}"));
+            return Err(AttemptError {
+                err: anyhow::anyhow!("llama-server HTTP {status}: {snippet}"),
+                server_dead: false,
+            });
         }
 
-        let mut acc = String::new();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut stream = resp.bytes_stream();
-        // One-shot TTFT log so a slow prompt-eval stage shows up in
-        // the timeline alongside the existing total-time log. Set the
-        // first time content lands in `acc`.
-        let mut first_chunk_at: Option<Instant> = None;
+        let stream_fut = async {
+            let mut acc = String::new();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut stream = resp.bytes_stream();
+            // One-shot TTFT log so a slow prompt-eval stage shows up in
+            // the timeline alongside the existing total-time log. Set the
+            // first time content lands in `acc`.
+            let mut first_chunk_at: Option<Instant> = None;
 
-        while let Some(next) = stream.next().await {
-            let bytes = next.map_err(|e| anyhow::anyhow!("stream read: {e}"))?;
-            buf.extend_from_slice(&bytes);
-            if buf.len() > SSE_BUFFER_MAX_BYTES {
-                return Err(anyhow::anyhow!(
-                    "SSE buffer exceeded {SSE_BUFFER_MAX_BYTES} bytes without an event boundary"
-                ));
-            }
+            while let Some(next) = stream.next().await {
+                let bytes = next.map_err(|e| AttemptError {
+                    err: anyhow::anyhow!("stream read: {e}"),
+                    server_dead: false,
+                })?;
+                buf.extend_from_slice(&bytes);
+                if buf.len() > SSE_BUFFER_MAX_BYTES {
+                    return Err(AttemptError {
+                        err: anyhow::anyhow!(
+                            "SSE buffer exceeded {SSE_BUFFER_MAX_BYTES} bytes without an event boundary"
+                        ),
+                        server_dead: false,
+                    });
+                }
 
-            // SSE events end at a blank line — \n\n in the byte stream.
-            // Drain complete events from the buffer one at a time so a
-            // partial trailing event stays buffered for the next chunk.
-            loop {
-                let Some(pos) = find_double_newline(&buf) else {
-                    break;
-                };
-                let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
-                let event_len = event.len().saturating_sub(2);
-                let event_str = match std::str::from_utf8(&event[..event_len]) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if let Some(stop) = parse_sse_event(event_str, &mut acc) {
-                    if stop {
-                        // [DONE] sentinel — final chunk delivered, exit
-                        // both the inner and outer loops cleanly.
+                // SSE events end at a blank line — \n\n in the byte stream.
+                // Drain complete events from the buffer one at a time so a
+                // partial trailing event stays buffered for the next chunk.
+                loop {
+                    let Some(pos) = find_double_newline(&buf) else {
+                        break;
+                    };
+                    let event = buf.drain(..pos + 2).collect::<Vec<u8>>();
+                    let event_len = event.len().saturating_sub(2);
+                    let event_str = match std::str::from_utf8(&event[..event_len]) {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    if let Some(stop) = parse_sse_event(event_str, &mut acc) {
+                        if stop {
+                            // [DONE] sentinel — final chunk delivered, exit
+                            // both the inner and outer loops cleanly.
+                            on_chunk(&acc);
+                            return Ok(acc.trim().to_string());
+                        }
                         on_chunk(&acc);
-                        return Ok(acc.trim().to_string());
-                    }
-                    on_chunk(&acc);
-                    if first_chunk_at.is_none() && !acc.is_empty() {
-                        first_chunk_at = Some(Instant::now());
-                        log::debug!(
-                            "gemma-http: first polish chunk at {} ms (acc={} chars)",
-                            started.elapsed().as_millis(),
-                            acc.len(),
-                        );
+                        if first_chunk_at.is_none() && !acc.is_empty() {
+                            first_chunk_at = Some(Instant::now());
+                            log::debug!(
+                                "gemma-http: first polish chunk at {} ms (acc={} chars)",
+                                started.elapsed().as_millis(),
+                                acc.len(),
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        // Stream ended without a [DONE] marker — flush whatever we
-        // accumulated and treat as best-effort success.
-        on_chunk(&acc);
-        Ok(acc.trim().to_string())
+            // Stream ended without a [DONE] marker — flush whatever we
+            // accumulated and treat as best-effort success.
+            on_chunk(&acc);
+            Ok(acc.trim().to_string())
+        };
+
+        match tokio::time::timeout(deadline, stream_fut).await {
+            Ok(r) => r,
+            Err(_) => Err(AttemptError {
+                err: anyhow::anyhow!(
+                    "llama-server stream timed out after {}s",
+                    deadline.as_secs()
+                ),
+                server_dead: false,
+            }),
+        }
     }
 }
 
@@ -660,8 +789,8 @@ mod tests {
 
     #[test]
     fn dynamic_max_tokens_floors_short_inputs() {
-        assert_eq!(dynamic_max_tokens(5), MIN_NEW_TOKENS as i32);
-        assert_eq!(dynamic_max_tokens(0), MIN_NEW_TOKENS as i32);
+        assert_eq!(dynamic_max_tokens(5, true), MIN_NEW_TOKENS as i32);
+        assert_eq!(dynamic_max_tokens(0, true), MIN_NEW_TOKENS as i32);
     }
 
     #[test]
@@ -674,7 +803,7 @@ mod tests {
         // empty, and the session fell through to copying the raw
         // Whisper transcript untouched. The budget must now leave
         // room for thinking + a polished reply.
-        let cap = dynamic_max_tokens(1_600);
+        let cap = dynamic_max_tokens(1_600, true);
         assert!(
             cap >= 1_800,
             "1600-char input must budget for thinking + answer, got {cap}"
@@ -684,14 +813,14 @@ mod tests {
     #[test]
     fn dynamic_max_tokens_scales_for_30min_audio() {
         // 30 min × 150 wpm × ~5 chars/word ≈ 22.5k chars input.
-        let cap = dynamic_max_tokens(22_500);
+        let cap = dynamic_max_tokens(22_500, true);
         assert!(cap >= 6_000, "30-min polish needs at least 6k output tokens, got {cap}");
         assert!(cap <= MAX_NEW_TOKENS_CAP as i32);
     }
 
     #[test]
     fn dynamic_max_tokens_caps_pathological_inputs() {
-        assert_eq!(dynamic_max_tokens(200_000), MAX_NEW_TOKENS_CAP as i32);
+        assert_eq!(dynamic_max_tokens(200_000, true), MAX_NEW_TOKENS_CAP as i32);
     }
 
     #[test]

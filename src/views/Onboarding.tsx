@@ -19,6 +19,7 @@ import {
   finishOnboarding,
   getSettings,
   inferenceServerStatus,
+  languageDisplayName,
   listModels,
   loadModelWarm,
   onBinaryDone,
@@ -28,6 +29,10 @@ import {
   onModelError,
   onModelProgress,
   openAccessibilitySettings,
+  PARAKEET_SUPPORTED_LANGUAGES,
+  parakeetAvailability,
+  parakeetSupportsLanguage,
+  recommendedSttEngineFor,
   recommendTier,
   requestMicrophone,
   setSettings,
@@ -35,6 +40,7 @@ import {
   type HotkeyDiagnostic,
   type InferenceServerStatus,
   type ModelStatus,
+  type ParakeetAvailability,
   type PermissionStatus,
   type Settings,
   type TierRecommendation,
@@ -43,11 +49,20 @@ import { VoxLogo } from "../components/VoxLogo";
 
 type PolishChoice = "apple-fm" | "gemma-local";
 
-type Step = 0 | 1 | 2 | 3;
+type Step = 0 | 1 | 2 | 3 | 4;
 
-const STEP_COUNT = 4;
-const LAST_STEP: Step = 3;
-const MODELS_STEP: Step = 2;
+const STEP_COUNT = 5;
+const LAST_STEP: Step = 4;
+const MODELS_STEP: Step = 3;
+const MIC_STEP: Step = 2;
+const LANGUAGE_STEP: Step = 1;
+
+// Common languages that aren't in Parakeet's 25-language set. Listed
+// here so the language picker can offer them as a one-tap "this routes
+// to Whisper" path without forcing the user into a free-form input.
+const NON_PARAKEET_COMMON: readonly string[] = [
+  "zh", "ja", "ko", "ar", "hi", "tr", "vi", "th",
+] as const;
 
 /** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a glyph
  *  string ("⌥⇧V", "F13"). Bare `AltRight`/`AltLeft` map to `⌥`.
@@ -113,6 +128,12 @@ export default function OnboardingView() {
     microphone: false,
     accessibility: false,
   });
+  // Probed once on mount; the language step uses it for engine routing
+  // and to decide whether the "auto-detect → Parakeet" path is even
+  // viable on this Mac.
+  const [parakeet, setParakeet] = createSignal<ParakeetAvailability | null>(
+    null,
+  );
   // Gates Continue while downloads run, AND until the chosen engine's
   // required artifacts are on disk. The user cannot skip past the models
   // step: Whisper is mandatory, plus Gemma + llama-server when the
@@ -129,6 +150,11 @@ export default function OnboardingView() {
       setTier(await recommendTier());
     } catch (e) {
       console.error(e);
+    }
+    try {
+      setParakeet(await parakeetAvailability());
+    } catch (e) {
+      console.warn("parakeetAvailability failed:", e);
     }
     const poll = async () => {
       try {
@@ -204,7 +230,14 @@ export default function OnboardingView() {
           <Show when={step() === 0}>
             <Welcome />
           </Show>
-          <Show when={step() === 1}>
+          <Show when={step() === LANGUAGE_STEP}>
+            <LanguageStep
+              s={s()}
+              parakeet={parakeet()}
+              patch={patch}
+            />
+          </Show>
+          <Show when={step() === MIC_STEP}>
             <MicStep
               granted={perms().microphone}
               onAllow={async () => {
@@ -293,7 +326,7 @@ function PrimaryButton(props: {
   // every required artifact is on disk for the chosen engine. Racing
   // ahead with a partial GGUF leaves the app broken on first use.
   const disabled = () =>
-    (props.step === 1 && !props.perms.microphone) ||
+    (props.step === MIC_STEP && !props.perms.microphone) ||
     (props.step === MODELS_STEP &&
       (props.downloadInFlight || !props.modelsReady));
   const label = () => {
@@ -384,6 +417,243 @@ function PermStatus(props: {
   );
 }
 
+// Sentinel for the secondary `<select>` so the user can opt into the
+// Parakeet auto-detect path even after first picking an explicit code.
+const AUTO_VALUE = "__auto__";
+
+function LanguageStep(props: {
+  s: Settings | null;
+  parakeet: ParakeetAvailability | null;
+  patch: (p: Partial<Settings>) => void;
+}) {
+  // Render the 25 supported codes in display-name order so e.g. "Czech"
+  // is near "Croatian" instead of being grouped by ISO ordering.
+  const supportedSorted = createMemo(() =>
+    [...PARAKEET_SUPPORTED_LANGUAGES].sort((a, b) =>
+      languageDisplayName(a).localeCompare(languageDisplayName(b)),
+    ),
+  );
+  const otherSorted = createMemo(() =>
+    [...NON_PARAKEET_COMMON].sort((a, b) =>
+      languageDisplayName(a).localeCompare(languageDisplayName(b)),
+    ),
+  );
+
+  // Buckets the current language for the radio cards: `auto`, an
+  // explicit Parakeet code, or "other" (which collapses every
+  // non-Parakeet code into a single card backed by the secondary
+  // dropdown).
+  type Bucket = "auto" | "supported" | "other";
+  const bucket = (): Bucket => {
+    const cur = props.s?.language ?? "auto";
+    if (cur === "auto") return "auto";
+    if (parakeetSupportsLanguage(cur)) return "supported";
+    return "other";
+  };
+
+  // Tracks the dropdown's last explicit choice so flipping back to the
+  // "Auto" card doesn't lose the user's prior pick. Initialised from
+  // the persisted setting when it's an explicit Parakeet code.
+  const [supportedPick, setSupportedPick] = createSignal<string>(
+    props.s?.language && parakeetSupportsLanguage(props.s.language)
+      ? props.s.language
+      : "en",
+  );
+  const [otherPick, setOtherPick] = createSignal<string>(
+    props.s?.language && !parakeetSupportsLanguage(props.s.language) && props.s.language !== "auto"
+      ? props.s.language
+      : "zh",
+  );
+
+  const parakeetOk = () => props.parakeet?.available ?? false;
+
+  async function persist(language: string) {
+    const engine = recommendedSttEngineFor(language, parakeetOk());
+    const stt_model_id =
+      engine === "parakeet-local"
+        ? "parakeet-tdt-0.6b-v3"
+        : (props.s?.stt_model_id ?? "");
+    await props.patch({ language, stt_engine: engine, stt_model_id });
+  }
+
+  async function pickAuto() {
+    await persist("auto");
+  }
+  async function pickSupported(code: string) {
+    setSupportedPick(code);
+    await persist(code);
+  }
+  async function pickOther(code: string) {
+    setOtherPick(code);
+    await persist(code);
+  }
+
+  const engineForBucket = (b: Bucket): "parakeet-local" | "whisper-local" => {
+    if (!parakeetOk()) return "whisper-local";
+    return b === "other" ? "whisper-local" : "parakeet-local";
+  };
+
+  return (
+    <div class="flex w-full max-w-[440px] flex-col gap-4">
+      <div class="flex flex-col gap-1.5">
+        <h2 class="text-[20px] font-semibold">What language do you speak?</h2>
+        <p class="text-[13px] text-[var(--color-ink-mute)]">
+          We'll pick the best on-device model for your language. You can
+          change this later in Settings.
+        </p>
+      </div>
+
+      <div
+        class="flex flex-col gap-2"
+        role="radiogroup"
+        aria-label="Dictation language"
+      >
+        <LanguageCard
+          title="Detect automatically"
+          subtitle={
+            parakeetOk()
+              ? "Parakeet — fast multilingual recognition across 25 supported languages."
+              : "Whisper picks the language automatically."
+          }
+          recommended={true}
+          engine={engineForBucket("auto")}
+          selected={bucket() === "auto"}
+          onSelect={pickAuto}
+        />
+
+        <LanguageCard
+          title="Pick a specific language"
+          subtitle="Tell Vox exactly which language you'll speak in."
+          recommended={false}
+          engine={engineForBucket("supported")}
+          selected={bucket() === "supported"}
+          onSelect={() => pickSupported(supportedPick())}
+        >
+          <select
+            aria-label="Specific language"
+            value={supportedPick()}
+            onChange={(e) => pickSupported(e.currentTarget.value)}
+            class="mt-2 w-full rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] text-[var(--color-ink)] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          >
+            <For each={supportedSorted()}>
+              {(code) => (
+                <option value={code}>
+                  {languageDisplayName(code)} ({code})
+                </option>
+              )}
+            </For>
+          </select>
+        </LanguageCard>
+
+        <LanguageCard
+          title="Other language (uses Whisper)"
+          subtitle="For languages outside Parakeet's 25-language set."
+          recommended={false}
+          engine="whisper-local"
+          selected={bucket() === "other"}
+          onSelect={() => pickOther(otherPick())}
+        >
+          <select
+            aria-label="Other language"
+            value={otherPick() === "auto" ? AUTO_VALUE : otherPick()}
+            onChange={(e) => {
+              const v = e.currentTarget.value;
+              pickOther(v === AUTO_VALUE ? "auto" : v);
+            }}
+            class="mt-2 w-full rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] text-[var(--color-ink)] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+          >
+            <For each={otherSorted()}>
+              {(code) => (
+                <option value={code}>
+                  {languageDisplayName(code)} ({code})
+                </option>
+              )}
+            </For>
+            <option value={AUTO_VALUE}>Other / Multilingual (auto-detect)</option>
+          </select>
+        </LanguageCard>
+      </div>
+
+      <Show when={!parakeetOk() && props.parakeet}>
+        <p class="text-[11px] text-[var(--color-ink-faint)]">
+          Parakeet isn't available on this Mac
+          {props.parakeet!.reason ? ` (${props.parakeet!.reason})` : ""} —
+          all languages will use Whisper.
+        </p>
+      </Show>
+    </div>
+  );
+}
+
+function LanguageCard(props: {
+  title: string;
+  subtitle: string;
+  recommended: boolean;
+  engine: "parakeet-local" | "whisper-local";
+  selected: boolean;
+  onSelect: () => void;
+  children?: JSX.Element;
+}) {
+  const engineLabel = () =>
+    props.engine === "parakeet-local" ? "Parakeet" : "Whisper";
+  return (
+    <div
+      role="radio"
+      aria-checked={props.selected}
+      tabindex={0}
+      onClick={props.onSelect}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          props.onSelect();
+        }
+      }}
+      class="flex cursor-pointer flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
+      classList={{
+        "ring-1 ring-[var(--color-border)]": !props.selected,
+        "ring-2 ring-[var(--color-accent)]": props.selected,
+      }}
+    >
+      <div class="flex items-center justify-between gap-2">
+        <span class="text-[13px] font-medium text-[var(--color-ink)]">
+          {props.title}
+        </span>
+        <span
+          class="flex h-3.5 w-3.5 items-center justify-center rounded-full"
+          classList={{
+            "ring-1 ring-[var(--color-border-strong)]": !props.selected,
+            "bg-[var(--color-accent)]": props.selected,
+          }}
+          aria-hidden="true"
+        >
+          <Show when={props.selected}>
+            <span class="h-1.5 w-1.5 rounded-full bg-[var(--color-on-accent)]" />
+          </Show>
+        </span>
+      </div>
+      <span class="text-[11px] text-[var(--color-ink-mute)]">
+        {props.subtitle}
+      </span>
+      <div class="mt-1 flex flex-wrap gap-1">
+        <Show when={props.recommended}>
+          <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+            Recommended
+          </span>
+        </Show>
+        <span class="rounded-full bg-[var(--color-ink-faint)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-ink-mute)]">
+          {engineLabel()}
+        </span>
+      </div>
+      <Show when={props.children}>
+        {/* Stop click bubbling so opening the dropdown doesn't re-fire
+            the parent card's onSelect with the *previous* dropdown
+            value. */}
+        <div onClick={(e) => e.stopPropagation()}>{props.children}</div>
+      </Show>
+    </div>
+  );
+}
+
 function DownloadStep(props: {
   s: Settings | null;
   tier: TierRecommendation | null;
@@ -468,18 +738,29 @@ function DownloadStep(props: {
     }
   });
 
+  // Filter the STT options shown in the form to the engine the user
+  // picked in the Language step — there's no point in offering Whisper
+  // sizes when they're going to download Parakeet, and vice versa.
+  // Falls back to "all STT models" before settings are loaded.
+  const visibleSttModels = createMemo(() => {
+    const all = sttModels();
+    const eng = props.s?.stt_engine;
+    if (!eng) return all;
+    return all.filter((m) => m.descriptor.engine === eng);
+  });
+
   // Auto-select default models. Prefer the user's persisted setting if
   // it still maps to a catalog entry (Replay onboarding), else the
   // hardware-tier recommendation. Runs once each — `selectedXId()` gate
   // makes the effect idempotent.
   createEffect(() => {
     const t = props.tier;
-    const stts = sttModels();
+    const stts = visibleSttModels();
     const cur = props.s;
     if (!t || stts.length === 0 || selectedSttId()) return;
     const stored = cur?.stt_model_id;
     const ok = stored && stts.some((m) => m.descriptor.id === stored);
-    setSelectedSttId(ok ? stored! : t.stt_model_id);
+    setSelectedSttId(ok ? stored! : stts[0].descriptor.id);
   });
 
   createEffect(() => {
@@ -540,11 +821,19 @@ function DownloadStep(props: {
     if (!t || !cur || !sttId) return;
     setStarted(true);
 
+    // Derive the engine id from the chosen model descriptor — the
+    // user could have switched engines via the Language step but the
+    // settings store hasn't echoed yet.
+    const sttEngine =
+      sttModels().find((m) => m.descriptor.id === sttId)?.descriptor.engine
+        ?? cur.stt_engine
+        ?? "whisper-local";
+
     if (choice === "apple-fm") {
-      // Apple Intelligence: no GGUF download, no llama-server. Whisper
+      // Apple Intelligence: no GGUF download, no llama-server. STT
       // is still local and still needs to come down.
       await props.patch({
-        stt_engine: "whisper-local",
+        stt_engine: sttEngine,
         stt_model_id: sttId,
         llm_engine: "apple-fm",
         // Keep the recommended Gemma id so a later switch in Settings
@@ -574,7 +863,7 @@ function DownloadStep(props: {
       await acceptGemmaTos();
     }
     await props.patch({
-      stt_engine: "whisper-local",
+      stt_engine: sttEngine,
       stt_model_id: sttId,
       llm_engine: "gemma-local",
       llm_model_id: llmId,
@@ -619,20 +908,24 @@ function DownloadStep(props: {
       <h2 class="text-[20px] font-semibold">Set up your dictation models.</h2>
       <Show when={!started()}>
         <p class="text-[13px] text-[var(--color-ink-mute)]">
-          Vox runs everything on this Mac. Pick a Whisper for transcription
-          and a polishing engine to clean each transcript up.
+          Vox runs everything on this Mac. Pick a transcription model and
+          a polishing engine to clean each transcript up.
         </p>
 
-        <Show when={sttModels().length > 0 && props.tier}>
+        <Show when={visibleSttModels().length > 0 && props.tier}>
           {(t) => (
             <div
               class="flex flex-col gap-2"
               role="radiogroup"
-              aria-label="Whisper model"
+              aria-label="Speech recognition model"
             >
               <div class="flex items-baseline justify-between">
                 <span class="text-[13px] font-medium">
-                  Speech recognition (Whisper)
+                  Speech recognition (
+                  {props.s?.stt_engine === "parakeet-local"
+                    ? "Parakeet"
+                    : "Whisper"}
+                  )
                 </span>
                 <Show when={t().physical_ram_gb > 0}>
                   <span class="text-[11px] text-[var(--color-ink-faint)]">
@@ -640,12 +933,15 @@ function DownloadStep(props: {
                   </span>
                 </Show>
               </div>
-              <For each={sttModels()}>
+              <For each={visibleSttModels()}>
                 {(m) => (
                   <ModelCard
                     model={m}
                     selected={selectedSttId() === m.descriptor.id}
-                    recommended={m.descriptor.id === t().stt_model_id}
+                    recommended={
+                      m.descriptor.engine === "parakeet-local"
+                        || m.descriptor.id === t().stt_model_id
+                    }
                     swapWarn={
                       t().physical_ram_gb > 0 &&
                       m.descriptor.ram_peak_mb >

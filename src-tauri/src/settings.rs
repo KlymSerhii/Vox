@@ -37,6 +37,8 @@ pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
 
 const KEY_ENABLE_THINKING: &str = "enable_thinking";
 
+const KEY_TRY_PARAKEET_DISMISSED: &str = "try_parakeet_dismissed";
+
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
@@ -168,6 +170,12 @@ pub struct Settings {
     /// stale children. Empty = not yet generated.
     #[serde(default)]
     pub inference_api_key: String,
+
+    /// User dismissed the "Try Parakeet" upgrade banner in
+    /// Settings → Models. Sticky — once true, the banner stays hidden
+    /// regardless of language / availability state.
+    #[serde(default)]
+    pub try_parakeet_dismissed: bool,
 }
 
 impl Default for Settings {
@@ -194,6 +202,7 @@ impl Default for Settings {
             streaming_pill_enabled: default_streaming_pill_enabled(),
             enable_thinking: false,
             inference_api_key: String::new(),
+            try_parakeet_dismissed: false,
         }
     }
 }
@@ -255,6 +264,14 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let mut store_dirty = false;
 
     // Rewrite historical cloud engine selections to local equivalents.
+    //
+    // Recognised STT engine ids today: "whisper-local", "parakeet-local".
+    // No hard whitelist here — STT settings predate the LLM whitelist
+    // pattern and quietly clamping unknown values would silently undo a
+    // future engine added in another build that downgrades back to this
+    // one. Migration logic stays narrow: only the known-cloud values
+    // ("groq", "cloud") are rewritten. New users hitting Parakeet must
+    // opt in via onboarding / Settings rather than being auto-migrated.
     let stt_engine = {
         let stored = get_str(KEY_STT_ENGINE).unwrap_or_else(default_stt_engine);
         if matches!(stored.as_str(), "groq" | "cloud") {
@@ -343,6 +360,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
 
     let inference_api_key = get_str(KEY_INFERENCE_API_KEY).unwrap_or_default();
 
+    let try_parakeet_dismissed = get_bool(KEY_TRY_PARAKEET_DISMISSED, false);
+
     // Scrub legacy cloud-era keys + Keychain entries on first local-only launch.
     for key in [
         KEY_LEGACY_GROQ,
@@ -386,6 +405,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         streaming_pill_enabled,
         enable_thinking,
         inference_api_key,
+        try_parakeet_dismissed,
     }
 }
 
@@ -433,6 +453,8 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     b(KEY_ENABLE_THINKING, settings.enable_thinking);
 
     s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
+
+    b(KEY_TRY_PARAKEET_DISMISSED, settings.try_parakeet_dismissed);
 
     // Drop legacy keys defensively in case a downgraded build re-introduced them.
     for key in [

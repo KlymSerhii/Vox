@@ -85,6 +85,7 @@ pub fn run() {
             commands::restart_inference_server,
             commands::delete_inference_server,
             commands::apple_fm_availability,
+            commands::parakeet_availability,
             commands::list_modes,
             commands::get_mode,
             commands::save_mode,

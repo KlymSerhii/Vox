@@ -46,7 +46,9 @@ fn load_context_blocking(
     model_id: &str,
     path: &Path,
 ) -> anyhow::Result<Arc<Mutex<whisper_rs::WhisperContext>>> {
-    let params = whisper_rs::WhisperContextParameters::default();
+    let mut params = whisper_rs::WhisperContextParameters::default();
+    // flash-attn cuts decoder memory bandwidth on Metal/CoreML.
+    params.flash_attn(true);
     let path_str = path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("model path is not UTF-8"))?;
@@ -82,7 +84,7 @@ impl SttEngine for WhisperLocalEngine {
                     load_context_blocking(&model_id, &path)
                 })?;
                 let pcm = decode_wav_to_f32_mono_16k(&wav_owned)?;
-                run_whisper_full(ctx, &pcm, lang.as_deref(), &dict, on_segment)
+                run_whisper_full(ctx, &model_id, &pcm, lang.as_deref(), &dict, on_segment)
             })
             .await
             .map_err(|e| anyhow::anyhow!("whisper-local task panicked: {e}"))?
@@ -137,8 +139,10 @@ impl SttEngine for WhisperLocalEngine {
 }
 
 // Re-validate spec defensively even though we produced the WAV ourselves.
+// `pub(crate)` because parakeet_local reuses this — both engines consume
+// the same 16 kHz mono PCM contract from `audio::stop_and_encode`.
 #[cfg(feature = "local-engines")]
-fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
     use std::io::Cursor;
     let mut reader = hound::WavReader::new(Cursor::new(wav))
         .map_err(|e| anyhow::anyhow!("wav header: {e}"))?;
@@ -176,6 +180,7 @@ fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
 #[cfg(feature = "local-engines")]
 fn run_whisper_full(
     ctx: &Arc<Mutex<whisper_rs::WhisperContext>>,
+    model_id: &str,
     pcm: &[f32],
     lang: Option<&str>,
     dict: &[String],
@@ -196,8 +201,36 @@ fn run_whisper_full(
     params.set_print_realtime(false);
     params.set_print_special(false);
     params.set_print_timestamps(false);
-    if let Some(l) = lang.filter(|l| *l != "auto") {
+    // English-only models can never decode anything else; skipping
+    // lang-detect saves ~1 s on the first decoder pass.
+    let is_english_only_model = model_id.contains("-en-");
+    let auto_lang = lang.map(|l| l == "auto").unwrap_or(true);
+    let effective_lang: Option<&str> = if auto_lang && is_english_only_model {
+        Some("en")
+    } else {
+        lang.filter(|l| *l != "auto")
+    };
+    if let Some(l) = effective_lang {
         params.set_language(Some(l));
+    }
+
+    // Encoder cost scales with audio_ctx; default 1500 = full 30 s mel.
+    // Clamp floor at 500 (~10 s of context): whisper.cpp's encoder
+    // positional embeddings have been reported to truncate and corrupt
+    // short-clip output at audio_ctx values below ~256, so 500 stays
+    // comfortably above that while still leaving meaningful encoder
+    // speedup for 5–10 s clips compared to the 1500-position default.
+    let audio_ctx = (((pcm.len() / 16000) * 50) + 100).clamp(500, 1500) as i32;
+    params.set_audio_ctx(audio_ctx);
+
+    // Streaming speculative passes need per-segment callbacks for clips
+    // that span multiple segments; only collapse to one segment for
+    // short utterances where a single segment is the natural shape.
+    // Gate on the absence of a segment callback: the speculative path
+    // always passes Some(callback) and must stay multi-segment so the
+    // pill paints partial transcripts as decoding progresses.
+    if pcm.len() < 16_000 * 25 && on_segment.is_none() {
+        params.set_single_segment(true);
     }
     let prompt;
     let cleaned: Vec<&str> = dict.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();

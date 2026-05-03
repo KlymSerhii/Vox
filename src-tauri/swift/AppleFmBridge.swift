@@ -61,6 +61,128 @@ private final class ErrorSlot: @unchecked Sendable {
     }
 }
 
+// Session cache keyed by full system-prompt string. Reusing a session
+// across calls with the same prompt skips Foundation Models' system-
+// prompt prefill (a meaningful TTFT win on Apple Intelligence).
+//
+// Swift actor isolation gives us two things at once:
+//   1. Mutating the LRU map is serialized (no `NSLock` needed).
+//   2. A vended session is held inside the actor's state, so callers
+//      that race on the same prompt naturally line up behind one
+//      another via `await acquire(...)` / `release(...)`.
+//
+// `LanguageModelSession` itself is single-threaded per Apple's docs;
+// even when two callers grab the same key we hand the session to one
+// at a time. The cap of 4 covers the 5 built-in voice modes minus one
+// rarely-active mode at any moment.
+#if canImport(FoundationModels)
+@available(macOS 26.0, *)
+private actor SessionCache {
+    static let shared = SessionCache()
+
+    // Bounded LRU. `order` holds keys oldest→newest; `entries[k]`
+    // is the cached session plus a one-slot waitlist used to serialise
+    // concurrent calls hitting the same key.
+    private struct Entry {
+        var session: LanguageModelSession
+        // Continuation queue for callers waiting on this session. The
+        // session is "owned" by whichever caller most recently called
+        // `acquire` and hasn't yet called `release`.
+        var inUse: Bool = false
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
+
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+    private let cap = 4
+
+    // Acquire exclusive use of the session for `prompt`, constructing a
+    // new one (and prewarming it) on miss. Caller MUST pair this with
+    // `release(prompt:)` once finished, success or failure.
+    func acquire(prompt: String) async -> LanguageModelSession {
+        // Touch LRU order on every access — if present, move to MRU.
+        if entries[prompt] != nil {
+            if let idx = order.firstIndex(of: prompt) {
+                order.remove(at: idx)
+            }
+            order.append(prompt)
+        } else {
+            let session = LanguageModelSession {
+                prompt
+            }
+            // Fire-and-forget prewarm — amortises the first-call cost
+            // outside the user-visible TTFT for this very call. The
+            // session is safe to use immediately; prewarm just primes.
+            session.prewarm()
+            entries[prompt] = Entry(session: session)
+            order.append(prompt)
+            evictIfNeeded()
+        }
+
+        // Wait our turn if another caller currently owns this session.
+        while entries[prompt]?.inUse == true {
+            await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+                entries[prompt]?.waiters.append(cont)
+            }
+        }
+        // While we were suspended on the continuation, a concurrent
+        // caller's stream task may have errored and called `evict` —
+        // which removes the entry entirely and wakes all waiters. If
+        // we resumed into that state, fall back through the cache-miss
+        // path to construct a fresh session. The recursion is bounded:
+        // after one trip through the miss branch the entry is present
+        // with `inUse == true`, so we cannot recurse a second time.
+        if entries[prompt] == nil {
+            return await acquire(prompt: prompt)
+        }
+        entries[prompt]!.inUse = true
+        return entries[prompt]!.session
+    }
+
+    func release(prompt: String) {
+        guard var entry = entries[prompt] else { return }
+        entry.inUse = false
+        let next = entry.waiters.isEmpty ? nil : entry.waiters.removeFirst()
+        entries[prompt] = entry
+        next?.resume()
+    }
+
+    // Drop a session that errored mid-use so the next caller starts
+    // clean rather than inheriting a corrupted transcript history.
+    func evict(prompt: String) {
+        if let idx = order.firstIndex(of: prompt) {
+            order.remove(at: idx)
+        }
+        if var entry = entries.removeValue(forKey: prompt) {
+            // Wake any waiters so they can re-acquire (which will
+            // reconstruct a fresh session on the next acquire call).
+            for waiter in entry.waiters {
+                waiter.resume()
+            }
+            entry.waiters.removeAll()
+        }
+    }
+
+    private func evictIfNeeded() {
+        // Bounded scan: at most one full pass. If every cached entry
+        // is currently in use we accept being temporarily over cap
+        // rather than yanking a session out from under an active call.
+        guard order.count > cap else { return }
+        var scanned = 0
+        let scanCap = order.count
+        while order.count > cap && scanned < scanCap {
+            let key = order.removeFirst()
+            scanned += 1
+            if let entry = entries[key], entry.inUse {
+                order.append(key)
+                continue
+            }
+            entries.removeValue(forKey: key)
+        }
+    }
+}
+#endif
+
 @_cdecl("vox_apple_fm_availability")
 public func vox_apple_fm_availability() -> Int32 {
 #if canImport(FoundationModels)
@@ -121,11 +243,21 @@ public func vox_apple_fm_polish_blocking(
     // happens-before edge between the Task's write and our read.
     nonisolated(unsafe) var result: Result<String, Error>? = nil
 
-    Task.detached {
+    // Lifetime gate for the detached Task — same shape as the streaming
+    // path. `done` flips to true when EITHER the task completes
+    // naturally (success or error) OR the timeout path fires. Both
+    // sides consult this flag under the lock so the timeout path can
+    // distinguish "task finished after we gave up" from "task is still
+    // alive and we need to evict its session".
+    let doneLock = NSLock()
+    nonisolated(unsafe) var done = false
+
+    let task = Task.detached {
+        // Reuse a cached session keyed by systemPrompt to skip
+        // Foundation Models' system-prompt prefill on repeat calls.
+        let session = await SessionCache.shared.acquire(prompt: systemPrompt)
+        var taskResult: Result<String, Error>
         do {
-            let session = LanguageModelSession {
-                systemPrompt
-            }
             let options = GenerationOptions(
                 temperature: 0.2,
                 maximumResponseTokens: Int(maxTokens)
@@ -135,15 +267,47 @@ public func vox_apple_fm_polish_blocking(
             let userMessage =
                 "Clean this transcript. Output only the cleaned text.\n\n```\n\(transcript)\n```"
             let response = try await session.respond(to: userMessage, options: options)
-            result = .success(response.content)
+            taskResult = .success(response.content)
         } catch {
-            result = .failure(error)
+            taskResult = .failure(error)
+        }
+        // Decide cache fate AFTER checking whether the timeout path
+        // beat us to the punch. If `done` is already set the parent
+        // pthread has returned (or is about to), so the result is
+        // discarded — and either way we must evict, not release: a
+        // cancelled-mid-call or timed-out session may carry partial
+        // state that would corrupt the next caller.
+        doneLock.lock()
+        let timedOut = done
+        done = true
+        doneLock.unlock()
+        if timedOut || Task.isCancelled {
+            await SessionCache.shared.evict(prompt: systemPrompt)
+        } else {
+            switch taskResult {
+            case .success:
+                await SessionCache.shared.release(prompt: systemPrompt)
+            case .failure:
+                // Drop the session on error — its in-flight transcript
+                // may be corrupted; safer to start fresh next call.
+                await SessionCache.shared.evict(prompt: systemPrompt)
+            }
+            result = taskResult
         }
         semaphore.signal()
     }
 
     let deadline = DispatchTime.now() + .seconds(Int(timeoutSecs))
     if semaphore.wait(timeout: deadline) == .timedOut {
+        // Mark done first so the racing task sees `timedOut == true`
+        // when it eventually finishes and routes its session to
+        // `evict` instead of `release`. Then cancel cooperatively so
+        // the underlying Foundation Models call has a chance to bail
+        // out if it supports cancellation.
+        doneLock.lock()
+        done = true
+        doneLock.unlock()
+        task.cancel()
         ErrorSlot.shared.set("Apple Intelligence polish timed out after \(timeoutSecs)s")
         return nil
     }
@@ -222,10 +386,12 @@ public func vox_apple_fm_polish_stream(
     nonisolated(unsafe) var done = false
 
     let task = Task.detached {
+        // Reuse a cached session keyed by systemPrompt — same TTFT
+        // win as the blocking path. Release on every exit including
+        // cancellation; on error evict so the next caller starts clean.
+        let session = await SessionCache.shared.acquire(prompt: systemPrompt)
+        var didErr = false
         do {
-            let session = LanguageModelSession {
-                systemPrompt
-            }
             let options = GenerationOptions(
                 temperature: 0.2,
                 maximumResponseTokens: Int(maxTokens)
@@ -263,7 +429,15 @@ public func vox_apple_fm_polish_stream(
             }
             finalResult = .success(lastSnapshot)
         } catch {
+            didErr = true
             finalResult = .failure(error)
+        }
+        // A cancelled task (timeout path) leaves the session in an
+        // unknown state; treat that the same as an error and evict.
+        if didErr || Task.isCancelled {
+            await SessionCache.shared.evict(prompt: systemPrompt)
+        } else {
+            await SessionCache.shared.release(prompt: systemPrompt)
         }
         // Mark done before signaling so a timeout racing the natural
         // completion sees `done == true` and skips its cancel/drain.

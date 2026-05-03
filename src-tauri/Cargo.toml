@@ -34,9 +34,14 @@ png = "0.17"
 # cleanly on Linux/Windows but produces no native code there. CI
 # machines without Xcode/Swift can opt out via
 # `--no-default-features --features local-engines`.
-default = ["local-engines", "apple-fm"]
+default = ["local-engines", "apple-fm", "parakeet"]
 local-engines = ["dep:whisper-rs"]
 apple-fm = []
+# Parakeet STT via FluidAudio's Swift package — Apple-Silicon-only.
+# build.rs gates on `target_arch = "aarch64"` so x86_64 / non-macOS
+# builds drop the Swift step and the engine module compiles out via
+# the matching `#[cfg(...)]` in `engines::parakeet_*`.
+parakeet = []
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }

@@ -142,6 +142,154 @@ fn build_apple_fm_bridge() -> Result<(), String> {
     Ok(())
 }
 
+/// Build the Parakeet STT bridge: a SwiftPM package at
+/// `src-tauri/swift-parakeet/` that pulls in FluidAudio and exports a
+/// C ABI consumed from `engines::parakeet_bridge`.
+///
+/// Why SwiftPM instead of a single-file `swiftc` invocation like
+/// AppleFmBridge: FluidAudio is a third-party library with its own
+/// transitive C/Cxx wrappers (FastClusterWrapper, MachTaskSelfWrapper).
+/// `swift build` is the only path that resolves and compiles those
+/// alongside our bridge sources without us re-implementing dependency
+/// resolution by hand.
+///
+/// Failure modes are non-fatal — emitted as `cargo:warning` so a
+/// machine without `swift` installed, without network for the SwiftPM
+/// dependency fetch, or with a transient compile failure still
+/// produces a working Vox binary. The Parakeet engine module's runtime
+/// `is_available()` returns false in that case and `Registry::stt`
+/// returns a clear error if anyone selects `parakeet-local`.
+#[cfg(target_os = "macos")]
+fn build_parakeet_bridge() {
+    let manifest_dir = match env::var("CARGO_MANIFEST_DIR") {
+        Ok(p) => p,
+        Err(e) => {
+            println!("cargo:warning=parakeet bridge: CARGO_MANIFEST_DIR missing ({e}), feature disabled");
+            return;
+        }
+    };
+
+    let pkg_dir = PathBuf::from(&manifest_dir).join("swift-parakeet");
+    let pkg_swift = pkg_dir.join("Package.swift");
+    let bridge_src = pkg_dir.join("Sources/ParakeetBridge/ParakeetBridge.swift");
+
+    if !pkg_swift.exists() || !bridge_src.exists() {
+        println!(
+            "cargo:warning=parakeet bridge: missing Swift sources at {}, feature disabled at runtime",
+            pkg_dir.display()
+        );
+        return;
+    }
+
+    println!("cargo:rerun-if-changed={}", pkg_swift.display());
+    println!("cargo:rerun-if-changed={}", bridge_src.display());
+
+    if Command::new("swift").arg("--version").output().is_err() {
+        println!("cargo:warning=parakeet bridge: `swift` CLI not found, feature disabled at runtime");
+        return;
+    }
+
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "aarch64".into());
+    if target_arch != "aarch64" {
+        println!(
+            "cargo:warning=parakeet bridge: target arch '{target_arch}' unsupported by FluidAudio (arm64 only), feature disabled at runtime"
+        );
+        return;
+    }
+
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "debug".into());
+    let swift_config = if profile == "release" { "release" } else { "debug" };
+
+    let output = match Command::new("swift")
+        .args([
+            "build",
+            "-c",
+            swift_config,
+            "--package-path",
+            &pkg_dir.display().to_string(),
+        ])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            println!("cargo:warning=parakeet bridge: `swift build` failed to start ({e}), feature disabled at runtime");
+            return;
+        }
+    };
+
+    if !output.status.success() {
+        println!(
+            "cargo:warning=parakeet bridge: `swift build` failed (exit {}), feature disabled at runtime. stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    // Resolve the bin path SwiftPM produced — `swift build --show-bin-path`
+    // emits the absolute directory containing libParakeetBridge.a plus
+    // the resolved transitive .a files (FastClusterWrapper et al.).
+    let bin_path_out = match Command::new("swift")
+        .args([
+            "build",
+            "-c",
+            swift_config,
+            "--package-path",
+            &pkg_dir.display().to_string(),
+            "--show-bin-path",
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            println!(
+                "cargo:warning=parakeet bridge: `swift build --show-bin-path` failed (exit {}), feature disabled at runtime. stderr:\n{}",
+                o.status,
+                String::from_utf8_lossy(&o.stderr)
+            );
+            return;
+        }
+        Err(e) => {
+            println!("cargo:warning=parakeet bridge: --show-bin-path failed ({e}), feature disabled at runtime");
+            return;
+        }
+    };
+    let bin_path = String::from_utf8_lossy(&bin_path_out.stdout)
+        .trim()
+        .to_string();
+    let bin_dir = Path::new(&bin_path);
+
+    if !bin_dir.join("libParakeetBridge.a").exists() {
+        println!(
+            "cargo:warning=parakeet bridge: libParakeetBridge.a missing at {}, feature disabled at runtime",
+            bin_dir.display()
+        );
+        return;
+    }
+
+    println!("cargo:rustc-link-search=native={}", bin_dir.display());
+    // SwiftPM merges every transitive object (FluidAudio, FastCluster,
+    // MachTaskSelfWrapper, etc.) into a single libParakeetBridge.a, so
+    // there is exactly one archive to link from the Rust side.
+    println!("cargo:rustc-link-lib=static=ParakeetBridge");
+
+    // Apple frameworks FluidAudio's ASR pipeline reaches: Foundation +
+    // AVFoundation for audio I/O, CoreML for the .mlmodelc inference,
+    // Accelerate for the FastClusterWrapper BLAS path, Metal +
+    // MetalPerformanceShaders for CoreML's GPU compute units. libc++
+    // covers the Cxx 17 wrappers in FluidAudio's Package.swift.
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=AVFoundation");
+    println!("cargo:rustc-link-lib=framework=CoreML");
+    println!("cargo:rustc-link-lib=framework=Accelerate");
+    println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+    println!("cargo:rustc-link-lib=dylib=c++");
+
+    println!("cargo:rustc-link-search=native=/usr/lib/swift");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+}
+
 fn main() {
     // On macOS, AXIsProcessTrusted lives in ApplicationServices.
     #[cfg(target_os = "macos")]
@@ -163,6 +311,12 @@ fn main() {
                     "apple-fm bridge build failed:\n  {e}\n\nIf you don't have Xcode/Swift, build without it:\n  cargo build --no-default-features --features local-engines"
                 );
             }
+        }
+        if env::var("CARGO_FEATURE_PARAKEET").is_ok() {
+            // Soft-fail (warn-only) rather than panic — Parakeet is a
+            // secondary STT engine and a missing/broken Swift toolchain
+            // shouldn't block the rest of the app.
+            build_parakeet_bridge();
         }
     }
 

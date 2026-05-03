@@ -14,6 +14,12 @@ pub mod apple_fm;
 pub mod apple_fm_bridge;
 pub mod gemma_http;
 pub mod none;
+// Parakeet bridge module compiles unconditionally so the Registry can
+// reference its types from any cfg; the Swift FFI is only linked in
+// when the parakeet feature + macOS arm64 target apply (see
+// `parakeet_bridge::imp` cfg branches).
+pub mod parakeet_bridge;
+pub mod parakeet_local;
 pub mod whisper_local;
 
 /// Optional callback fired by an STT engine as it produces partial
@@ -133,6 +139,10 @@ impl Registry {
                 app.clone(),
                 model_id.to_string(),
             )),
+            "parakeet-local" => Arc::new(parakeet_local::ParakeetLocalEngine::new(
+                app.clone(),
+                model_id.to_string(),
+            )),
             _ => return None,
         };
 
@@ -181,6 +191,17 @@ impl Registry {
         let mut guard = self.inner.lock();
         guard.stt.retain(|k, _| !k.ends_with(&suffix));
         guard.llm.retain(|k, _| !k.ends_with(&suffix));
+        drop(guard);
+
+        // The Parakeet engine's cached `AsrManager` lives in the Swift
+        // `ModelsCache` actor, not in the Rust Registry — dropping the
+        // Rust-side `Arc<ParakeetLocalEngine>` doesn't release it.
+        // Without this evict, a delete + re-download cycle would keep
+        // serving transcribes from the stale pre-delete in-memory
+        // copy until the app restarts.
+        if model_id == "parakeet-tdt-0.6b-v3" {
+            parakeet_bridge::evict();
+        }
     }
 }
 

@@ -33,6 +33,9 @@ export interface Settings {
   /// Token identifying our `llama-server` children for orphan reaping.
   /// Not a secret (server is loopback-only).
   inference_api_key: string;
+  /// User dismissed the "Try Parakeet" upgrade banner in
+  /// Settings → Models. Sticky once true.
+  try_parakeet_dismissed: boolean;
 }
 
 export type PunctuationStyle = "Aggressive" | "Standard" | "Minimal" | "None";
@@ -358,6 +361,60 @@ export interface AppleFmAvailability {
 
 export async function appleFmAvailability(): Promise<AppleFmAvailability> {
   return invoke<AppleFmAvailability>("apple_fm_availability");
+}
+
+// Mirror of models.rs::PARAKEET_SUPPORTED_LANGUAGES — keep in sync.
+// Source: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+export const PARAKEET_SUPPORTED_LANGUAGES: readonly string[] = [
+  "bg", "hr", "cs", "da", "nl", "en", "et", "fi", "fr", "de", "el",
+  "hu", "it", "lv", "lt", "mt", "pl", "pt", "ro", "sk", "sl", "es",
+  "sv", "ru", "uk",
+] as const;
+
+export function parakeetSupportsLanguage(code: string): boolean {
+  return PARAKEET_SUPPORTED_LANGUAGES.includes(code);
+}
+
+// Pick the recommended STT engine id given language preference and
+// runtime availability. Mirrors models.rs::recommended_stt_engine_for.
+export function recommendedSttEngineFor(
+  language: string,
+  parakeetAvailable: boolean,
+): "parakeet-local" | "whisper-local" {
+  if (!parakeetAvailable) return "whisper-local";
+  if (language === "auto" || parakeetSupportsLanguage(language)) {
+    return "parakeet-local";
+  }
+  return "whisper-local";
+}
+
+// Render an ISO 639-1 code as a UI-facing display name. Falls back to
+// the upper-cased code when Intl.DisplayNames doesn't recognise it
+// (older WebKit, exotic codes) so we never show a blank label.
+export function languageDisplayName(code: string): string {
+  if (code === "auto") return "Detect automatically";
+  try {
+    return new Intl.DisplayNames(["en"], { type: "language" }).of(code) ?? code.toUpperCase();
+  } catch {
+    return code.toUpperCase();
+  }
+}
+
+// Mirror of commands::parakeet_availability shape.
+export interface ParakeetAvailability {
+  available: boolean;
+  reason: string | null;
+}
+
+// Tolerates the backend command not being registered yet (parallel
+// implementation work) — returns `{ available: false, reason: ... }` so
+// the UI degrades to Whisper-only without throwing.
+export async function parakeetAvailability(): Promise<ParakeetAvailability> {
+  try {
+    return await invoke<ParakeetAvailability>("parakeet_availability");
+  } catch (e) {
+    return { available: false, reason: String(e) };
+  }
 }
 
 export async function onBinaryProgress(

@@ -717,6 +717,38 @@ pub fn apple_fm_availability() -> AppleFmAvailabilityResult {
     }
 }
 
+/// Status of the Parakeet TDT v3 STT engine on this host. The reason
+/// gating is compile-time (cfg!) so the runtime call is just a flag check
+/// — frontends call this once in onboarding / Settings → Models to decide
+/// whether to surface the Parakeet card.
+#[derive(Debug, Serialize)]
+pub struct ParakeetAvailability {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[tauri::command]
+pub async fn parakeet_availability() -> ParakeetAvailability {
+    let available = crate::engines::parakeet_bridge::is_available();
+    if available {
+        return ParakeetAvailability { available: true, reason: None };
+    }
+    let reason = if !cfg!(target_os = "macos") {
+        "macOS only"
+    } else if !cfg!(target_arch = "aarch64") {
+        "requires Apple Silicon"
+    } else if !cfg!(feature = "parakeet") {
+        "Parakeet not compiled into this build"
+    } else {
+        "Parakeet not available on this host"
+    };
+    ParakeetAvailability {
+        available: false,
+        reason: Some(reason.into()),
+    }
+}
+
 #[tauri::command]
 pub fn list_modes<R: Runtime>(app: AppHandle<R>) -> Vec<VoiceMode> {
     modes::list_modes(&app)
