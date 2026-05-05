@@ -407,12 +407,27 @@ impl SessionManager {
             Some(g) => g,
             None => {
                 log::warn!("ignoring hotkey: pipeline still in flight");
-                pill::show(app);
+                // No pill::show here on purpose: the pill is guaranteed
+                // visible because a pipeline is in flight (the busy_gate
+                // cap-1 IS the proof of life). Calling show would fire
+                // the frontend's `pill:show` listener which calls
+                // clearStreaming(), wiping the in-flight polish stream
+                // out from under the user.
                 pill::emit_toast(
                     app,
                     "Still finishing previous".into(),
                     BUSY_TOAST_MS,
                 );
+                // Restore the live pipeline stage on the pill as soon as
+                // the toast plays out. The frontend's toast handler
+                // (Pill.tsx) flips state to "saturated" on toast arrival
+                // and only schedules a clear of the toast MESSAGE — it
+                // never clears the state itself. Without this re-emit
+                // the pill stays stuck on the saturated warning until
+                // the pipeline's next stage transition fires a fresh
+                // pill:state event, which during a long polish run is
+                // typically not until Done.
+                self.schedule_pill_state_restore(app, u64::from(BUSY_TOAST_MS));
                 return BeginOutcome::PipelineBusy;
             }
         };
@@ -577,10 +592,13 @@ impl SessionManager {
             }
         };
 
-        // Disarm Escape grab the moment recording stops; another
-        // session may still be running but its cancel uses the
-        // popover X (no global key grab). The next begin re-arms.
-        crate::hotkey::disarm_cancel(&app);
+        // Escape stays grabbed past the end of recording — the user can
+        // still cancel during the transcribe / polish stages. Disarm is
+        // owned by `PipelineGuard::Drop` (covers success, all error
+        // returns, the silent / too-short / silent-buffer skips, and
+        // both cancel paths via the guard's tail call); `cancel_session`
+        // also disarms eagerly on its foreground branch so the next
+        // hotkey press doesn't have to wait for the pipeline to unwind.
 
         let session = match self.sessions.lock().get(&sid).cloned() {
             Some(s) => s,
@@ -843,6 +861,69 @@ impl SessionManager {
         });
     }
 
+    /// Re-emit the pill owner's CURRENT stage after `ms` ms. Used by the
+    /// `PipelineBusy` branch of `begin` to restore the live pipeline
+    /// stage on the pill once the busy toast clears. Without it the
+    /// frontend's toast handler leaves `state="saturated"` until the
+    /// next pipeline stage transition fires a `pill:state` event —
+    /// which during a long polishing run can be many seconds away, so
+    /// the warning sign visibly outlives the busy event.
+    ///
+    /// The fired stage is read FRESH at fire time, not snapshotted at
+    /// schedule time: if the pipeline has progressed transcribing →
+    /// polishing while the toast was up, we restore to the live stage,
+    /// not the one the user interrupted. Sessions that have already
+    /// reached a terminal state (Done/Error/Canceled) are skipped — the
+    /// terminal emit already painted the right treatment with the right
+    /// message, and re-emitting from here would clobber that message.
+    fn schedule_pill_state_restore<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+        ms: u64,
+    ) {
+        let manager = self.clone();
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            // Hold pill_owner across the read-and-emit span, mirroring
+            // set_stage's pattern (~line 730). Without this, a
+            // concurrent set_stage(Done) for the same session could
+            // interleave between our stage read and our emit, leaving
+            // the frontend painted with a stale "polishing" treatment
+            // on top of a Done that just emitted.
+            let owner_guard = manager.pill_owner.lock();
+            let owner_id = match *owner_guard {
+                Some(id) => id,
+                None => return,
+            };
+            let session = match manager.sessions.lock().get(&owner_id).cloned() {
+                Some(s) => s,
+                None => return,
+            };
+            let stage = session.current_stage();
+            if !should_restore_pill_state(stage) {
+                return;
+            }
+            let warning = *session.warning.lock();
+            let pill_state = match stage {
+                Stage::Listening => PillState::Listening,
+                Stage::Transcribing => PillState::Transcribing,
+                Stage::Polishing => PillState::Polishing,
+                Stage::Done => PillState::Done,
+                Stage::Error => PillState::Error,
+                Stage::Canceled => PillState::Canceled,
+            };
+            let bg = manager
+                .background_count_excluding_pill_owner_locked(Some(owner_id));
+            if warning {
+                pill::emit_state_warning_with_bg(&app_clone, pill_state, None, bg);
+            } else {
+                pill::emit_state_with_bg(&app_clone, pill_state, None, bg);
+            }
+            drop(owner_guard);
+        });
+    }
+
     /// Delayed pill-hide that respects ownership. Sleeps `ms`, then hides
     /// the pill IFF `pill_owner` is `None` or still equal to
     /// `expected_owner`. A newer session that has claimed the pill in
@@ -905,6 +986,15 @@ fn should_hide_pill(owner: Option<SessionId>, expected: SessionId) -> bool {
     owner.is_none() || owner == Some(expected)
 }
 
+/// Predicate used by [`SessionManager::schedule_pill_state_restore`] to
+/// decide whether to re-emit the live stage. Terminal stages already
+/// painted the right treatment (with the right message) when set_stage
+/// fired them; re-emitting from the restore path would clobber that
+/// message with a `None`. Restore only the in-flight stages.
+fn should_restore_pill_state(stage: Stage) -> bool {
+    !matches!(stage, Stage::Done | Stage::Error | Stage::Canceled)
+}
+
 /// Pipeline body. Lifted out of the old `end_recording` async block —
 /// reads everything from the per-session snapshot rather than the
 /// global settings store, so a mid-flight settings change cannot pin
@@ -928,10 +1018,11 @@ async fn run_pipeline(
     struct PipelineGuard {
         finalised: bool,
         session: Arc<SessionState>,
+        app: AppHandle<Wry>,
     }
     impl PipelineGuard {
-        fn new(session: Arc<SessionState>) -> Self {
-            Self { finalised: false, session }
+        fn new(session: Arc<SessionState>, app: AppHandle<Wry>) -> Self {
+            Self { finalised: false, session, app }
         }
         fn finalise(&mut self) {
             self.finalised = true;
@@ -951,9 +1042,17 @@ async fn run_pipeline(
             if let Some(g) = self.session.busy_guard.lock().take() {
                 g.release();
             }
+            // Tear down the OS Escape grab now that the pipeline has
+            // reached a terminal state. Idempotent — cancel_session may
+            // already have called disarm. Doing this here (instead of
+            // in end_recording, where it lived previously) is what lets
+            // Escape interrupt the transcription / polishing stages —
+            // the grab survives from begin() through to pipeline
+            // finalisation.
+            crate::hotkey::disarm_cancel(&self.app);
         }
     }
-    let mut _guard = PipelineGuard::new(session.clone());
+    let mut _guard = PipelineGuard::new(session.clone(), app.clone());
 
     if session.is_canceled() {
         log::info!("session {id} canceled before pipeline ran");
@@ -2034,6 +2133,20 @@ mod tests {
         // Different (newer) owner: a fresh recording has claimed the pill;
         // the stale timer must NOT hide it.
         assert!(!should_hide_pill(Some(next), prev));
+    }
+
+    #[test]
+    fn pill_state_restore_skips_terminal_stages() {
+        // The post-busy-toast restore re-emits the live stage so the
+        // pill drops the saturated/warning treatment. Terminal stages
+        // already painted their own treatment with the right message;
+        // re-emitting from here would clobber it with a None message.
+        assert!(should_restore_pill_state(Stage::Listening));
+        assert!(should_restore_pill_state(Stage::Transcribing));
+        assert!(should_restore_pill_state(Stage::Polishing));
+        assert!(!should_restore_pill_state(Stage::Done));
+        assert!(!should_restore_pill_state(Stage::Error));
+        assert!(!should_restore_pill_state(Stage::Canceled));
     }
 
     #[test]
