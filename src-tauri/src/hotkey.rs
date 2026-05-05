@@ -631,6 +631,10 @@ fn handle_begin(app: &tauri::AppHandle<tauri::Wry>, manager: &Arc<SessionManager
             // begin already emitted the friendly pill error and
             // scheduled an auto-hide.
         }
+        BeginOutcome::PipelineBusy => {
+            // begin already logged a WARN and emitted the busy toast;
+            // the user retries once the pill clears.
+        }
     }
 }
 

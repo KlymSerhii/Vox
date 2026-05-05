@@ -12,7 +12,7 @@
 //! on the clipboard.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -46,7 +46,86 @@ const TERMINAL_LINGER_MS: u64 = 1500;
 /// Toast duration for the saturated state.
 const SATURATED_TOAST_MS: u32 = 1500;
 
+/// Toast duration for the "pipeline still in flight" rejection. Slightly
+/// shorter than the saturation toast — the user is mid-keystroke and we
+/// just want a brief acknowledgement that the press was seen but ignored.
+const BUSY_TOAST_MS: u32 = 1500;
+
 pub type SessionId = u64;
+
+/// Binary admission gate for the dictation pipeline. While a previous
+/// session is still in its post-recording stages (transcribe → polish →
+/// clipboard) a new hotkey press is rejected so the second pipeline
+/// can't double-up on the `WhisperContext` mutex or race the audio
+/// device.
+///
+/// Implemented as `AtomicUsize` rather than `AtomicBool` so the same
+/// type can later be retargeted to a cap-N variant (e.g. when the
+/// shared-state hazards behind the gate get factored out) without
+/// changing the public API. Today only `try_acquire` admits, and it
+/// uses `compare_exchange(0, 1)` — strictly binary. Release happens
+/// via the RAII [`BusyGuard`] on Drop, with an idempotent eager
+/// [`BusyGuard::release`] for cancel and audio-rollback paths.
+#[derive(Clone, Default)]
+pub struct BusyGate {
+    count: Arc<AtomicUsize>,
+}
+
+impl BusyGate {
+    pub fn new() -> Self {
+        Self {
+            count: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Try to take the gate. Returns `Some(BusyGuard)` if the gate was
+    /// idle (count was 0 → 1); returns `None` if a pipeline is already
+    /// in flight. The returned guard decrements on Drop; release is
+    /// idempotent so an explicit release in a cancel path won't
+    /// double-decrement when the guard is later dropped.
+    pub fn try_acquire(&self) -> Option<BusyGuard> {
+        match self.count.compare_exchange(
+            0,
+            1,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) => Some(BusyGuard {
+                count: self.count.clone(),
+                released: AtomicBool::new(false),
+            }),
+            Err(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn in_flight(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+/// RAII handle that decrements the [`BusyGate`] on Drop. Idempotent
+/// `release()` lets the cancel and audio-rollback paths free the gate
+/// promptly without breaking the Drop-side decrement that fires when
+/// the owning `SessionState` is finally dropped.
+pub struct BusyGuard {
+    count: Arc<AtomicUsize>,
+    released: AtomicBool,
+}
+
+impl BusyGuard {
+    pub fn release(&self) {
+        if !self.released.swap(true, Ordering::SeqCst) {
+            self.count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -164,6 +243,17 @@ pub struct SessionState {
     pub streaming_enabled: bool,
     /// Resolved at session start: per-mode override falls back to the global `Settings` value.
     pub enable_thinking: bool,
+    /// RAII handle for the `SessionManager::busy_gate`. Held by the
+    /// session for its entire lifetime; the gate decrements when the
+    /// last `Arc<SessionState>` is dropped (after the spawned
+    /// pipeline task finishes and the terminal-cleanup linger removes
+    /// the session from the manager's map). `cancel_session` and the
+    /// audio-start failure path call `release()` explicitly so the
+    /// next press is accepted promptly without waiting for the
+    /// terminal linger or any pending Arc clones to drain. `release()`
+    /// is idempotent — the eventual Drop is a no-op once it's been
+    /// released early.
+    pub busy_guard: Mutex<Option<BusyGuard>>,
 }
 
 impl SessionState {
@@ -203,6 +293,11 @@ pub enum BeginOutcome {
     DictationDisabled,
     AlreadyRecording,
     AudioError(String),
+    /// A previous session is still in its post-recording pipeline
+    /// (transcribe / polish / clipboard) and a new press would race the
+    /// shared `WhisperContext` mutex. Surface a brief pill toast and
+    /// drop the press; the user retries once the pill clears.
+    PipelineBusy,
 }
 
 pub struct SessionManager {
@@ -223,6 +318,14 @@ pub struct SessionManager {
     /// "Last-finished-wins" still holds — whichever lock acquisition
     /// runs second writes last.
     clipboard_lock: Mutex<()>,
+    /// Single-pipeline admission gate. `try_acquire` is the one
+    /// admission point — a press while a previous pipeline is still
+    /// in its post-recording stages (transcribe / polish / clipboard)
+    /// gets `None` back and surfaces a brief pill toast. Release
+    /// happens via the RAII guard parked on `SessionState::busy_guard`
+    /// (Drop) plus eager `release()` calls in `cancel_session` and the
+    /// audio-rollback branch of `begin`.
+    pub busy_gate: BusyGate,
 }
 
 impl SessionManager {
@@ -235,6 +338,7 @@ impl SessionManager {
             pill_owner: Mutex::new(None),
             max_concurrent: MAX_CONCURRENT_SESSIONS,
             clipboard_lock: Mutex::new(()),
+            busy_gate: BusyGate::new(),
         }
     }
 
@@ -293,9 +397,33 @@ impl SessionManager {
             return BeginOutcome::DictationDisabled;
         }
 
+        // Single-pipeline gate. A press while a previous session is
+        // still running its post-recording stages (transcribe / polish /
+        // clipboard) is rejected with a brief pill toast — without this
+        // the second pipeline would contend for the shared
+        // `WhisperContext` mutex held inside `spawn_blocking`, freezing
+        // the app for the duration of the previous decode.
+        let busy_guard = match self.busy_gate.try_acquire() {
+            Some(g) => g,
+            None => {
+                log::warn!("ignoring hotkey: pipeline still in flight");
+                pill::show(app);
+                pill::emit_toast(
+                    app,
+                    "Still finishing previous".into(),
+                    BUSY_TOAST_MS,
+                );
+                return BeginOutcome::PipelineBusy;
+            }
+        };
+
         // Saturation check: total in-flight (including any active
-        // recording) must be < max_concurrent before we start a new one.
-        // The 4th attempt is rejected.
+        // recording) must be < max_concurrent before we start a new
+        // one. The busy_gate above is cap-1, so this branch is
+        // currently unreachable; it stays as the cap-N saturation
+        // policy so future work that flips the gate to cap-N (after
+        // the shared-state hazards behind it get factored out) doesn't
+        // have to re-derive when to emit the saturated toast.
         {
             let map = self.sessions.lock();
             if map.len() >= self.max_concurrent {
@@ -304,6 +432,7 @@ impl SessionManager {
                     "session: saturated ({in_flight}/{}) — rejecting new session",
                     self.max_concurrent
                 );
+                drop(busy_guard);
                 return BeginOutcome::Saturated { in_flight };
             }
         }
@@ -315,6 +444,7 @@ impl SessionManager {
         let mut active = self.active_recording.lock();
         if active.is_some() {
             log::debug!("begin called while a recording is already active; ignored");
+            drop(busy_guard);
             return BeginOutcome::AlreadyRecording;
         }
 
@@ -363,6 +493,7 @@ impl SessionManager {
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: settings::load(app).streaming_pill_enabled,
             enable_thinking,
+            busy_guard: Mutex::new(Some(busy_guard)),
         });
 
         // Insert into map BEFORE starting audio so the saturation
@@ -398,8 +529,12 @@ impl SessionManager {
 
         if let Err(e) = self.audio.start() {
             log::error!("failed to start audio: {e}");
-            // Roll back: remove session, clear active_recording, and
-            // tear down the cancel grab so Escape works in other apps.
+            // Roll back: release the busy gate, remove session, clear
+            // active_recording, and tear down the cancel grab so Escape
+            // works in other apps.
+            if let Some(g) = session.busy_guard.lock().take() {
+                g.release();
+            }
             self.sessions.lock().remove(&new_sid);
             *self.active_recording.lock() = None;
             // Roll back pill ownership too if it's still pointing at
@@ -417,8 +552,7 @@ impl SessionManager {
                 PillState::Error,
                 Some("No mic access — grant in System Settings.".into()),
             );
-            let app_arc = Arc::new(app.clone());
-            pill::hide_after(&app_arc, 3000);
+            self.schedule_pill_hide_unless_taken(app, new_sid, 3000);
             emit_sessions_changed(app, self);
             return BeginOutcome::AudioError(e.to_string());
         }
@@ -517,6 +651,12 @@ impl SessionManager {
             }
         };
         session.cancel.store(true, Ordering::SeqCst);
+        // Release the busy gate immediately so the next press is
+        // accepted promptly. Idempotent — the SessionState's eventual
+        // Drop is a no-op once released.
+        if let Some(g) = session.busy_guard.lock().take() {
+            g.release();
+        }
 
         // If this is the foreground recording, tear down the audio
         // capture and the Escape grab. The pipeline task picks up the
@@ -538,8 +678,7 @@ impl SessionManager {
             // Snap the pill back to compact in case streaming widened it.
             pill::set_wide(app, false);
             pill::emit_state(app, PillState::Canceled, None);
-            let app_arc = Arc::new(app.clone());
-            pill::hide_after(&app_arc, 600);
+            self.schedule_pill_hide_unless_taken(app, id, 600);
         }
 
         self.set_stage(app, id, Stage::Canceled, None, false);
@@ -704,6 +843,38 @@ impl SessionManager {
         });
     }
 
+    /// Delayed pill-hide that respects ownership. Sleeps `ms`, then hides
+    /// the pill IFF `pill_owner` is `None` or still equal to
+    /// `expected_owner`. A newer session that has claimed the pill in
+    /// the meantime is left alone — its own pipeline tail will hide the
+    /// pill when it's done. Replaces the previous unconditional
+    /// `pill::hide` schedules everywhere a fresh recording can
+    /// legitimately race the linger window; without this guard the
+    /// previous session's stale timer hides the pill the user just
+    /// brought up by pressing the hotkey again.
+    fn schedule_pill_hide_unless_taken<R: Runtime>(
+        self: &Arc<Self>,
+        app: &AppHandle<R>,
+        expected_owner: SessionId,
+        ms: u64,
+    ) {
+        let manager = self.clone();
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            // Bounded race: a `begin()` that lands between the lock
+            // release here and the `pill::hide` below would lose its
+            // pill briefly, but that begin's own `pill::show` +
+            // `emit_state(Listening)` re-asserts within the next event
+            // loop tick. Holding the lock across `pill::hide` is worse
+            // (`app.emit_to` does real work).
+            let owner = *manager.pill_owner.lock();
+            if should_hide_pill(owner, expected_owner) {
+                pill::hide(&app_clone);
+            }
+        });
+    }
+
     /// Last-finished-wins clipboard write, serialised across pipelines.
     pub fn write_clipboard<R: Runtime>(
         self: &Arc<Self>,
@@ -724,6 +895,14 @@ impl SessionManager {
 fn emit_sessions_changed<R: Runtime>(app: &AppHandle<R>, manager: &SessionManager) {
     let snap = manager.snapshot();
     let _ = app.emit("sessions:changed", &snap);
+}
+
+/// Owner-check predicate used by [`SessionManager::schedule_pill_hide_unless_taken`].
+/// Hide the pill only when no one owns it, or when the previous owner
+/// (the one who scheduled the hide) is still the owner — never trample
+/// a newer session that has already claimed the pill.
+fn should_hide_pill(owner: Option<SessionId>, expected: SessionId) -> bool {
+    owner.is_none() || owner == Some(expected)
 }
 
 /// Pipeline body. Lifted out of the old `end_recording` async block —
@@ -763,6 +942,15 @@ async fn run_pipeline(
             // Idempotent — set_stage's terminal-state path may have
             // already marked completion. Either order is fine.
             self.session.mark_completed();
+            // Release the busy gate on every pipeline exit path
+            // (success, STT error, polish error, cancel). Idempotent —
+            // cancel_session and the audio-rollback path may have
+            // already released it. Done before the Arc<SessionState>
+            // drops at end of scope so the next hotkey press is
+            // accepted with no extra latency.
+            if let Some(g) = self.session.busy_guard.lock().take() {
+                g.release();
+            }
         }
     }
     let mut _guard = PipelineGuard::new(session.clone());
@@ -1204,9 +1392,8 @@ async fn run_pipeline(
     // captured up at the start of run_pipeline is the right anchor —
     // foreground_id() has been None ever since end_recording cleared it.
     if owns_pill {
-        let app_arc = Arc::new(app.clone());
         let hide_ms = if warning_flag { 3500 } else { 1800 };
-        pill::hide_after(&app_arc, hide_ms);
+        manager.schedule_pill_hide_unless_taken(&app, id, hide_ms);
     }
 
     _guard.finalise();
@@ -1629,6 +1816,7 @@ mod tests {
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: false,
             enable_thinking: false,
+            busy_guard: Mutex::new(None),
         })
     }
 
@@ -1829,6 +2017,26 @@ mod tests {
     }
 
     #[test]
+    fn pill_hide_yields_to_newer_owner() {
+        // The owner-check predicate that gates schedule_pill_hide_unless_taken's
+        // delayed hide. A stale timer scheduled by the previous session must
+        // not hide the pill once a newer session has claimed ownership.
+        let prev: SessionId = 1;
+        let next: SessionId = 2;
+
+        // No owner: the previous session's timer is the only one in flight,
+        // so hiding is safe.
+        assert!(should_hide_pill(None, prev));
+
+        // Same owner: previous session is still the rightful owner — hide.
+        assert!(should_hide_pill(Some(prev), prev));
+
+        // Different (newer) owner: a fresh recording has claimed the pill;
+        // the stale timer must NOT hide it.
+        assert!(!should_hide_pill(Some(next), prev));
+    }
+
+    #[test]
     fn max_record_guard_drops_after_session_complete() {
         // The max-record guard captures Arc<SessionState>; without
         // the completion-Notify wakeup it would hold the Arc for the
@@ -1878,6 +2086,117 @@ mod tests {
             Arc::strong_count(&session),
             strong_before,
             "guard task must drop its Arc<SessionState> when completion fires"
+        );
+    }
+
+    #[test]
+    fn busy_gate_acquire_blocks_second_attempt() {
+        // Gate starts idle: first acquire succeeds, second is rejected.
+        // Dropping the first guard returns the gate to idle so the next
+        // acquire succeeds again. Explicit release() before drop is a
+        // no-op on the second invocation (idempotency check).
+        let gate = BusyGate::new();
+        assert_eq!(gate.in_flight(), 0);
+
+        let g1 = gate.try_acquire().expect("first acquire must succeed");
+        assert_eq!(gate.in_flight(), 1);
+
+        assert!(
+            gate.try_acquire().is_none(),
+            "second acquire while first is held must return None"
+        );
+        assert_eq!(
+            gate.in_flight(),
+            1,
+            "rejected acquire must not bump the counter"
+        );
+
+        // Explicit release before Drop — gate goes back to idle.
+        g1.release();
+        assert_eq!(gate.in_flight(), 0);
+
+        // Drop the (already-released) guard: still idempotent, count
+        // doesn't underflow.
+        drop(g1);
+        assert_eq!(gate.in_flight(), 0);
+
+        // Next acquire works.
+        let g2 = gate.try_acquire().expect("post-release acquire must succeed");
+        drop(g2);
+        assert_eq!(gate.in_flight(), 0);
+    }
+
+    #[test]
+    fn busy_gate_drop_decrements() {
+        // The Drop side of the RAII pattern releases the gate when the
+        // guard is dropped without an explicit release. Used by the
+        // success-path PipelineGuard at the tail of run_pipeline.
+        let gate = BusyGate::new();
+        {
+            let _g = gate.try_acquire().expect("acquire");
+            assert_eq!(gate.in_flight(), 1);
+            assert!(gate.try_acquire().is_none());
+        }
+        assert_eq!(
+            gate.in_flight(),
+            0,
+            "guard's Drop must decrement the gate"
+        );
+        assert!(gate.try_acquire().is_some(), "gate must accept after drop");
+    }
+
+    #[test]
+    fn manager_busy_gate_rejects_concurrent_acquire() {
+        // Lifecycle test on the manager-owned gate: catches the
+        // regression where a future refactor forgets to wire
+        // busy_guard into SessionState (the gate would never get
+        // populated) or adds an early-return between gate-acquire and
+        // SessionState construction without dropping the guard (the
+        // gate would stay locked forever and every subsequent press
+        // would be rejected).
+        let mgr = fresh_manager();
+        assert_eq!(mgr.busy_gate.in_flight(), 0);
+
+        // First acquire admits.
+        let g1 = mgr
+            .busy_gate
+            .try_acquire()
+            .expect("first manager-gate acquire must succeed on idle gate");
+        assert_eq!(mgr.busy_gate.in_flight(), 1);
+
+        // Concurrent acquire is rejected and does not bump the counter.
+        assert!(
+            mgr.busy_gate.try_acquire().is_none(),
+            "concurrent acquire on the manager's busy_gate must return None"
+        );
+        assert_eq!(
+            mgr.busy_gate.in_flight(),
+            1,
+            "rejected acquire must not bump the counter"
+        );
+
+        // Eager release (mirrors the cancel_session / audio-rollback
+        // path) frees the gate without waiting for Drop.
+        g1.release();
+        assert_eq!(mgr.busy_gate.in_flight(), 0);
+        let g2 = mgr
+            .busy_gate
+            .try_acquire()
+            .expect("post-release acquire must succeed");
+        assert_eq!(mgr.busy_gate.in_flight(), 1);
+
+        // Drop-only release: leaving scope without an explicit
+        // release() must also return the gate to idle (the
+        // success-path PipelineGuard relies on this).
+        drop(g2);
+        assert_eq!(
+            mgr.busy_gate.in_flight(),
+            0,
+            "guard's Drop must decrement the manager's busy_gate"
+        );
+        assert!(
+            mgr.busy_gate.try_acquire().is_some(),
+            "manager's gate must admit again after the previous guard was dropped"
         );
     }
 

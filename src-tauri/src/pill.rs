@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -204,17 +203,16 @@ fn emit_state_inner<R: Runtime>(
     crate::tray_icon::set_state(app, tray_state);
 }
 
-/// Emit a transient toast on the pill window. The frontend listens
-/// for `pill:toast`, displays the message for `ms`, then expects the
-/// caller to hide the pill (or the pill auto-hides via `hide_after`).
+/// Emit a transient toast on the pill window. The frontend reverts the
+/// visible toast text after `ms`; the pill window itself stays visible —
+/// the in-flight pipeline owns the lifetime of the window. Callers that
+/// need an unconditional auto-hide must schedule it themselves.
 pub fn emit_toast<R: Runtime>(app: &AppHandle<R>, message: String, ms: u32) {
     let payload = PillToastPayload {
         message: message.clone(),
         ms,
     };
     let _ = app.emit_to(LABEL, "pill:toast", payload);
-    // Schedule auto-hide so the toast isn't sticky.
-    hide_after_ms(app, ms.into());
 }
 
 pub fn emit_audio_level<R: Runtime>(app: &AppHandle<R>, level: f32) {
@@ -439,25 +437,6 @@ pub fn emit_mode_suggestion<R: Runtime>(
         icon: m.icon,
     });
     let _ = app.emit_to(LABEL, "pill:mode_suggestion", payload);
-}
-
-pub fn hide_after<R: Runtime>(app: &Arc<AppHandle<R>>, ms: u64) {
-    let app_clone = Arc::clone(app);
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-        hide(&app_clone);
-    });
-}
-
-/// Convenience that takes the AppHandle by value and clones the
-/// underlying handle internally — saves the caller a `Arc::new` wrap
-/// for one-off auto-hide schedules.
-pub fn hide_after_ms<R: Runtime>(app: &AppHandle<R>, ms: u64) {
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(ms)).await;
-        hide(&app_clone);
-    });
 }
 
 fn reposition<R: Runtime>(win: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
