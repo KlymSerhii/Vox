@@ -693,11 +693,21 @@ impl SessionManager {
             // Drain the audio buffer so cpal's input stream is freed.
             let _ = self.audio.stop_and_encode();
             crate::hotkey::disarm_cancel(app);
-            // Snap the pill back to compact in case streaming widened it.
-            pill::set_wide(app, false);
-            pill::emit_state(app, PillState::Canceled, None);
-            self.schedule_pill_hide_unless_taken(app, id, 600);
         }
+
+        // Pill cleanup runs for both foreground (cancel during recording)
+        // and background (cancel during transcribe / polish) cancels so
+        // the pill always disappears a beat after Escape. Without the
+        // hide schedule on the non-foreground path, the Canceled label
+        // stayed on screen indefinitely — the pipeline's own cancel
+        // branch paints the label and clears pill_owner, but nothing
+        // schedules the OS window hide. set_wide(false) is also moved
+        // out so a streaming-wide polish snaps to compact in the same
+        // tick the Canceled label is painted, instead of waiting ~50 ms
+        // for the pipeline's wait_for_cancel poll to fire.
+        pill::set_wide(app, false);
+        pill::emit_state(app, PillState::Canceled, None);
+        self.schedule_pill_hide_unless_taken(app, id, 600);
 
         self.set_stage(app, id, Stage::Canceled, None, false);
     }
