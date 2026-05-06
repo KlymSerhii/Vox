@@ -4,6 +4,16 @@
 //! `apple_fm_bridge`, which uses `LanguageModelSession` from
 //! Apple's `FoundationModels` framework.
 //!
+//! Session lifecycle: `LanguageModelSession` instances are reused
+//! across calls inside the Swift `SessionCache` actor (see
+//! `swift/AppleFmBridge.swift`), keyed on system-prompt string and
+//! capped at 4 entries with LRU eviction. A session whose call errored
+//! or was cancelled by timeout is evicted before the next caller wakes
+//! so we never inherit a corrupted transcript history. The Rust side
+//! is intentionally stateless w.r.t. session reuse — every `cleanup`
+//! / `cleanup_stream` invocation goes through the bridge, and the
+//! actor handles the cache key match.
+//!
 //! Failure modes that fall back to the raw transcript via the existing
 //! `session.rs` fail-open path:
 //! - macOS < 26 (`OsTooOld`)

@@ -49,15 +49,23 @@ fn av_media_type_audio() -> *const AnyObject {
     unsafe { AVMediaTypeAudio }
 }
 
-fn av_capture_device_class() -> &'static AnyClass {
-    AnyClass::get(c"AVCaptureDevice").expect("AVCaptureDevice class missing")
+fn av_capture_device_class() -> Option<&'static AnyClass> {
+    AnyClass::get(c"AVCaptureDevice")
 }
 
 /// Non-prompting status check. Safe to call repeatedly.
+///
+/// Returns `Restricted` (the most conservative non-granted state) if the
+/// `AVCaptureDevice` class can't be looked up — the probe is hot-path
+/// (tray icon, onboarding poller) and must never panic.
 pub fn authorization_status() -> MicAuthStatus {
+    let Some(cls) = av_capture_device_class() else {
+        log::warn!("mac_perm: AVCaptureDevice class missing — falling back to Restricted");
+        return MicAuthStatus::Restricted;
+    };
     // SAFETY: class method returning `AVAuthorizationStatus` (NSInteger).
     let raw: i64 = unsafe {
-        msg_send![av_capture_device_class(), authorizationStatusForMediaType: av_media_type_audio()]
+        msg_send![cls, authorizationStatusForMediaType: av_media_type_audio()]
     };
     MicAuthStatus::from_raw(raw)
 }
@@ -81,11 +89,19 @@ pub fn request_access_blocking() -> bool {
         }
     });
 
+    let Some(cls) = av_capture_device_class() else {
+        log::warn!(
+            "mac_perm: AVCaptureDevice class missing during request_access_blocking — \
+             treating as denied"
+        );
+        return false;
+    };
+
     // SAFETY: `+requestAccessForMediaType:completionHandler:` takes an
     // `AVMediaType` (NSString *) and a `void (^)(BOOL)` block.
     unsafe {
         let _: () = msg_send![
-            av_capture_device_class(),
+            cls,
             requestAccessForMediaType: av_media_type_audio(),
             completionHandler: &*handler,
         ];

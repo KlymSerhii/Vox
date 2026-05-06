@@ -1,5 +1,6 @@
 import {
   createMemo,
+  createResource,
   createSignal,
   For,
   type JSX,
@@ -21,10 +22,12 @@ import {
   duplicateMode,
   exportMode,
   getActiveHotkey,
+  getAppVersion,
   getLaunchAtLogin,
   getSettings,
   importModeJson,
   inferenceServerStatus,
+  languageDisplayName,
   listModels,
   listModes,
   onBinaryCanceled,
@@ -37,6 +40,7 @@ import {
   onModelProgress,
   onSettingsChanged,
   openAccessibilitySettings,
+  PARAKEET_SUPPORTED_LANGUAGES,
   parakeetAvailability,
   parakeetSupportsLanguage,
   replayOnboarding,
@@ -156,18 +160,21 @@ const CASE_OPTIONS: { value: CaseStyle; label: string }[] = [
   { value: "AsSpoken", label: "As spoken" },
 ];
 
+// Common languages that aren't in Parakeet's 25-language set. Mirrors
+// `NON_PARAKEET_COMMON` in Onboarding.tsx so both surfaces offer the
+// same coverage.
+const NON_PARAKEET_COMMON: readonly string[] = [
+  "zh", "ja", "ko", "ar", "hi", "tr", "vi", "th",
+] as const;
+
 const LANGUAGE_OPTIONS: { value: string; label: string }[] = [
   { value: "auto", label: "Auto (detect)" },
-  { value: "en", label: "English" },
-  { value: "es", label: "Spanish" },
-  { value: "fr", label: "French" },
-  { value: "de", label: "German" },
-  { value: "it", label: "Italian" },
-  { value: "pt", label: "Portuguese" },
-  { value: "ja", label: "Japanese" },
-  { value: "zh", label: "Chinese" },
-  { value: "ru", label: "Russian" },
-  { value: "ar", label: "Arabic" },
+  ...[
+    ...PARAKEET_SUPPORTED_LANGUAGES,
+    ...NON_PARAKEET_COMMON,
+  ]
+    .map((code) => ({ value: code, label: `${languageDisplayName(code)} (${code})` }))
+    .sort((a, b) => a.label.localeCompare(b.label)),
 ];
 
 export default function SettingsView() {
@@ -269,6 +276,7 @@ function Loader() {
 }
 
 function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
+  const [version] = createResource(() => getAppVersion());
   return (
     <aside
       class="flex h-full w-[208px] flex-col border-r border-[var(--color-border)] px-3 pt-5 pb-3"
@@ -321,7 +329,7 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
         </For>
       </nav>
       <div class="mt-auto flex items-center justify-between px-2 text-[10px] text-[var(--color-ink-faint)]">
-        <span>Vox 1.0.0</span>
+        <span>Vox {version() ?? "—"}</span>
         <span
           class="rounded-full bg-[var(--color-success)]/15 px-1.5 py-[1px] text-[9px] font-medium uppercase tracking-[0.08em] text-[var(--color-success)]"
           title="Audio and transcripts never leave this Mac."
@@ -646,7 +654,7 @@ function GeneralTab(props: {
       <Card>
         <Row
           label="Spoken language"
-          hint="Whisper detects automatically when set to Auto."
+          hint={`${friendlySttEngineName(props.s.stt_engine)} detects the language automatically when set to Auto.`}
         >
           <select
             class="rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
@@ -760,7 +768,6 @@ function HotkeysTab(props: {
   });
 
   async function onTest() {
-    setTestStatus("Reading…");
     try {
       const a = await getActiveHotkey();
       if (!a.bound) {
@@ -821,8 +828,6 @@ function HotkeysTab(props: {
                     testStatus()?.startsWith("Bound") ?? false,
                   "text-[var(--color-danger)]":
                     testStatus()?.startsWith("Failed") ?? false,
-                  "text-[var(--color-ink-mute)]":
-                    testStatus() === "Reading…",
                 }}
               >
                 {testStatus()}
@@ -853,9 +858,9 @@ function HotkeysTab(props: {
         />
       </Card>
       <p class="text-[11px] text-[var(--color-ink-mute)]">
-        Changes take effect after the app restarts. If the configured key
-        fails to bind on macOS, Vox falls back to the next compatible
-        shortcut and shows it under the picker.
+        Changes apply immediately. If the configured key fails to bind on
+        macOS, Vox falls back to the next compatible shortcut and shows
+        it under the picker.
       </p>
     </>
   );
@@ -988,6 +993,12 @@ function isModifierOnlySpec(spec: string | null | undefined): boolean {
     "Shift",
   ]);
   return tokens.every((t) => MODS.has(t));
+}
+
+function friendlySttEngineName(engine: string): string {
+  if (engine === "parakeet-local") return "Parakeet";
+  if (engine === "whisper-local") return "Whisper";
+  return "The active engine";
 }
 
 function pttHint(
@@ -1550,17 +1561,13 @@ function AppleFmEngineRow(props: {
             </p>
           </Show>
         </div>
-        <div class="flex shrink-0 flex-col gap-1">
+        <div class="flex shrink-0 flex-col items-end gap-1">
           <Show
             when={!props.isActive}
             fallback={
-              <button
-                type="button"
-                disabled
-                class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] disabled:cursor-default"
-              >
-                In use
-              </button>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Active
+              </span>
             }
           >
             <button
@@ -1576,7 +1583,7 @@ function AppleFmEngineRow(props: {
             <button
               type="button"
               onClick={props.onRefresh}
-              class="rounded-[8px] bg-transparent px-3 py-1 text-[10px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+              class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] font-medium text-[var(--color-ink)] hover:bg-[var(--color-control-hover)]"
             >
               Re-check
             </button>
@@ -1610,13 +1617,9 @@ function GemmaEngineRow(props: { isActive: boolean; onUse: () => void }) {
           <Show
             when={!props.isActive}
             fallback={
-              <button
-                type="button"
-                disabled
-                class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] disabled:cursor-default"
-              >
-                In use
-              </button>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Active
+              </span>
             }
           >
             <button
@@ -1712,10 +1715,22 @@ function InferenceServerSection() {
     }
   }
 
+  // Inline two-step confirm. `window.confirm` is a silent no-op in
+  // Tauri's WKWebView so we render a Confirm/Cancel pair on the row
+  // instead.
+  const [reinstallConfirming, setReinstallConfirming] = createSignal(false);
+  let reinstallTimer: ReturnType<typeof setTimeout> | undefined;
+  function armReinstallConfirm() {
+    setReinstallConfirming(true);
+    if (reinstallTimer) clearTimeout(reinstallTimer);
+    reinstallTimer = setTimeout(() => setReinstallConfirming(false), 5000);
+  }
+  function cancelReinstallConfirm() {
+    setReinstallConfirming(false);
+    if (reinstallTimer) clearTimeout(reinstallTimer);
+  }
   async function reinstall() {
-    if (!confirm("Reinstall the inference engine? This stops the running server and re-downloads the binary.")) {
-      return;
-    }
+    cancelReinstallConfirm();
     try {
       await deleteInferenceServer();
       await refresh();
@@ -1725,6 +1740,9 @@ function InferenceServerSection() {
       setErr(String(e));
     }
   }
+  onCleanup(() => {
+    if (reinstallTimer) clearTimeout(reinstallTimer);
+  });
 
   async function restart() {
     try {
@@ -1746,7 +1764,11 @@ function InferenceServerSection() {
       />
       <Card>
         <Row
-          label={`llama-server ${version()}`}
+          label={
+            version()
+              ? `llama-server (llama.cpp build ${version()})`
+              : "llama-server"
+          }
           hint={
             installed()
               ? "Pre-built, sandboxed inference subprocess. Crashes here can't take down Vox."
@@ -1764,7 +1786,7 @@ function InferenceServerSection() {
                 Install
               </button>
             </Show>
-            <Show when={installed() && !downloading()}>
+            <Show when={installed() && !downloading() && !reinstallConfirming()}>
               <button
                 type="button"
                 class="rounded-[6px] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
@@ -1776,7 +1798,26 @@ function InferenceServerSection() {
               <button
                 type="button"
                 class="rounded-[6px] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
-                onClick={reinstall}
+                onClick={armReinstallConfirm}
+              >
+                Reinstall
+              </button>
+            </Show>
+            <Show when={installed() && !downloading() && reinstallConfirming()}>
+              <span class="text-[11px] text-[var(--color-ink-mute)]">
+                Reinstall? Re-downloads the binary.
+              </span>
+              <button
+                type="button"
+                class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
+                onClick={cancelReinstallConfirm}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                class="rounded-[6px] bg-[var(--color-danger)] px-3 py-1 text-[11px] font-medium text-white hover:brightness-110"
+                onClick={() => void reinstall()}
               >
                 Reinstall
               </button>
@@ -1922,7 +1963,7 @@ function ModelRow(props: {
           </Show>
           <Show when={props.m.installed && confirming()}>
             <span class="text-[11px] text-[var(--color-ink-mute)]">
-              Free ~{sizeMb()} MB?
+              Free ~{formatBytes(props.m.descriptor.size_bytes)}?
             </span>
             <button
               type="button"
@@ -1975,6 +2016,41 @@ function ModesTab(props: {
   const [modes, setModes] = createSignal<VoiceMode[]>([]);
   const [editing, setEditing] = createSignal<VoiceMode | null>(null);
   const [importErr, setImportErr] = createSignal<string | null>(null);
+  const [resetMsg, setResetMsg] = createSignal<string | null>(null);
+  const [saveErr, setSaveErr] = createSignal<string | null>(null);
+  // Inline two-step confirm states. `confirmDeleteId` is the row that's
+  // armed for delete; `confirmReset` arms the reset-to-defaults button.
+  // `window.confirm` is a silent no-op in Tauri's WKWebView, so we
+  // can't depend on it — replace with these inline flags + 5s
+  // auto-revert.
+  const [confirmDeleteId, setConfirmDeleteId] = createSignal<string | null>(
+    null,
+  );
+  const [confirmReset, setConfirmReset] = createSignal(false);
+  let confirmDeleteTimer: ReturnType<typeof setTimeout> | undefined;
+  let confirmResetTimer: ReturnType<typeof setTimeout> | undefined;
+  function armDeleteConfirm(id: string) {
+    setConfirmDeleteId(id);
+    if (confirmDeleteTimer) clearTimeout(confirmDeleteTimer);
+    confirmDeleteTimer = setTimeout(() => setConfirmDeleteId(null), 5000);
+  }
+  function cancelDeleteConfirm() {
+    setConfirmDeleteId(null);
+    if (confirmDeleteTimer) clearTimeout(confirmDeleteTimer);
+  }
+  function armResetConfirm() {
+    setConfirmReset(true);
+    if (confirmResetTimer) clearTimeout(confirmResetTimer);
+    confirmResetTimer = setTimeout(() => setConfirmReset(false), 5000);
+  }
+  function cancelResetConfirm() {
+    setConfirmReset(false);
+    if (confirmResetTimer) clearTimeout(confirmResetTimer);
+  }
+  onCleanup(() => {
+    if (confirmDeleteTimer) clearTimeout(confirmDeleteTimer);
+    if (confirmResetTimer) clearTimeout(confirmResetTimer);
+  });
   let fileInput: HTMLInputElement | undefined;
 
   async function refresh() {
@@ -2038,7 +2114,7 @@ function ModesTab(props: {
   }
 
   async function onDelete(id: string) {
-    if (!confirm("Delete this mode? This cannot be undone.")) return;
+    cancelDeleteConfirm();
     try {
       await deleteMode(id);
       await refresh();
@@ -2066,10 +2142,18 @@ function ModesTab(props: {
   }
 
   async function onReset() {
+    cancelResetConfirm();
+    setResetMsg(null);
     try {
       const n = await resetDefaultModes();
       await refresh();
-      if (n === 0) alert("All defaults are already present.");
+      if (n === 0) {
+        setResetMsg("All defaults are already present.");
+        setTimeout(() => setResetMsg(null), 4000);
+      } else {
+        setResetMsg(`Restored ${n} default mode${n === 1 ? "" : "s"}.`);
+        setTimeout(() => setResetMsg(null), 4000);
+      }
     } catch (e) {
       console.error("reset:", e);
     }
@@ -2105,14 +2189,23 @@ function ModesTab(props: {
         .replace(/(^-|-$)/g, "");
       if (!id) id = `mode-${Date.now()}`;
     }
-    const toSave: VoiceMode = { ...mode, id };
+    // Strip trigger rows where every field is blank — those are
+    // half-filled drafts, not real triggers.
+    const cleanedTriggers = mode.auto_triggers.filter((t) => {
+      const bundle = (t.bundle_id_glob ?? "").trim();
+      const title = (t.window_title_substring ?? "").trim();
+      return bundle.length > 0 || title.length > 0;
+    });
+    const toSave: VoiceMode = { ...mode, id, auto_triggers: cleanedTriggers };
     try {
       await saveMode(toSave);
       await refresh();
       setEditing(null);
     } catch (e) {
       console.error("save mode:", e);
-      alert(`Save failed: ${e}`);
+      // Surface the error inline rather than via window.alert (no-op in
+      // WKWebView). The editor stays open so the user can adjust + retry.
+      setSaveErr(String(e));
     }
   }
 
@@ -2151,10 +2244,13 @@ function ModesTab(props: {
           <ModeRow
             m={m}
             isActive={m.id === props.s.active_mode_id}
+            confirmingDelete={confirmDeleteId() === m.id}
             onActivate={() => onActivate(m.id)}
             onEdit={() => setEditing(m)}
             onDuplicate={() => onDuplicate(m.id)}
-            onDelete={() => onDelete(m.id)}
+            onArmDelete={() => armDeleteConfirm(m.id)}
+            onCancelDelete={cancelDeleteConfirm}
+            onConfirmDelete={() => onDelete(m.id)}
             onExport={() => onExport(m)}
           />
         )}
@@ -2175,13 +2271,38 @@ function ModesTab(props: {
         >
           Import .voxmode
         </button>
-        <button
-          type="button"
-          onClick={onReset}
-          class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
+        <Show
+          when={!confirmReset()}
+          fallback={
+            <>
+              <span class="self-center text-[11px] text-[var(--color-ink-mute)]">
+                Restore built-in modes?
+              </span>
+              <button
+                type="button"
+                onClick={cancelResetConfirm}
+                class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={onReset}
+                class="rounded-[6px] bg-[var(--color-danger)] px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"
+              >
+                Reset
+              </button>
+            </>
+          }
         >
-          Reset to defaults
-        </button>
+          <button
+            type="button"
+            onClick={armResetConfirm}
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
+          >
+            Reset to defaults
+          </button>
+        </Show>
         <input
           ref={fileInput}
           type="file"
@@ -2190,6 +2311,9 @@ function ModesTab(props: {
           onChange={onFilePick}
         />
       </div>
+      <Show when={resetMsg()}>
+        <p class="mt-2 text-[11px] text-[var(--color-ink-mute)]">{resetMsg()}</p>
+      </Show>
       <p class="mt-3 text-[11px] text-[var(--color-ink-mute)]">
         Drag a <code class="text-[var(--color-ink)]">.voxmode</code> file
         anywhere on this tab to import. Built-in modes can't be edited
@@ -2201,8 +2325,15 @@ function ModesTab(props: {
           <ModeEditor
             mode={m()}
             llmEngine={props.s.llm_engine}
-            onCancel={() => setEditing(null)}
-            onSave={onSaveDraft}
+            saveError={saveErr()}
+            onCancel={() => {
+              setSaveErr(null);
+              setEditing(null);
+            }}
+            onSave={(mode) => {
+              setSaveErr(null);
+              return onSaveDraft(mode);
+            }}
           />
         )}
       </Show>
@@ -2213,10 +2344,13 @@ function ModesTab(props: {
 function ModeRow(props: {
   m: VoiceMode;
   isActive: boolean;
+  confirmingDelete: boolean;
   onActivate: () => void;
   onEdit: () => void;
   onDuplicate: () => void;
-  onDelete: () => void;
+  onArmDelete: () => void;
+  onCancelDelete: () => void;
+  onConfirmDelete: () => void;
   onExport: () => void;
 }) {
   return (
@@ -2249,7 +2383,7 @@ function ModeRow(props: {
           </div>
         </div>
         <div class="flex shrink-0 items-center gap-1.5">
-          <Show when={!props.isActive}>
+          <Show when={!props.isActive && !props.confirmingDelete}>
             <button
               type="button"
               class="rounded-[6px] bg-[var(--color-accent)]/80 px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent)]"
@@ -2258,7 +2392,7 @@ function ModeRow(props: {
               Use
             </button>
           </Show>
-          <Show when={props.m.built_in}>
+          <Show when={props.m.built_in && !props.confirmingDelete}>
             <button
               type="button"
               class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
@@ -2268,7 +2402,7 @@ function ModeRow(props: {
               Duplicate
             </button>
           </Show>
-          <Show when={!props.m.built_in}>
+          <Show when={!props.m.built_in && !props.confirmingDelete}>
             <button
               type="button"
               class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
@@ -2279,8 +2413,27 @@ function ModeRow(props: {
             <ModeOverflowMenu
               onExport={props.onExport}
               onDuplicate={props.onDuplicate}
-              onDelete={props.onDelete}
+              onDelete={props.onArmDelete}
             />
+          </Show>
+          <Show when={props.confirmingDelete}>
+            <span class="text-[11px] text-[var(--color-ink-mute)]">
+              Delete this mode?
+            </span>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
+              onClick={props.onCancelDelete}
+            >
+              Keep
+            </button>
+            <button
+              type="button"
+              class="rounded-[6px] bg-[var(--color-danger)] px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110"
+              onClick={props.onConfirmDelete}
+            >
+              Delete
+            </button>
           </Show>
         </div>
       </div>
@@ -2390,11 +2543,18 @@ function MenuItem(props: {
 function ModeEditor(props: {
   mode: VoiceMode;
   llmEngine: string;
+  saveError: string | null;
   onCancel: () => void;
   onSave: (m: VoiceMode) => void;
 }) {
   const [draft, setDraft] = createSignal<VoiceMode>({ ...props.mode });
   const [dictDraft, setDictDraft] = createSignal("");
+  // Toggled true on a save attempt with an empty required field so the
+  // inline error renders without flashing on every keystroke.
+  const [showValidation, setShowValidation] = createSignal(false);
+  const nameInvalid = () => draft().name.trim().length === 0;
+  const promptInvalid = () => draft().system_prompt.trim().length === 0;
+  const canSave = () => !nameInvalid() && !promptInvalid();
 
   function patch(partial: Partial<VoiceMode>) {
     setDraft({ ...draft(), ...partial });
@@ -2467,12 +2627,23 @@ function ModeEditor(props: {
         <div class="flex-1 overflow-y-auto scrollbar-thin px-4 py-4">
           <Card>
             <Row label="Name">
-              <input
-                type="text"
-                class="w-48 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-                value={draft().name}
-                onInput={(e) => patch({ name: e.currentTarget.value })}
-              />
+              <div class="flex flex-col items-end gap-1">
+                <input
+                  type="text"
+                  class="w-48 rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                  classList={{
+                    "ring-[var(--color-danger)]":
+                      showValidation() && nameInvalid(),
+                  }}
+                  value={draft().name}
+                  onInput={(e) => patch({ name: e.currentTarget.value })}
+                />
+                <Show when={showValidation() && nameInvalid()}>
+                  <span class="text-[11px] text-[var(--color-danger)]">
+                    Name can't be empty.
+                  </span>
+                </Show>
+              </div>
             </Row>
             <Row label="Icon (emoji or text)">
               <input
@@ -2497,14 +2668,22 @@ function ModeEditor(props: {
               <div class="mb-1 text-[12px] font-medium">System prompt</div>
               <textarea
                 class="h-48 w-full rounded-[6px] bg-[var(--color-input-bg)] px-2 py-2 font-mono text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+                classList={{
+                  "ring-[var(--color-danger)]":
+                    showValidation() && promptInvalid(),
+                }}
                 value={draft().system_prompt}
                 onInput={(e) => patch({ system_prompt: e.currentTarget.value })}
               />
               <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
                 {draft().system_prompt.length} chars. Tip: keep it tight
-                (~150–250 tokens) and end with explicit "Output only the
-                cleaned text."
+                and end with explicit "Output only the cleaned text."
               </p>
+              <Show when={showValidation() && promptInvalid()}>
+                <p class="mt-1 text-[11px] text-[var(--color-danger)]">
+                  System prompt can't be empty.
+                </p>
+              </Show>
             </div>
           </Card>
 
@@ -2704,6 +2883,11 @@ function ModeEditor(props: {
           </Card>
         </div>
         <footer class="flex items-center justify-end gap-2 border-t border-[var(--color-border)] px-4 py-3">
+          <Show when={props.saveError}>
+            <span class="mr-auto text-[11px] text-[var(--color-danger)]">
+              {props.saveError}
+            </span>
+          </Show>
           <button
             type="button"
             class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
@@ -2713,8 +2897,15 @@ function ModeEditor(props: {
           </button>
           <button
             type="button"
-            class="rounded-[6px] bg-[var(--color-accent)] px-4 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
-            onClick={() => props.onSave(draft())}
+            disabled={!canSave()}
+            class="rounded-[6px] bg-[var(--color-accent)] px-4 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => {
+              if (!canSave()) {
+                setShowValidation(true);
+                return;
+              }
+              props.onSave(draft());
+            }}
           >
             Save
           </button>
@@ -2920,15 +3111,12 @@ function PrivacyTab(_props: { s: Settings }) {
           </For>
         </ul>
       </div>
-      <p class="text-[11px] text-[var(--color-ink-faint)]">
-        Verifiable: Vox is open source — open Activity Monitor while
-        dictating to confirm there are no outbound connections.
-      </p>
     </>
   );
 }
 
 function AboutTab() {
+  const [version] = createResource(() => getAppVersion());
   const [checking, setChecking] = createSignal(false);
   const [updateResult, setUpdateResult] = createSignal<UpdateCheckResult | null>(
     null,
@@ -2937,6 +3125,25 @@ function AboutTab() {
   const [diagErr, setDiagErr] = createSignal<string | null>(null);
   const [devInfo, setDevInfo] = createSignal<DevBinaryInfo | null>(null);
   const [devCopied, setDevCopied] = createSignal(false);
+
+  // Load dev binary info eagerly so the path chip is visible without
+  // requiring the user to click first.
+  onMount(async () => {
+    try {
+      setDevInfo(await revealDevBinaryPath());
+    } catch (err) {
+      console.warn("revealDevBinaryPath failed:", err);
+    }
+  });
+
+  // Open System Settings only when the user actually needs it: a dev
+  // build (sig rotates, Accessibility entry stale) or Accessibility
+  // currently denied. Otherwise just copy the path.
+  const shouldAutoOpenAxSettings = () => {
+    const d = devInfo();
+    if (!d) return false;
+    return d.is_dev_build || !d.accessibility_granted;
+  };
 
   async function onReplay() {
     try {
@@ -2968,7 +3175,9 @@ function AboutTab() {
       } catch {
         setDevCopied(false);
       }
-      await openAccessibilitySettings();
+      if (info.is_dev_build || !info.accessibility_granted) {
+        await openAccessibilitySettings();
+      }
     } catch (err) {
       console.error(err);
     }
@@ -3007,7 +3216,7 @@ function AboutTab() {
         </div>
         <div class="mt-3 flex flex-wrap items-center gap-1.5">
           <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
-            v1.0.0
+            v{version() ?? "—"}
           </span>
           <span class="rounded-full bg-[var(--color-success)]/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-success)]">
             Local-first
@@ -3022,7 +3231,7 @@ function AboutTab() {
       <Card>
         <Row
           label="Check for updates"
-          hint="Auto-update requires a signed release."
+          hint="Auto-update is not yet configured for this build."
           last={!updateResult()}
         >
           <button
@@ -3038,7 +3247,7 @@ function AboutTab() {
           {(r) => (
             <div class="px-4 py-3">
               <span
-                class="text-[12px]"
+                class="inline-flex items-center gap-1.5 text-[12px]"
                 classList={{
                   "text-[var(--color-success)]": r().status === "available",
                   "text-[var(--color-ink-mute)]":
@@ -3047,6 +3256,23 @@ function AboutTab() {
                   "text-[var(--color-danger)]": r().status === "error",
                 }}
               >
+                <Show when={r().status === "unconfigured"}>
+                  <svg
+                    width="11"
+                    height="11"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2.25"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    aria-hidden="true"
+                  >
+                    <circle cx="12" cy="12" r="9" />
+                    <line x1="12" y1="16" x2="12" y2="12" />
+                    <line x1="12" y1="8" x2="12.01" y2="8" />
+                  </svg>
+                </Show>
                 {r().message ?? r().status}
               </span>
             </div>
@@ -3081,7 +3307,7 @@ function AboutTab() {
           </button>
         </Row>
         <Row
-          label="Reveal binary for Accessibility"
+          label="Binary path for Accessibility"
           hint="For chord hotkeys only. Copies the build path so you can add it under Privacy & Security."
           last={!devInfo() && !diagErr() && !diag()}
         >
@@ -3090,7 +3316,7 @@ function AboutTab() {
             onClick={() => void onRevealDevPath()}
             class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
           >
-            Open & copy path
+            {shouldAutoOpenAxSettings() ? "Open & copy path" : "Copy path"}
           </button>
         </Row>
         <Show when={devInfo()}>

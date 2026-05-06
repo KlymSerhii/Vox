@@ -1089,7 +1089,7 @@ async fn run_pipeline(
                 &app,
                 id,
                 Stage::Error,
-                Some("Audio error.".into()),
+                Some("Audio error — try again".into()),
                 false,
             );
             _guard.finalise();
@@ -1142,7 +1142,7 @@ async fn run_pipeline(
                 &app,
                 id,
                 Stage::Error,
-                Some("STT engine not configured. Open Settings → Models.".into()),
+                Some("STT engine not configured — open Settings → Models".into()),
                 false,
             );
             _guard.finalise();
@@ -1460,7 +1460,7 @@ async fn run_pipeline(
                         &app,
                         id,
                         Stage::Done,
-                        Some("Copied".into()),
+                        Some("Copied — press \u{2318}V".into()),
                         false,
                     );
                 }
@@ -1476,7 +1476,7 @@ async fn run_pipeline(
                 &app,
                 id,
                 Stage::Error,
-                Some("Copy failed.".into()),
+                Some("Copy failed — try again".into()),
                 false,
             );
         }
@@ -1489,7 +1489,7 @@ async fn run_pipeline(
                 &app,
                 id,
                 Stage::Error,
-                Some("Copy failed.".into()),
+                Some("Copy failed — try again".into()),
                 false,
             );
         }
@@ -1518,16 +1518,45 @@ async fn wait_for_cancel(session: Arc<SessionState>) {
 }
 
 fn wav_peak_pcm16(wav: &[u8]) -> f32 {
-    let body = wav.get(44..).unwrap_or(&[]);
-    let mut peak = 0i16;
-    for chunk in body.chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]);
-        let abs = sample.saturating_abs();
-        if abs > peak {
-            peak = abs;
+    // Parse via hound rather than assuming a fixed 44-byte header — WAV
+    // files with extra chunks (`LIST`, `bext`, etc.) push the data offset
+    // past 44 bytes, so the old slice-based approach would walk into
+    // metadata as if it were samples and false-positive on silence.
+    // On any parse error we treat the buffer as silent (returning 0.0)
+    // so the session still completes via the silent-buffer pill path
+    // rather than crashing the pipeline.
+    let mut reader = match hound::WavReader::new(std::io::Cursor::new(wav)) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("wav_peak_pcm16: header parse failed ({e}); treating as silent");
+            return 0.0;
+        }
+    };
+    let spec = reader.spec();
+    let mut peak: f32 = 0.0;
+    match spec.sample_format {
+        hound::SampleFormat::Int => {
+            for s in reader.samples::<i16>() {
+                if let Ok(v) = s {
+                    let mag = (v as f32).abs() / i16::MAX as f32;
+                    if mag > peak {
+                        peak = mag;
+                    }
+                }
+            }
+        }
+        hound::SampleFormat::Float => {
+            for s in reader.samples::<f32>() {
+                if let Ok(v) = s {
+                    let mag = v.abs();
+                    if mag > peak {
+                        peak = mag;
+                    }
+                }
+            }
         }
     }
-    peak as f32 / i16::MAX as f32
+    peak.min(1.0)
 }
 
 fn friendly_stt_error(e: &anyhow::Error, _engine_id: &str) -> String {
@@ -1575,6 +1604,16 @@ fn spawn_max_record_guard(
                 if manager.foreground_id() == Some(id) {
                     log::warn!(
                         "recording exceeded {max_secs}s safety cap — auto-stopping (sid={id})"
+                    );
+                    // Surface the cap to the user — without this the
+                    // pipeline silently transitions to Transcribing
+                    // and the user has no idea the safety guard
+                    // fired. The transcript still gets copied (via
+                    // the regular end_recording → run_pipeline path).
+                    pill::emit_toast(
+                        &app,
+                        "Stopped after 30 min — paste or discard".into(),
+                        4000,
                     );
                     manager.end_recording(app);
                 }
@@ -1886,9 +1925,11 @@ fn merge_dictionaries(global: &[String], mode: &[String]) -> Vec<String> {
 const SATURATED_TOAST_MS_PUB: u32 = SATURATED_TOAST_MS;
 
 /// Helper for the hotkey layer: emit a saturated toast through the pill.
-pub fn emit_saturated_toast<R: Runtime>(app: &AppHandle<R>, in_flight: usize, max: usize) {
+pub fn emit_saturated_toast<R: Runtime>(app: &AppHandle<R>, _in_flight: usize, _max: usize) {
     pill::show(app);
-    let msg = format!("Too many in flight ({in_flight}/{max})");
+    // Plain English instead of jargon. Capped at <40 chars so it fits
+    // the pill width comfortably across all states.
+    let msg = "One at a time — try again in a moment".to_string();
     pill::emit_toast(app, msg, SATURATED_TOAST_MS_PUB);
 }
 
@@ -1897,7 +1938,7 @@ mod tests {
     use super::*;
 
     fn fresh_manager() -> Arc<SessionManager> {
-        let audio = AudioHandle::spawn();
+        let audio = AudioHandle::spawn().expect("spawn audio thread for tests");
         Arc::new(SessionManager::new(audio))
     }
 

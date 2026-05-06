@@ -410,6 +410,17 @@ async fn wait_for_healthy(handle: &mut ServerHandle) -> anyhow::Result<()> {
 /// for this installation — that lets the orphan reaper kill stale
 /// processes from a previous (force-killed) parent without needing
 /// to rebuild the mapping.
+///
+/// **Concurrency contract**: this MUST only be reached through the
+/// `ensure_running` slow path while the `ServerStateInner::spawning`
+/// mutex is held. The race that the contract closes is two
+/// simultaneous first-spawns each generating different keys, racing on
+/// `settings::save`, and ending up with a child running under a key
+/// the orphan reaper can no longer recognise. The single existing
+/// call site is `spawn(...)`, reached only after `ensure_running`
+/// awaited the spawn lock — so the read-modify-write below is
+/// serialised by construction. If you add a new caller, route it
+/// through `ensure_running` rather than calling this directly.
 fn persistent_api_key<R: Runtime>(app: &AppHandle<R>) -> String {
     let s = settings::load(app);
     if !s.inference_api_key.is_empty() {
@@ -482,15 +493,27 @@ pub fn reap_orphans_at_startup<R: Runtime>(app: &AppHandle<R>) {
         // graceful shutdown to honour. SIGKILL is uncatchable, so
         // this can't wedge on a llama-server build that ignores
         // SIGTERM.
-        if proc_.kill_with(Signal::Kill).unwrap_or(false) {
-            log::info!(
-                "reaped orphan llama-server pid={} cmd={:?}",
-                pid.as_u32(),
-                proc_.cmd()
-            );
-            killed += 1;
-        } else {
-            log::warn!("orphan llama-server pid={} could not be killed", pid.as_u32());
+        //
+        // sysinfo's `kill_with` returns Option<bool>: `None` means
+        // the platform doesn't support sending the signal at all,
+        // `Some(false)` means delivery failed (permissions / dead
+        // proc). Either case leaves the orphan running, so log loud.
+        match proc_.kill_with(Signal::Kill) {
+            Some(true) => {
+                log::info!(
+                    "reaped orphan llama-server pid={} cmd={:?}",
+                    pid.as_u32(),
+                    proc_.cmd()
+                );
+                killed += 1;
+            }
+            other => {
+                log::warn!(
+                    "could not kill orphan llama-server pid={}: kill_with returned {:?}",
+                    pid.as_u32(),
+                    other
+                );
+            }
         }
     }
     if seen == 0 {
@@ -503,27 +526,26 @@ pub fn reap_orphans_at_startup<R: Runtime>(app: &AppHandle<R>) {
 }
 
 /// Tear down the managed server (if any). Called from `RunEvent::Exit`
-/// in `lib.rs::run`. `block_on` is acceptable here — we are already on
-/// the way out, and the kill is fast.
+/// in `lib.rs::run`. We are NOT allowed to `block_on` here — the
+/// `RunEvent::Exit` callback runs on the Tauri event loop and a
+/// synchronous block on a tokio runtime risks a deadlock if any of
+/// the work being awaited needs to schedule onto that same loop.
+/// Instead we hand the child off to a dedicated OS thread that owns
+/// the kill+reap sequence. The orphan reaper at next launch
+/// (`reap_orphans_at_startup`) is the safety net for the rare case
+/// where this thread doesn't finish before macOS forcibly terminates
+/// the parent.
 pub fn shutdown_managed<R: Runtime>(app: &AppHandle<R>) {
     let st = match app.try_state::<ServerState>() {
         Some(s) => s,
         None => return,
     };
     let taken = st.handle.lock().take();
-    let Some(mut h) = taken else { return };
+    let Some(h) = taken else { return };
     log::info!("shutting down inference server pid={:?}", h.child.id());
-    // `start_kill` is the synchronous fire-and-forget signal:
-    // SIGKILL on Unix (delivered to the process group) and Job
-    // Object close on Windows (terminates everything in the group).
-    // The async `kill` would await; we're on the way out and don't
-    // want to block the run loop.
-    let _ = h.child.start_kill();
-    // Best-effort reap so we don't leave a zombie. A 2 s ceiling
-    // keeps quit responsive even if the child is somehow stuck.
-    let _ = tauri::async_runtime::block_on(async {
-        tokio::time::timeout(Duration::from_secs(2), h.child.wait()).await
-    });
+    // The owning thread reaps with a hard 2 s ceiling so quit stays
+    // responsive even if the child is somehow stuck.
+    spawn_async_killer(h, "shutdown_managed");
 }
 
 /// Tear down the managed server iff it is currently serving `model_id`.
@@ -543,16 +565,68 @@ pub fn shutdown_if_using<R: Runtime>(app: &AppHandle<R>, model_id: &str) -> bool
             _ => None,
         }
     };
-    let Some(mut h) = taken else { return false };
+    let Some(h) = taken else { return false };
     log::info!(
         "stopping inference server pid={:?} so model {model_id} can be removed",
         h.child.id()
     );
-    let _ = h.child.start_kill();
-    let _ = tauri::async_runtime::block_on(async {
-        tokio::time::timeout(Duration::from_secs(2), h.child.wait()).await
-    });
+    // Same reasoning as `shutdown_managed`: this is invoked from the
+    // command handler that may itself be on the event loop. Hand the
+    // kill+wait to a plain OS thread to avoid risking a deadlock
+    // through `block_on` re-entering the runtime.
+    spawn_async_killer(h, "shutdown_if_using");
     true
+}
+
+/// Spawn a detached OS thread that takes ownership of the
+/// `ServerHandle` and tears it down without blocking the event loop.
+/// The thread asks the child to quit via `start_kill()`, then polls
+/// `try_wait` on a 100 ms cadence up to a 2 s deadline; if the child
+/// is still alive past the deadline it sends an unconditional kill
+/// (which on Unix is a SIGKILL via the process-group child Drop
+/// path, and on Windows closes the Job Object).
+fn spawn_async_killer(mut h: ServerHandle, label: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name(format!("vox-inference-killer-{label}"))
+        .spawn(move || {
+            let pid = h.child.id();
+            // `start_kill` sends the OS signal without awaiting.
+            if let Err(e) = h.child.start_kill() {
+                log::warn!(
+                    "{label}: start_kill on llama-server pid={pid:?} failed: {e}"
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match h.child.try_wait() {
+                    Ok(Some(status)) => {
+                        log::info!(
+                            "{label}: llama-server pid={pid:?} exited with {status}"
+                        );
+                        return;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        log::warn!(
+                            "{label}: try_wait on llama-server pid={pid:?} failed: {e}"
+                        );
+                        return;
+                    }
+                }
+                if Instant::now() >= deadline {
+                    log::warn!(
+                        "{label}: llama-server pid={pid:?} still alive after 2s; \
+                         forcing teardown via Drop (process-group SIGKILL)"
+                    );
+                    // Drop on `AsyncGroupChild` SIGKILLs the entire
+                    // process group on Unix and closes the Windows
+                    // Job Object — this is the unconditional fallback.
+                    drop(h);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
 }
 
 /// Conditionally pre-warm the inference server in the background so the

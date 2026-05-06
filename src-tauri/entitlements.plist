@@ -4,8 +4,6 @@
 <dict>
   <key>com.apple.security.device.audio-input</key>
   <true/>
-  <key>com.apple.security.automation.apple-events</key>
-  <true/>
   <!-- Required by llama.cpp / whisper.cpp Metal shader compilation
        under hardened runtime. -->
   <key>com.apple.security.cs.allow-jit</key>

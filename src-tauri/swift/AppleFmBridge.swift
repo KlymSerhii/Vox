@@ -100,6 +100,20 @@ private actor SessionCache {
     // new one (and prewarming it) on miss. Caller MUST pair this with
     // `release(prompt:)` once finished, success or failure.
     func acquire(prompt: String) async -> LanguageModelSession {
+        return await acquire(prompt: prompt, depth: 0)
+    }
+
+    private func acquire(prompt: String, depth: Int) async -> LanguageModelSession {
+        // Recursion is bounded by exactly one re-entry in normal
+        // operation: a waiter wakes to find the entry has been
+        // `evict`ed, then re-runs the cache-miss path which
+        // synchronously installs a fresh entry with `inUse == true`.
+        // Any deeper recursion would indicate either a bug in the
+        // wait/wake protocol or an attacker-influenced storm of
+        // mid-flight evictions — fail loud rather than silently
+        // blowing the actor's stack.
+        precondition(depth <= 1, "SessionCache.acquire recursion exceeded depth=1; aborting")
+
         // Touch LRU order on every access — if present, move to MRU.
         if entries[prompt] != nil {
             if let idx = order.firstIndex(of: prompt) {
@@ -131,9 +145,10 @@ private actor SessionCache {
         // we resumed into that state, fall back through the cache-miss
         // path to construct a fresh session. The recursion is bounded:
         // after one trip through the miss branch the entry is present
-        // with `inUse == true`, so we cannot recurse a second time.
+        // with `inUse == true`, so we cannot recurse a second time —
+        // the precondition at the top of this method enforces that.
         if entries[prompt] == nil {
-            return await acquire(prompt: prompt)
+            return await acquire(prompt: prompt, depth: depth + 1)
         }
         entries[prompt]!.inUse = true
         return entries[prompt]!.session

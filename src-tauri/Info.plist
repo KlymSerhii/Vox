@@ -4,8 +4,6 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>Vox needs your microphone to transcribe speech while you hold the hotkey. Audio is never saved to disk.</string>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>Vox sends a Cmd+V keystroke to paste the transcript into your focused app.</string>
   <key>LSUIElement</key>
   <true/>
 </dict>

@@ -118,6 +118,14 @@ impl GemmaHttpEngine {
         // ~10 ms on macOS and compounds across short utterances.
         let client = reqwest::Client::builder()
             .timeout(HARD_TIMEOUT)
+            // Loopback only — a healthy llama-server accepts inside a
+            // few ms. A 5 s connect timeout means a hung TCP handshake
+            // (e.g. supervisor died mid-spawn but the kernel still has
+            // a half-open listener) fails fast instead of holding the
+            // user-visible 240 s request timeout. The request-level
+            // timeout above stays HARD_TIMEOUT so a real generation
+            // gets the full budget.
+            .connect_timeout(Duration::from_secs(5))
             .pool_max_idle_per_host(2)
             .build()
             .unwrap_or_else(|e| {

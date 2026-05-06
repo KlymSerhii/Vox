@@ -42,9 +42,23 @@ pub fn get_settings<R: Runtime>(
     Ok(settings::load(&app))
 }
 
+/// Public projection of [`settings::Settings`] for the unrestricted
+/// `get_public_settings` command. Mirrors the shape `tray-popover.tsx`
+/// expects but redacts `inference_api_key` so a "public" command's
+/// response never carries the loopback token. The full settings payload
+/// (including the api key) is reachable only via `get_settings`, which
+/// is gated to the privileged `settings`/`onboarding` windows.
+///
+/// The api key is loopback-only and not security-critical — but keeping
+/// it out of the public command's response means a future window with
+/// no business reading it can't accidentally pick it up.
 #[tauri::command]
 pub fn get_public_settings<R: Runtime>(app: AppHandle<R>) -> settings::Settings {
-    settings::load(&app)
+    let mut s = settings::load(&app);
+    // Blank the api key for the public surface. Settings::save is never
+    // called from this command, so the persisted value is preserved.
+    s.inference_api_key = String::new();
+    s
 }
 
 #[tauri::command]
@@ -283,6 +297,11 @@ pub fn close_tray_popover<R: Runtime>(app: AppHandle<R>) {
 
 #[tauri::command]
 pub fn quit_app<R: Runtime>(app: AppHandle<R>) {
+    // RunEvent::Exit doesn't always fire reliably on macOS for menu-bar
+    // (Accessory) apps, so we tear the inference subprocess down on the
+    // synchronous quit path before app.exit() to guarantee the
+    // `llama-server` child doesn't outlive us.
+    crate::inference_proc::shutdown_managed(&app);
     app.exit(0);
 }
 
@@ -483,6 +502,11 @@ pub struct UpdateCheckResult {
     pub available_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[tauri::command]
+pub fn get_app_version<R: Runtime>(app: AppHandle<R>) -> String {
+    app.package_info().version.to_string()
 }
 
 #[tauri::command]

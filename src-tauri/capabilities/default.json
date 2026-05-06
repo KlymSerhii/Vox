@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for Vox windows.",
-  "windows": ["settings", "pill", "onboarding", "tray-popover", "migration"],
+  "description": "Privileged permissions for Vox's interactive windows (settings, onboarding, tray-popover, migration). The pill window — which is read-only — is covered by `readonly-windows.json` instead so it can't emit arbitrary events.",
+  "windows": ["settings", "onboarding", "tray-popover", "migration"],
   "permissions": [
     "core:default",
     "core:window:allow-show",

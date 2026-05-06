@@ -4,6 +4,8 @@ import {
   closeTrayPopover,
   copyText,
   getPublicSettings,
+  inferenceServerStatus,
+  listModels,
   listModes,
   onSessionsChanged,
   onSettingsChanged,
@@ -18,6 +20,7 @@ import {
   setPolishingEnabled,
   setStreamingPillEnabled,
   type InProgressEntry,
+  type ModelStatus,
   type RecentTranscript,
   type SessionsSnapshot,
   type Settings,
@@ -33,6 +36,24 @@ export default function TrayPopoverView() {
   const [copyFlash, setCopyFlash] = createSignal<number | null>(null);
   const [modes, setModes] = createSignal<VoiceMode[]>([]);
   const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
+  // Header status uses these to detect "models not yet installed". A
+  // non-empty configured id whose ModelStatus reports `installed: false`
+  // means the user is past onboarding but the artifact didn't survive
+  // (manual delete, partial download). The header should say
+  // "Setup needed" so they don't trust the "ready" badge for a pipeline
+  // that will fail on first use.
+  const [models, setModels] = createSignal<ModelStatus[]>([]);
+  const [inferenceInstalled, setInferenceInstalled] = createSignal<boolean | null>(null);
+  // Anchor for the mode-picker dropdown. Used by Show-when-open to
+  // position the listbox via fixed coordinates so it isn't clipped by
+  // the popover root's `overflow-hidden`.
+  let modeTriggerRef: HTMLButtonElement | undefined;
+  let modeMenuRef: HTMLDivElement | undefined;
+  const [modeMenuPos, setModeMenuPos] = createSignal<{
+    top: number;
+    left: number;
+    minWidth: number;
+  }>({ top: 0, left: 0, minWidth: 0 });
 
   let unlistenSettings: (() => void) | null = null;
   let unlistenTranscripts: (() => void) | null = null;
@@ -63,6 +84,20 @@ export default function TrayPopoverView() {
       setS(settings);
       applySnapshot(snap);
       setModes(list);
+      // Probe installed-model status so the header can flag
+      // "Setup needed" when the configured ids aren't on disk yet.
+      // Failures here are non-fatal — we fall back to the conservative
+      // "is the configured id non-empty" check.
+      try {
+        const [allModels, infer] = await Promise.all([
+          listModels(),
+          inferenceServerStatus(),
+        ]);
+        setModels(allModels);
+        setInferenceInstalled(infer.installed);
+      } catch (err) {
+        console.warn("model status probes failed:", err);
+      }
     } finally {
       setLoaded(true);
     }
@@ -82,6 +117,30 @@ export default function TrayPopoverView() {
     document.addEventListener("keydown", (e) => {
       if (e.key === "Escape") closeTrayPopover();
     });
+
+    // Outside-click handler closes the fixed-positioned mode-picker
+    // dropdown. Without it, the menu can persist after losing focus
+    // and reappear out-of-context when the popover hides + re-shows.
+    document.addEventListener("mousedown", (e) => {
+      if (!modeMenuOpen()) return;
+      const target = e.target as Node | null;
+      if (!target) return;
+      const inMenu = !!modeMenuRef && modeMenuRef.contains(target);
+      const inTrigger =
+        !!modeTriggerRef && modeTriggerRef.contains(target);
+      if (!inMenu && !inTrigger) setModeMenuOpen(false);
+    });
+
+    // Tauri fires this when the popover loses key window status, e.g.
+    // when the user clicks outside the popover entirely.
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      await getCurrentWindow().onFocusChanged(({ payload }) => {
+        if (!payload) setModeMenuOpen(false);
+      });
+    } catch (err) {
+      console.warn("focus listener init failed:", err);
+    }
   });
 
   onCleanup(() => {
@@ -118,11 +177,13 @@ export default function TrayPopoverView() {
   async function togglePolishing(v: boolean) {
     const cur = s();
     if (!cur) return;
-    setS({
-      ...cur,
-      polishing_enabled: v,
-      llm_engine: v ? "gemma-local" : "none",
-    });
+    // Optimistically flip only the toggle's own field. The backend's
+    // `set_polishing_enabled` preserves the user's chosen `llm_engine`
+    // (e.g. apple-fm) — hardcoding it to "gemma-local"/"none" here
+    // would clobber that choice for the brief window before
+    // `settings:changed` reconciles. Engine name reflows naturally
+    // through the onSettingsChanged listener.
+    setS({ ...cur, polishing_enabled: v });
     await setPolishingEnabled(v);
   }
 
@@ -150,11 +211,40 @@ export default function TrayPopoverView() {
     }
   }
 
-  function statusLine(): { label: string; tone: "ok" | "off" } {
+  function statusLine(): { label: string; tone: "ok" | "off" | "warn" } {
     const cur = s();
     if (!cur) return { label: "Loading…", tone: "ok" };
     if (!cur.dictation_enabled) return { label: "Dictation off", tone: "off" };
+    if (setupNeeded()) return { label: "Setup needed", tone: "warn" };
     return { label: "Local · ready", tone: "ok" };
+  }
+
+  /// True when the user has the polishing pipeline configured but a
+  /// required artifact is missing. The header "Local · ready" badge
+  /// would otherwise lie before the user has actually downloaded
+  /// anything. Conservative fallback: when we couldn't probe (null
+  /// `inferenceInstalled`), only flag missing configuration ids — once
+  /// the probe lands the full check kicks in.
+  function setupNeeded(): boolean {
+    const cur = s();
+    if (!cur) return false;
+    if (!cur.stt_model_id) return true;
+    const sttId = cur.stt_model_id;
+    const llmId = cur.llm_model_id;
+    const probed = models();
+    if (probed.length > 0) {
+      const sttOk = probed.find((m) => m.descriptor.id === sttId)?.installed ?? false;
+      if (!sttOk) return true;
+      // Apple FM has no GGUF/llama-server requirement.
+      if (cur.llm_engine === "gemma-local") {
+        if (!llmId) return true;
+        const llmOk = probed.find((m) => m.descriptor.id === llmId)?.installed ?? false;
+        if (!llmOk) return true;
+        const inf = inferenceInstalled();
+        if (inf === false) return true;
+      }
+    }
+    return false;
   }
 
   return (
@@ -170,15 +260,35 @@ export default function TrayPopoverView() {
         {(st) => (
           <>
             <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center gap-2">
-                <StatusDot tone={statusLine().tone} />
-                <span class="text-[13px] font-semibold tracking-[-0.005em] text-[var(--color-ink)]">
-                  {statusLine().label}
-                </span>
-              </div>
+              <Show
+                when={setupNeeded()}
+                fallback={
+                  <div class="flex items-center gap-2">
+                    <StatusDot tone={statusLine().tone} />
+                    <span class="text-[13px] font-semibold tracking-[-0.005em] text-[var(--color-ink)]">
+                      {statusLine().label}
+                    </span>
+                  </div>
+                }
+              >
+                <button
+                  type="button"
+                  class="-mx-1 inline-flex items-center gap-2 rounded-[6px] px-1 py-0.5 text-left transition-colors hover:bg-[var(--color-overlay)]"
+                  onClick={() => openSettingsWindow()}
+                  title="Open Settings → Models"
+                >
+                  <StatusDot tone={statusLine().tone} />
+                  <span class="text-[13px] font-semibold tracking-[-0.005em] text-[var(--color-ink)]">
+                    {statusLine().label}
+                  </span>
+                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+                    Open Models →
+                  </span>
+                </button>
+              </Show>
               <button
                 type="button"
-                class="rounded-[6px] p-1 text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-[6px] p-1.5 text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
                 title="Open Settings"
                 onClick={() => openSettingsWindow()}
               >
@@ -271,6 +381,22 @@ export default function TrayPopoverView() {
               </div>
             </div>
 
+            <div class="border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Press to talk
+                  </span>
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    Trigger with{" "}
+                    <span class="keycap">
+                      {hotkeyLabel(st().hotkey || "CommandOrControl+Alt+Period")}
+                    </span>
+                  </span>
+                </div>
+              </div>
+            </div>
+
             <div class="relative border-b border-[var(--color-border)] px-4 py-3">
               <div class="flex items-center justify-between gap-3">
                 <div class="flex min-w-0 flex-col">
@@ -285,9 +411,30 @@ export default function TrayPopoverView() {
                   </span>
                 </div>
                 <button
+                  ref={(el) => (modeTriggerRef = el)}
                   type="button"
                   class="liquid-card inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
-                  onClick={() => setModeMenuOpen(!modeMenuOpen())}
+                  onClick={() => {
+                    const next = !modeMenuOpen();
+                    if (next && modeTriggerRef) {
+                      // The popover root has `overflow-hidden` so an
+                      // `absolute` dropdown would clip inside the
+                      // popover. Anchor via fixed coords from the
+                      // trigger's bounding rect so the listbox can
+                      // escape the clipped container without bringing
+                      // a positioning library along for the ride.
+                      const r = modeTriggerRef.getBoundingClientRect();
+                      const menuW = Math.max(r.width, 224);
+                      const right = r.right;
+                      const left = Math.max(8, right - menuW);
+                      setModeMenuPos({
+                        top: r.bottom + 4,
+                        left,
+                        minWidth: menuW,
+                      });
+                    }
+                    setModeMenuOpen(next);
+                  }}
                   aria-haspopup="listbox"
                   aria-expanded={modeMenuOpen()}
                 >
@@ -314,8 +461,15 @@ export default function TrayPopoverView() {
               </div>
               <Show when={modeMenuOpen()}>
                 <div
-                  class="liquid-glass absolute right-4 top-full z-10 mt-1 max-h-60 w-56 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  ref={(el) => (modeMenuRef = el)}
+                  class="liquid-glass z-50 max-h-60 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
                   role="listbox"
+                  style={{
+                    position: "fixed",
+                    top: `${modeMenuPos().top}px`,
+                    left: `${modeMenuPos().left}px`,
+                    "min-width": `${modeMenuPos().minWidth}px`,
+                  }}
                 >
                   <For each={modes()}>
                     {(m) => (
@@ -361,17 +515,22 @@ export default function TrayPopoverView() {
                 </For>
                 <div class="mb-2 mt-2 h-px bg-[var(--color-border)]" />
               </Show>
-              <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
-                Recent (cleared on quit)
-              </div>
               <Show
                 when={recents().length > 0}
                 fallback={
-                  <div class="px-2 py-4 text-[12px] text-[var(--color-ink-mute)]">
-                    Your last 5 transcripts will appear here.
-                  </div>
+                  <>
+                    <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+                      Recent
+                    </div>
+                    <div class="px-2 py-4 text-[12px] text-[var(--color-ink-mute)]">
+                      Your last 5 transcripts will appear here.
+                    </div>
+                  </>
                 }
               >
+                <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+                  Recent (cleared on quit)
+                </div>
                 <For each={recents()}>
                   {(r, idx) => (
                     <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
@@ -383,7 +542,7 @@ export default function TrayPopoverView() {
                       </span>
                       <button
                         type="button"
-                        class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
+                        class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
                         onClick={() => copyRecent(idx(), r.text)}
                         title="Copy to clipboard (⌘V to paste)"
                       >
@@ -448,9 +607,13 @@ export default function TrayPopoverView() {
   );
 }
 
-function StatusDot(props: { tone: "ok" | "off" }) {
+function StatusDot(props: { tone: "ok" | "off" | "warn" }) {
   const color =
-    props.tone === "ok" ? "var(--color-success)" : "var(--color-ink-faint)";
+    props.tone === "ok"
+      ? "var(--color-success)"
+      : props.tone === "warn"
+        ? "var(--color-warning)"
+        : "var(--color-ink-faint)";
   return (
     <span
       class="inline-block h-2 w-2 rounded-full"
@@ -503,7 +666,7 @@ function InProgressRow(props: {
       </span>
       <button
         type="button"
-        class="rounded p-1 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
+        class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
         title="Cancel session"
         aria-label="Cancel session"
         onClick={(e) => {
@@ -731,7 +894,50 @@ function hotkeyLabel(k: string): string {
     case "CommandOrControl+Shift+M":
     case "Cmd+Shift+M":
       return "⌘⇧M";
+    case "CommandOrControl+Alt+Period":
+    case "Cmd+Alt+Period":
+      return "⌘⌥.";
     default:
-      return k;
+      // Best-effort fallback so any user-configured chord at least
+      // shows its modifier glyphs instead of the raw "Alt+Shift+V"
+      // tokens. Mirrors the formatter in Onboarding.tsx without the
+      // shifted-glyph collapsing — the popover is content with the
+      // simpler rendering.
+      return k
+        .split("+")
+        .map((t) => {
+          const trimmed = t.trim();
+          switch (trimmed) {
+            case "Alt":
+            case "Option":
+              return "⌥";
+            case "Shift":
+              return "⇧";
+            case "Cmd":
+            case "Command":
+            case "CommandOrControl":
+            case "Meta":
+            case "Super":
+              return "⌘";
+            case "Ctrl":
+            case "Control":
+              return "⌃";
+            case "Period":
+              return ".";
+            case "Comma":
+              return ",";
+            case "Slash":
+              return "/";
+            case "Semicolon":
+              return ";";
+            case "Backslash":
+              return "\\";
+            case "Quote":
+              return "'";
+            default:
+              return trimmed;
+          }
+        })
+        .join("");
   }
 }

@@ -7,6 +7,7 @@
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_void};
+use std::sync::Arc;
 
 extern "C" {
     fn vox_apple_fm_availability() -> c_int;
@@ -111,22 +112,52 @@ struct StreamCtx {
     cb: Box<dyn Fn(&str) + Send + Sync + 'static>,
 }
 
+// Ownership convention for the StreamCtx pointer crossing into Swift:
+// the value is heap-allocated as `Arc<StreamCtx>` and passed in via
+// `Arc::into_raw`. Each Rust trampoline invoked from Swift takes a
+// non-owning view by calling `Arc::increment_strong_count(ptr)` and
+// then `Arc::from_raw(ptr)` to materialise a strong handle without
+// consuming the original count. The single explicit "release" path —
+// `stream_done_trampoline` (always called by Swift, including the
+// timeout drain) — does NOT increment first; it consumes one count via
+// `Arc::from_raw` and lets the Drop run. This means even if Apple's
+// `streamResponse` fires a chunk callback after the Rust caller has
+// returned, the strong count keeps the `StreamCtx` alive until that
+// last chunk callback unwinds — no use-after-free on the timeout path.
+
 extern "C" fn stream_chunk_trampoline(user_data: *mut c_void, text: *const c_char) {
     if user_data.is_null() || text.is_null() {
         return;
     }
-    // SAFETY: Swift only calls us back while the Rust caller is parked
-    // on the bridge's DispatchSemaphore — the StreamCtx box outlives
-    // every invocation.
-    let ctx = unsafe { &*(user_data as *const StreamCtx) };
+    // SAFETY: `user_data` was created via `Arc::into_raw` and the
+    // explicit "release" callback (`stream_done_trampoline`) has not
+    // yet consumed the original count when this fires. We bump the
+    // strong count and materialise a temporary `Arc` so this borrow
+    // is independent of the release path's eventual consume.
+    let ctx: Arc<StreamCtx> = unsafe {
+        Arc::increment_strong_count(user_data as *const StreamCtx);
+        Arc::from_raw(user_data as *const StreamCtx)
+    };
     let s = unsafe { CStr::from_ptr(text).to_string_lossy().into_owned() };
-    (ctx.cb)(&s);
+    // Panicking across the FFI boundary is undefined behaviour in
+    // Swift; trap any unwind from user code here so we never propagate.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (ctx.cb)(&s)));
 }
 
-extern "C" fn stream_done_trampoline(_user_data: *mut c_void, _text: *const c_char) {
-    // Final text is captured separately via the function's return code +
-    // last on_chunk invocation; the trampoline is required by the FFI
-    // signature but doesn't need to do anything Rust-side.
+extern "C" fn stream_done_trampoline(user_data: *mut c_void, _text: *const c_char) {
+    if user_data.is_null() {
+        return;
+    }
+    // The "release" path. Consumes the original `Arc::into_raw` count
+    // (no increment first). Any concurrent chunk-trampoline still
+    // holding its bumped strong count keeps the StreamCtx alive until
+    // its own scope ends.
+    //
+    // SAFETY: Swift guarantees this is invoked exactly once per call
+    // to `vox_apple_fm_polish_stream` — including on the timeout
+    // drain path.
+    let ctx: Arc<StreamCtx> = unsafe { Arc::from_raw(user_data as *const StreamCtx) };
+    drop(ctx);
 }
 
 /// Streaming polish — fires `on_chunk` with cumulative partial output as
@@ -145,8 +176,12 @@ pub fn polish_stream_blocking(
     let transcript_c = CString::new(transcript)
         .map_err(|e| format!("transcript has interior NUL: {e}"))?;
 
-    let ctx = Box::new(StreamCtx { cb: on_chunk });
-    let raw_ctx = Box::into_raw(ctx);
+    // Allocate the context as an Arc so that any chunk callback firing
+    // concurrently with the release path (e.g. on the Swift timeout
+    // drain) keeps its own strong reference for its lifetime. The
+    // "original" count is consumed exactly once by the
+    // `stream_done_trampoline` released callback below.
+    let raw_ctx = Arc::into_raw(Arc::new(StreamCtx { cb: on_chunk })) as *mut StreamCtx;
 
     let rc = unsafe {
         vox_apple_fm_polish_stream(
@@ -160,14 +195,12 @@ pub fn polish_stream_blocking(
         )
     };
 
-    // Reclaim ownership immediately so we always drop the StreamCtx.
-    // `vox_apple_fm_polish_stream` returns after EITHER the semaphore
-    // signals (natural completion path) OR the timeout fires; in the
-    // latter case Swift cancels the detached Task, marks an internal
-    // `done` flag under a lock, and sleeps ~50 ms to drain any
-    // in-flight chunk callback before returning. After this point no
-    // more callbacks can fire, so `Box::from_raw` is safe.
-    let _ = unsafe { Box::from_raw(raw_ctx) };
+    // Ownership: the Swift bridge guarantees `stream_done_trampoline`
+    // fires exactly once per call (including the timeout-drain path);
+    // that callback is responsible for consuming the original
+    // `Arc::into_raw` count. Rust does NOT reclaim here. Any
+    // chunk-trampoline still racing to fire will have already
+    // incremented the strong count and is safe in its own right.
 
     if rc == 0 {
         Ok(())

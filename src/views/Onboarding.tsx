@@ -200,6 +200,29 @@ export default function OnboardingView() {
     setStep(Math.max(0, step() - 1) as Step);
   }
 
+  /// Skip handler runs the same step advance, plus a per-step reconcile
+  /// pass. On the Language step we have to make sure the persisted
+  /// stt_engine matches what's actually available on this Mac:
+  /// `auto`/`en` would otherwise leave the user with `parakeet-local`
+  /// queued from a default while the runtime can't load it. Falls back
+  /// to `whisper-local` when parakeet probe says unavailable so the
+  /// downloads step doesn't try to fetch a Parakeet model that won't
+  /// run.
+  async function skip() {
+    if (step() === LANGUAGE_STEP) {
+      const cur = s();
+      const pk = parakeet();
+      if (cur && pk && !pk.available && cur.stt_engine !== "whisper-local") {
+        try {
+          await patch({ stt_engine: "whisper-local" });
+        } catch (err) {
+          console.warn("language skip: reconcile failed", err);
+        }
+      }
+    }
+    next();
+  }
+
   return (
     <div class="flex h-screen w-screen flex-col bg-[var(--color-bg)] text-[var(--color-ink)]">
       <header class="flex items-center justify-between px-6 pt-5 pb-2">
@@ -275,7 +298,7 @@ export default function OnboardingView() {
             <button
               type="button"
               class="text-[12px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
-              onClick={next}
+              onClick={() => void skip()}
             >
               Skip
             </button>
@@ -411,7 +434,38 @@ function PermStatus(props: {
         "text-[var(--color-ink-mute)]": !props.granted,
       }}
     >
-      <span>{props.granted ? "✓" : "○"}</span>
+      <Show
+        when={props.granted}
+        fallback={
+          <svg
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="12" cy="12" r="9" />
+          </svg>
+        }
+      >
+        <svg
+          width="12"
+          height="12"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.5"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <polyline points="4 12 10 18 20 6" />
+        </svg>
+      </Show>
       <span>{props.granted ? props.grantedLabel : props.pendingLabel}</span>
     </div>
   );
@@ -608,7 +662,7 @@ function LanguageCard(props: {
           props.onSelect();
         }
       }}
-      class="flex cursor-pointer flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
+      class="liquid-card flex cursor-pointer flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]"
       classList={{
         "ring-1 ring-[var(--color-border)]": !props.selected,
         "ring-2 ring-[var(--color-accent)]": props.selected,
@@ -1091,7 +1145,7 @@ function PolishEngineCard(props: {
       aria-checked={props.selected}
       disabled={props.disabled}
       onClick={props.onSelect}
-      class="flex flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color] disabled:cursor-not-allowed"
+      class="liquid-card flex flex-col gap-1 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 text-left transition-[box-shadow,background-color] disabled:cursor-not-allowed"
       classList={{
         "ring-1 ring-[var(--color-border)]": !props.selected && !props.disabled,
         "ring-2 ring-[var(--color-accent)]": props.selected,
@@ -1242,7 +1296,11 @@ function ModelCard(props: {
 }
 
 function shortModelName(name: string): string {
-  return name.replace(/\s*\([^)]*\)/g, "").replace(/ —.*$/, "");
+  // Keep the parenthesised quant tag (e.g. "(Q5_K_M)") so the
+  // download bar matches the picker's full label. Only strip the
+  // trailing em-dash tier suffix ("— Small"), which is duplicated by
+  // the row's RAM/size hints elsewhere on the same screen.
+  return name.replace(/ —.*$/, "");
 }
 
 function DownloadBar(props: {

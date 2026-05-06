@@ -29,6 +29,8 @@ pub enum AudioError {
     Wav(#[from] hound::Error),
     #[error("audio thread died")]
     ThreadDied,
+    #[error("failed to spawn audio thread: {0}")]
+    SpawnFailed(String),
 }
 
 enum Command {
@@ -65,15 +67,15 @@ pub struct AudioHandle {
 }
 
 impl AudioHandle {
-    pub fn spawn() -> Self {
+    pub fn spawn() -> Result<Self, AudioError> {
         let (tx, rx) = mpsc::channel::<Command>();
         let rms_bits = Arc::new(AtomicU32::new(0));
         let rms_for_thread = Arc::clone(&rms_bits);
         thread::Builder::new()
             .name("vox-audio".into())
             .spawn(move || audio_thread(rx, rms_for_thread))
-            .expect("spawn audio thread");
-        Self { tx, rms_bits }
+            .map_err(|e| AudioError::SpawnFailed(e.to_string()))?;
+        Ok(Self { tx, rms_bits })
     }
 
     pub fn start(&self) -> Result<(), AudioError> {
@@ -120,6 +122,31 @@ struct ActiveCapture {
 }
 
 fn audio_thread(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
+    // Wrap the entire dispatch loop in catch_unwind so a panic in cpal /
+    // hound / postprocessing kills the thread cleanly rather than silently
+    // tearing down without a log line. We deliberately do NOT auto-respawn
+    // from inside the thread — that risks an infinite restart loop on a
+    // wedged audio stack. The next session attempt will see `tx` closed
+    // and surface a clean `AudioError::ThreadDied` instead of stalling.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        audio_thread_inner(rx, rms_bits)
+    }));
+    if let Err(payload) = result {
+        let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+            (*s).to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        log::error!(
+            "audio thread panicked: {msg}. Audio capture is now offline; \
+             the next session attempt will return AudioError::ThreadDied."
+        );
+    }
+}
+
+fn audio_thread_inner(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
     let mut active: Option<ActiveCapture> = None;
 
     for cmd in rx {

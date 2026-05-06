@@ -1,7 +1,15 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, Runtime, WebviewUrl};
+
+/// Bumped on every `show`/`hide`. The 10ms-deferred `pill:show` emit
+/// captures this at scheduling time and drops the emit if a hide (or
+/// another show) advanced the generation while it was sleeping. Without
+/// this guard a sub-10ms hide-after-show paints a pill the user already
+/// dismissed.
+static PILL_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 pub const LABEL: &str = "pill";
 // The window is sized larger than the visible pill (116×26) so glow
@@ -120,15 +128,25 @@ pub fn show<R: Runtime>(app: &AppHandle<R>) {
         let _ = reposition(&win);
         let _ = win.show();
         // Delayed emit so a freshly-created WebView can subscribe before the event fires.
+        // The generation counter is bumped synchronously here so any hide
+        // that arrives within the 10ms window will advance the gen and
+        // cause this scheduled emit to drop on wakeup.
+        let scheduled_gen = PILL_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            let _ = app_clone.emit_to(LABEL, "pill:show", ());
+            if PILL_GENERATION.load(Ordering::SeqCst) == scheduled_gen {
+                let _ = app_clone.emit_to(LABEL, "pill:show", ());
+            }
         });
     }
 }
 
 pub fn hide<R: Runtime>(app: &AppHandle<R>) {
+    // Bump generation so any in-flight delayed `pill:show` emit from a
+    // recent show() drops itself on wakeup instead of painting a pill the
+    // user just dismissed.
+    PILL_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(LABEL) {
         let _ = app.emit_to(LABEL, "pill:hide", ());
         let _ = win.hide();

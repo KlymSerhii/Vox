@@ -39,6 +39,12 @@
   --caret-glow-cyan: rgba(91, 214, 224, 0.55);
   --caret-glow-violet: rgba(180, 155, 255, 0.55);
   --polishing-dot-glow: rgba(180, 155, 255, 0.6);
+  /* Pill outer glows for terminal states. Theme-tokenised so the
+   * Done/Warning/Saturated halos pick up alpha tuned for each surface
+   * — replaces the previously hardcoded rgba on the pill box-shadow. */
+  --pill-glow-success: rgba(74, 222, 128, 0.42);
+  --pill-glow-warning: rgba(245, 158, 11, 0.4);
+  --pill-glow-saturated: rgba(168, 85, 247, 0.4);
   --color-danger: #ff6b6b;
   --color-success: #4ade80;
   --color-warning: #fbbf24;
@@ -121,6 +127,12 @@
   --caret-glow-cyan: rgba(10, 181, 194, 0.50);
   --caret-glow-violet: rgba(138, 109, 255, 0.48);
   --polishing-dot-glow: rgba(138, 109, 255, 0.55);
+  /* Light-mode pill glows: hue shifted darker + alpha softened so the
+   * halo reads as elevation against the cream pill instead of a
+   * neon ring on a near-white surface. */
+  --pill-glow-success: rgba(34, 160, 80, 0.32);
+  --pill-glow-warning: rgba(180, 110, 10, 0.32);
+  --pill-glow-saturated: rgba(120, 60, 180, 0.30);
   --color-danger: #e5484d;
   --color-success: #22a06b;
   --color-warning: #d9870f;
@@ -137,9 +149,9 @@
    * macOS NSWindow "fade-when-inactive" behaviour that made the
    * popover half-disappear when the cursor stopped moving. The
    * backdrop-filter still tints against the wallpaper. */
-  --color-surface: rgba(252, 250, 247, 0.88);
-  --color-surface-raised: rgba(252, 250, 247, 0.92);
-  --color-surface-glass: rgba(252, 250, 247, 0.94);
+  --color-surface: rgba(252, 250, 247, 0.78);
+  --color-surface-raised: rgba(252, 250, 247, 0.84);
+  --color-surface-glass: rgba(252, 250, 247, 0.88);
   /* Pill-specific glass — slightly more translucent than the rest of
    * the UI but still opaque enough that the bright rim doesn't read
    * as a separate ring against the cream interior on dark wallpapers
@@ -156,7 +168,7 @@
   --color-overlay: rgb(15 15 20 / 0.07);
   --color-scrim: rgb(15 15 20 / 0.35);
 
-  --color-meter: rgba(40, 44, 56, 0.5);
+  --color-meter: rgba(40, 44, 56, 0.75);
   --color-meter-shadow: rgba(20, 24, 40, 0.25);
 
   /* Cool blue-grey shadow hue + bumped alphas so floating panels carry
@@ -175,6 +187,17 @@ html,
 body,
 #root {
   height: 100%;
+}
+
+/* Global keyboard-focus ring. Components that paint their own
+ * `focus-visible:ring-*` override this via Tailwind utility specificity,
+ * so the rule below acts as a safety net for everything else.
+ * `outline` follows the element's existing border-radius in WebKit, so
+ * we deliberately do NOT set a radius here — doing so would clobber
+ * `rounded-full` controls (mode picker, pill state buttons, tab pills). */
+*:focus-visible {
+  outline: 2px solid var(--color-accent, #5b8cff);
+  outline-offset: 2px;
 }
 
 body {
@@ -331,6 +354,14 @@ body.translucent {
   animation: polishing-dot-pulse 1.4s ease-in-out infinite;
 }
 
+/* Suppress bar height/opacity transitions while the pill itself is
+ * resizing (200ms window after a stage change). The two animations
+ * running simultaneously produced a visible squeeze on the waveform
+ * bars; freezing the bars for the layout flip removes the jitter. */
+.pill-transitioning > div > div {
+  transition: none !important;
+}
+
 .animate-pulse-mic {
   animation: pulse-mic 1.2s ease-in-out infinite;
 }
@@ -348,6 +379,18 @@ body.translucent {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* Global reduced-motion baseline. Without this, Tailwind's
+   * `transition-*` utilities (used on the pill width / waveform bars
+   * etc.) keep running at full duration even when the user has opted
+   * out. Setting a near-zero override at the universal selector
+   * collapses those animations to instant; specific components can
+   * still opt back in via `!important` if they truly need motion. */
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 
   .animate-pulse-mic,
   .animate-spinner,
@@ -437,6 +480,18 @@ body.translucent {
     box-shadow 250ms ease,
     backdrop-filter 250ms ease,
     -webkit-backdrop-filter 250ms ease;
+}
+
+/* Light-mode card elevation. The default stack reads as flat against
+ * cream-on-cream surfaces, so we layer a softer ambient + tighter
+ * contact shadow so cards sit visibly above the wallpaper-tinted
+ * background. */
+[data-theme="light"] .liquid-card {
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 1px 2px var(--glass-shadow-contact),
+    0 4px 10px var(--glass-shadow-soft),
+    0 12px 28px var(--glass-shadow);
 }
 
 .liquid-glass {

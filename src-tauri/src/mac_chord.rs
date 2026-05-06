@@ -239,10 +239,14 @@ pub fn install(
             thread: Some(thread),
         }),
         Err(e) => {
-            // Worker either failed or timed out. Join + free the box.
+            // The worker thread OWNS the `Box<Inner>` and is the only
+            // thread that may free it (see `run_loop_thread`). On any
+            // error path we MUST NOT call `Box::from_raw(inner_ptr)`
+            // here — doing so would race with the worker still
+            // referencing `inner.shared` through `&*inner_ptr` and
+            // cause a use-after-free. Joining the worker is enough:
+            // its tail will reclaim the box.
             let _ = thread.join();
-            // SAFETY: nobody else has the pointer.
-            unsafe { drop(Box::from_raw(inner_ptr)) };
             Err(e)
         }
     }
@@ -250,49 +254,60 @@ pub fn install(
 
 impl Drop for ChordHandle {
     fn drop(&mut self) {
-        // Order matters: stop the run loop first so the worker exits, join,
-        // THEN free `inner`. Invalidate the mach port before CFRelease so any
-        // in-flight callback sees a no-op rather than UAF on `inner`.
-        // SAFETY: we own `inner` until this drop completes.
+        // The worker thread owns the `Box<Inner>` allocation and
+        // reclaims it at thread exit — see `run_loop_thread`. We must
+        // NOT call `Box::from_raw(self.inner)` here.
+        //
+        // To avoid racing the worker on `&*self.inner` we snapshot the
+        // CF refs out of the locked slots, ask the run loop to stop,
+        // join, and only THEN release the CF objects. Once the worker
+        // returns from `CFRunLoopRun` it frees the box in its tail —
+        // but the CF refs we snapshotted are CFRetain'd kernel mach
+        // ports unaffected by that free, so we can release them after
+        // the join.
+        let port_snap;
+        let rl_snap;
+        let src_snap;
+        // SAFETY: worker is still running at this point (we have not
+        // joined yet) and it only frees `inner` AFTER its run loop
+        // exits; we are about to ask the run loop to exit, so the
+        // borrow here is bounded.
         unsafe {
             let inner = &*self.inner;
-            if let Ok(g) = inner.mach_port.lock() {
-                if !g.is_null() {
-                    CGEventTapEnable(*g, false);
-                }
+            port_snap = inner.mach_port.lock().ok().map(|g| *g).unwrap_or(std::ptr::null());
+            rl_snap = inner.run_loop.lock().ok().map(|g| *g).unwrap_or(std::ptr::null());
+            src_snap = inner.run_loop_source.lock().ok().map(|g| *g).unwrap_or(std::ptr::null());
+        }
+
+        unsafe {
+            if !port_snap.is_null() {
+                CGEventTapEnable(port_snap, false);
             }
-            if let (Ok(rl), Ok(src)) = (inner.run_loop.lock(), inner.run_loop_source.lock()) {
-                if !rl.is_null() && !src.is_null() {
-                    CFRunLoopRemoveSource(*rl, *src, kCFRunLoopCommonModes);
-                }
-                if !rl.is_null() {
-                    CFRunLoopStop(*rl);
-                }
+            if !rl_snap.is_null() && !src_snap.is_null() {
+                CFRunLoopRemoveSource(rl_snap, src_snap, kCFRunLoopCommonModes);
+            }
+            if !rl_snap.is_null() {
+                CFRunLoopStop(rl_snap);
             }
         }
 
         if let Some(t) = self.thread.take() {
+            // After this returns, the worker has freed `self.inner`.
             let _ = t.join();
         }
 
+        // Worker is gone — safe to release CF objects we still hold
+        // a reference to.
         unsafe {
-            let inner = &*self.inner;
-            if let Ok(g) = inner.mach_port.lock() {
-                if !g.is_null() {
-                    CFMachPortInvalidate(*g);
-                }
+            if !port_snap.is_null() {
+                CFMachPortInvalidate(port_snap);
             }
-            if let Ok(g) = inner.run_loop_source.lock() {
-                if !g.is_null() {
-                    CFRelease(*g);
-                }
+            if !src_snap.is_null() {
+                CFRelease(src_snap);
             }
-            if let Ok(g) = inner.mach_port.lock() {
-                if !g.is_null() {
-                    CFRelease(*g);
-                }
+            if !port_snap.is_null() {
+                CFRelease(port_snap);
             }
-            drop(Box::from_raw(self.inner));
         }
     }
 }
@@ -323,8 +338,14 @@ struct Inner {
 }
 
 fn run_loop_thread(inner_ptr: *mut Inner) {
-    // SAFETY: `inner_ptr` is valid until `ChordHandle::Drop` joins us.
-    let inner: &Inner = unsafe { &*inner_ptr };
+    // The worker thread is the sole owner of the `Box<Inner>` allocated
+    // in `install`. Every exit path (early failure or run-loop return)
+    // funnels through the `Box::from_raw` at the bottom of this
+    // function so the install-side caller never has to reclaim it —
+    // which is what closes the use-after-free window the previous
+    // design had: the install-side `recv_timeout(2s)` could fire while
+    // the worker was still holding `&*inner_ptr` past the
+    // `CGEventTapCreate` decision.
     let mask: CGEventMask = 1 << K_CG_EVENT_FLAGS_CHANGED;
 
     log::error!(
@@ -346,7 +367,13 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
     if port.is_null() {
         // Most likely Accessibility was revoked between the pre-check and now.
         log::error!("mac_chord: CGEventTapCreate returned NULL — Accessibility revoked?");
+        // SAFETY: still the unique reference; install caller never
+        // touches `inner_ptr` on its own.
+        let inner: &Inner = unsafe { &*inner_ptr };
         notify_ready(inner, Err(ChordError::TapCreateFailed));
+        // Reclaim the box at thread exit so the install caller can
+        // remain "we never own this".
+        unsafe { drop(Box::from_raw(inner_ptr)) };
         return;
     }
     log::error!("mac_chord: CGEventTapCreate ok (port={:p})", port);
@@ -358,7 +385,9 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
             CGEventTapEnable(port, false);
             CFRelease(port);
         }
+        let inner: &Inner = unsafe { &*inner_ptr };
         notify_ready(inner, Err(ChordError::RunLoopFailed));
+        unsafe { drop(Box::from_raw(inner_ptr)) };
         return;
     }
 
@@ -369,21 +398,32 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
     }
     log::error!("mac_chord: tap enabled; entering CFRunLoopRun (rl={:p})", rl);
 
-    if let Ok(mut g) = inner.run_loop.lock() {
-        *g = rl;
-    }
-    if let Ok(mut g) = inner.mach_port.lock() {
-        *g = port;
-    }
-    if let Ok(mut g) = inner.run_loop_source.lock() {
-        *g = source;
-    }
+    // Borrow `inner` only inside scopes that don't outlive the run-loop
+    // body; the final `Box::from_raw` reclaim at the bottom is the
+    // single freer.
+    {
+        let inner: &Inner = unsafe { &*inner_ptr };
+        if let Ok(mut g) = inner.run_loop.lock() {
+            *g = rl;
+        }
+        if let Ok(mut g) = inner.mach_port.lock() {
+            *g = port;
+        }
+        if let Ok(mut g) = inner.run_loop_source.lock() {
+            *g = source;
+        }
 
-    notify_ready(inner, Ok(()));
+        notify_ready(inner, Ok(()));
+    }
 
     // Park on the run loop until `CFRunLoopStop` from the drop handler.
     unsafe { CFRunLoopRun() };
     log::error!("mac_chord: CFRunLoopRun exited; thread terminating");
+
+    // Worker is the sole freer of `Box<Inner>`. The Drop path joins us
+    // before observing `inner`, so reclaiming here is correct on every
+    // exit path (see `ChordHandle::drop` and the `install` error arm).
+    unsafe { drop(Box::from_raw(inner_ptr)) };
 }
 
 fn notify_ready(inner: &Inner, result: Result<(), ChordError>) {

@@ -6,7 +6,16 @@
     <meta name="color-scheme" content="dark light" />
     <title>Welcome to Vox</title>
     <script>
-      document.documentElement.dataset.theme = (() => { const v = localStorage.getItem('vox-theme'); return v === 'light' || v === 'dark' ? v : 'dark'; })();
+      // Resolve theme before any markup paints. Mirrors onto
+      // `colorScheme` so native form controls (the language picker's
+      // `<select>`s, scrollbars) inherit the right hue.
+      (function () {
+        var v = null;
+        try { v = localStorage.getItem('vox-theme'); } catch (_) {}
+        var t = v === 'light' || v === 'dark' ? v : 'dark';
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+      })();
     </script>
   </head>
   <body class="antialiased">

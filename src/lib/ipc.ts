@@ -253,6 +253,8 @@ export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke<UpdateCheckResult>("check_for_updates");
 }
 
+export const getAppVersion = (): Promise<string> => invoke("get_app_version");
+
 export async function listModels(): Promise<ModelStatus[]> {
   return invoke<ModelStatus[]>("list_models");
 }

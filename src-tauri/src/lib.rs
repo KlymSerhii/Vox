@@ -36,7 +36,7 @@ pub fn run() {
     )
     .try_init();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
@@ -72,6 +72,7 @@ pub fn run() {
             commands::get_launch_at_login,
             commands::set_launch_at_login,
             commands::check_for_updates,
+            commands::get_app_version,
             commands::list_models,
             commands::download_model,
             commands::cancel_download,
@@ -111,7 +112,27 @@ pub fn run() {
 
             let app_handle = app.handle();
 
-            let audio = AudioHandle::spawn();
+            let audio = match AudioHandle::spawn() {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!(
+                        "failed to spawn audio thread: {e}. \
+                         Recording will fail until the next launch."
+                    );
+                    // We still need *some* AudioHandle for SessionManager to
+                    // hold; the caller will surface a clean audio error on
+                    // the first record attempt rather than panicking here.
+                    // Try once more — if even the second spawn fails we
+                    // log and bail out of setup rather than crashing.
+                    match AudioHandle::spawn() {
+                        Ok(a) => a,
+                        Err(e2) => {
+                            log::error!("audio thread re-spawn failed: {e2}");
+                            return Err(Box::new(e2) as Box<dyn std::error::Error>);
+                        }
+                    }
+                }
+            };
             let manager = Arc::new(SessionManager::new(audio));
             app.manage(manager.clone());
 
@@ -187,13 +208,21 @@ pub fn run() {
                 }
             }
         })
-        .build(tauri::generate_context!())
-        .expect("error while running tauri application")
-        .run(|app_handle, event| {
-            // Tear down on Exit (not ExitRequested) so a canceled Cmd+Q
-            // doesn't kill the inference subprocess prematurely.
-            if let tauri::RunEvent::Exit = event {
-                crate::inference_proc::shutdown_managed(app_handle);
-            }
-        });
+        .build(tauri::generate_context!());
+
+    let app = match app {
+        Ok(a) => a,
+        Err(e) => {
+            log::error!("Tauri application failed to build: {e:?}");
+            std::process::exit(1);
+        }
+    };
+
+    app.run(|app_handle, event| {
+        // Tear down on Exit (not ExitRequested) so a canceled Cmd+Q
+        // doesn't kill the inference subprocess prematurely.
+        if let tauri::RunEvent::Exit = event {
+            crate::inference_proc::shutdown_managed(app_handle);
+        }
+    });
 }

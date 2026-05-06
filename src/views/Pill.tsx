@@ -85,6 +85,17 @@ export default function PillView() {
       typeof window.matchMedia === "function" &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches,
   );
+  // Gates bar-height transitions during pill width animation. The pill
+  // div runs a `transition-[width,box-shadow,padding,border-radius]
+  // duration-200` on state change; the inner waveform bars run their
+  // own per-bar height transitions at 110ms. Without coordination the
+  // two run simultaneously and produce visible jitter as the bars
+  // squeeze while the pill is still re-laying-out. While
+  // `pillTransitioning()` is true, the `.pill-transitioning` class on
+  // the pill root suppresses bar height transitions for the width
+  // animation's 200ms window.
+  const [pillTransitioning, setPillTransitioning] = createSignal(false);
+  let pillTransitionTimer: number | null = null;
   let reducedMotionMql: MediaQueryList | null = null;
   let reducedMotionListener: ((e: MediaQueryListEvent) => void) | null = null;
   // Rate-limited reveal: targetText is the full cumulative buffer the
@@ -363,6 +374,19 @@ export default function PillView() {
         setMessage(e.payload.message ?? null);
         setWarning(e.payload.warning ?? false);
         setBackgroundCount(e.payload.background_count ?? 0);
+        // Width transition window — disable inner bar height
+        // transitions for the 200ms while the pill resizes so they
+        // don't jitter alongside the layout flip.
+        if (prevState !== e.payload.state) {
+          setPillTransitioning(true);
+          if (pillTransitionTimer !== null) {
+            clearTimeout(pillTransitionTimer);
+          }
+          pillTransitionTimer = window.setTimeout(() => {
+            setPillTransitioning(false);
+            pillTransitionTimer = null;
+          }, 220);
+        }
         // Listening starts a brand-new utterance — drop any leftover
         // streaming buffers from a stale session that finalised.
         if (e.payload.state === "listening") {
@@ -462,6 +486,10 @@ export default function PillView() {
     for (const u of unlisten) u();
     if (toastTimer !== null) {
       clearTimeout(toastTimer);
+    }
+    if (pillTransitionTimer !== null) {
+      clearTimeout(pillTransitionTimer);
+      pillTransitionTimer = null;
     }
     stopReveal();
     clearTranscriptHold();
@@ -756,6 +784,7 @@ export default function PillView() {
       <div
         ref={(el) => (pillRef = el)}
         class="animate-pill-in pointer-events-none relative flex min-h-[26px] items-center rounded-[14px] px-3 py-1.5 transition-[width,box-shadow,padding,border-radius] duration-200 ease-out"
+        classList={{ "pill-transitioning": pillTransitioning() }}
         style={{
           // Stack the persistent Polishing label above the streaming
           // body during polishing — replaces the prior absolute-position
@@ -806,16 +835,49 @@ export default function PillView() {
           "-webkit-backdrop-filter": "var(--glass-blur)",
           border: "1px solid var(--glass-rim)",
           "box-shadow": isDoneSuccess()
-            ? "inset 0 0 0 1.5px var(--color-success), 0 0 18px rgba(74, 222, 128, 0.42), var(--glass-shadow-pill)"
+            ? "inset 0 0 0 1.5px var(--color-success), 0 0 18px var(--pill-glow-success), var(--glass-shadow-pill)"
             : isDoneWarning()
-              ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px rgba(251, 191, 36, 0.38), var(--glass-shadow-pill)"
+              ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px var(--pill-glow-warning), var(--glass-shadow-pill)"
               : isSaturated()
-                ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px rgba(251, 191, 36, 0.32), var(--glass-shadow-pill)"
+                ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px var(--pill-glow-saturated), var(--glass-shadow-pill)"
                 : "var(--glass-shadow-pill)",
         }}
         role="status"
-        aria-live="polite"
+        aria-live="off"
       >
+        {/* Stage-only live region. The pill body mutates per token
+            during streaming, which would spam screen readers if the
+            outer container were polite. We keep the outer container
+            silent (aria-live="off") and announce stage transitions
+            (Listening/Transcribing/Polishing/Done) through this
+            visually-hidden child region instead. */}
+        <span
+          aria-live="polite"
+          aria-atomic="true"
+          style={{
+            position: "absolute",
+            width: "1px",
+            height: "1px",
+            padding: 0,
+            margin: "-1px",
+            overflow: "hidden",
+            clip: "rect(0, 0, 0, 0)",
+            "white-space": "nowrap",
+            border: 0,
+          }}
+        >
+          {(() => {
+            const st = effectiveState();
+            if (st === "listening") return "Listening";
+            if (st === "transcribing") return "Transcribing";
+            if (st === "polishing") return "Polishing";
+            if (st === "done") return message() ?? (warning() ? "Raw copy" : "Done");
+            if (st === "error") return message() ?? "Error";
+            if (st === "canceled") return message() ?? "Canceled";
+            if (st === "saturated") return toastMessage() ?? message() ?? "Too many in flight";
+            return "";
+          })()}
+        </span>
         <Show when={state() === "listening"}>
           <Waveform levels={levels()} color={meterColor()} />
         </Show>
@@ -1012,7 +1074,7 @@ function StreamingText(props: {
         // wrap, hostile for anything past ~10 words.
         "justify-content": "flex-start",
       }}
-      aria-live="polite"
+      aria-live="off"
     >
       <span
         class="text-[11px] font-medium"
@@ -1200,7 +1262,11 @@ function QueueDot(props: { count: number }) {
         height: "9px",
         "border-radius": "9999px",
         background: "var(--color-violet, #a78bfa)",
-        "box-shadow": "0 0 0 1.5px var(--color-pill-surface), 0 0 8px rgba(167, 139, 250, 0.55)",
+        // Halo ring matches the surrounding bg, not the translucent pill
+        // surface — using --color-pill-surface in light mode produced a
+        // visible cream halo around the violet dot that read as a paint
+        // bug. --color-bg merges into the ambient backdrop at any theme.
+        "box-shadow": "0 0 0 1.5px var(--color-bg), 0 0 8px rgba(167, 139, 250, 0.55)",
         display: "flex",
         "align-items": "center",
         "justify-content": "center",

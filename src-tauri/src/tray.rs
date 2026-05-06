@@ -159,6 +159,7 @@ pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     if let Some(monitor) = monitor {
         let scale = monitor.scale_factor();
         let mw = monitor.size().width as f64 / scale;
+        let mh = monitor.size().height as f64 / scale;
         let mx = monitor.position().x as f64 / scale;
         let my = monitor.position().y as f64 / scale;
 
@@ -171,12 +172,26 @@ pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             None => (mx + mw - 32.0, my + 8.0 + 22.0),
         };
 
+        // Clamp the popover height so it fits under the menu bar on
+        // small displays (e.g. external 13" panels): take min(POPOVER_H,
+        // available_height) where available = screen_height - menu_bar
+        // (~22 px) - 24 px breathing room. Falls back to POPOVER_H if
+        // the screen probe yielded a non-positive height.
+        let menu_bar_h = 22.0;
+        let breathing_room = 24.0;
+        let available_h = mh - menu_bar_h - breathing_room;
+        let popover_h = if available_h > 0.0 {
+            POPOVER_H.min(available_h)
+        } else {
+            POPOVER_H
+        };
+
         let x = (cx_logical - POPOVER_W / 2.0)
             .min(mx + mw - POPOVER_W - 8.0)
             .max(mx + 8.0);
         let y = top_y.max(my + 8.0 + 22.0);
 
-        let _ = win.set_size(LogicalSize::new(POPOVER_W, POPOVER_H));
+        let _ = win.set_size(LogicalSize::new(POPOVER_W, popover_h));
         let _ = win.set_position(LogicalPosition::new(x, y));
     }
 

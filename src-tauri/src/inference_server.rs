@@ -85,7 +85,9 @@ const HOST_BINARY: &BinaryDescriptor = &BinaryDescriptor {
     id: "llama-server-b8953-macos-arm64",
     version: LLAMA_CPP_TAG,
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b8953/llama-b8953-bin-macos-arm64.tar.gz",
-    expected_sha256: None,
+    // Computed locally from the b8953 release archive on 2026-05-04.
+    // Pin: bumping LLAMA_CPP_TAG REQUIRES recomputing this digest.
+    expected_sha256: Some("343b6ac2a5bd77b6d9cc6a6af2b298de7228aa3ea9d5056ac0fbbf6b77186ada"),
     archive: ArchiveFormat::TarGz,
     size_bytes: 9_000_000,
     binary_filename: "llama-server",
@@ -96,7 +98,9 @@ const HOST_BINARY: &BinaryDescriptor = &BinaryDescriptor {
     id: "llama-server-b8953-win-vulkan-x64",
     version: LLAMA_CPP_TAG,
     url: "https://github.com/ggml-org/llama.cpp/releases/download/b8953/llama-b8953-bin-win-vulkan-x64.zip",
-    expected_sha256: None,
+    // Computed locally from the b8953 release archive on 2026-05-04.
+    // Pin: bumping LLAMA_CPP_TAG REQUIRES recomputing this digest.
+    expected_sha256: Some("af6f9b7a98fd549609db979015bb727fa0048df20d40954678bc2571d514e2e3"),
     archive: ArchiveFormat::Zip,
     size_bytes: 36_000_000,
     binary_filename: "llama-server.exe",
@@ -373,14 +377,94 @@ async fn run_download<R: Runtime>(
     Ok(())
 }
 
+/// Validates an in-archive relative path against `dest`. Returns the
+/// safe joined path on success. Rejects:
+///   - absolute paths (`/etc/passwd`, `C:\Windows\System32\...`)
+///   - any `..` or other parent-dir component
+///   - empty / current-dir-only paths
+///
+/// `dest` does not need to exist yet, but it must be canonicalised by
+/// the caller (we canonicalise inside as a defence-in-depth check).
+/// The historical `tar::Archive::unpack` and `zip::ZipArchive::extract`
+/// helpers each follow symlinks and normalise lazily — a malicious
+/// archive can use either to escape `dest`. We hand-roll iteration
+/// here so neither codepath is reachable.
+fn safe_join(dest: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
+    if relative.as_os_str().is_empty() {
+        anyhow::bail!("archive entry has empty path");
+    }
+    if relative.is_absolute() {
+        anyhow::bail!("archive contains absolute path: {}", relative.display());
+    }
+    for c in relative.components() {
+        match c {
+            std::path::Component::Normal(_) => {}
+            // CurDir (".") is benign but useless; reject for clarity.
+            // RootDir / Prefix should already have been caught by
+            // is_absolute, but be defensive.
+            _ => {
+                anyhow::bail!(
+                    "archive contains unsafe path component: {}",
+                    relative.display()
+                );
+            }
+        }
+    }
+    let joined = dest.join(relative);
+    // Defence-in-depth: even if components() somehow misses a tricky
+    // construction, verify the joined path stays within dest. We don't
+    // canonicalise (the file may not exist yet) but we use a literal
+    // prefix comparison.
+    if !joined.starts_with(dest) {
+        anyhow::bail!(
+            "archive entry escapes destination directory: {}",
+            relative.display()
+        );
+    }
+    Ok(joined)
+}
+
 fn extract_tar_gz(archive: &Path, dest: &Path) -> anyhow::Result<()> {
     let f = std::fs::File::open(archive)
         .map_err(|e| anyhow::anyhow!("open archive: {e}"))?;
     let gz = flate2::read::GzDecoder::new(f);
     let mut tar = tar::Archive::new(gz);
     tar.set_preserve_permissions(true);
-    tar.unpack(dest)
-        .map_err(|e| anyhow::anyhow!("untar: {e}"))?;
+    // `tar::Archive::unpack` follows symlinks during extraction and
+    // does not validate that entry paths stay under `dest`; a hostile
+    // archive can write `../../etc/passwd` or symlink-then-write to
+    // escape. Iterate manually so each entry is validated before any
+    // file is touched.
+    for entry in tar.entries()
+        .map_err(|e| anyhow::anyhow!("read tar entries: {e}"))?
+    {
+        let mut entry = entry.map_err(|e| anyhow::anyhow!("tar entry: {e}"))?;
+        let rel: PathBuf = entry
+            .path()
+            .map_err(|e| anyhow::anyhow!("tar entry path: {e}"))?
+            .into_owned();
+        let safe = safe_join(dest, &rel)?;
+        // Defence-in-depth for symlink entries: reject any link target
+        // that resolves outside `dest`.
+        if let Ok(Some(link)) = entry.link_name() {
+            // `link_name` is the literal target (relative or absolute).
+            // We must validate it the same way as the entry path —
+            // otherwise an extracted file could pass safe_join while
+            // pointing at /etc/passwd.
+            let link_path: PathBuf = link.into_owned();
+            // Allow only relative, no-parent-dir link targets.
+            if let Err(e) = safe_join(dest, &link_path) {
+                anyhow::bail!(
+                    "tar entry {} has unsafe symlink target {}: {e}",
+                    rel.display(),
+                    link_path.display()
+                );
+            }
+        }
+        entry
+            .unpack(&safe)
+            .map_err(|e| anyhow::anyhow!("untar entry {}: {e}", rel.display()))?;
+    }
     Ok(())
 }
 
@@ -389,8 +473,51 @@ fn extract_zip(archive: &Path, dest: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("open archive: {e}"))?;
     let mut zip =
         zip::ZipArchive::new(f).map_err(|e| anyhow::anyhow!("read zip: {e}"))?;
-    zip.extract(dest)
-        .map_err(|e| anyhow::anyhow!("unzip: {e}"))?;
+    // `ZipArchive::extract` does its own zip-slip check in recent
+    // versions, but we prefer to be explicit so a future dependency
+    // bump can't silently regress. Iterate, validate each path, and
+    // write into `dest` ourselves.
+    for i in 0..zip.len() {
+        let mut zfile = zip
+            .by_index(i)
+            .map_err(|e| anyhow::anyhow!("read zip entry {i}: {e}"))?;
+        // `enclosed_name` returns None for any path containing absolute
+        // or parent-dir components — exactly the validation we want.
+        let rel = zfile
+            .enclosed_name()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "zip entry has unsafe path: {}",
+                    zfile.name()
+                )
+            })?
+            .to_path_buf();
+        let safe = safe_join(dest, &rel)?;
+        if zfile.is_dir() {
+            std::fs::create_dir_all(&safe)
+                .map_err(|e| anyhow::anyhow!("create dir {}: {e}", safe.display()))?;
+            continue;
+        }
+        if let Some(parent) = safe.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create parent {}: {e}", parent.display()))?;
+        }
+        let mut out = std::fs::File::create(&safe)
+            .map_err(|e| anyhow::anyhow!("create file {}: {e}", safe.display()))?;
+        std::io::copy(&mut zfile, &mut out)
+            .map_err(|e| anyhow::anyhow!("write file {}: {e}", safe.display()))?;
+        // Preserve unix permissions if the entry carries them.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Some(mode) = zfile.unix_mode() {
+                let _ = std::fs::set_permissions(
+                    &safe,
+                    std::fs::Permissions::from_mode(mode),
+                );
+            }
+        }
+    }
     Ok(())
 }
 
