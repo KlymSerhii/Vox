@@ -17,6 +17,7 @@ mod onboarding;
 mod pill;
 mod session;
 mod settings;
+mod stats;
 mod transcripts;
 mod tray;
 mod tray_glyphs;
@@ -56,6 +57,7 @@ pub fn run() {
             commands::set_appearance,
             commands::copy_text,
             commands::get_recent_transcripts,
+            commands::get_time_saved_stats,
             commands::open_settings,
             commands::close_tray_popover,
             commands::quit_app,

@@ -4,11 +4,13 @@ import {
   closeTrayPopover,
   copyText,
   getPublicSettings,
+  getTimeSavedStats,
   inferenceServerStatus,
   listModels,
   listModes,
   onSessionsChanged,
   onSettingsChanged,
+  onStatsChanged,
   onTranscriptsChanged,
   openSettingsWindow,
   quitApp,
@@ -21,10 +23,12 @@ import {
   setStreamingPillEnabled,
   type InProgressEntry,
   type ModelStatus,
+  type Period,
   type RecentTranscript,
   type SessionsSnapshot,
   type Settings,
   type Stage,
+  type TimeSavedStats,
   type VoiceMode,
 } from "../lib/ipc";
 
@@ -44,6 +48,12 @@ export default function TrayPopoverView() {
   // that will fail on first use.
   const [models, setModels] = createSignal<ModelStatus[]>([]);
   const [inferenceInstalled, setInferenceInstalled] = createSignal<boolean | null>(null);
+  const [period, setPeriod] = createSignal<Period>("day");
+  const [stats, setStats] = createSignal<TimeSavedStats>({
+    saved_seconds: 0,
+    sessions: 0,
+  });
+  const [quickSettingsOpen, setQuickSettingsOpen] = createSignal(false);
   // Anchor for the mode-picker dropdown. Used by Show-when-open to
   // position the listbox via fixed coordinates so it isn't clipped by
   // the popover root's `overflow-hidden`.
@@ -54,10 +64,37 @@ export default function TrayPopoverView() {
     left: number;
     minWidth: number;
   }>({ top: 0, left: 0, minWidth: 0 });
+  const [periodMenuOpen, setPeriodMenuOpen] = createSignal(false);
+  let periodTriggerRef: HTMLButtonElement | undefined;
+  let periodMenuRef: HTMLDivElement | undefined;
+  const [periodMenuPos, setPeriodMenuPos] = createSignal<{
+    top: number;
+    left: number;
+    minWidth: number;
+  }>({ top: 0, left: 0, minWidth: 0 });
+  const PERIOD_OPTIONS: { value: Period; label: string }[] = [
+    { value: "last_session", label: "Last session" },
+    { value: "day", label: "Today" },
+    { value: "week", label: "Week" },
+    { value: "month", label: "Month" },
+    { value: "year", label: "Year" },
+  ];
+  const periodLabel = () =>
+    PERIOD_OPTIONS.find((o) => o.value === period())?.label ?? "Today";
 
   let unlistenSettings: (() => void) | null = null;
   let unlistenTranscripts: (() => void) | null = null;
   let unlistenSessions: (() => void) | null = null;
+  let unlistenStats: (() => void) | null = null;
+
+  async function refreshStats() {
+    try {
+      setStats(await getTimeSavedStats(period()));
+    } catch (e) {
+      console.warn(e);
+      setStats({ saved_seconds: 0, sessions: 0 });
+    }
+  }
 
   function applySnapshot(snap: SessionsSnapshot) {
     setInProgress(snap.in_progress);
@@ -109,6 +146,8 @@ export default function TrayPopoverView() {
     unlistenSettings = await onSettingsChanged(setS);
     unlistenTranscripts = await onTranscriptsChanged(setRecents);
     unlistenSessions = await onSessionsChanged(applySnapshot);
+    unlistenStats = await onStatsChanged(refreshStats);
+    void refreshStats();
 
     window.addEventListener("focus", () => {
       void sessionsSnapshot().then(applySnapshot);
@@ -122,13 +161,20 @@ export default function TrayPopoverView() {
     // dropdown. Without it, the menu can persist after losing focus
     // and reappear out-of-context when the popover hides + re-shows.
     document.addEventListener("mousedown", (e) => {
-      if (!modeMenuOpen()) return;
       const target = e.target as Node | null;
       if (!target) return;
-      const inMenu = !!modeMenuRef && modeMenuRef.contains(target);
-      const inTrigger =
-        !!modeTriggerRef && modeTriggerRef.contains(target);
-      if (!inMenu && !inTrigger) setModeMenuOpen(false);
+      if (modeMenuOpen()) {
+        const inMenu = !!modeMenuRef && modeMenuRef.contains(target);
+        const inTrigger =
+          !!modeTriggerRef && modeTriggerRef.contains(target);
+        if (!inMenu && !inTrigger) setModeMenuOpen(false);
+      }
+      if (periodMenuOpen()) {
+        const inMenu = !!periodMenuRef && periodMenuRef.contains(target);
+        const inTrigger =
+          !!periodTriggerRef && periodTriggerRef.contains(target);
+        if (!inMenu && !inTrigger) setPeriodMenuOpen(false);
+      }
     });
 
     // Tauri fires this when the popover loses key window status, e.g.
@@ -136,7 +182,10 @@ export default function TrayPopoverView() {
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
       await getCurrentWindow().onFocusChanged(({ payload }) => {
-        if (!payload) setModeMenuOpen(false);
+        if (!payload) {
+          setModeMenuOpen(false);
+          setPeriodMenuOpen(false);
+        }
       });
     } catch (err) {
       console.warn("focus listener init failed:", err);
@@ -147,6 +196,7 @@ export default function TrayPopoverView() {
     unlistenSettings?.();
     unlistenTranscripts?.();
     unlistenSessions?.();
+    unlistenStats?.();
   });
 
   async function pickMode(id: string) {
@@ -259,7 +309,7 @@ export default function TrayPopoverView() {
       >
         {(st) => (
           <>
-            <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+            <header class="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
               <Show
                 when={setupNeeded()}
                 fallback={
@@ -306,78 +356,209 @@ export default function TrayPopoverView() {
               </button>
             </header>
 
+            <div class="flex min-h-0 flex-1 flex-col overflow-y-auto">
             <div class="border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between gap-3">
-                <div class="flex min-w-0 flex-col">
-                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
-                    {st().hands_free_enabled ? "Press to talk" : "Hold to talk"}
+              <div class="liquid-card flex items-center gap-3 rounded-[10px] px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+                <div class="flex min-w-0 flex-1 flex-col">
+                  <span class="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-mute)]">
+                    Time saved
                   </span>
-                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                    {st().hands_free_enabled
-                      ? "Press the hotkey to start, press again to stop."
-                      : "Hold the hotkey while speaking, release to stop."}
+                  <span class="mt-0.5 text-[20px] font-semibold leading-none tracking-[-0.01em] text-[var(--color-ink)] tabular-nums">
+                    {formatDuration(stats().saved_seconds)}
+                  </span>
+                  <span class="mt-1 text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    {sessionsSubLine(stats().sessions)}
                   </span>
                 </div>
-                <Toggle
-                  checked={st().hands_free_enabled}
-                  onChange={toggleHandsFree}
-                />
+                <button
+                  ref={(el) => (periodTriggerRef = el)}
+                  type="button"
+                  class="liquid-card inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                  onClick={() => {
+                    const next = !periodMenuOpen();
+                    if (next && periodTriggerRef) {
+                      const r = periodTriggerRef.getBoundingClientRect();
+                      const menuW = Math.max(r.width, 140);
+                      const right = r.right;
+                      const left = Math.max(8, right - menuW);
+                      setPeriodMenuPos({
+                        top: r.bottom + 4,
+                        left,
+                        minWidth: menuW,
+                      });
+                    }
+                    setPeriodMenuOpen(next);
+                  }}
+                  aria-haspopup="listbox"
+                  aria-expanded={periodMenuOpen()}
+                  aria-label="Time saved period"
+                >
+                  <span>{periodLabel()}</span>
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
               </div>
-            </div>
-
-            <div class="border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between gap-3">
-                <div class="flex min-w-0 flex-col">
-                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
-                    Polish transcripts
-                  </span>
-                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                    {st().polishing_enabled
-                      ? "Gemma cleans up the transcript before copying."
-                      : "Raw output is copied as-is."}
-                  </span>
-                </div>
-                <Toggle
-                  checked={st().polishing_enabled}
-                  onChange={togglePolishing}
-                />
-              </div>
-              <Show
-                when={
-                  st().polishing_enabled && st().llm_engine === "gemma-local"
-                }
-              >
-                <div class="mt-3 flex items-center justify-between gap-3 pl-6">
-                  <div class="flex min-w-0 flex-col">
-                    <span class="text-[12px] font-medium text-[var(--color-ink)]">
-                      Thinking
-                    </span>
-                    <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                      Reason silently before polishing.
-                    </span>
-                  </div>
-                  <Toggle
-                    checked={st().enable_thinking}
-                    onChange={(v) => void toggleEnableThinking(v)}
-                  />
+              <Show when={periodMenuOpen()}>
+                <div
+                  ref={(el) => (periodMenuRef = el)}
+                  class="liquid-glass z-50 max-h-60 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  role="listbox"
+                  style={{
+                    position: "fixed",
+                    top: `${periodMenuPos().top}px`,
+                    left: `${periodMenuPos().left}px`,
+                    "min-width": `${periodMenuPos().minWidth}px`,
+                  }}
+                >
+                  <For each={PERIOD_OPTIONS}>
+                    {(o) => (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={o.value === period()}
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                        classList={{
+                          "text-[var(--color-accent)]": o.value === period(),
+                          "text-[var(--color-ink)]": o.value !== period(),
+                        }}
+                        onClick={() => {
+                          setPeriod(o.value);
+                          setPeriodMenuOpen(false);
+                          void refreshStats();
+                        }}
+                      >
+                        <span class="flex-1">{o.label}</span>
+                        <Show when={o.value === period()}>
+                          <span class="text-[10px]">●</span>
+                        </Show>
+                      </button>
+                    )}
+                  </For>
                 </div>
               </Show>
             </div>
 
-            <div class="border-b border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between gap-3">
-                <div class="flex min-w-0 flex-col">
-                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
-                    Streaming pill
-                  </span>
-                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                    See the transcript appear live before it's copied.
-                  </span>
+            <div class="border-b border-[var(--color-border)]">
+              <button
+                type="button"
+                class="flex w-full items-center justify-between px-4 py-3 text-left transition-colors hover:bg-[var(--color-overlay)]"
+                aria-expanded={quickSettingsOpen()}
+                aria-controls="quick-settings-panel"
+                onClick={() => setQuickSettingsOpen(!quickSettingsOpen())}
+              >
+                <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                  Quick Settings
+                </span>
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  class="text-[var(--color-ink-mute)] transition-transform duration-200 ease-out"
+                  style={{
+                    transform: quickSettingsOpen()
+                      ? "rotate(180deg)"
+                      : "rotate(0deg)",
+                  }}
+                  aria-hidden="true"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+              <div
+                id="quick-settings-panel"
+                class="overflow-hidden transition-all duration-200 ease-out"
+                style={{
+                  "max-height": quickSettingsOpen() ? "500px" : "0px",
+                  opacity: quickSettingsOpen() ? 1 : 0,
+                }}
+              >
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        {st().hands_free_enabled ? "Press to talk" : "Hold to talk"}
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {st().hands_free_enabled
+                          ? "Press the hotkey to start, press again to stop."
+                          : "Hold the hotkey while speaking, release to stop."}
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().hands_free_enabled}
+                      onChange={toggleHandsFree}
+                    />
+                  </div>
                 </div>
-                <Toggle
-                  checked={st().streaming_pill_enabled}
-                  onChange={(v) => void toggleStreamingPill(v)}
-                />
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Polish transcripts
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {st().polishing_enabled
+                          ? "Gemma cleans up the transcript before copying."
+                          : "Raw output is copied as-is."}
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().polishing_enabled}
+                      onChange={togglePolishing}
+                    />
+                  </div>
+                  <Show
+                    when={
+                      st().polishing_enabled &&
+                      st().llm_engine === "gemma-local"
+                    }
+                  >
+                    <div class="mt-3 flex items-center justify-between gap-3 pl-6">
+                      <div class="flex min-w-0 flex-col">
+                        <span class="text-[12px] font-medium text-[var(--color-ink)]">
+                          Thinking
+                        </span>
+                        <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                          Reason silently before polishing.
+                        </span>
+                      </div>
+                      <Toggle
+                        checked={st().enable_thinking}
+                        onChange={(v) => void toggleEnableThinking(v)}
+                      />
+                    </div>
+                  </Show>
+                </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Streaming pill
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        See the transcript appear live before it's copied.
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().streaming_pill_enabled}
+                      onChange={(v) => void toggleStreamingPill(v)}
+                    />
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -498,7 +679,7 @@ export default function TrayPopoverView() {
               </Show>
             </div>
 
-            <div class="flex-1 overflow-y-auto scrollbar-thin px-2 py-2">
+            <div class="flex min-h-[180px] flex-1 flex-col px-2 py-2">
               <Show when={inProgress().length > 0}>
                 <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-violet,#a78bfa)]">
                   In progress
@@ -590,7 +771,8 @@ export default function TrayPopoverView() {
                 />
               </div>
             </div>
-            <footer class="flex items-center justify-between gap-2 border-t border-[var(--color-border)] px-4 py-2.5">
+            </div>
+            <footer class="flex shrink-0 items-center justify-between gap-2 border-t border-[var(--color-border)] px-4 py-2.5">
               <LocalBadge />
               <button
                 type="button"
@@ -868,6 +1050,27 @@ function MoonGlyph() {
       <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
     </svg>
   );
+}
+
+function formatDuration(totalSeconds: number): string {
+  if (!Number.isFinite(totalSeconds)) return "0s";
+  const t = Math.round(totalSeconds);
+  if (t < 1) return "0s";
+  if (t < 60) return `${t}s`;
+  if (t < 3600) {
+    const m = Math.floor(t / 60);
+    const s = t - m * 60;
+    return s === 0 ? `${m}m` : `${m}m ${s}s`;
+  }
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t - h * 3600) / 60);
+  return m === 0 ? `${h}h` : `${h}h ${m}m`;
+}
+
+function sessionsSubLine(n: number): string {
+  if (n === 0) return "No sessions yet";
+  if (n === 1) return "1 session";
+  return `${n} sessions`;
 }
 
 function ago(tsSeconds: number): string {

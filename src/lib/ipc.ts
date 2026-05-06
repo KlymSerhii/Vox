@@ -77,6 +77,13 @@ export interface RecentTranscript {
   text: string;
 }
 
+export type Period = "last_session" | "day" | "week" | "month" | "year";
+
+export interface TimeSavedStats {
+  saved_seconds: number;
+  sessions: number;
+}
+
 export type Stage =
   | "listening"
   | "transcribing"
@@ -199,6 +206,10 @@ export async function setAppearance(
 
 export async function getRecentTranscripts(): Promise<RecentTranscript[]> {
   return invoke<RecentTranscript[]>("get_recent_transcripts");
+}
+
+export async function getTimeSavedStats(period: Period): Promise<TimeSavedStats> {
+  return invoke<TimeSavedStats>("get_time_saved_stats", { period });
 }
 
 export async function openSettingsWindow(): Promise<void> {
@@ -458,6 +469,12 @@ export async function onTranscriptsChanged(
   cb: (rec: RecentTranscript[]) => void,
 ): Promise<UnlistenFn> {
   return listen<RecentTranscript[]>("transcripts:changed", (e) => cb(e.payload));
+}
+
+export async function onStatsChanged(
+  handler: () => void,
+): Promise<UnlistenFn> {
+  return listen<unknown>("stats:changed", () => handler());
 }
 
 export async function cancelSession(sessionId: number): Promise<void> {

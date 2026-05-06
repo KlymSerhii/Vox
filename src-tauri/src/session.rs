@@ -1434,6 +1434,23 @@ async fn run_pipeline(
     match copy_result {
         Ok(Ok(())) => {
             transcripts::push_completed(entry);
+            // Stats record covers both polish-succeeded and the
+            // LLM fail-open path — both arms above set `cleaned` to
+            // either the polished or raw transcript and fall through
+            // to this same successful-copy branch. A failed/panicked
+            // copy skips this; cancel/STT-error/silent paths return
+            // early before reaching here.
+            {
+                let actual_seconds = session.started_at.elapsed().as_secs_f64();
+                let now_ts = chrono::Utc::now().timestamp();
+                if let Some(t) = session.transcript.lock().as_deref() {
+                    crate::stats::record_session(&app, t, actual_seconds, now_ts);
+                } else {
+                    log::warn!(
+                        "stats: success branch reached with no transcript captured (sid={id}); skipping record"
+                    );
+                }
+            }
             // Legacy event keeps the existing tray-popover RECENT
             // logic working for any consumer that hasn't migrated.
             let _ = app.emit("transcripts:changed", transcripts::snapshot());

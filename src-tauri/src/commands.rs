@@ -276,6 +276,16 @@ pub fn get_recent_transcripts() -> Vec<transcripts::RecentTranscript> {
 }
 
 #[tauri::command]
+pub fn get_time_saved_stats<R: Runtime>(
+    app: AppHandle<R>,
+    period: String,
+) -> Result<crate::stats::TimeSavedStats, String> {
+    let p = crate::stats::Period::parse(&period)
+        .ok_or_else(|| format!("invalid period: {period}"))?;
+    Ok(crate::stats::aggregate(&app, p))
+}
+
+#[tauri::command]
 pub fn open_settings<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("settings") {
         crate::tray::position_settings_on_active_display(&win);
