@@ -4,7 +4,7 @@
 //! and Keychain entries from upgrades of the pre-local build.
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::models;
@@ -532,7 +532,17 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
 pub fn set_active_mode_id<R: Runtime>(app: &AppHandle<R>, id: &str) -> anyhow::Result<()> {
     let mut s = load(app);
     s.active_mode_id = id.to_string();
-    save(app, &s)
+    save(app, &s)?;
+    // Mirror `commands::set_settings`: any change to the live `Settings`
+    // doc must fan out so the tray popover, Settings window, and other
+    // listeners stay in sync. Without this, the keyboard mode-cycle
+    // and the `set_active_mode` / `cycle_active_mode` IPC commands all
+    // updated disk silently and any open UI showed stale state until
+    // the next full settings save.
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed after active mode update: {e}");
+    }
+    Ok(())
 }
 
 /// Persist a single hotkey field without rewriting the rest of the

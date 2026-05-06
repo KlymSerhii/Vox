@@ -47,6 +47,17 @@ interface StreamPayload {
   final: boolean;
 }
 
+interface ActiveModePayload {
+  id: string;
+  name: string;
+  icon: string;
+}
+
+/// Mode-cycle HUD lifetime. Matches the Rust-side `pill::hide` timer in
+/// `hotkey::spawn_cycle_active_mode` so the icon+name disappears with
+/// the window instead of trailing into the next dictation.
+const MODE_HUD_MS = 800;
+
 const BARS = 32;
 /** Soft cap on how many characters per second the streaming UI
  * reveals. Tuned to slightly LAG Gemma's ~50 tok/s × ~4 char/tok =
@@ -64,6 +75,21 @@ export default function PillView() {
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
   const [backgroundCount, setBackgroundCount] = createSignal(0);
   const [toastMessage, setToastMessage] = createSignal<string | null>(null);
+  // Mode-cycle HUD: when set, the pill renders the new voice mode
+  // (icon + name) instead of its usual dictation UI. Cleared after
+  // MODE_HUD_MS or when a real session event arrives, whichever is
+  // first, so a dictation that starts mid-HUD never has to share the
+  // pill slot with a stale mode label.
+  const [modeHud, setModeHud] = createSignal<ActiveModePayload | null>(null);
+  let modeHudTimer: number | null = null;
+
+  function clearModeHud() {
+    if (modeHudTimer !== null) {
+      clearTimeout(modeHudTimer);
+      modeHudTimer = null;
+    }
+    setModeHud(null);
+  }
 
   // Streaming UI state: only populated when the user has the streaming
   // pill enabled AND the active session is the pill's owner. The
@@ -369,6 +395,9 @@ export default function PillView() {
 
     unlisten.push(
       await listen<PillStatePayload>("pill:state", (e) => {
+        // Real session activity always wins the pill slot back from a
+        // mode-cycle HUD that's still inside its 800ms window.
+        clearModeHud();
         const prevState = state();
         setState(e.payload.state);
         setMessage(e.payload.message ?? null);
@@ -480,6 +509,21 @@ export default function PillView() {
         applyStreamPayload(e.payload, "polish");
       }),
     );
+    unlisten.push(
+      await listen<ActiveModePayload>("pill:active_mode", (e) => {
+        // Mode-cycle hotkey just landed. Take over the pill slot with
+        // an icon+name HUD and arm a self-clear timer so the HUD goes
+        // away in lockstep with the Rust-side window hide.
+        setModeHud(e.payload);
+        if (modeHudTimer !== null) {
+          clearTimeout(modeHudTimer);
+        }
+        modeHudTimer = window.setTimeout(() => {
+          setModeHud(null);
+          modeHudTimer = null;
+        }, MODE_HUD_MS);
+      }),
+    );
   });
 
   onCleanup(() => {
@@ -490,6 +534,10 @@ export default function PillView() {
     if (pillTransitionTimer !== null) {
       clearTimeout(pillTransitionTimer);
       pillTransitionTimer = null;
+    }
+    if (modeHudTimer !== null) {
+      clearTimeout(modeHudTimer);
+      modeHudTimer = null;
     }
     stopReveal();
     clearTranscriptHold();
@@ -867,6 +915,8 @@ export default function PillView() {
           }}
         >
           {(() => {
+            const hud = modeHud();
+            if (hud) return `Mode: ${hud.name}`;
             const st = effectiveState();
             if (st === "listening") return "Listening";
             if (st === "transcribing") return "Transcribing";
@@ -878,7 +928,10 @@ export default function PillView() {
             return "";
           })()}
         </span>
-        <Show when={state() === "listening"}>
+        <Show when={modeHud()}>
+          <ModeHudView mode={modeHud()!} />
+        </Show>
+        <Show when={state() === "listening" && !modeHud()}>
           <Waveform levels={levels()} color={meterColor()} />
         </Show>
 
@@ -890,7 +943,7 @@ export default function PillView() {
             transcript hold suppresses the row in lockstep with the
             rest of the polishing UI; the inner opacity transition
             still handles the 180ms crossfade as the stage flips. */}
-        <Show when={effectiveState() === "polishing"}>
+        <Show when={effectiveState() === "polishing" && !modeHud()}>
           <PolishingLabelRow visible={effectiveState() === "polishing"} />
         </Show>
 
@@ -904,13 +957,14 @@ export default function PillView() {
           when={
             isProcessing() &&
             !isStreaming() &&
-            effectiveState() !== "polishing"
+            effectiveState() !== "polishing" &&
+            !modeHud()
           }
         >
           <ShimmerWord text="Transcribing" tint={meterColor()} />
         </Show>
 
-        <Show when={isStreaming()}>
+        <Show when={isStreaming() && !modeHud()}>
           <StreamingText
             text={streamingText()}
             mode={streamingMode() ?? "transcript"}
@@ -922,32 +976,32 @@ export default function PillView() {
           />
         </Show>
 
-        <Show when={state() === "done"}>
+        <Show when={state() === "done" && !modeHud()}>
           <TerminalLine
             tone={warning() ? "warning" : "success"}
             label={message() ?? (warning() ? "Raw copy" : "Done")}
           />
         </Show>
 
-        <Show when={state() === "error"}>
+        <Show when={state() === "error" && !modeHud()}>
           <TerminalLine
             tone="error"
             label={message() ?? "Error"}
           />
         </Show>
 
-        <Show when={state() === "canceled"}>
+        <Show when={state() === "canceled" && !modeHud()}>
           <TerminalLine tone="muted" label={message() ?? "Canceled"} />
         </Show>
 
-        <Show when={isSaturated()}>
+        <Show when={isSaturated() && !modeHud()}>
           <TerminalLine
             tone="warning"
             label={toastMessage() ?? message() ?? "Too many in flight"}
           />
         </Show>
 
-        <Show when={backgroundCount() > 0 && !isSaturated()}>
+        <Show when={backgroundCount() > 0 && !isSaturated() && !modeHud()}>
           <QueueDot count={backgroundCount()} />
         </Show>
       </div>
@@ -958,6 +1012,18 @@ export default function PillView() {
 function clamp(n: number): number {
   if (Number.isNaN(n)) return 0;
   return Math.max(0, Math.min(1, n));
+}
+
+function ModeHudView(props: { mode: ActiveModePayload }) {
+  return (
+    <div
+      class="flex h-full w-full items-center justify-center gap-1.5 px-1 text-[12px] font-medium leading-none text-[var(--color-ink)]"
+      aria-hidden="true"
+    >
+      <span class="shrink-0">{props.mode.icon}</span>
+      <span class="truncate">{props.mode.name}</span>
+    </div>
+  );
 }
 
 function Waveform(props: { levels: number[]; color: string }) {

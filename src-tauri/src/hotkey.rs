@@ -750,6 +750,21 @@ fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
             log::warn!("failed to persist mode cycle: {e}");
             return;
         }
+        // Skip the pill HUD if a dictation session already owns the
+        // pill — otherwise we'd `pill::show` over a live `Listening`
+        // pill and override its waveform with a mode label, then
+        // `pill::hide` it 800 ms later mid-session. The mode change
+        // still applies to the next utterance (per the CLAUDE.md
+        // "switching modes mid-pipeline does not affect the current
+        // utterance" contract); the user sees it via the tray
+        // popover / Settings window through `settings:changed`.
+        let session_active = app
+            .try_state::<Arc<SessionManager>>()
+            .map(|mgr| mgr.is_recording() || mgr.has_active_pipeline())
+            .unwrap_or(false);
+        if session_active {
+            return;
+        }
         // 800 ms HUD so the user sees the new mode.
         crate::pill::show(&app);
         crate::pill::emit_active_mode(&app, &next);
