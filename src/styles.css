@@ -354,6 +354,34 @@ body.translucent {
   animation: polishing-dot-pulse 1.4s ease-in-out infinite;
 }
 
+/* Staggered 3-dot loading indicator used below sticky headers while
+ * no streamed text has arrived yet. Each dot cycles opacity at the
+ * same 1.4s period as the polishing-dot with a 120ms stagger so
+ * they read as a wave rather than a unison blink. */
+@keyframes typing-dot-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+.typing-dot {
+  animation: typing-dot-pulse 1.4s ease-in-out infinite;
+}
+
+/* Streaming body: no visible scrollbar, top-fade mask so older text
+ * dissolves rather than hard-clipping at the sticky header edge. */
+.streaming-body {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.streaming-body::-webkit-scrollbar {
+  display: none;
+}
+
+/* Processing header (both transcribing and polishing). Inherits the
+ * pill surface background — no extra translucency layer needed. */
+.processing-header {}
+
 /* Suppress bar height/opacity transitions while the pill itself is
  * resizing (200ms window after a stage change). The two animations
  * running simultaneously produced a visible squeeze on the waveform
@@ -419,6 +447,12 @@ body.translucent {
    * opted into reduced motion. */
   .polishing-label-row {
     transition: none !important;
+  }
+
+  /* Typing dots freeze at full opacity when motion is suppressed. */
+  .typing-dot {
+    animation: none !important;
+    opacity: 1 !important;
   }
 
   .pill-shimmer {

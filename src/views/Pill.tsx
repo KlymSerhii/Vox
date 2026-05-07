@@ -53,10 +53,11 @@ interface ActiveModePayload {
   icon: string;
 }
 
-/// Mode-cycle HUD lifetime. Matches the Rust-side `pill::hide` timer in
-/// `hotkey::spawn_cycle_active_mode` so the icon+name disappears with
-/// the window instead of trailing into the next dictation.
+/// Mode-cycle HUD lifetime for the full-takeover path (idle mode-cycle).
 const MODE_HUD_MS = 800;
+/// Companion chip lifetime when mode fires during an active recording
+/// session — long enough to read comfortably while listening starts.
+const MODE_CHIP_MS = 2000;
 
 const BARS = 32;
 /** Soft cap on how many characters per second the streaming UI
@@ -75,6 +76,10 @@ export default function PillView() {
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
   const [backgroundCount, setBackgroundCount] = createSignal(0);
   const [toastMessage, setToastMessage] = createSignal<string | null>(null);
+  // Tracks whether a recording session is currently in-flight.
+  // Used by the mode-cycle handler to choose chip vs full-takeover HUD.
+  // Starts false so a cold-start mode-cycle press correctly shows the HUD.
+  const [sessionActive, setSessionActive] = createSignal(false);
   // Mode-cycle HUD: when set, the pill renders the new voice mode
   // (icon + name) instead of its usual dictation UI. Cleared after
   // MODE_HUD_MS or when a real session event arrives, whichever is
@@ -82,6 +87,12 @@ export default function PillView() {
   // pill slot with a stale mode label.
   const [modeHud, setModeHud] = createSignal<ActiveModePayload | null>(null);
   let modeHudTimer: number | null = null;
+  // Companion chip shown BELOW the main pill while a recording session
+  // is active. Does NOT replace the waveform — both appear simultaneously.
+  const [modeChip, setModeChip] = createSignal<ActiveModePayload | null>(null);
+  const [modeChipFading, setModeChipFading] = createSignal(false);
+  let modeChipTimer: number | null = null;
+  let modeChipFadeTimer: number | null = null;
 
   function clearModeHud() {
     if (modeHudTimer !== null) {
@@ -90,6 +101,26 @@ export default function PillView() {
     }
     setModeHud(null);
   }
+
+  function clearModeChip() {
+    if (modeChipTimer !== null) {
+      clearTimeout(modeChipTimer);
+      modeChipTimer = null;
+    }
+    if (modeChipFadeTimer !== null) {
+      clearTimeout(modeChipFadeTimer);
+      modeChipFadeTimer = null;
+    }
+    setModeChipFading(false);
+    setModeChip(null);
+  }
+
+  // Ref to the scrollable streaming body — used by the auto-scroll effect.
+  let streamingBodyRef: HTMLDivElement | undefined;
+  // True only when the body has actual overflow (old content has scrolled
+  // out of view). Gates the top-fade mask so TypingDots / short text stay
+  // fully visible until there is genuine content to hide.
+  const [bodyOverflowing, setBodyOverflowing] = createSignal(false);
 
   // Streaming UI state: only populated when the user has the streaming
   // pill enabled AND the active session is the pill's owner. The
@@ -395,9 +426,21 @@ export default function PillView() {
 
     unlisten.push(
       await listen<PillStatePayload>("pill:state", (e) => {
-        // Real session activity always wins the pill slot back from a
-        // mode-cycle HUD that's still inside its 800ms window.
+        // Real session activity wins back the pill slot from any active HUD.
         clearModeHud();
+        // Chip is also cleared on terminal states so it doesn't linger
+        // into Done/Error/Canceled.
+        if (
+          e.payload.state === "done" ||
+          e.payload.state === "error" ||
+          e.payload.state === "canceled"
+        ) {
+          clearModeChip();
+          setSessionActive(false);
+        }
+        if (e.payload.state === "listening") {
+          setSessionActive(true);
+        }
         const prevState = state();
         setState(e.payload.state);
         setMessage(e.payload.message ?? null);
@@ -511,23 +554,45 @@ export default function PillView() {
     );
     unlisten.push(
       await listen<ActiveModePayload>("pill:active_mode", (e) => {
-        // Mode-cycle hotkey just landed. Take over the pill slot with
-        // an icon+name HUD and arm a self-clear timer so the HUD goes
-        // away in lockstep with the Rust-side window hide.
-        setModeHud(e.payload);
-        if (modeHudTimer !== null) {
-          clearTimeout(modeHudTimer);
+        // During an active recording session show a companion chip
+        // below the pill so the waveform stays visible. Outside a
+        // session use the full-takeover HUD (shorter lifetime).
+        if (sessionActive()) {
+          clearModeHud();
+          // Clear any in-flight fade before showing a fresh chip.
+          if (modeChipFadeTimer !== null) {
+            clearTimeout(modeChipFadeTimer);
+            modeChipFadeTimer = null;
+          }
+          setModeChipFading(false);
+          setModeChip(e.payload);
+          if (modeChipTimer !== null) clearTimeout(modeChipTimer);
+          modeChipTimer = window.setTimeout(() => {
+            modeChipTimer = null;
+            // Fade out over 220 ms, then unmount.
+            setModeChipFading(true);
+            modeChipFadeTimer = window.setTimeout(() => {
+              modeChipFadeTimer = null;
+              setModeChip(null);
+              setModeChipFading(false);
+            }, 220);
+          }, MODE_CHIP_MS);
+        } else {
+          clearModeChip();
+          setModeHud(e.payload);
+          if (modeHudTimer !== null) clearTimeout(modeHudTimer);
+          modeHudTimer = window.setTimeout(() => {
+            setModeHud(null);
+            modeHudTimer = null;
+          }, MODE_HUD_MS);
         }
-        modeHudTimer = window.setTimeout(() => {
-          setModeHud(null);
-          modeHudTimer = null;
-        }, MODE_HUD_MS);
       }),
     );
   });
 
   onCleanup(() => {
     for (const u of unlisten) u();
+    setSessionActive(false);
     if (toastTimer !== null) {
       clearTimeout(toastTimer);
     }
@@ -538,6 +603,14 @@ export default function PillView() {
     if (modeHudTimer !== null) {
       clearTimeout(modeHudTimer);
       modeHudTimer = null;
+    }
+    if (modeChipTimer !== null) {
+      clearTimeout(modeChipTimer);
+      modeChipTimer = null;
+    }
+    if (modeChipFadeTimer !== null) {
+      clearTimeout(modeChipFadeTimer);
+      modeChipFadeTimer = null;
     }
     stopReveal();
     clearTranscriptHold();
@@ -624,6 +697,13 @@ export default function PillView() {
   // so the window chrome matches. Width drives how snug the pill hugs
   // short polishes; height handles multi-line wrapping. Without this,
   // either dimension would clip past the OS window's compact frame.
+  //
+  // wrapperRef points to the outer flex-column container that holds
+  // both the pill body and the optional mode chip below it. The
+  // ResizeObserver watches the wrapper so pill_resize accounts for the
+  // chip's extra height; pillRef still targets the inner pill div for
+  // all the imperative min-width style writes.
+  let wrapperRef: HTMLDivElement | undefined;
   let pillRef: HTMLDivElement | undefined;
   let resizeObserver: ResizeObserver | null = null;
   let resizeRaf: number | null = null;
@@ -649,13 +729,12 @@ export default function PillView() {
   // width to exceed the floor when content needs more.
   //
   // H_min/H_max bracket the ramp; H_max should track HEIGHT_MAX in
-  // pill.rs (240). W_min is raised from the previous 224 px hard
-  // floor — single-line streaming feels intentional at 360 px instead
-  // of cramped. W_max keeps the existing 720 px ceiling.
-  const H_MIN = 64;
-  const H_MAX = 240;
-  const W_MIN = 360;
-  const W_MAX = 720;
+  // pill.rs (120). W_min is 180 px — single-line streaming feels
+  // intentional at that width. W_max is 360 px.
+  const H_MIN = 32;
+  const H_MAX = 120;
+  const W_MIN = 180;
+  const W_MAX = 360;
   // 12 px quantisation grid + 12 px grow / 32 px shrink hysteresis
   // bands stop the floor from chasing every sub-pixel content nudge
   // (each one would otherwise round-trip to Rust as a window resize).
@@ -760,7 +839,7 @@ export default function PillView() {
   }
 
   function setupResizeObserver() {
-    if (resizeObserver || !pillRef) return;
+    if (resizeObserver || !wrapperRef) return;
     resizeObserver = new ResizeObserver((entries) => {
       // Coalesce bursts via rAF so a flurry of streaming chunks only
       // produces one pill_resize per frame.
@@ -772,11 +851,18 @@ export default function PillView() {
         // Update the dynamic width floor BEFORE reporting size up so
         // the very next layout pass — which the floor change kicks
         // off — gets reported instead of the pre-floor measurement.
-        applyDynamicWidthFloor(last.contentRect.height);
+        // Use the inner pill height (not wrapper height) so the chip's
+        // extra ~29 px (gap + chip row) doesn't skew the floor lerp.
+        const pillHeight = pillRef
+          ? pillRef.getBoundingClientRect().height
+          : last.contentRect.height;
+        applyDynamicWidthFloor(pillHeight);
+        // reportPillSize still gets the wrapper's full height so the
+        // OS window accounts for the chip when it's visible.
         reportPillSize(last.contentRect.width, last.contentRect.height);
       });
     });
-    resizeObserver.observe(pillRef);
+    resizeObserver.observe(wrapperRef);
   }
 
   function teardownResizeObserver() {
@@ -795,6 +881,24 @@ export default function PillView() {
     lastReportedHeight = null;
     resetDynamicWidthFloor();
   }
+
+  // Auto-scroll the streaming body to bottom when new text arrives so
+  // the newest tokens are always visible. Also tracks whether the body
+  // is genuinely overflowing so the top-fade mask only applies then.
+  createEffect(() => {
+    const text = streamingText(); // reactive dependency
+    if (!streamingBodyRef) return;
+    // Reset overflow flag when there is no text (new session boundary).
+    if (!text) {
+      setBodyOverflowing(false);
+      return;
+    }
+    requestAnimationFrame(() => {
+      if (!streamingBodyRef) return;
+      streamingBodyRef.scrollTop = streamingBodyRef.scrollHeight;
+      setBodyOverflowing(streamingBodyRef.scrollHeight > streamingBodyRef.clientHeight + 1);
+    });
+  });
 
   // Toggle the observer with the streaming lifecycle so we don't push
   // height updates for the compact Listening/Done states (Rust handles
@@ -827,29 +931,46 @@ export default function PillView() {
     }
   });
 
+  // Option (b): drive explicit height IPC from modeChip/modeChipFading signals.
+  // The ResizeObserver is intentionally off during listening (compact pill, 116px
+  // wide — always-on observer would report W_MIN=180 and force a wide-mode resize).
+  // Instead we watch the chip signals directly and push compact-height updates.
+  createEffect(() => {
+    const chip = modeChip();
+    const fading = modeChipFading();
+    // Only active when streaming is off (listening phase, compact pill).
+    if (STREAM_GROW_ENABLED()) return;
+    if (state() !== "listening") return;
+    if (chip) {
+      // Pill (36px) + drawer (25px) + WINDOW_PADDING_H (10px) = 71 → round to 72.
+      void pillResize({ height: 72 }).catch(() => {});
+    } else if (!fading) {
+      // Drawer gone — restore compact height.
+      void pillResize({ height: 36 + WINDOW_PADDING_H }).catch(() => {});
+    }
+  });
+
   return (
     <div class="flex h-screen w-screen items-center justify-center bg-transparent">
+      <div ref={(el) => (wrapperRef = el)} class="flex flex-col items-center">
       <div
         ref={(el) => (pillRef = el)}
         class="animate-pill-in pointer-events-none relative flex min-h-[26px] items-center rounded-[14px] px-3 py-1.5 transition-[width,box-shadow,padding,border-radius] duration-200 ease-out"
         classList={{ "pill-transitioning": pillTransitioning() }}
         style={{
-          // Stack the persistent Polishing label above the streaming
-          // body during polishing — replaces the prior absolute-position
-          // hack + topInset coupling. Other states stay row-centered.
-          // Gated on `effectiveState()` so the column flip is delayed
-          // through the transcript hold, matching the rest of the
-          // polishing-UI predicates.
+          // Column layout during any processing stage so the sticky
+          // header sits above the scrollable streaming body. Other
+          // states stay row-centred.
           "flex-direction":
-            effectiveState() === "polishing" ? "column" : "row",
+            isProcessing() ? "column" : "row",
           "justify-content":
-            effectiveState() === "polishing" ? "flex-start" : "center",
+            isProcessing() ? "flex-start" : "center",
           "align-items":
-            effectiveState() === "polishing" ? "stretch" : "center",
+            isProcessing() ? "stretch" : "center",
           // Compact pill sits at 116 px. While streaming we use
           // `fit-content` so the pill div sizes itself to the actual
-          // text width; min/max clamp the box at a 360 px floor
-          // (single-line streaming feels intentional) and a 720 px
+          // text width; min/max clamp the box at a 180 px floor
+          // (single-line streaming feels intentional) and a 360 px
           // ceiling (matches WIDE_WIDTH_MAX − 40 px so the pill div
           // can fully fill the OS window's interior at the cap). The
           // ResizeObserver above watches `pillRef.contentRect.width`
@@ -877,7 +998,13 @@ export default function PillView() {
           // 9999px) look squashed at the corners — soften to a 14 px
           // rounded rect when wide and let the compact mode keep its
           // round-end silhouette via a higher value.
-          "border-radius": STREAM_GROW_ENABLED() ? "14px" : "9999px",
+          // When the mode drawer is attached below, flatten the bottom
+          // corners so the pill and drawer share a seamless continuous edge.
+          "border-radius": STREAM_GROW_ENABLED()
+            ? "14px"
+            : modeChip()
+              ? "9999px 9999px 0 0"
+              : "9999px",
           background: "var(--color-pill-surface)",
           "backdrop-filter": "var(--glass-blur)",
           "-webkit-backdrop-filter": "var(--glass-blur)",
@@ -935,45 +1062,51 @@ export default function PillView() {
           <Waveform levels={levels()} color={meterColor()} />
         </Show>
 
-        {/* Persistent "Polishing…" indicator. Stays visible for the
-            entire polishing stage — including while body text streams
-            below it — so the user has a stable signal that polishing
-            is still happening even when the caret is bouncing along
-            new tokens. Gated on `effectiveState()` so the post-final
-            transcript hold suppresses the row in lockstep with the
-            rest of the polishing UI; the inner opacity transition
-            still handles the 180ms crossfade as the stage flips. */}
-        <Show when={effectiveState() === "polishing" && !modeHud()}>
-          <PolishingLabelRow visible={effectiveState() === "polishing"} />
-        </Show>
+        {/* Unified processing layout: sticky header + scrollable body.
+            Active for both transcribing and polishing so the stage
+            label never scrolls off as text grows. */}
+        <Show when={isProcessing() && !modeHud()}>
+          {/* Sticky header — always visible for the entire stage. */}
+          <div class="processing-header" style={{ "padding-bottom": "2px" }}>
+            <Show when={effectiveState() === "polishing"}>
+              <PolishingLabelRow visible={true} />
+            </Show>
+            <Show when={effectiveState() === "transcribing"}>
+              <TranscribingLabelRow />
+            </Show>
+          </div>
 
-        {/* Non-streaming processing fallback: if we're transcribing or
-            polishing but no streamed text has arrived yet, the
-            existing ShimmerWord label stands in. We hide it during
-            polishing because the explicit label row above already
-            communicates the stage; the ShimmerWord stays for the
-            transcribing pre-stream gap. */}
-        <Show
-          when={
-            isProcessing() &&
-            !isStreaming() &&
-            effectiveState() !== "polishing" &&
-            !modeHud()
-          }
-        >
-          <ShimmerWord text="Transcribing" tint={meterColor()} />
-        </Show>
-
-        <Show when={isStreaming() && !modeHud()}>
-          <StreamingText
-            text={streamingText()}
-            mode={streamingMode() ?? "transcript"}
-            waitingForPolish={isWaitingForPolish()}
-            transcribingStreaming={
-              effectiveState() === "transcribing" &&
-              streamingMode() === "transcript"
-            }
-          />
+          {/* Scrollable body: auto-scrolls to bottom, fades top edge,
+              never grows past H_MAX minus header height. */}
+          <div
+            ref={(el) => (streamingBodyRef = el)}
+            class="streaming-body"
+            style={{
+              flex: "1",
+              "max-height": `${H_MAX - 28}px`,
+              "mask-image": bodyOverflowing()
+                ? "linear-gradient(to bottom, transparent 0%, black 24px)"
+                : "none",
+              "-webkit-mask-image": bodyOverflowing()
+                ? "linear-gradient(to bottom, transparent 0%, black 24px)"
+                : "none",
+            }}
+          >
+            <Show when={isStreaming()}>
+              <StreamingText
+                text={streamingText()}
+                mode={streamingMode() ?? "transcript"}
+                waitingForPolish={isWaitingForPolish()}
+                transcribingStreaming={
+                  effectiveState() === "transcribing" &&
+                  streamingMode() === "transcript"
+                }
+              />
+            </Show>
+            <Show when={!isStreaming()}>
+              <TypingDots color={meterColor()} />
+            </Show>
+          </div>
         </Show>
 
         <Show when={state() === "done" && !modeHud()}>
@@ -1004,6 +1137,13 @@ export default function PillView() {
         <Show when={backgroundCount() > 0 && !isSaturated() && !modeHud()}>
           <QueueDot count={backgroundCount()} />
         </Show>
+      </div>
+
+      {/* Mode drawer: attached half-pill that grows downward from the
+          main pill when the mode-cycle hotkey fires during a recording
+          session. No gap — the flat bottom edge of the main pill and
+          the flat top edge of the drawer share a seamless seam. */}
+      <ModeDrawer mode={modeChip()} fading={modeChipFading()} />
       </div>
     </div>
   );
@@ -1121,14 +1261,14 @@ function StreamingText(props: {
     props.mode === "polish"
       ? "var(--caret-glow-violet)"
       : "var(--caret-glow-cyan)";
-  // Body shimmer recolours per state: violet for the polish-gap (the
-  // existing behaviour), cyan whenever the transcription stream is
-  // actively flowing (the new behaviour for Fix 2). Anything else
-  // (no shimmer applied) leaves these as inert custom-prop fallbacks.
+  // Shimmer is active throughout both transcribing and polishing streaming
+  // phases so the user always sees the animated sweep on live text.
   const shimmerActive = () =>
-    props.waitingForPolish || props.transcribingStreaming;
+    props.waitingForPolish ||
+    props.transcribingStreaming ||
+    props.mode === "polish";
   const shimmerTint = () =>
-    props.waitingForPolish
+    props.waitingForPolish || props.mode === "polish"
       ? "var(--color-violet)"
       : "var(--color-cyan)";
   return (
@@ -1254,26 +1394,139 @@ function PolishingLabelRow(props: { visible: boolean }) {
   );
 }
 
-function ShimmerWord(props: { text: string; tint: string }) {
-  // A continuous left-to-right luminance sweep across the letters. The
-  // base glyphs sit at ink-mute; a brighter band travels through them
-  // on a 1.6s loop to communicate active progress without the visual
-  // noise of a spinner. CSS variables drive the gradient so the
-  // shimmer recolours per-state (teal → violet) to match the pipeline
-  // stage.
+/// Sticky header for the transcribing stage — mirrors PolishingLabelRow
+/// with cyan instead of violet.
+function TranscribingLabelRow() {
   return (
-    <span
-      class="pill-shimmer select-none text-[10.5px] font-medium leading-none"
+    <div
+      class="polishing-label-row pointer-events-none"
       style={{
-        "--shimmer-base": "var(--color-ink-mute)",
-        "--shimmer-tint": props.tint,
-        "letter-spacing": "0.01em",
+        display: "flex",
+        "align-items": "center",
+        gap: "6px",
+        "margin-bottom": "4px",
+        opacity: 1,
+        transition: "opacity 180ms ease-out",
       }}
+      aria-hidden="true"
     >
-      {props.text}
-    </span>
+      <span
+        class="polishing-dot"
+        style={{
+          width: "6px",
+          height: "6px",
+          "border-radius": "9999px",
+          background: "var(--color-cyan)",
+          "box-shadow": "0 0 8px var(--caret-glow-cyan)",
+          display: "inline-block",
+        }}
+      />
+      <span
+        style={{
+          "font-size": "10.5px",
+          "font-weight": 600,
+          "letter-spacing": "0.04em",
+          color: "var(--color-cyan)",
+          opacity: 0.85,
+          "line-height": "1",
+        }}
+      >
+        Transcribing…
+      </span>
+    </div>
   );
 }
+
+/// Three staggered pulsing dots shown in the body area while no streamed
+/// text has arrived yet. Gives a visible loading signal during the
+/// Whisper startup gap and the LLM TTFT gap.
+function TypingDots(props: { color: string }) {
+  const delays = ["0ms", "120ms", "240ms"];
+  return (
+    <div
+      class="flex items-center justify-center"
+      style={{ gap: "5px", padding: "4px 0 2px" }}
+      aria-hidden="true"
+    >
+      {delays.map((delay) => (
+        <span
+          class="typing-dot"
+          style={{
+            width: "5px",
+            height: "5px",
+            "border-radius": "9999px",
+            background: props.color,
+            display: "inline-block",
+            "animation-delay": delay,
+          }}
+        />
+      ))}
+    </div>
+  );
+}
+
+/// Mode drawer: an "attached half-pill" that grows downward from the bottom
+/// of the main listening pill when the mode-cycle hotkey fires during a
+/// recording session. No gap between pill and drawer — they share a continuous
+/// flat seam. The main pill's bottom border-radius transitions to 0 in lockstep.
+///
+/// Open:  height 0→25px + opacity 0→1 over 220ms ease-out.
+/// Close: fading=true drives opacity 1→0 over 220ms, then the parent
+///        clears `mode` (unmounting the content) after the same 220ms timer.
+///
+/// `mode` null means nothing is mounted — the drawer collapses to 0 height.
+function ModeDrawer(props: { mode: ActiveModePayload | null; fading: boolean }) {
+  return (
+    <div
+      class="pointer-events-none overflow-hidden"
+      style={{
+        // Grow downward from height 0. The 25px target matches the
+        // "half-pill" spec: padding (3px top/bottom) + content (~11px)
+        // + border-bottom (1px) = ~25px. Use height transition (not
+        // scaleY) so the rounded bottom corners aren't distorted.
+        height: props.mode ? "25px" : "0px",
+        opacity: props.mode && !props.fading ? 1 : 0,
+        transition: "height 220ms ease-out, opacity 220ms ease-out",
+        // Full width of the wrapper so longer mode names (e.g. "Code Comment")
+        // aren't clipped; visual distinction from the main pill comes from the
+        // height difference and the rounded-bottom-only shape.
+        width: "100%",
+        // Flat top edge (shared seam with pill), rounded bottom corners.
+        // 18px mirrors the effective radius on the main pill's top corners
+        // (border-radius:9999px on 116×36px → min(58,18) = 18px).
+        "border-radius": "0 0 18px 18px",
+        background: "var(--color-pill-surface)",
+        "backdrop-filter": "var(--glass-blur)",
+        "-webkit-backdrop-filter": "var(--glass-blur)",
+        // No top border — the shared seam must be invisible.
+        "border-left": "1px solid var(--glass-rim)",
+        "border-right": "1px solid var(--glass-rim)",
+        "border-bottom": "1px solid var(--glass-rim)",
+      }}
+      aria-hidden="true"
+    >
+      <Show when={props.mode}>
+        <div
+          style={{
+            display: "flex",
+            "align-items": "center",
+            "justify-content": "center",
+            gap: "5px",
+            padding: "3px 8px",
+            "font-size": "10.5px",
+            "font-weight": 500,
+            color: "var(--color-ink-mute)",
+            "white-space": "nowrap",
+          }}
+        >
+          <span>{props.mode!.icon}</span>
+          <span>{props.mode!.name}</span>
+        </div>
+      </Show>
+    </div>
+  );
+}
+
 
 function TerminalLine(props: {
   tone: "success" | "warning" | "error" | "muted";

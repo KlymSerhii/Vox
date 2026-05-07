@@ -255,22 +255,22 @@ pub fn emit_polish_stream<R: Runtime>(app: &AppHandle<R>, sid: u64, text: String
 
 /// Wide width when streaming text is showing. Capped to (screen_w - 64)
 /// so the pill never bleeds off-screen on small displays.
-const WIDE_WIDTH_MAX: f64 = 760.0;
+const WIDE_WIDTH_MAX: f64 = 380.0;
 const WIDE_WIDTH_MIN: f64 = 144.0;
 /// Floor for the streaming-mode pill once content-driven width feedback
 /// kicks in. Below this we revert to the pure compact silhouette via
-/// `set_wide(false)`. Raised from 240 → 360 to match the frontend's
-/// new W_MIN floor (`Pill.tsx`); the buffer covers WINDOW_PADDING_W
-/// (16 px) so a 360-px content min-width round-trips through the IPC
-/// without the Rust clamp dropping it below the pill's content floor.
-pub const WIDE_WIDTH_MIN_DYNAMIC: f64 = 360.0;
+/// `set_wide(false)`. Matches the frontend's W_MIN floor (`Pill.tsx`);
+/// the buffer covers WINDOW_PADDING_W (16 px) so a 180-px content
+/// min-width round-trips through the IPC without the Rust clamp
+/// dropping it below the pill's content floor.
+pub const WIDE_WIDTH_MIN_DYNAMIC: f64 = 180.0;
 /// Caps for content-driven height growth during streaming. `HEIGHT` is
 /// the compact single-line frame; `HEIGHT_MAX` keeps long polishes from
 /// taking over the screen — the inner div scrolls beyond that.
-pub const HEIGHT_MAX: f64 = 240.0;
+pub const HEIGHT_MAX: f64 = 145.0; // +25px reserves room for the mode drawer when it appears during streaming.
 
 /// Resize the pill window. `wide=true` enters streaming mode at the
-/// dynamic floor (360 px); the frontend's ResizeObserver then drives
+/// dynamic floor (180 px); the frontend's ResizeObserver then drives
 /// width up via `set_size` as the streamed text grows. `wide=false`
 /// snaps back to the compact 144 px. Repositions afterwards so the
 /// pill stays horizontally centred AND bottom-anchored so vertical
