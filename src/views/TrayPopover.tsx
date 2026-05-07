@@ -756,21 +756,19 @@ export default function TrayPopoverView() {
               </Show>
             </div>
 
-            <div class="border-t border-[var(--color-border)] px-4 py-3">
-              <div class="flex items-center justify-between">
-                <span class="text-[12px] font-medium text-[var(--color-ink-mute)]">
-                  Appearance
-                </span>
-                <AppearanceToggle
-                  value={st().appearance}
-                  onChange={(v) => {
-                    const cur = s();
-                    if (cur) setS({ ...cur, appearance: v });
-                    void setAppearance(v);
-                  }}
-                />
-              </div>
             </div>
+            <div class="flex shrink-0 items-center justify-between border-t border-[var(--color-border)] px-4 py-3">
+              <span class="text-[12px] font-medium text-[var(--color-ink-mute)]">
+                Appearance
+              </span>
+              <AppearanceToggle
+                value={st().appearance}
+                onChange={(v) => {
+                  const cur = s();
+                  if (cur) setS({ ...cur, appearance: v });
+                  void setAppearance(v);
+                }}
+              />
             </div>
             <footer class="flex shrink-0 items-center justify-between gap-2 border-t border-[var(--color-border)] px-4 py-2.5">
               <LocalBadge />
