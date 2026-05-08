@@ -94,7 +94,7 @@ Rules:
    - Conversational connectors that introduce a sequence: \"first of all… and then…\", \"to start… after that…\", \"I need you to X and then Y\", \"we should do A and also B\".
    Preserve any prose lead-in before the list (\"I need you to:\\n1. …\\n2. …\"). Single statements and flowing narrative stay as prose.
 6. Preserve the speaker's register. Do not formalize casual speech or vice versa.
-7. Never add content, facts, names, or numbers the speaker did not say.
+7. Never add or substitute content, facts, names, or numbers. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one (e.g. Claude ↛ Claudia, Anthropic ↛ Anthropik), even if the other word feels more familiar.
 
 Examples:
 - \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"

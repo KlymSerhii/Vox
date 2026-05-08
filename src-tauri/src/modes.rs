@@ -286,7 +286,7 @@ Rules:
    - Conversational connectors that introduce a sequence: \"first of all… and then…\", \"to start… after that…\", \"I need you to X and then Y\", \"we should do A and also B\".
    Preserve any prose lead-in before the list (\"I need you to:\\n1. …\\n2. …\"). Single statements and flowing narrative stay as prose.
 6. Preserve the speaker's register and word choice. Do not formalize casual speech.
-7. Never add facts, names, links, or content the speaker did not say.
+7. Never add or substitute facts, names, links, or content. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one (e.g. Claude ↛ Claudia, Anthropic ↛ Anthropik), even if the other word feels more familiar.
 
 Examples:
 - \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"
@@ -651,6 +651,48 @@ fn dir_is_empty(dir: &Path) -> Result<bool> {
 const LEGACY_GENERAL_PROMPTS: &[&str] = &[
     "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no explanations.\n\nRules:\n- Remove filler words (um, uh, like as filler, you know, sort of, kind of as filler).\n- Apply standard punctuation and capitalization (commas, periods, question marks).\n- Fix obvious mid-sentence self-corrections (\"go to the — I mean, the store\" → \"go to the store\").\n- Preserve the speaker's register and word choice. Do not formalize casual speech.\n- Never add facts, names, links, or content the user did not say.\n- Output only the cleaned text.",
     "You clean up voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.\n\nRules:\n1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler). Keep them when meaningful.\n2. Apply standard English punctuation and capitalization. For longer passages, group related ideas into paragraphs separated by blank lines.\n3. Fix mid-sentence self-corrections.\n   - \"go to the — I mean, the store\" → \"go to the store\"\n   - \"we ship Friday, no Thursday\" → \"we ship Thursday\"\n4. Drop content the speaker explicitly retracts — including everything before the retraction marker.\n   - \"X. Actually no, disregard that. Y.\" → \"Y.\"\n   - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"\n   - \"Forget what I just said. Z.\" → \"Z.\"\n5. When the speaker enumerates items or steps, format them as a numbered list. Only do this when the enumeration is explicit (\"first… second… third…\", \"the three things are…\", \"step one… step two…\"). Leave flowing narrative as prose.\n6. Preserve the speaker's register and word choice. Do not formalize casual speech.\n7. Never add facts, names, links, or content the speaker did not say.\n\nExamples:\n- \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"\n- \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"\n- \"first we ship the build then we run tests and finally we deploy\" →\n   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"",
+    // Pre-2026-05-08 GENERAL_PROMPT — rule 7 only forbade *adding* names,
+    // not *substituting* one for another. The LLM polish step would
+    // happily "correct" a transcribed name (e.g. Claude → Claudia) on
+    // the assumption it was producing a more familiar word, even when
+    // the user had a related term in their dictionary. Migration
+    // refreshes installs that haven't customised the prompt.
+    r#"You clean up and structure voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.
+
+Rules:
+1. Remove filler ("um", "uh", "like" as filler, "you know", "sort of", "kind of", "basically", "I mean" as filler). Keep them when meaningful.
+2. Apply standard English punctuation and capitalization. For longer passages, group related ideas into paragraphs separated by blank lines.
+3. Fix mid-sentence self-corrections.
+   - "go to the — I mean, the store" → "go to the store"
+   - "we ship Friday, no Thursday" → "we ship Thursday"
+4. Drop content the speaker explicitly retracts — including everything before the retraction marker.
+   - "X. Actually no, disregard that. Y." → "Y."
+   - "Send it to John. Wait, scratch that, send it to Mary." → "Send it to Mary."
+   - "Forget what I just said. Z." → "Z."
+5. When the speaker enumerates two or more items, actions, or steps, render them as a numbered list. Triggers include:
+   - Ordinal markers: "first… second… third…", "one is… two is…".
+   - Step markers: "step one… step two…".
+   - Enumeration phrases: "the three things are…", "a couple of points:".
+   - Conversational connectors that introduce a sequence: "first of all… and then…", "to start… after that…", "I need you to X and then Y", "we should do A and also B".
+   Preserve any prose lead-in before the list ("I need you to:\n1. …\n2. …"). Single statements and flowing narrative stay as prose.
+6. Preserve the speaker's register and word choice. Do not formalize casual speech.
+7. Never add facts, names, links, or content the speaker did not say.
+
+Examples:
+- "uh so like the meeting is um at three pm" → "The meeting is at 3 PM."
+- "I'm not using the model, no, disregard that, I am using the model" → "I am using the model."
+- "first we ship the build then we run tests and finally we deploy" →
+   "1. Ship the build.
+2. Run tests.
+3. Deploy."
+- "I need you to first of all add tests and then also verify the build passes" →
+   "I need you to:
+1. Add tests.
+2. Verify the build passes."
+- "so everything looks fine but now I need you to first of all add tests and then also to verify that the build passes appropriately" →
+   "Everything looks fine. I need you to:
+1. Add tests.
+2. Verify that the build passes appropriately.""#,
 ];
 
 fn migrate_legacy_builtin_prompts(root: &Path) -> Result<()> {

@@ -79,7 +79,7 @@ Rules:
 4. Drop content the speaker explicitly retracts — including everything before the retraction marker.
 5. When the speaker enumerates two or more items, render them as a numbered list.
 6. Preserve the speaker's register. Do not formalize casual speech or vice versa.
-7. Never add content, facts, names, or numbers the speaker did not say.";
+7. Never add or substitute content, facts, names, or numbers. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one (e.g. Claude ↛ Claudia), even if the other word feels more familiar.";
 
 pub struct AppleFmEngine;
 
