@@ -290,11 +290,55 @@ fn build_parakeet_bridge() {
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 }
 
+/// Explicitly link `libclang_rt.osx.a` so symbols emitted by
+/// `__builtin_available()` / `@available()` checks (notably
+/// `___isPlatformVersionAtLeast` in whisper-rs's `ggml-metal-device.m`)
+/// resolve at link time.
+///
+/// On developer Macs the static linker normally finds these via
+/// `libSystem.tbd`, but the symbol table varies across SDK / Xcode
+/// versions, and CI runners with mismatched Xcode + SDK pairings
+/// produce `Undefined symbols: ___isPlatformVersionAtLeast`.
+/// Linking clang's compiler-rt fallback guarantees resolution.
+#[cfg(target_os = "macos")]
+fn link_clang_rt_osx() {
+    // `clang -print-resource-dir` points at e.g.
+    //   /Applications/Xcode_*.app/Contents/Developer/Toolchains/
+    //     XcodeDefault.xctoolchain/usr/lib/clang/<ver>
+    // — the lib/darwin/ subdirectory under it is where clang_rt lives.
+    let output = match Command::new("clang").arg("-print-resource-dir").output() {
+        Ok(o) if o.status.success() => o,
+        _ => {
+            println!(
+                "cargo:warning=link_clang_rt_osx: `clang -print-resource-dir` failed; \
+                 macOS availability symbols may be unresolved at link time"
+            );
+            return;
+        }
+    };
+    let rdir = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if rdir.is_empty() {
+        return;
+    }
+    let lib_darwin = PathBuf::from(&rdir).join("lib").join("darwin");
+    if !lib_darwin.exists() {
+        println!(
+            "cargo:warning=link_clang_rt_osx: {} not found; \
+             skipping clang_rt.osx link",
+            lib_darwin.display()
+        );
+        return;
+    }
+    println!("cargo:rustc-link-search=native={}", lib_darwin.display());
+    println!("cargo:rustc-link-lib=static=clang_rt.osx");
+}
+
 fn main() {
     // On macOS, AXIsProcessTrusted lives in ApplicationServices.
     #[cfg(target_os = "macos")]
     {
         println!("cargo:rustc-link-lib=framework=ApplicationServices");
+        link_clang_rt_osx();
     }
 
     #[cfg(target_os = "macos")]
