@@ -37,21 +37,23 @@
       "icons/icon.icns"
     ],
     "category": "Utility",
-    "shortDescription": "Voice dictation for macOS",
-    "longDescription": "Vox is a macOS menu-bar app that lets you hold a hotkey, speak, and have the transcript pasted into the focused text field.",
+    "shortDescription": "On-device voice dictation",
+    "longDescription": "Vox is a menu-bar app that lets you hold a hotkey, speak, and copy the transcript to the clipboard ready for ⌘V. Fully on-device — no cloud, no telemetry, no API keys.",
     "macOS": {
       "minimumSystemVersion": "13.0",
       "entitlements": "entitlements.plist",
       "exceptionDomain": "",
-      "frameworks": []
+      "frameworks": [],
+      "signingIdentity": "Developer ID Application: Serhii Klymenko (4NUJDWKWX5)",
+      "providerShortName": "4NUJDWKWX5"
     }
   },
   "plugins": {
     "updater": {
       "endpoints": [
-        "https://updates.vox.local/{{target}}/{{arch}}/{{current_version}}"
+        "https://github.com/KlymSerhii/vox-releases/releases/latest/download/latest.json"
       ],
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNFMzBGM0IzREMwMzA2NEQKUldSTkJnUGNzL013UGl4bkZZeGVnbXBLOGZCdEtkTDlFM3krVUlMYUx1ZUtSUmtQNFh1WEpsUmsK",
       "windows": {
         "installMode": "passive"
       }

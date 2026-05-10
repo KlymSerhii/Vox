@@ -1,0 +1,235 @@
+# Release workflow for Vox.
+#
+# Triggers:
+#   - On push of any tag matching `v*` (e.g. `v1.0.0`).
+#   - Manually via "Run workflow" in the Actions tab (uses workflow_dispatch
+#     for re-runs without re-tagging; the version is read from Cargo.toml).
+#
+# What it does on each run:
+#   1. Imports the Developer ID Application certificate (from the
+#      APPLE_CERTIFICATE secret) into a fresh per-job keychain.
+#   2. Builds the macOS .app + .dmg + Tauri updater .tar.gz, all
+#      signed with the Developer ID cert.
+#   3. Submits the .app to Apple's notary service for notarization
+#      (via APPLE_ID + APPLE_PASSWORD + APPLE_TEAM_ID) and staples
+#      the ticket.
+#   4. Generates a `latest.json` updater manifest containing the
+#      version, signature (from the .tar.gz.sig), and the GitHub
+#      Releases download URL.
+#   5. Creates a release on the public KlymSerhii/vox-releases repo
+#      and uploads the .app.tar.gz + .sig + .dmg + latest.json.
+#
+# Secrets consumed (all configured under Settings → Secrets → Actions
+# in the *private* KlymSerhii/Vox repo):
+#   APPLE_ID                          - Apple ID email
+#   APPLE_PASSWORD                    - app-specific password
+#   APPLE_TEAM_ID                     - Apple Team ID (e.g. 4NUJDWKWX5)
+#   APPLE_SIGNING_IDENTITY            - "Developer ID Application: Name (TEAM)"
+#   APPLE_CERTIFICATE                 - base64 of the .p12 cert export
+#   APPLE_CERTIFICATE_PASSWORD        - .p12 export password
+#   KEYCHAIN_PASSWORD                 - random password for the temp keychain
+#   RELEASES_TOKEN                    - fine-grained PAT for vox-releases
+#   TAURI_SIGNING_PRIVATE_KEY         - contents of ~/.tauri/vox-updater.key
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD - password set when generating it
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release-macos:
+    name: Build & release (macOS Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache Cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Resolve version
+        id: vars
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION=$(grep -m1 '^version' src-tauri/Cargo.toml | sed -E 's/version *= *"(.*)"/\1/')
+          fi
+          echo "Resolved version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Import Developer ID Application certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Decode the base64 .p12 to a temp file
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          # Create a fresh keychain for this job and make it the default
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+
+          # Import the cert + private key, granting codesign access
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security \
+            -T /usr/bin/productbuild
+
+          # Authorize codesign to use the imported key without prompts
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          # Verify the identity is now visible to codesign
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          # Wipe the .p12 from disk
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build, sign, and notarize Vox
+        env:
+          # Apple notary credentials. Tauri's bundler picks these up
+          # automatically when present and submits the .app to notary
+          # via xcrun notarytool, then staples the ticket.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          # Tauri updater signing key (signs the .app.tar.gz so the
+          # auto-updater can verify against the embedded pubkey).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npm run tauri build -- \
+            --target aarch64-apple-darwin \
+            --bundles app,dmg,updater \
+            --verbose
+
+      - name: Stage release artifacts
+        id: stage
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle"
+          STAGE="$RUNNER_TEMP/release-staging"
+          mkdir -p "$STAGE"
+
+          # Tauri names the .app bundle dir "<productName>.app", and the
+          # DMG follows "<productName>_<version>_<arch>.dmg". The updater
+          # tarball + signature live next to the .app.
+          APP_TARGZ="$BUNDLE_DIR/macos/Vox.app.tar.gz"
+          APP_SIG="$BUNDLE_DIR/macos/Vox.app.tar.gz.sig"
+          DMG="$BUNDLE_DIR/dmg/Vox_${VERSION}_aarch64.dmg"
+
+          # Sanity check: fail loudly if any expected artifact is missing.
+          for f in "$APP_TARGZ" "$APP_SIG" "$DMG"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing expected artifact: $f"
+              echo "Bundle dir contents:"
+              ls -la "$BUNDLE_DIR/macos" "$BUNDLE_DIR/dmg" || true
+              exit 1
+            fi
+          done
+
+          cp "$APP_TARGZ" "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz"
+          cp "$APP_SIG"   "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz.sig"
+          cp "$DMG"       "$STAGE/Vox_${VERSION}_aarch64.dmg"
+
+          # Generate the Tauri updater manifest. The signature is the
+          # contents of the .sig file (a single-line minisign signature
+          # the updater verifies against tauri.conf.json's pubkey).
+          SIGNATURE=$(cat "$APP_SIG")
+          PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          cat > "$STAGE/latest.json" <<EOF
+          {
+            "version": "${VERSION}",
+            "notes": "See https://github.com/KlymSerhii/vox-releases/releases/tag/v${VERSION} for release notes.",
+            "pub_date": "${PUB_DATE}",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "${SIGNATURE}",
+                "url": "https://github.com/KlymSerhii/vox-releases/releases/download/v${VERSION}/Vox_${VERSION}_aarch64.app.tar.gz"
+              }
+            }
+          }
+          EOF
+
+          ls -la "$STAGE"
+          echo "stage_dir=$STAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Gatekeeper acceptance of signed .app
+        run: |
+          set -euo pipefail
+          APP_PATH="src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Vox.app"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type exec --verbose=4 "$APP_PATH"
+
+      - name: Publish release to KlymSerhii/vox-releases
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          VERSION: ${{ steps.vars.outputs.version }}
+          STAGE: ${{ steps.stage.outputs.stage_dir }}
+        run: |
+          set -euo pipefail
+          # If the release already exists (e.g. a manual dispatch retry),
+          # delete it so we start clean. `gh release delete` is a no-op
+          # if the release doesn't exist.
+          gh release delete "v${VERSION}" \
+            --repo KlymSerhii/vox-releases \
+            --yes || true
+
+          gh release create "v${VERSION}" \
+            --repo KlymSerhii/vox-releases \
+            --title "Vox ${VERSION}" \
+            --notes "Apple Silicon build of Vox ${VERSION}.
+
+          ## Install
+          1. Download \`Vox_${VERSION}_aarch64.dmg\`.
+          2. Open the DMG and drag Vox into Applications.
+          3. Launch from Applications. macOS will verify the signature & notarization on first launch — no \"unknown developer\" warning.
+
+          ## Auto-update
+          The auto-updater fetches \`latest.json\` from this release. Existing v${VERSION}- users will receive future updates automatically.
+
+          ## License
+          Free for personal use. Commercial use requires a paid license — contact \`klym.serhiy@gmail.com\`. See [LICENSE](https://github.com/KlymSerhii/vox-releases/blob/main/LICENSE)." \
+            "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz" \
+            "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz.sig" \
+            "$STAGE/Vox_${VERSION}_aarch64.dmg" \
+            "$STAGE/latest.json"
+
+          echo "Released v${VERSION} to https://github.com/KlymSerhii/vox-releases/releases/tag/v${VERSION}"
