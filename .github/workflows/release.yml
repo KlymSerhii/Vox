@@ -42,12 +42,62 @@ on:
 jobs:
   release-macos:
     name: Build & release (macOS Apple Silicon)
-    runs-on: macos-14
+    # macos-latest currently maps to a runner with Xcode 16+; the
+    # apple-fm bridge weak-links FoundationModels.framework which
+    # requires the macOS 26 SDK (Xcode 17+). We select the newest
+    # available Xcode in a step below.
+    runs-on: macos-latest
     timeout-minutes: 90
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+
+      - name: Diagnostics — runner OS & available Xcode versions
+        run: |
+          set -eu
+          echo "macOS version: $(sw_vers -productVersion)"
+          echo "Default Xcode:"
+          xcodebuild -version || true
+          echo
+          echo "All installed Xcode versions:"
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          echo
+          echo "Checking for FoundationModels.framework in the active SDK:"
+          SDK_PATH=$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)
+          echo "SDK path: $SDK_PATH"
+          if [ -n "$SDK_PATH" ] && [ -d "$SDK_PATH/System/Library/Frameworks/FoundationModels.framework" ]; then
+            echo "FoundationModels FOUND in active SDK."
+          else
+            echo "FoundationModels NOT in active SDK — will try alternate Xcode versions."
+          fi
+
+      - name: Select newest available Xcode (needs macOS 26 SDK for FoundationModels)
+        run: |
+          set -eu
+          # Walk installed Xcodes newest-first, pick the first one whose
+          # SDK contains FoundationModels.framework. If none has it, fall
+          # back to the newest Xcode anyway and let the build fail loudly
+          # with a clear diagnostic.
+          chosen=""
+          for app in $(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr); do
+            sdk="$app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+            if [ -d "$sdk/System/Library/Frameworks/FoundationModels.framework" ]; then
+              chosen="$app"
+              echo "Found FoundationModels SDK in: $app"
+              break
+            fi
+          done
+          if [ -z "$chosen" ]; then
+            # No Xcode on the runner has the macOS 26 SDK. Fall back to
+            # whatever is newest and let the build surface a clear error.
+            chosen=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -Vr | head -1)
+            echo "::warning::No Xcode on this runner has FoundationModels.framework. Selected newest ($chosen) but the apple-fm bridge link step will fail. If this is sustained, switch CI to a self-hosted runner or build with --no-default-features --features local-engines,parakeet."
+          fi
+          sudo xcode-select -s "$chosen/Contents/Developer"
+          echo "Selected Xcode:"
+          xcodebuild -version
+          echo "Active SDK path: $(xcrun --sdk macosx --show-sdk-path)"
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
