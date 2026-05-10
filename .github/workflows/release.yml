@@ -190,9 +190,12 @@ jobs:
           MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           set -euo pipefail
+          # `--bundles app dmg` selects the macOS .app + .dmg targets.
+          # The updater .tar.gz + .sig is generated automatically because
+          # `bundle.createUpdaterArtifacts: true` is set in tauri.conf.json.
           npm run tauri build -- \
             --target aarch64-apple-darwin \
-            --bundles app,dmg,updater \
+            --bundles app dmg \
             --verbose
 
       - name: Stage release artifacts
