@@ -180,6 +180,14 @@ jobs:
           # auto-updater can verify against the embedded pubkey).
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Pin the deployment target across every sub-build (cargo cc,
+          # swiftc, cargo link, tauri bundle). Mismatched targets between
+          # Swift bridges (built at 14.0), whisper-rs's Obj-C ggml-metal
+          # (built with host default), and the final link step produce
+          # `___isPlatformVersionAtLeast` undefined-symbol errors.
+          # 14.0 is the floor required by FluidAudio (Parakeet bridge);
+          # Apple Intelligence still requires macOS 26 at runtime.
+          MACOSX_DEPLOYMENT_TARGET: "14.0"
         run: |
           set -euo pipefail
           npm run tauri build -- \

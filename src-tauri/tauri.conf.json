@@ -40,7 +40,7 @@
     "shortDescription": "On-device voice dictation",
     "longDescription": "Vox is a menu-bar app that lets you hold a hotkey, speak, and copy the transcript to the clipboard ready for ⌘V. Fully on-device — no cloud, no telemetry, no API keys.",
     "macOS": {
-      "minimumSystemVersion": "13.0",
+      "minimumSystemVersion": "14.0",
       "entitlements": "entitlements.plist",
       "exceptionDomain": "",
       "frameworks": [],
