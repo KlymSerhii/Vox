@@ -892,17 +892,10 @@ function HotkeyRow(props: {
     const d = props.diagnostic;
     return d != null && !d.bound && props.configured !== "";
   };
-  const chordRequiresAx = () => {
-    const d = props.diagnostic;
-    if (!d || d.bound) return false;
-    // Modifier-only specs only ever fail for permission reasons, so we
-    // surface Accessibility as the action even if the error wording
-    // changes upstream.
-    if (d.error?.toLowerCase().includes("accessibility")) return true;
-    return isModifierOnlySpec(d.configured);
-  };
-  const failedChip = () =>
-    chordRequiresAx() ? "Not bound — Accessibility required" : "Not bound";
+  // v1 picker options never include modifier-only chords, so the
+  // chord-Accessibility branch is unreachable. Keep the helper for the
+  // diagnostic snapshot but render a single "Not bound" chip.
+  const failedChip = () => "Not bound";
   return (
     <div
       class="flex items-start justify-between gap-4 px-4 py-3"
@@ -938,15 +931,6 @@ function HotkeyRow(props: {
             {props.diagnostic?.error}
           </span>
         </Show>
-        <Show when={chordRequiresAx()}>
-          <button
-            type="button"
-            onClick={() => void openAccessibilitySettings()}
-            class="mt-1 self-start rounded-[6px] bg-[var(--color-danger)]/15 px-2 py-1 text-[11px] text-[var(--color-danger)] hover:bg-[var(--color-danger)]/25"
-          >
-            Open Accessibility settings
-          </button>
-        </Show>
       </div>
       <div class="flex shrink-0 items-center gap-2">
         <select
@@ -972,27 +956,6 @@ function HotkeyRow(props: {
 function labelForValue(opts: HotkeyOption[], value: string): string | null {
   const m = opts.find((o) => o.value === value);
   return m?.label ?? null;
-}
-
-/** True if the spec is only modifier tokens. Mirrors the Rust parser in
- * `mac_chord::try_parse_chord`. */
-function isModifierOnlySpec(spec: string | null | undefined): boolean {
-  if (!spec) return false;
-  const tokens = spec.split("+").map((t) => t.trim());
-  if (tokens.length === 0 || tokens.some((t) => !t)) return false;
-  const MODS = new Set([
-    "Alt",
-    "Option",
-    "Ctrl",
-    "Control",
-    "Cmd",
-    "Command",
-    "Meta",
-    "Super",
-    "CommandOrControl",
-    "Shift",
-  ]);
-  return tokens.every((t) => MODS.has(t));
 }
 
 function friendlySttEngineName(engine: string): string {
@@ -3308,7 +3271,7 @@ function AboutTab() {
         </Row>
         <Row
           label="Binary path for Accessibility"
-          hint="For chord hotkeys only. Copies the build path so you can add it under Privacy & Security."
+          hint="Dev-build only. macOS keys Accessibility grants by signature, which rotates each rebuild; copy this path to re-add Vox under Privacy & Security if needed."
           last={!devInfo() && !diagErr() && !diag()}
         >
           <button

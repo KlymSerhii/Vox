@@ -64,7 +64,7 @@ Each mode contributes:
 ## Permissions
 
 - **Microphone** — required, prompted lazily inside the onboarding wizard via `AVCaptureDevice.requestAccessForMediaType`. The non-prompting `authorizationStatusForMediaType:` is used everywhere else (so the tray icon doesn't trigger a TCC prompt at launch).
-- **Accessibility** — **not required** for the default pipeline. The `Cmd+Alt+Period` (⌘⌥.) shortcut goes through Carbon `RegisterEventHotKey`, which doesn't need a TCC grant. Accessibility is only needed if the user picks a modifier-only chord PTT in Settings (routed through `mac_chord.rs`, `CGEventTap`).
+- **Accessibility** — **not required in v1**. The `Cmd+Alt+Period` (⌘⌥.) push-to-talk goes through Carbon `RegisterEventHotKey`, which doesn't need a TCC grant. The `mac_chord.rs` / `CGEventTap` modifier-only chord path is dormant — no UI picker exposes it in v1, and the cancel/mode-cycle hotkey pickers only offer non-chord options (Escape, F13–F15, ⌥M, ⌥⇧M, ⌘⇧M). The chord plumbing is retained for a future "chord PTT" Settings option. About → Diagnostics → "Binary path for Accessibility" is a dev-build-only escape hatch (signature rotation makes the dev TCC entry stale).
 
 ## Repository layout
 
@@ -143,7 +143,7 @@ cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --feature
 
 In that mode `commands::apple_fm_availability` returns `framework_missing`, the onboarding wizard's Apple Intelligence card is disabled, and only the Gemma 4 path is reachable.
 
-Onboarding fires automatically when `onboarded == false`: Welcome → Mic → Accessibility (optional, only matters for chord hotkeys) → Download local models → How to use.
+Onboarding fires automatically when `onboarded == false`: Welcome → Language → Microphone → Download local models → How to use. (Five steps. No Accessibility step — the default ⌘⌥. hotkey doesn't need it, and chord PTT isn't user-pickable in v1.)
 
 ### Reset for a clean first-launch experience
 
@@ -202,9 +202,9 @@ VOX_LOG=debug npm run tauri dev
 
 ### Dev-mode permission quirk
 
-`tauri dev` produces an unbundled binary at `src-tauri/target/debug/vox` whose code signature changes on every rebuild. macOS TCC keys grants by signature, so chord-hotkey users may see "Vox is in the Accessibility list but `AXIsProcessTrusted()=false`". `./scripts/dev-bundle.sh` builds a proper `.app` whose identity is stable; use that for any work that touches Accessibility.
+`tauri dev` produces an unbundled binary at `src-tauri/target/debug/vox` whose code signature changes on every rebuild. macOS TCC keys grants by signature, so any feature that touches Accessibility (Microphone in particular, since the v1 pipeline only needs that) may show stale grants across rebuilds. `./scripts/dev-bundle.sh` builds a proper `.app` whose identity is stable; use it for permission-sensitive work.
 
-The default `Cmd+Alt+Period` shortcut sidesteps this entirely — it goes through the Carbon `RegisterEventHotKey` path which doesn't require Accessibility. Only users who configure a modifier-only chord PTT in Settings hit the dev-mode signature-rotation issue; for them, `./scripts/dev-bundle.sh` builds a proper `.app` whose identity is stable.
+The default `Cmd+Alt+Period` shortcut sidesteps Accessibility entirely — it goes through the Carbon `RegisterEventHotKey` path. The dormant chord-PTT code in `mac_chord.rs` would need Accessibility if ever exposed in v1.1+; until then, the only TCC surface that affects v1 end users is Microphone.
 
 ## Settings tabs
 
