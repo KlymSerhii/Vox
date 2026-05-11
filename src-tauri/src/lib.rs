@@ -64,6 +64,7 @@ pub fn run() {
             commands::open_accessibility_settings,
             commands::open_microphone_settings,
             commands::open_external_url,
+            commands::uninstall_app,
             commands::check_permissions,
             commands::request_microphone,
             commands::show_pill,

@@ -239,6 +239,13 @@ export async function openExternalUrl(url: string): Promise<void> {
   await invoke("open_external_url", { url });
 }
 
+/// Wipe all Vox state (settings, modes, models, llama-server binaries,
+/// TCC entries, autostart) and quit. The user must drag `Vox.app` to
+/// Trash manually to finish uninstalling.
+export async function uninstallApp(): Promise<void> {
+  await invoke("uninstall_app");
+}
+
 export async function checkPermissions(): Promise<PermissionStatus> {
   return invoke<PermissionStatus>("check_permissions");
 }

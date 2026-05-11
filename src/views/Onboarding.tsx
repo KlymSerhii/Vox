@@ -29,6 +29,7 @@ import {
   onModelError,
   onModelProgress,
   openAccessibilitySettings,
+  openExternalUrl,
   PARAKEET_SUPPORTED_LANGUAGES,
   parakeetAvailability,
   parakeetSupportsLanguage,
@@ -1084,7 +1085,14 @@ function DownloadStep(props: {
               </For>
               <p class="text-[11px] text-[var(--color-ink-faint)]">
                 By continuing you accept the{" "}
-                <a class="underline" href="https://ai.google.dev/gemma/terms" target="_blank">
+                <a
+                  class="underline"
+                  href="https://ai.google.dev/gemma/terms"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void openExternalUrl("https://ai.google.dev/gemma/terms");
+                  }}
+                >
                   Gemma Terms of Use
                 </a>
                 .

@@ -52,6 +52,7 @@ import {
   setAppearance,
   setLaunchAtLogin,
   setSettings,
+  uninstallApp,
   type AppleFmAvailability,
   type CaseStyle,
   type DevBinaryInfo,
@@ -1386,7 +1387,10 @@ function ModelsTab(props: {
               <a
                 class="underline"
                 href="https://ai.google.dev/gemma/terms"
-                target="_blank"
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openExternalUrl("https://ai.google.dev/gemma/terms");
+                }}
               >
                 Gemma Terms of Use
               </a>{" "}
@@ -3007,7 +3011,7 @@ function PrivacyTab(_props: { s: Settings }) {
           <div
             class="flex h-9 w-9 shrink-0 items-center justify-center rounded-[10px]"
             style={{
-              background: "var(--color-success)",
+              background: "var(--color-accent)",
               "box-shadow":
                 "inset 0 1px 0 rgba(255,255,255,0.35), 0 1px 2px rgba(0,0,0,0.15)",
             }}
@@ -3089,6 +3093,9 @@ function AboutTab() {
   const [diagErr, setDiagErr] = createSignal<string | null>(null);
   const [devInfo, setDevInfo] = createSignal<DevBinaryInfo | null>(null);
   const [devCopied, setDevCopied] = createSignal(false);
+  const [confirmingUninstall, setConfirmingUninstall] = createSignal(false);
+  const [uninstalling, setUninstalling] = createSignal(false);
+  let uninstallTimer: ReturnType<typeof setTimeout> | undefined;
 
   // Load dev binary info eagerly so the path chip is visible without
   // requiring the user to click first.
@@ -3162,6 +3169,36 @@ function AboutTab() {
       setChecking(false);
     }
   }
+
+  // Inline two-step confirm. WKWebView swallows native `window.confirm()`
+  // (see ModelRow for the same pattern), so we gate the destructive call
+  // behind a transient `confirmingUninstall` state that auto-dismisses
+  // after 5 s.
+  function armUninstall() {
+    setConfirmingUninstall(true);
+    if (uninstallTimer) clearTimeout(uninstallTimer);
+    uninstallTimer = setTimeout(() => setConfirmingUninstall(false), 5000);
+  }
+  function cancelUninstall() {
+    setConfirmingUninstall(false);
+    if (uninstallTimer) clearTimeout(uninstallTimer);
+  }
+  async function onUninstall() {
+    if (uninstalling()) return;
+    if (uninstallTimer) clearTimeout(uninstallTimer);
+    setUninstalling(true);
+    try {
+      await uninstallApp();
+      // The backend exits the process; we don't expect this to return.
+    } catch (err) {
+      console.error("uninstall failed:", err);
+      setUninstalling(false);
+      setConfirmingUninstall(false);
+    }
+  }
+  onCleanup(() => {
+    if (uninstallTimer) clearTimeout(uninstallTimer);
+  });
 
   return (
     <>
@@ -3350,8 +3387,12 @@ function AboutTab() {
             Speech recognition powered by{" "}
             <a
               href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3"
-              target="_blank"
-              rel="noopener"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternalUrl(
+                  "https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3",
+                );
+              }}
               class="text-[var(--color-accent)] hover:underline"
             >
               NVIDIA Parakeet-TDT-0.6B-v3
@@ -3359,8 +3400,12 @@ function AboutTab() {
             (CC-BY-4.0). CoreML conversion by{" "}
             <a
               href="https://github.com/FluidInference/FluidAudio"
-              target="_blank"
-              rel="noopener"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternalUrl(
+                  "https://github.com/FluidInference/FluidAudio",
+                );
+              }}
               class="text-[var(--color-accent)] hover:underline"
             >
               FluidInference
@@ -3371,8 +3416,10 @@ function AboutTab() {
             Whisper by{" "}
             <a
               href="https://github.com/openai/whisper"
-              target="_blank"
-              rel="noopener"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternalUrl("https://github.com/openai/whisper");
+              }}
               class="text-[var(--color-accent)] hover:underline"
             >
               OpenAI
@@ -3380,8 +3427,12 @@ function AboutTab() {
             (MIT). Inference via{" "}
             <a
               href="https://github.com/ggerganov/whisper.cpp"
-              target="_blank"
-              rel="noopener"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternalUrl(
+                  "https://github.com/ggerganov/whisper.cpp",
+                );
+              }}
               class="text-[var(--color-accent)] hover:underline"
             >
               whisper.cpp
@@ -3392,8 +3443,10 @@ function AboutTab() {
             Polishing engines: Apple Foundation Models (system) and{" "}
             <a
               href="https://ai.google.dev/gemma"
-              target="_blank"
-              rel="noopener"
+              onClick={(e) => {
+                e.preventDefault();
+                void openExternalUrl("https://ai.google.dev/gemma");
+              }}
               class="text-[var(--color-accent)] hover:underline"
             >
               Gemma
@@ -3401,6 +3454,43 @@ function AboutTab() {
             by Google (Gemma terms).
           </p>
         </div>
+      </Card>
+
+      <SectionHeader title="Danger zone" />
+      <Card>
+        <Row
+          label="Uninstall Vox"
+          hint="Wipes settings, voice modes, downloaded models, and the local llama-server. Resets Microphone + Accessibility permissions, disables Launch at Login, then quits. To finish uninstalling, drag Vox.app from /Applications to the Trash."
+          last
+        >
+          <Show when={!confirmingUninstall()}>
+            <button
+              type="button"
+              onClick={armUninstall}
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] text-[var(--color-ink-mute)] hover:bg-[var(--color-danger)]/20 hover:text-[var(--color-danger)]"
+            >
+              Uninstall…
+            </button>
+          </Show>
+          <Show when={confirmingUninstall()}>
+            <button
+              type="button"
+              onClick={cancelUninstall}
+              disabled={uninstalling()}
+              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={() => void onUninstall()}
+              disabled={uninstalling()}
+              class="rounded-[6px] bg-[var(--color-danger)] px-3 py-1.5 text-[12px] font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {uninstalling() ? "Uninstalling…" : "Confirm uninstall"}
+            </button>
+          </Show>
+        </Row>
       </Card>
     </>
   );

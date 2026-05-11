@@ -347,6 +347,66 @@ pub fn open_external_url<R: Runtime>(_app: AppHandle<R>, url: String) -> Result<
     Ok(())
 }
 
+/// Full app-state wipe and quit, mirroring `scripts/dev-clean-state.sh`:
+///   * stop the `llama-server` child
+///   * disable launch-at-login
+///   * `tccutil reset` Microphone + Accessibility (best-effort)
+///   * delete `<app_data_dir>` (settings, modes, models, inference-server)
+///   * `app.exit(0)`
+///
+/// We deliberately cannot remove `Vox.app` itself — the running binary
+/// holds the bundle open. The UI explains that the user must drag the
+/// `.app` to Trash to finish uninstalling.
+#[tauri::command]
+pub fn uninstall_app<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    log::info!("uninstall_app: full reset requested");
+
+    // Tear down the inference subprocess before deleting its on-disk
+    // tree so the kill-then-rm ordering matches quit_app and so no
+    // `llama-server` survives the wipe holding open weights.
+    crate::inference_proc::shutdown_managed(&app);
+
+    // Best-effort: disable launch-at-login. A failure here shouldn't
+    // block the rest of the uninstall.
+    if let Err(e) = app.autolaunch().disable() {
+        log::warn!("uninstall_app: disable autostart failed: {e}");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = app.config().identifier.clone();
+        for service in ["Microphone", "Accessibility"] {
+            match std::process::Command::new("tccutil")
+                .arg("reset")
+                .arg(service)
+                .arg(&bundle)
+                .status()
+            {
+                Ok(s) if s.success() => {
+                    log::info!("uninstall_app: tccutil reset {service} {bundle} ok");
+                }
+                Ok(s) => log::warn!(
+                    "uninstall_app: tccutil reset {service} {bundle} exited with {s}"
+                ),
+                Err(e) => log::warn!("uninstall_app: tccutil reset {service} failed: {e}"),
+            }
+        }
+    }
+
+    if let Ok(dir) = app.path().app_data_dir() {
+        log::info!("uninstall_app: deleting {}", dir.display());
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            // Don't abort on a partial delete — log and let the quit
+            // proceed. The next launch will see a clean-ish state and
+            // re-seed defaults; any leftover bytes are harmless.
+            log::warn!("uninstall_app: remove_dir_all({}): {e}", dir.display());
+        }
+    }
+
+    app.exit(0);
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub struct DevBinaryInfo {
     pub binary_path: String,
