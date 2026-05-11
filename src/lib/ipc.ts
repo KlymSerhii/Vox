@@ -70,6 +70,10 @@ export interface UpdateCheckResult {
   current_version?: string;
   available_version?: string;
   message?: string;
+  /// `notes` field from the release's `latest.json` — typically a
+  /// bullet list of commit subjects since the previous tag. Only
+  /// populated when `status === "available"`.
+  release_notes?: string;
 }
 
 /// Mirrors the `UpdaterProgress` enum emitted on `updater:progress`.

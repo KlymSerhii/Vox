@@ -3350,6 +3350,18 @@ function AboutTab() {
                   </button>
                 </Show>
               </div>
+              <Show
+                when={
+                  r().status === "available" && r().release_notes && !installing()
+                }
+              >
+                <div class="rounded-[8px] bg-[var(--color-control)]/60 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+                  <div class="mb-1 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
+                    What's new
+                  </div>
+                  <pre class="m-0 max-h-40 overflow-auto whitespace-pre-wrap font-sans text-[12px] leading-[1.5] text-[var(--color-ink)]">{r().release_notes}</pre>
+                </div>
+              </Show>
               <Show when={installing() && installProgress()}>
                 {(p) => (
                   <div class="flex flex-col gap-1.5">

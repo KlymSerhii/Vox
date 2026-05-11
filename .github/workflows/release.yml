@@ -52,6 +52,11 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          # Full history + tags so we can `git describe` the previous
+          # release tag and diff commit messages between it and HEAD for
+          # auto-generated release notes (see "Generate release notes" step).
+          fetch-depth: 0
 
       - name: Diagnostics — runner OS & available Xcode versions
         run: |
@@ -126,6 +131,73 @@ jobs:
           fi
           echo "Resolved version: $VERSION"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate release notes from commit log
+        id: notes
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Find the previous v* tag so we can diff commit messages.
+          # Tag pushes (refs/tags/v*) sit ON the new tag, so we walk
+          # back from HEAD's parent to skip it. Manual workflow_dispatch
+          # runs on a branch, so the latest tag IS the previous release.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            PREV_TAG=$(git describe --tags --abbrev=0 --match='v*' HEAD^ 2>/dev/null || true)
+          else
+            PREV_TAG=$(git describe --tags --abbrev=0 --match='v*' 2>/dev/null || true)
+          fi
+
+          NOTES_BODY="$RUNNER_TEMP/release-body.md"
+          NOTES_PLAIN="$RUNNER_TEMP/release-notes.txt"
+
+          if [ -n "$PREV_TAG" ]; then
+            echo "Diffing $PREV_TAG..HEAD"
+            # `--no-merges` drops PR merge commits. `--reverse` puts
+            # oldest-first so the chronology matches what users expect.
+            COMMITS=$(git log "$PREV_TAG"..HEAD --no-merges --reverse --pretty=format:'- %s')
+            if [ -z "$COMMITS" ]; then
+              COMMITS="- No user-visible changes since ${PREV_TAG}."
+            fi
+            HEADING="## What's new since ${PREV_TAG}"
+          else
+            echo "No previous tag — first release"
+            COMMITS="- Initial release."
+            HEADING="## What's new"
+          fi
+
+          # Plain bullet list — used as-is for `latest.json` so the
+          # in-app installer can render it next to the Install button.
+          printf '%s\n' "$COMMITS" > "$NOTES_PLAIN"
+
+          # Full GitHub release body: changelog on top, then the install
+          # + license boilerplate that used to be hardcoded in the
+          # `gh release create --notes` invocation.
+          {
+            echo "${HEADING}"
+            echo
+            echo "$COMMITS"
+            echo
+            echo "## Install"
+            echo "1. Download \`Vox.dmg\`."
+            echo "2. Open the DMG and drag Vox into Applications."
+            echo "3. Launch from Applications. macOS will verify the signature & notarization on first launch — no \"unknown developer\" warning."
+            echo
+            echo "## Auto-update"
+            echo "The auto-updater fetches \`latest.json\` from this release. Existing v${VERSION}+ users will receive future updates automatically."
+            echo
+            echo "## License"
+            echo "Free for personal use. Commercial use requires a paid license — contact \`vox@rizenhq.com\`. See [LICENSE](https://github.com/KlymSerhii/vox-releases/blob/main/LICENSE)."
+          } > "$NOTES_BODY"
+
+          echo "--- release notes (plain) ---"
+          cat "$NOTES_PLAIN"
+          echo "--- release body (markdown) ---"
+          cat "$NOTES_BODY"
+
+          echo "notes_plain=$NOTES_PLAIN" >> "$GITHUB_OUTPUT"
+          echo "notes_body=$NOTES_BODY" >> "$GITHUB_OUTPUT"
+          echo "prev_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Import Developer ID Application certificate
         env:
@@ -202,6 +274,7 @@ jobs:
         id: stage
         env:
           VERSION: ${{ steps.vars.outputs.version }}
+          NOTES_PLAIN: ${{ steps.notes.outputs.notes_plain }}
         run: |
           set -euo pipefail
           BUNDLE_DIR="src-tauri/target/aarch64-apple-darwin/release/bundle"
@@ -236,22 +309,32 @@ jobs:
           # Generate the Tauri updater manifest. The signature is the
           # contents of the .sig file (a single-line minisign signature
           # the updater verifies against tauri.conf.json's pubkey).
+          # `jq -Rs` slurps the notes file as one raw string so embedded
+          # newlines and quotes are JSON-escaped automatically — using
+          # heredoc + interpolation here would break the moment a commit
+          # subject contained a `"` or `\`.
           SIGNATURE=$(cat "$APP_SIG")
           PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          URL="https://github.com/KlymSerhii/vox-releases/releases/download/v${VERSION}/Vox.app.tar.gz"
 
-          cat > "$STAGE/latest.json" <<EOF
-          {
-            "version": "${VERSION}",
-            "notes": "See https://github.com/KlymSerhii/vox-releases/releases/tag/v${VERSION} for release notes.",
-            "pub_date": "${PUB_DATE}",
-            "platforms": {
-              "darwin-aarch64": {
-                "signature": "${SIGNATURE}",
-                "url": "https://github.com/KlymSerhii/vox-releases/releases/download/v${VERSION}/Vox.app.tar.gz"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg pub_date "$PUB_DATE" \
+            --arg sig "$SIGNATURE" \
+            --arg url "$URL" \
+            --rawfile notes "$NOTES_PLAIN" \
+            '{
+              version: $version,
+              notes: $notes,
+              pub_date: $pub_date,
+              platforms: {
+                "darwin-aarch64": { signature: $sig, url: $url }
               }
-            }
-          }
-          EOF
+            }' > "$STAGE/latest.json"
+
+          echo "--- latest.json ---"
+          cat "$STAGE/latest.json"
+          echo "-------------------"
 
           ls -la "$STAGE"
           echo "stage_dir=$STAGE" >> "$GITHUB_OUTPUT"
@@ -268,6 +351,7 @@ jobs:
           GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
           VERSION: ${{ steps.vars.outputs.version }}
           STAGE: ${{ steps.stage.outputs.stage_dir }}
+          NOTES_BODY: ${{ steps.notes.outputs.notes_body }}
         run: |
           set -euo pipefail
           # If the release already exists (e.g. a manual dispatch retry),
@@ -277,21 +361,14 @@ jobs:
             --repo KlymSerhii/vox-releases \
             --yes || true
 
+          # `--notes-file` reads the markdown body assembled in the
+          # "Generate release notes" step (changelog + install/license
+          # boilerplate). Avoids re-escaping the same content inline and
+          # keeps the source of truth in one place.
           gh release create "v${VERSION}" \
             --repo KlymSerhii/vox-releases \
             --title "Vox ${VERSION}" \
-            --notes "Apple Silicon build of Vox ${VERSION}.
-
-          ## Install
-          1. Download \`Vox.dmg\`.
-          2. Open the DMG and drag Vox into Applications.
-          3. Launch from Applications. macOS will verify the signature & notarization on first launch — no \"unknown developer\" warning.
-
-          ## Auto-update
-          The auto-updater fetches \`latest.json\` from this release. Existing v${VERSION}- users will receive future updates automatically.
-
-          ## License
-          Free for personal use. Commercial use requires a paid license — contact \`vox@rizenhq.com\`. See [LICENSE](https://github.com/KlymSerhii/vox-releases/blob/main/LICENSE)." \
+            --notes-file "$NOTES_BODY" \
             "$STAGE/Vox.app.tar.gz" \
             "$STAGE/Vox.app.tar.gz.sig" \
             "$STAGE/Vox.dmg" \

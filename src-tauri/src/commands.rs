@@ -592,6 +592,12 @@ pub struct UpdateCheckResult {
     pub available_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// `notes` field from `latest.json` — the auto-generated changelog
+    /// that the workflow assembles from `git log $PREV_TAG..HEAD`.
+    /// `None` whenever no update is available, or for older releases
+    /// whose `latest.json` was generated before the workflow change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_notes: Option<String>,
 }
 
 /// Progress payload for `updater:progress` events. The frontend uses
@@ -634,6 +640,7 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
             current_version: Some(cur),
             available_version: None,
             message: Some("Auto-update is not yet configured for this build.".into()),
+            release_notes: None,
         };
     }
 
@@ -645,6 +652,7 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
                 current_version: Some(cur),
                 available_version: None,
                 message: Some(format!("Auto-update not yet configured ({e}).")),
+                release_notes: None,
             };
         }
     };
@@ -655,18 +663,30 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
             current_version: Some(cur),
             available_version: Some(update.version.clone()),
             message: Some(format!("Vox {} is available.", update.version)),
+            // Strip whitespace so an "(no changes)" placeholder or
+            // accidental trailing newlines don't render as a half-empty
+            // box in the UI; if there's nothing meaningful left, drop
+            // the field so the UI hides the section entirely.
+            release_notes: update
+                .body
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
         },
         Ok(None) => UpdateCheckResult {
             status: "up-to-date".into(),
             current_version: Some(cur),
             available_version: None,
             message: Some("Vox is up to date.".into()),
+            release_notes: None,
         },
         Err(e) => UpdateCheckResult {
             status: "error".into(),
             current_version: Some(cur),
             available_version: None,
             message: Some(format!("Update check failed: {e}")),
+            release_notes: None,
         },
     }
 }
