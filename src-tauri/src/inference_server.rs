@@ -378,10 +378,12 @@ async fn run_download<R: Runtime>(
 }
 
 /// Validates an in-archive relative path against `dest`. Returns the
-/// safe joined path on success. Rejects:
+/// safe joined path on success — `CurDir` (".") components are
+/// normalised away so a bare `./` entry returns `dest` itself, which
+/// the caller treats as "skip, this is just the archive root". Rejects:
 ///   - absolute paths (`/etc/passwd`, `C:\Windows\System32\...`)
 ///   - any `..` or other parent-dir component
-///   - empty / current-dir-only paths
+///   - empty paths
 ///
 /// `dest` does not need to exist yet, but it must be canonicalised by
 /// the caller (we canonicalise inside as a defence-in-depth check).
@@ -396,12 +398,16 @@ fn safe_join(dest: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
     if relative.is_absolute() {
         anyhow::bail!("archive contains absolute path: {}", relative.display());
     }
+    let mut joined = dest.to_path_buf();
     for c in relative.components() {
         match c {
-            std::path::Component::Normal(_) => {}
-            // CurDir (".") is benign but useless; reject for clarity.
-            // RootDir / Prefix should already have been caught by
-            // is_absolute, but be defensive.
+            std::path::Component::Normal(part) => joined.push(part),
+            // CurDir (".") components are benign — they don't traverse
+            // anywhere. The macOS llama.cpp release tarball ships a
+            // root "./" entry plus paths like "./bin/llama-server", so
+            // we strip CurDir rather than reject the whole archive.
+            std::path::Component::CurDir => continue,
+            // ParentDir / RootDir / Prefix are all unsafe.
             _ => {
                 anyhow::bail!(
                     "archive contains unsafe path component: {}",
@@ -410,7 +416,6 @@ fn safe_join(dest: &Path, relative: &Path) -> anyhow::Result<PathBuf> {
             }
         }
     }
-    let joined = dest.join(relative);
     // Defence-in-depth: even if components() somehow misses a tricky
     // construction, verify the joined path stays within dest. We don't
     // canonicalise (the file may not exist yet) but we use a literal
@@ -444,6 +449,12 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("tar entry path: {e}"))?
             .into_owned();
         let safe = safe_join(dest, &rel)?;
+        // `./` (the archive root) normalises to `dest` itself, which
+        // the caller already created. Skip it so we don't try to
+        // unpack a directory entry on top of the destination.
+        if safe == dest {
+            continue;
+        }
         // Defence-in-depth for symlink entries: reject any link target
         // that resolves outside `dest`.
         if let Ok(Some(link)) = entry.link_name() {
@@ -493,6 +504,12 @@ fn extract_zip(archive: &Path, dest: &Path) -> anyhow::Result<()> {
             })?
             .to_path_buf();
         let safe = safe_join(dest, &rel)?;
+        // `./` (the archive root) normalises to `dest` itself, which
+        // already exists. Skip rather than create-it-again or attempt
+        // to write a file at the destination path.
+        if safe == dest {
+            continue;
+        }
         if zfile.is_dir() {
             std::fs::create_dir_all(&safe)
                 .map_err(|e| anyhow::anyhow!("create dir {}: {e}", safe.display()))?;
@@ -682,5 +699,32 @@ mod tests {
         let found = walk_for_binary(&tmp, "llama-server");
         assert_eq!(found.as_deref(), Some(target.as_path()));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn safe_join_accepts_curdir_components() {
+        // The macOS llama.cpp release tarball contains a bare "./" root
+        // entry plus paths like "./bin/llama-server". Both must extract
+        // cleanly — see the onboarding regression where this surfaced
+        // as "archive contains unsafe path component: ./" in red.
+        let dest = Path::new("/tmp/vox-dest");
+        assert_eq!(safe_join(dest, Path::new("./")).unwrap(), dest);
+        assert_eq!(
+            safe_join(dest, Path::new("./bin/llama-server")).unwrap(),
+            dest.join("bin").join("llama-server")
+        );
+        assert_eq!(
+            safe_join(dest, Path::new("bin/llama-server")).unwrap(),
+            dest.join("bin").join("llama-server")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_parent_dir_and_absolute() {
+        let dest = Path::new("/tmp/vox-dest");
+        assert!(safe_join(dest, Path::new("../etc/passwd")).is_err());
+        assert!(safe_join(dest, Path::new("bin/../../etc/passwd")).is_err());
+        assert!(safe_join(dest, Path::new("/etc/passwd")).is_err());
+        assert!(safe_join(dest, Path::new("")).is_err());
     }
 }
