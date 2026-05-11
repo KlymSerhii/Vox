@@ -17,6 +17,7 @@ import {
   deleteMode,
   deleteModel,
   diagnoseHotkeys,
+  downloadAndInstallUpdate,
   downloadInferenceServer,
   downloadModel,
   duplicateMode,
@@ -39,6 +40,7 @@ import {
   onModelError,
   onModelProgress,
   onSettingsChanged,
+  onUpdaterProgress,
   openAccessibilitySettings,
   openExternalUrl,
   PARAKEET_SUPPORTED_LANGUAGES,
@@ -64,6 +66,7 @@ import {
   type PunctuationStyle,
   type Settings,
   type UpdateCheckResult,
+  type UpdaterProgress,
   type VoiceMode,
 } from "../lib/ipc";
 import { VoxLogo } from "../components/VoxLogo";
@@ -3089,6 +3092,10 @@ function AboutTab() {
   const [updateResult, setUpdateResult] = createSignal<UpdateCheckResult | null>(
     null,
   );
+  const [installing, setInstalling] = createSignal(false);
+  const [installError, setInstallError] = createSignal<string | null>(null);
+  const [installProgress, setInstallProgress] =
+    createSignal<UpdaterProgress | null>(null);
   const [diag, setDiag] = createSignal<DiagnoseHotkeys | null>(null);
   const [diagErr, setDiagErr] = createSignal<string | null>(null);
   const [devInfo, setDevInfo] = createSignal<DevBinaryInfo | null>(null);
@@ -3106,6 +3113,26 @@ function AboutTab() {
       console.warn("revealDevBinaryPath failed:", err);
     }
   });
+
+  // Subscribe to updater progress for the entire AboutTab lifetime.
+  // Disposed by onCleanup. The Rust side emits `started` → `progress*` →
+  // `installing` → `done`/`error`; on success the process restarts so
+  // `done` may not be observed.
+  let unlistenProgress: (() => void) | undefined;
+  onMount(async () => {
+    try {
+      unlistenProgress = await onUpdaterProgress((p) => {
+        setInstallProgress(p);
+        if (p.phase === "error") {
+          setInstallError(p.message);
+          setInstalling(false);
+        }
+      });
+    } catch (err) {
+      console.warn("onUpdaterProgress failed:", err);
+    }
+  });
+  onCleanup(() => unlistenProgress?.());
 
   // Open System Settings only when the user actually needs it: a dev
   // build (sig rotates, Accessibility entry stale) or Accessibility
@@ -3157,6 +3184,8 @@ function AboutTab() {
   async function onCheckUpdates() {
     setChecking(true);
     setUpdateResult(null);
+    setInstallError(null);
+    setInstallProgress(null);
     try {
       const r = await checkForUpdates();
       setUpdateResult(r);
@@ -3168,6 +3197,43 @@ function AboutTab() {
     } finally {
       setChecking(false);
     }
+  }
+
+  async function onInstallUpdate() {
+    if (installing()) return;
+    setInstalling(true);
+    setInstallError(null);
+    setInstallProgress(null);
+    try {
+      // Resolves only on failure — success ends with app.restart() in
+      // Rust, which tears down this webview.
+      await downloadAndInstallUpdate();
+    } catch (err) {
+      setInstallError(String(err));
+      setInstalling(false);
+    }
+  }
+
+  function progressLabel(p: UpdaterProgress): string {
+    if (p.phase === "started") return "Starting download…";
+    if (p.phase === "progress") {
+      const total = p.content_length ?? null;
+      if (total && total > 0) {
+        const pct = Math.min(100, Math.round((p.downloaded / total) * 100));
+        return `Downloading… ${pct}% (${formatBytes(p.downloaded)} / ${formatBytes(total)})`;
+      }
+      return `Downloading… ${formatBytes(p.downloaded)}`;
+    }
+    if (p.phase === "installing") return "Installing…";
+    if (p.phase === "done") return "Restarting Vox…";
+    return "";
+  }
+
+  function progressPercent(p: UpdaterProgress): number | null {
+    if (p.phase !== "progress") return null;
+    const total = p.content_length ?? null;
+    if (!total || total <= 0) return null;
+    return Math.min(100, Math.round((p.downloaded / total) * 100));
   }
 
   // Inline two-step confirm. WKWebView swallows native `window.confirm()`
@@ -3229,13 +3295,13 @@ function AboutTab() {
       <Card>
         <Row
           label="Check for updates"
-          hint="Auto-update is not yet configured for this build."
-          last={!updateResult()}
+          hint="Vox will download and install the latest release."
+          last={!updateResult() && !installing() && !installError()}
         >
           <button
             type="button"
             onClick={onCheckUpdates}
-            disabled={checking()}
+            disabled={checking() || installing()}
             class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)] disabled:opacity-40"
           >
             {checking() ? "Checking…" : "Check now"}
@@ -3243,36 +3309,79 @@ function AboutTab() {
         </Row>
         <Show when={updateResult()}>
           {(r) => (
-            <div class="px-4 py-3">
-              <span
-                class="inline-flex items-center gap-1.5 text-[12px]"
-                classList={{
-                  "text-[var(--color-success)]": r().status === "available",
-                  "text-[var(--color-ink-mute)]":
-                    r().status === "up-to-date" ||
-                    r().status === "unconfigured",
-                  "text-[var(--color-danger)]": r().status === "error",
-                }}
-              >
-                <Show when={r().status === "unconfigured"}>
-                  <svg
-                    width="11"
-                    height="11"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    stroke-width="2.25"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    aria-hidden="true"
+            <div class="flex flex-col gap-2 px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <span
+                  class="inline-flex items-center gap-1.5 text-[12px]"
+                  classList={{
+                    "text-[var(--color-success)]": r().status === "available",
+                    "text-[var(--color-ink-mute)]":
+                      r().status === "up-to-date" ||
+                      r().status === "unconfigured",
+                    "text-[var(--color-danger)]": r().status === "error",
+                  }}
+                >
+                  <Show when={r().status === "unconfigured"}>
+                    <svg
+                      width="11"
+                      height="11"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="2.25"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      aria-hidden="true"
+                    >
+                      <circle cx="12" cy="12" r="9" />
+                      <line x1="12" y1="16" x2="12" y2="12" />
+                      <line x1="12" y1="8" x2="12.01" y2="8" />
+                    </svg>
+                  </Show>
+                  {r().message ?? r().status}
+                </span>
+                <Show when={r().status === "available" && !installing()}>
+                  <button
+                    type="button"
+                    onClick={onInstallUpdate}
+                    class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90"
                   >
-                    <circle cx="12" cy="12" r="9" />
-                    <line x1="12" y1="16" x2="12" y2="12" />
-                    <line x1="12" y1="8" x2="12.01" y2="8" />
-                  </svg>
+                    Install update
+                  </button>
                 </Show>
-                {r().message ?? r().status}
-              </span>
+              </div>
+              <Show when={installing() && installProgress()}>
+                {(p) => (
+                  <div class="flex flex-col gap-1.5">
+                    <div class="text-[11px] text-[var(--color-ink-mute)]">
+                      {progressLabel(p())}
+                    </div>
+                    <div class="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-control)]">
+                      <Show
+                        when={progressPercent(p()) !== null}
+                        fallback={
+                          <div class="h-full w-1/3 animate-pulse rounded-full bg-[var(--color-accent)]" />
+                        }
+                      >
+                        <div
+                          class="h-full rounded-full bg-[var(--color-accent)] transition-[width] duration-200"
+                          style={{ width: `${progressPercent(p())}%` }}
+                        />
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </Show>
+              <Show when={installing() && !installProgress()}>
+                <div class="text-[11px] text-[var(--color-ink-mute)]">
+                  Preparing download…
+                </div>
+              </Show>
+              <Show when={installError()}>
+                <div class="text-[11px] text-[var(--color-danger)]">
+                  {installError()}
+                </div>
+              </Show>
             </div>
           )}
         </Show>

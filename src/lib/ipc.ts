@@ -72,6 +72,21 @@ export interface UpdateCheckResult {
   message?: string;
 }
 
+/// Mirrors the `UpdaterProgress` enum emitted on `updater:progress`.
+/// `download_and_install_update` fires these as it walks: started →
+/// progress* → installing → done. An `error` payload terminates the
+/// sequence.
+export type UpdaterProgress =
+  | { phase: "started"; content_length?: number | null }
+  | {
+      phase: "progress";
+      downloaded: number;
+      content_length?: number | null;
+    }
+  | { phase: "installing" }
+  | { phase: "done" }
+  | { phase: "error"; message: string };
+
 export interface RecentTranscript {
   ts: number;
   text: string;
@@ -276,6 +291,20 @@ export async function copyText(text: string): Promise<void> {
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke<UpdateCheckResult>("check_for_updates");
+}
+
+/// Kick off the actual download + install. Resolves only on failure —
+/// success ends with `app.restart()` on the Rust side, so the webview
+/// goes away with the process. Listen on `updater:progress` for the
+/// running state via `onUpdaterProgress`.
+export async function downloadAndInstallUpdate(): Promise<void> {
+  await invoke("download_and_install_update");
+}
+
+export async function onUpdaterProgress(
+  cb: (p: UpdaterProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<UpdaterProgress>("updater:progress", (e) => cb(e.payload));
 }
 
 export const getAppVersion = (): Promise<string> => invoke("get_app_version");

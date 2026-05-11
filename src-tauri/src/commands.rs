@@ -594,6 +594,25 @@ pub struct UpdateCheckResult {
     pub message: Option<String>,
 }
 
+/// Progress payload for `updater:progress` events. The frontend uses
+/// these to drive the inline progress bar shown next to "Install update".
+#[derive(Debug, Serialize, Clone)]
+#[serde(tag = "phase", rename_all = "kebab-case")]
+pub enum UpdaterProgress {
+    Started {
+        content_length: Option<u64>,
+    },
+    Progress {
+        downloaded: u64,
+        content_length: Option<u64>,
+    },
+    Installing,
+    Done,
+    Error {
+        message: String,
+    },
+}
+
 #[tauri::command]
 pub fn get_app_version<R: Runtime>(app: AppHandle<R>) -> String {
     app.package_info().version.to_string()
@@ -650,6 +669,84 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
             message: Some(format!("Update check failed: {e}")),
         },
     }
+}
+
+/// Download and install the pending update, then restart Vox.
+///
+/// Returns `Ok(())` only on the install path that does not return — the
+/// `app.restart()` call at the end terminates the current process. Any
+/// error short-circuits via the returned `Err(String)` and emits an
+/// `updater:progress` event with phase=`error` so the frontend can clear
+/// its progress UI.
+///
+/// Progress events fire on `updater:progress`:
+///   - phase=`started`    when the download begins (with optional total bytes)
+///   - phase=`progress`   on every chunk (cumulative `downloaded` + total)
+///   - phase=`installing` once the bytes are on disk and verification starts
+///   - phase=`done`       just before `app.restart()` (best-effort — may not be observed)
+///   - phase=`error`      on any failure path
+#[tauri::command]
+pub async fn download_and_install_update<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    use tauri_plugin_updater::UpdaterExt as _;
+
+    if updater_is_stub(&app) {
+        return Err("Auto-update is not configured for this build.".into());
+    }
+
+    let updater = app
+        .updater()
+        .map_err(|e| format!("Auto-update not configured ({e})."))?;
+
+    let update = updater
+        .check()
+        .await
+        .map_err(|e| format!("Update check failed: {e}"))?
+        .ok_or_else(|| "No update available.".to_string())?;
+
+    let emit_app = app.clone();
+    let emit_progress = move |payload: UpdaterProgress| {
+        // Best-effort — a failed emit must not abort the install.
+        let _ = emit_app.emit("updater:progress", payload);
+    };
+
+    // `download_and_install` calls the chunk callback on every incoming
+    // chunk and the done callback once bytes are on disk and the install
+    // step is about to run. We track cumulative downloaded bytes inside
+    // a stack closure (the callback's `&mut` borrow is single-threaded).
+    let mut downloaded: u64 = 0;
+    let mut started = false;
+    let progress_for_chunk = emit_progress.clone();
+    let progress_for_done = emit_progress.clone();
+    let install_result = update
+        .download_and_install(
+            move |chunk_length, content_length| {
+                if !started {
+                    started = true;
+                    progress_for_chunk(UpdaterProgress::Started { content_length });
+                }
+                downloaded = downloaded.saturating_add(chunk_length as u64);
+                progress_for_chunk(UpdaterProgress::Progress {
+                    downloaded,
+                    content_length,
+                });
+            },
+            move || {
+                progress_for_done(UpdaterProgress::Installing);
+            },
+        )
+        .await;
+
+    if let Err(e) = install_result {
+        let msg = format!("Update install failed: {e}");
+        emit_progress(UpdaterProgress::Error {
+            message: msg.clone(),
+        });
+        return Err(msg);
+    }
+
+    emit_progress(UpdaterProgress::Done);
+    // `restart` does not return; the new binary takes over the process.
+    app.restart();
 }
 
 /// True when running with the placeholder host or empty pubkey — the

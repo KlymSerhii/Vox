@@ -76,6 +76,7 @@ pub fn run() {
             commands::get_launch_at_login,
             commands::set_launch_at_login,
             commands::check_for_updates,
+            commands::download_and_install_update,
             commands::get_app_version,
             commands::list_models,
             commands::download_model,
