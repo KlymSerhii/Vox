@@ -188,8 +188,8 @@ pub fn set_polishing_enabled<R: Runtime>(
     // the toggle: session.rs short-circuits to the no-op when
     // polishing_enabled is false, so we don't need to overwrite
     // llm_engine. Only fix up the edge case where engine was left as
-    // "none" (cloud migration, fresh install) — pick gemma-local as the
-    // safe default when polishing is being turned ON.
+    // "none" — pick gemma-local as the safe default when polishing is
+    // being turned ON.
     if enabled && s.llm_engine == "none" {
         s.llm_engine = "gemma-local".into();
     }

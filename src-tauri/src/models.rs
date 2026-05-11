@@ -1019,16 +1019,6 @@ pub fn recommended_llm_model_id() -> &'static str {
     }
 }
 
-/// IDs `settings::load` migrates to the current default — either
-/// retired from the catalog (a dangling reference `descriptor_for`
-/// can't resolve) or known to crash the bundled `llama.cpp`.
-pub fn is_known_broken_llm_id(id: &str) -> bool {
-    matches!(
-        id,
-        "phi-4-mini-q4_k_m" | "gemma-4-e4b-q4_k_m" | "gemma-4-e2b-q4_k_m"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

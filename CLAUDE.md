@@ -22,7 +22,7 @@ This file is the canonical project reference. The README that used to live at th
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `hotkey` | `Cmd+Alt+Period` (⌘⌥.) | Hardcoded — `settings::load` rewrites any other persisted value back to this on every launch. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
+| `hotkey` | `Cmd+Alt+Period` (⌘⌥.) | Hardcoded — `settings::load` always writes the default into the persisted store on every launch. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
 | `cancel_hotkey` | `Escape` | Aborts the in-flight session. The OS grab is acquired only while a session is active (`hotkey::arm_cancel` at `session::begin_recording`, `hotkey::disarm_cancel` from `PipelineGuard::drop`) so Escape works normally in every other app when Vox isn't dictating. |
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
@@ -101,7 +101,7 @@ Each mode contributes:
 │       ├── tray_glyphs.rs             ← state glyphs
 │       ├── frontmost.rs               ← focused-app probe for mode suggestion
 │       ├── transcripts.rs             ← in-memory ring buffer (cleared on quit)
-│       ├── settings.rs                ← tauri-plugin-store + legacy scrubbing
+│       ├── settings.rs                ← tauri-plugin-store backed Settings doc
 │       ├── modes.rs                   ← Voice Modes store + JSON I/O + post-processing
 │       ├── models.rs                  ← model catalog + resumable downloader (`stream_to_file` is reused for the llama-server archive)
 │       ├── inference_server.rs        ← llama-server release-binary catalog + downloader/extractor
@@ -122,7 +122,7 @@ Each mode contributes:
     └── dev-reset-permissions.sh       ← only resets TCC, keeps settings/models
 ```
 
-Files that no longer exist (and the migrations that removed them) are documented inline: `settings.rs` (cloud scrub), `inject.rs` (Cmd+V removal), and `engines/gemma_http.rs` (replaced the old in-process `gemma_local.rs` + `llama-cpp-2` to keep C++ asserts from killing the menu-bar app).
+Files that no longer exist are documented inline: `inject.rs` (Cmd+V removal) and `engines/gemma_http.rs` (replaced the old in-process `gemma_local.rs` + `llama-cpp-2` to keep C++ asserts from killing the menu-bar app).
 
 ## Development
 
@@ -148,7 +148,7 @@ Onboarding fires automatically when `onboarded == false`: Welcome → Language �
 ### Reset for a clean first-launch experience
 
 ```bash
-./scripts/dev-clean-state.sh   # wipes settings, modes, models, TCC, legacy keychain entries
+./scripts/dev-clean-state.sh   # wipes settings, modes, models, TCC
 npm run tauri dev
 ```
 
@@ -161,7 +161,6 @@ npm run tauri dev
 | Whisper / Gemma weights | `~/Library/Application Support/com.vox.app/models/{stt,llm}/<id>/model.{bin,gguf}` |
 | `llama-server` binary tree | `~/Library/Application Support/com.vox.app/inference-server/<llama.cpp tag>/` (sentinel: `.complete`) |
 | TCC entries | macOS-managed; reset with `tccutil reset {Microphone,Accessibility} com.vox.app` |
-| Keychain (legacy only) | service `app.vox.vox`, accounts `groq` / `anthropic` — auto-scrubbed on launch |
 
 ### Building a release `.app`
 
@@ -239,14 +238,14 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - **Auto-update is stubbed.** `commands::check_for_updates` short-circuits to `unconfigured` until the placeholder endpoint and pubkey are replaced and the bundle is signed + notarized.
 - **No code signing yet.** Built `.app` is ad-hoc signed; macOS Gatekeeper will block it on first launch (control-click → Open once to trust).
 - **Gemma polish runs out-of-process.** `inference_server.rs` pins `LLAMA_CPP_TAG` (currently `b8953`) and downloads the matching official `llama-server` archive from the llama.cpp GitHub release. `inference_proc.rs` spawns it as a process-group / Job-Object child so the parent's death tears the child down too, even on SIGKILL. Bumping llama.cpp = bump `LLAMA_CPP_TAG` and (when set) `expected_sha256`; users on the old tag re-download into a different version directory and `cleanup_stale_versions` reaps the previous tree on the launch after.
-- **MatFormer Gemma 4 GGUFs from Unsloth crash llama.cpp.** Their conversion produces `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the FGDN auto-detect path in `llama-context.cpp::sched_reserve` expects, so a `GGML_ASSERT` fires. With the engine out-of-process the assert now exits the child cleanly and `session.rs` fail-opens to the raw transcript (instead of crashing the menu-bar app, as it did under the old in-process `llama-cpp-2`). **bartowski's MatFormer Gemma 4 GGUFs avoid this** — their conversion uses tensor names that do not trip FGDN auto-detect, so we source E2B and E4B from bartowski. If a future Unsloth-converted MatFormer variant is ever added, gate it via `is_known_broken_llm_id`.
-- **LLM catalog**: `models.rs` ships three polishing options — **Gemma 4 E2B** (`gemma-4-e2b-q5_k_m`, ~3.7 GB, small — default for <12 GB RAM; bartowski Q5_K_M), **Gemma 4 E4B** (`gemma-4-e4b-q5_k_m`, ~5.4 GB, balanced — default for ≥12 GB RAM; bartowski), and **Gemma 4 26B-A4B MoE** (`gemma-4-26b-a4b-q4_k_m`, ~17 GB, quality; Unsloth UD-Q4_K_M for its imatrix calibration edge — safe under any converter because the MoE graph has zero GDN ops, dispatching through `llm_build_gemma4_iswa`'s standard `build_attn` path with `shared_kv_layers=0` and no per-layer embedding). All Gemma releases share the same `<start_of_turn>` chat template. `settings.rs::load` migrates retired ids (currently `phi-4-mini-q4_k_m`, `gemma-4-e4b-q4_k_m`, and `gemma-4-e2b-q4_k_m`) to the current default via `models::is_known_broken_llm_id`. On <12 GB Macs the migration also functions as a tier downgrade: `recommended_llm_model_id()` returns `gemma-4-e2b-q5_k_m` for the `small` tier, so a user who had explicitly selected E4B but is below the 12 GB floor lands on E2B after migration.
+- **MatFormer Gemma 4 GGUFs from Unsloth crash llama.cpp.** Their conversion produces `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the FGDN auto-detect path in `llama-context.cpp::sched_reserve` expects, so a `GGML_ASSERT` fires. With the engine out-of-process the assert now exits the child cleanly and `session.rs` fail-opens to the raw transcript (instead of crashing the menu-bar app, as it did under the old in-process `llama-cpp-2`). **bartowski's MatFormer Gemma 4 GGUFs avoid this** — their conversion uses tensor names that do not trip FGDN auto-detect, so we source E2B and E4B from bartowski.
+- **LLM catalog**: `models.rs` ships three polishing options — **Gemma 4 E2B** (`gemma-4-e2b-q5_k_m`, ~3.7 GB, small — default for <12 GB RAM; bartowski Q5_K_M), **Gemma 4 E4B** (`gemma-4-e4b-q5_k_m`, ~5.4 GB, balanced — default for ≥12 GB RAM; bartowski), and **Gemma 4 26B-A4B MoE** (`gemma-4-26b-a4b-q4_k_m`, ~17 GB, quality; Unsloth UD-Q4_K_M for its imatrix calibration edge — safe under any converter because the MoE graph has zero GDN ops, dispatching through `llm_build_gemma4_iswa`'s standard `build_attn` path with `shared_kv_layers=0` and no per-layer embedding). All Gemma releases share the same `<start_of_turn>` chat template. `recommended_llm_model_id()` returns `gemma-4-e2b-q5_k_m` for the `small` tier (<12 GB RAM), `gemma-4-e4b-q5_k_m` for `balanced`, and `gemma-4-26b-a4b-q4_k_m` only when the user explicitly opts in via Settings.
 - **Pill always renders on the primary display.** Multi-display follow-the-focus is a future enhancement.
 
 ## Contact points for changes
 
 - New IPC command: add to `src-tauri/src/commands.rs`, register in `src-tauri/src/lib.rs::invoke_handler!`, expose a typed binding in `src/lib/ipc.ts`.
-- New Settings field: extend the `Settings` struct + `Default` impl + `load`/`save` in `settings.rs`, mirror the field in `src/lib/ipc.ts::Settings`, and add a one-shot migration if old installs need backfill.
+- New Settings field: extend the `Settings` struct + `Default` impl + `load`/`save` in `settings.rs`, and mirror the field in `src/lib/ipc.ts::Settings`. New fields rely on per-field `#[serde(default)]` to fall back when absent from an older on-disk doc.
 - New Voice Mode built-in: add a clone in `modes::builtins()` plus a brand new `*_PROMPT` constant, update tests in `modes::tests`.
-- New engine: implement `SttEngine` or `LlmEngine` in `engines/`, wire it into `engines::Registry`, and add the engine id to the whitelist in `settings::load`'s `llm_engine` migration so a stored value of `"<your-engine>"` round-trips intact.
+- New engine: implement `SttEngine` or `LlmEngine` in `engines/` and wire it into `engines::Registry`. The engine id is used as-is from the stored Settings doc — `Registry::stt`/`Registry::llm` return `None` for an unknown id, which `session.rs` surfaces as a clear error (STT) or fail-opens to the raw transcript (LLM).
 - New native FFI bridge (Swift / Objective-C / C++): mirror `swift/AppleFmBridge.swift` + `engines/apple_fm_bridge.rs` + `build.rs::build_apple_fm_bridge`. The pattern: hand-rolled `@_cdecl` exports with `strdup`'d return strings, a thread-local error slot, and a Cargo feature flag so non-macOS builds skip both the build.rs step and the engine module via `#[cfg(all(target_os = "macos", feature = "..."))]`.

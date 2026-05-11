@@ -1,7 +1,4 @@
 //! Settings — backed by `tauri-plugin-store` for non-secret fields.
-//!
-//! Local-only build: `load` scrubs any historical cloud engine selections
-//! and Keychain entries from upgrades of the pre-local build.
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Runtime};
@@ -42,18 +39,6 @@ const KEY_TRY_PARAKEET_DISMISSED: &str = "try_parakeet_dismissed";
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
-
-// Legacy keys read once at load for scrubbing — see the cloud-scrub
-// block in `load`.
-const KEY_LEGACY_CLEANUP_ENABLED: &str = "cleanup_enabled";
-const KEY_LEGACY_SEND_AUDIO_CLOUD: &str = "send_audio_to_cloud";
-const KEY_LEGACY_GROQ: &str = "groq_api_key";
-const KEY_LEGACY_ANTHROPIC: &str = "anthropic_api_key";
-const KEY_LEGACY_MIGRATION_SEEN: &str = "migration_seen";
-
-const KEYRING_SERVICE: &str = "app.vox.vox";
-const KEYRING_ACCOUNT_LEGACY_GROQ: &str = "groq";
-const KEYRING_ACCOUNT_LEGACY_ANTHROPIC: &str = "anthropic";
 
 fn default_hotkey() -> String {
     // ⌘⌥. — Cmd + Option + Period. Bound via Carbon
@@ -207,18 +192,6 @@ impl Default for Settings {
     }
 }
 
-/// Best-effort delete of a Keychain entry left over from the cloud-era build.
-fn keyring_delete(account: &str) {
-    match keyring::Entry::new(KEYRING_SERVICE, account) {
-        Ok(entry) => match entry.delete_credential() {
-            Ok(_) => log::info!("scrubbed legacy keychain entry: {account}"),
-            Err(keyring::Error::NoEntry) => {}
-            Err(e) => log::warn!("keychain delete failed ({account}): {e}"),
-        },
-        Err(e) => log::warn!("keychain entry open failed ({account}): {e}"),
-    }
-}
-
 pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let store = match app.store(STORE_FILE) {
         Ok(s) => s,
@@ -232,16 +205,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         |k: &str| store.get(k).and_then(|v| v.as_str().map(|s| s.to_string()));
     let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
-    // Hotkey is currently hardcoded; force the stored value to match so
-    // the picker reflects reality.
-    let hotkey = {
-        let forced = default_hotkey();
-        if get_str(KEY_HOTKEY).as_deref() != Some(forced.as_str()) {
-            store.set(KEY_HOTKEY, serde_json::Value::String(forced.clone()));
-            let _ = store.save();
-        }
-        forced
-    };
+    // Hotkey is currently hardcoded; always write the default so the
+    // picker reflects reality even if a stored value drifted.
+    let hotkey = default_hotkey();
+    store.set(KEY_HOTKEY, serde_json::Value::String(hotkey.clone()));
+
     let cancel_hotkey = get_str(KEY_CANCEL_HOTKEY).unwrap_or_else(default_cancel_hotkey);
     let language = get_str(KEY_LANGUAGE).unwrap_or_else(default_language);
 
@@ -261,86 +229,12 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         })
         .unwrap_or_default();
 
-    let mut store_dirty = false;
-
-    // Rewrite historical cloud engine selections to local equivalents.
-    //
-    // Recognised STT engine ids today: "whisper-local", "parakeet-local".
-    // No hard whitelist here — STT settings predate the LLM whitelist
-    // pattern and quietly clamping unknown values would silently undo a
-    // future engine added in another build that downgrades back to this
-    // one. Migration logic stays narrow: only the known-cloud values
-    // ("groq", "cloud") are rewritten. New users hitting Parakeet must
-    // opt in via onboarding / Settings rather than being auto-migrated.
-    let stt_engine = {
-        let stored = get_str(KEY_STT_ENGINE).unwrap_or_else(default_stt_engine);
-        if matches!(stored.as_str(), "groq" | "cloud") {
-            log::error!("settings: migrating stt_engine '{stored}' -> 'whisper-local'.");
-            store.set(KEY_STT_ENGINE, serde_json::Value::String("whisper-local".into()));
-            store_dirty = true;
-            "whisper-local".into()
-        } else {
-            stored
-        }
-    };
+    let stt_engine = get_str(KEY_STT_ENGINE).unwrap_or_else(default_stt_engine);
     let stt_model_id = get_str(KEY_STT_MODEL_ID).unwrap_or_else(default_stt_model_id);
+    let llm_engine = get_str(KEY_LLM_ENGINE).unwrap_or_else(default_llm_engine);
+    let llm_model_id = get_str(KEY_LLM_MODEL_ID).unwrap_or_else(default_llm_model_id);
 
-    let llm_engine = {
-        let stored = get_str(KEY_LLM_ENGINE).unwrap_or_else(default_llm_engine);
-        match stored.as_str() {
-            "anthropic" | "claude" | "cloud" => {
-                log::error!("settings: migrating llm_engine '{stored}' -> 'none'.");
-                store.set(KEY_LLM_ENGINE, serde_json::Value::String("none".into()));
-                store_dirty = true;
-                "none".to_string()
-            }
-            // Whitelist of engines the Registry knows how to construct.
-            // Anything else (a setting from a future build, a hand-edit)
-            // becomes the default so the pipeline doesn't dead-end.
-            "gemma-local" | "apple-fm" | "none" => stored,
-            other => {
-                let replacement = default_llm_engine();
-                log::error!(
-                    "settings: unknown llm_engine '{other}' -> '{replacement}'."
-                );
-                store.set(KEY_LLM_ENGINE, serde_json::Value::String(replacement.clone()));
-                store_dirty = true;
-                replacement
-            }
-        }
-    };
-    // Rewrite retired or known-crashing model ids to the current default.
-    let llm_model_id = {
-        let stored = get_str(KEY_LLM_MODEL_ID).unwrap_or_else(default_llm_model_id);
-        if models::is_known_broken_llm_id(&stored) {
-            let replacement = default_llm_model_id();
-            log::error!(
-                "settings: migrating retired/broken llm_model_id '{stored}' -> '{replacement}'."
-            );
-            store.set(KEY_LLM_MODEL_ID, serde_json::Value::String(replacement.clone()));
-            store_dirty = true;
-            replacement
-        } else {
-            stored
-        }
-    };
-
-    // First-run inference for upgraders: if cloud cleanup was on (or any
-    // LLM engine was set), preserve "polishing on" so it returns when
-    // Gemma is available.
-    let polishing_enabled = match store.get(KEY_POLISHING_ENABLED) {
-        Some(v) => v.as_bool().unwrap_or_else(default_polishing_enabled),
-        None => {
-            let inferred = get_bool(KEY_LEGACY_CLEANUP_ENABLED, false)
-                || matches!(
-                    get_str(KEY_LLM_ENGINE).as_deref(),
-                    Some("anthropic") | Some("gemma-local")
-                );
-            store.set(KEY_POLISHING_ENABLED, serde_json::Value::Bool(inferred));
-            store_dirty = true;
-            inferred
-        }
-    };
+    let polishing_enabled = get_bool(KEY_POLISHING_ENABLED, default_polishing_enabled());
 
     let active_mode_id = get_str(KEY_ACTIVE_MODE_ID).unwrap_or_else(default_active_mode_id);
     let mode_cycle_hotkey =
@@ -362,26 +256,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
 
     let try_parakeet_dismissed = get_bool(KEY_TRY_PARAKEET_DISMISSED, false);
 
-    // Scrub legacy cloud-era keys + Keychain entries on first local-only launch.
-    for key in [
-        KEY_LEGACY_GROQ,
-        KEY_LEGACY_ANTHROPIC,
-        KEY_LEGACY_CLEANUP_ENABLED,
-        KEY_LEGACY_SEND_AUDIO_CLOUD,
-        KEY_LEGACY_MIGRATION_SEEN,
-    ] {
-        if store.get(key).is_some() {
-            store.delete(key);
-            store_dirty = true;
-            log::info!("scrubbed legacy settings key: {key}");
-        }
-    }
-    keyring_delete(KEYRING_ACCOUNT_LEGACY_GROQ);
-    keyring_delete(KEYRING_ACCOUNT_LEGACY_ANTHROPIC);
-
-    if store_dirty {
-        let _ = store.save();
-    }
+    let _ = store.save();
 
     Settings {
         hotkey,
@@ -455,17 +330,6 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
 
     b(KEY_TRY_PARAKEET_DISMISSED, settings.try_parakeet_dismissed);
-
-    // Drop legacy keys defensively in case a downgraded build re-introduced them.
-    for key in [
-        KEY_LEGACY_GROQ,
-        KEY_LEGACY_ANTHROPIC,
-        KEY_LEGACY_CLEANUP_ENABLED,
-        KEY_LEGACY_SEND_AUDIO_CLOUD,
-        KEY_LEGACY_MIGRATION_SEEN,
-    ] {
-        store.delete(key);
-    }
 
     store
         .save()
@@ -593,8 +457,7 @@ mod tests {
         let restored: Settings = serde_json::from_str(&json).expect("deserialize");
         assert!(!restored.streaming_pill_enabled);
 
-        // And verify the default kicks in when the field is absent —
-        // older installs upgrading to this build must opt in by default.
+        // And verify the default kicks in when the field is absent.
         let bare = "{}";
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(restored.streaming_pill_enabled);
