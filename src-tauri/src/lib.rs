@@ -188,6 +188,12 @@ pub fn run() {
             // safe to call again later from settings/tray toggles.
             crate::inference_proc::prewarm_in_background(app_handle);
             crate::engines::prewarm_stt_in_background(app_handle);
+            // Trigger the macOS NSPasteboard / Gatekeeper first-use
+            // signature check during onboarding rather than on the
+            // user's first dictation, where it otherwise stalls the
+            // post-polish clipboard write for 30-60 s with a
+            // "Verifying com.vox…" system dialog.
+            crate::inject::prewarm_in_background();
 
             if !s.onboarded {
                 if let Err(e) = onboarding::show(app_handle) {
