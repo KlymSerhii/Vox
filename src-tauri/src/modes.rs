@@ -264,6 +264,22 @@ pub fn builtins() -> Vec<VoiceMode> {
             created_at: now,
             updated_at: now,
         },
+        VoiceMode {
+            id: "summary".into(),
+            name: "Summary".into(),
+            icon: "📋".into(),
+            description: "Condense the dictation into a short summary of key points.".into(),
+            system_prompt: SUMMARY_PROMPT.into(),
+            dictionary: vec![],
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: None,
+            enable_thinking: None,
+            auto_triggers: vec![],
+            built_in: true,
+            created_at: now,
+            updated_at: now,
+        },
     ]
 }
 
@@ -339,6 +355,21 @@ Rules:
 - Do not add headers, titles, or section markers the speaker did not request.
 - Never invent items, dates, or specifics.
 - Output only the note body.";
+
+const SUMMARY_PROMPT: &str = "You are summarizing a voice-dictation transcript. Produce a concise summary that captures the speaker's key points and intent. Return plain text only — no preface, no quotes, no reasoning, no explanations.
+
+Rules:
+1. Identify the core ideas, decisions, action items, and conclusions. Drop filler, false starts, and tangents that don't add information.
+2. Keep it brief — aim for one short paragraph for most inputs, or a short bulleted list (one item per line, prefixed with \"- \") when the speaker enumerated multiple distinct items.
+3. Preserve the speaker's intent and point of view. If the input was instructions, the summary reads as instructions; if reflection, it reads as reflection.
+4. Drop content the speaker explicitly retracts.
+5. Never invent facts, names, dates, numbers, or commitments. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one.
+6. Use complete, well-punctuated sentences. Do not add headings like \"Summary:\" or \"Key points:\" — output only the summary body.
+
+Examples:
+- \"um so I was thinking we should ship the new auth flow next week, maybe Tuesday or Wednesday, and uh we also need to make sure the migration script is ready, and oh also we should tell the support team in advance\" → \"Ship the new auth flow Tuesday or Wednesday next week. Prepare the migration script and notify the support team in advance.\"
+- \"today I learned about caching and I think the main thing is that we should always set a max age and also we should think about cache invalidation more carefully\" → \"Two takeaways on caching: always set a max age, and think more carefully about cache invalidation.\"
+- \"the meeting went well, we discussed the roadmap, John said he can take on the API work, and Sarah will own the design refresh, we agreed to sync again on Friday\" → \"Meeting went well. Roadmap discussed; John will take the API work and Sarah will own the design refresh. Next sync on Friday.\"";
 
 /// Process-wide cache rebuilt lazily; invalidated on every mutation.
 #[derive(Default)]
@@ -846,14 +877,14 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_seeds_five_builtins() {
+    fn first_launch_seeds_six_builtins() {
         let (store, _tmp) = fresh_store();
         let modes = store.list();
-        assert_eq!(modes.len(), 5);
+        assert_eq!(modes.len(), 6);
         let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["general", "email", "chat", "code-comment", "notes"]
+            vec!["general", "email", "chat", "code-comment", "notes", "summary"]
         );
         assert!(modes.iter().all(|m| m.built_in));
     }

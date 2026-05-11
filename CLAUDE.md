@@ -32,7 +32,7 @@ This file is the canonical project reference. The README that used to live at th
 | `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
 | `enable_thinking` | `false` | Gemma 4 only. When on, Gemma reasons silently before producing the polished output (slower, can improve quality on complex inputs). Sent as `chat_template_kwargs: {"enable_thinking": true}` per request. Apple Intelligence has no equivalent knob and ignores the value. |
 | `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. |
-| `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`. |
+| `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`, `summary`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
 | `appearance` | `dark` | `light` or `dark`; coerced to `dark` if unrecognised. |
 | `inference_api_key` | `""` | Random token generated lazily on first `llama-server` spawn (see `inference_proc::persistent_api_key`); reused so the startup-time orphan reaper can identify our child processes. Loopback-only — not a security secret. |
@@ -45,13 +45,14 @@ Errors surface in the pill: missing model, mic denied, audio device error, silen
 
 ## Voice Modes
 
-Five built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch:
+Six built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch:
 
 - `general` — Balanced cleanup. Default fallback.
 - `email` — Formal tone, full punctuation.
 - `chat` — Casual, drops trailing periods, capped length.
 - `code-comment` — Lowercase, slash-prefixed.
 - `notes` — Sentence-case bullet style.
+- `summary` — Condenses the dictation into a short summary of key points.
 
 Modes are JSON files under `~/Library/Application Support/com.vox.app/modes/`. Built-ins re-seed if deleted (`reset_default_modes`). Users can clone via `duplicate_mode`, edit via `save_mode`, export/import as JSON, or auto-trigger by bundle id glob / window-title substring.
 
