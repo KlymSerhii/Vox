@@ -63,6 +63,7 @@ pub fn run() {
             commands::quit_app,
             commands::open_accessibility_settings,
             commands::open_microphone_settings,
+            commands::open_external_url,
             commands::check_permissions,
             commands::request_microphone,
             commands::show_pill,

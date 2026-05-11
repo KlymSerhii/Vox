@@ -327,6 +327,26 @@ pub fn open_accessibility_settings<R: Runtime>(_app: AppHandle<R>) -> Result<(),
     Ok(())
 }
 
+/// Open an `http(s)://` URL in the user's default browser. Tauri webviews
+/// ignore `target="_blank"` on anchor tags (no default-browser fallback),
+/// so the frontend has to round-trip through this command to launch
+/// external links. Restricted to http/https to prevent the renderer from
+/// driving `open` into arbitrary file:// or x-apple-* URI handlers.
+#[tauri::command]
+pub fn open_external_url<R: Runtime>(_app: AppHandle<R>, url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("only http(s) URLs are allowed".into());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&url)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize)]
 pub struct DevBinaryInfo {
     pub binary_path: String,

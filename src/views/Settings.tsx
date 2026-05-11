@@ -40,6 +40,7 @@ import {
   onModelProgress,
   onSettingsChanged,
   openAccessibilitySettings,
+  openExternalUrl,
   PARAKEET_SUPPORTED_LANGUAGES,
   parakeetAvailability,
   parakeetSupportsLanguage,
@@ -3249,14 +3250,15 @@ function AboutTab() {
           label="Report a bug"
           hint="Found something broken? Open an issue on GitHub."
         >
-          <a
-            href="https://github.com/KlymSerhii/vox-releases/issues"
-            target="_blank"
-            rel="noopener"
+          <button
+            type="button"
+            onClick={() =>
+              void openExternalUrl("https://github.com/KlymSerhii/vox-releases/issues")
+            }
             class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
           >
             Open issues
-          </a>
+          </button>
         </Row>
         <Row
           label="Replay onboarding"

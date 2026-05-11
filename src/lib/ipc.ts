@@ -232,6 +232,13 @@ export async function openMicrophoneSettings(): Promise<void> {
   await invoke("open_microphone_settings");
 }
 
+/// Open an http(s) URL in the user's default browser. Tauri webviews
+/// ignore `target="_blank"`, so external links must round-trip through
+/// this command.
+export async function openExternalUrl(url: string): Promise<void> {
+  await invoke("open_external_url", { url });
+}
+
 export async function checkPermissions(): Promise<PermissionStatus> {
   return invoke<PermissionStatus>("check_permissions");
 }
