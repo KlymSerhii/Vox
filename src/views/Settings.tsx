@@ -3246,6 +3246,19 @@ function AboutTab() {
       <SectionHeader title="Help & diagnostics" />
       <Card>
         <Row
+          label="Report a bug"
+          hint="Found something broken? Open an issue on GitHub."
+        >
+          <a
+            href="https://github.com/KlymSerhii/vox-releases/issues"
+            target="_blank"
+            rel="noopener"
+            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)]"
+          >
+            Open issues
+          </a>
+        </Row>
+        <Row
           label="Replay onboarding"
           hint="Walk through the setup wizard again."
         >
