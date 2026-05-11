@@ -530,6 +530,23 @@ function LanguageStep(props: {
     await props.patch({ language, stt_engine: engine, stt_model_id });
   }
 
+  // The Auto card highlights itself by default and labels itself
+  // "Parakeet" when the probe succeeds, but a fresh user lands here
+  // with the persisted `stt_engine` still at its `whisper-local`
+  // default — so a Continue click without ever touching a card leaves
+  // the models step filtering Whisper-only. Reconcile the persisted
+  // engine + model id with what this step's UI implies. No-ops once
+  // aligned; re-runs only when the language or parakeet probe changes.
+  createEffect(() => {
+    const cur = props.s;
+    const pk = props.parakeet;
+    if (!cur || !pk) return;
+    const expectedEngine = recommendedSttEngineFor(cur.language, pk.available);
+    if (cur.stt_engine !== expectedEngine) {
+      void persist(cur.language);
+    }
+  });
+
   async function pickAuto() {
     await persist("auto");
   }
