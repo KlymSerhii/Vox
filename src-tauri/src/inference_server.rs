@@ -472,9 +472,25 @@ fn extract_tar_gz(archive: &Path, dest: &Path) -> anyhow::Result<()> {
                 );
             }
         }
+        // `Entry::unpack` (unlike the higher-level `Archive::unpack`)
+        // does NOT create parent directories. The llama.cpp release
+        // tarball ships entries like `llama-b8953/llama-mtmd-debug`
+        // with no intermediate `llama-b8953/` directory entry, so we
+        // must create the parent ourselves. The zip extractor below
+        // does the same.
+        let entry_type = entry.header().entry_type();
+        if entry_type.is_dir() {
+            std::fs::create_dir_all(&safe)
+                .map_err(|e| anyhow::anyhow!("create dir {}: {e}", safe.display()))?;
+            continue;
+        }
+        if let Some(parent) = safe.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create parent {}: {e}", parent.display()))?;
+        }
         entry
             .unpack(&safe)
-            .map_err(|e| anyhow::anyhow!("untar entry {}: {e}", rel.display()))?;
+            .map_err(|e| anyhow::anyhow!("untar entry {}: {e:#}", rel.display()))?;
     }
     Ok(())
 }
@@ -726,5 +742,63 @@ mod tests {
         assert!(safe_join(dest, Path::new("bin/../../etc/passwd")).is_err());
         assert!(safe_join(dest, Path::new("/etc/passwd")).is_err());
         assert!(safe_join(dest, Path::new("")).is_err());
+    }
+
+    #[test]
+    fn extract_tar_gz_creates_missing_parent_dirs() {
+        // The llama.cpp release tarball ships file entries like
+        // `llama-b8953/llama-mtmd-debug` with NO separate directory
+        // entry for `llama-b8953/`. `tar::Entry::unpack` doesn't
+        // auto-create parent dirs, so the extractor must.
+        let unique = format!(
+            "vox-extract-tar-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let work = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&work).unwrap();
+        let archive_path = work.join("test.tar.gz");
+        let dest = work.join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        // Build a tar.gz with a "./" root entry and a deeply-nested
+        // file with no intermediate directory entries — exactly the
+        // shape that broke onboarding.
+        let f = std::fs::File::create(&archive_path).unwrap();
+        let gz = flate2::write::GzEncoder::new(f, flate2::Compression::default());
+        let mut builder = tar::Builder::new(gz);
+
+        let mut root_header = tar::Header::new_gnu();
+        root_header.set_path("./").unwrap();
+        root_header.set_size(0);
+        root_header.set_entry_type(tar::EntryType::Directory);
+        root_header.set_mode(0o755);
+        root_header.set_cksum();
+        builder
+            .append(&root_header, std::io::empty())
+            .unwrap();
+
+        let payload = b"binary contents";
+        let mut file_header = tar::Header::new_gnu();
+        file_header.set_path("llama-b8953/llama-mtmd-debug").unwrap();
+        file_header.set_size(payload.len() as u64);
+        file_header.set_mode(0o755);
+        file_header.set_entry_type(tar::EntryType::Regular);
+        file_header.set_cksum();
+        builder
+            .append(&file_header, &payload[..])
+            .unwrap();
+
+        builder.into_inner().unwrap().finish().unwrap();
+
+        extract_tar_gz(&archive_path, &dest).expect("extraction must succeed");
+        let extracted = dest.join("llama-b8953").join("llama-mtmd-debug");
+        assert!(extracted.is_file(), "expected {} to exist", extracted.display());
+        assert_eq!(std::fs::read(&extracted).unwrap(), payload);
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 }
