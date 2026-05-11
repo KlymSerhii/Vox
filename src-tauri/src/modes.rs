@@ -1,6 +1,8 @@
 //! Voice Modes: per-mode JSON files at `<app_data_dir>/modes/<id>.json`.
-//! Built-ins seed the directory on first launch only — never overwrite
-//! an existing user-edited file.
+//! Any missing built-in is seeded on every launch — so new built-ins
+//! shipped in an update appear automatically. Existing files are
+//! never overwritten, so user edits (and manually deleted built-ins
+//! that the user later re-creates) are preserved.
 
 use std::collections::HashMap;
 use std::fs;
@@ -386,12 +388,10 @@ impl ModeStore {
     pub fn init_with_root(self: &Arc<Self>, root: PathBuf) -> Result<()> {
         fs::create_dir_all(&root).context("create modes dir")?;
         *self.root.write() = Some(root.clone());
-        if dir_is_empty(&root)? {
-            for mode in builtins() {
-                let path = mode_path(&root, &mode.id);
-                if !path.exists() {
-                    write_mode_file(&path, &mode)?;
-                }
+        for mode in builtins() {
+            let path = mode_path(&root, &mode.id);
+            if !path.exists() {
+                write_mode_file(&path, &mode)?;
             }
         }
         *self.inner.write() = None;
@@ -666,14 +666,6 @@ pub fn modes_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
         .join("app.vox.vox/modes")
 }
 
-fn dir_is_empty(dir: &Path) -> Result<bool> {
-    if !dir.exists() {
-        return Ok(true);
-    }
-    Ok(fs::read_dir(dir)?.next().is_none())
-}
-
-
 fn mode_path(root: &Path, id: &str) -> PathBuf {
     root.join(format!("{id}.json"))
 }
@@ -887,6 +879,46 @@ mod tests {
             vec!["general", "email", "chat", "code-comment", "notes", "summary"]
         );
         assert!(modes.iter().all(|m| m.built_in));
+    }
+
+    #[test]
+    fn init_seeds_new_builtin_into_existing_dir() {
+        // Simulates an upgrade: user already has the older built-ins
+        // on disk from a prior launch, and we ship a new built-in.
+        // The new one must appear without the user having to click
+        // "Reset built-ins".
+        let dir = ScratchDir::new();
+        // Pre-populate the dir with everything *except* the new mode.
+        for mode in builtins().into_iter().filter(|m| m.id != "summary") {
+            write_mode_file(&mode_path(dir.path(), &mode.id), &mode).unwrap();
+        }
+        // Sanity: the new built-in is missing before init runs.
+        assert!(!mode_path(dir.path(), "summary").exists());
+
+        let store = Arc::new(ModeStore::new());
+        store.init_with_root(dir.path().to_path_buf()).unwrap();
+
+        // After init, the missing built-in is on disk and listed.
+        assert!(mode_path(dir.path(), "summary").exists());
+        let ids: Vec<String> = store.list().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&"summary".to_string()));
+        assert_eq!(ids.len(), 6);
+    }
+
+    #[test]
+    fn init_does_not_overwrite_edited_builtin_file() {
+        // A built-in JSON edited on disk (e.g. by a power-user) must
+        // survive re-init. Only *missing* files get written.
+        let dir = ScratchDir::new();
+        let mut email = builtins().into_iter().find(|m| m.id == "email").unwrap();
+        email.system_prompt = "custom on-disk prompt".into();
+        write_mode_file(&mode_path(dir.path(), "email"), &email).unwrap();
+
+        let store = Arc::new(ModeStore::new());
+        store.init_with_root(dir.path().to_path_buf()).unwrap();
+
+        let reloaded = store.get("email").unwrap();
+        assert_eq!(reloaded.system_prompt, "custom on-disk prompt");
     }
 
     #[test]
