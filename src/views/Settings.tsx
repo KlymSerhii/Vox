@@ -316,11 +316,11 @@ function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
               style={
                 props.tab === t.id
                   ? {
-                      background: "var(--color-surface-raised)",
-                      "backdrop-filter": "var(--glass-blur)",
-                      "-webkit-backdrop-filter": "var(--glass-blur)",
-                      "box-shadow": "var(--glass-shadow-stack-sm)",
-                    }
+                    background: "var(--color-surface-raised)",
+                    "backdrop-filter": "var(--glass-blur)",
+                    "-webkit-backdrop-filter": "var(--glass-blur)",
+                    "box-shadow": "var(--glass-shadow-stack-sm)",
+                  }
                   : {}
               }
             >
@@ -559,15 +559,15 @@ function SegmentedControl<T extends string>(props: {
               style={
                 active()
                   ? {
-                      background: "var(--color-surface-raised)",
-                      // Contained shadow: a 1px inset highlight + a 1px
-                      // hairline drop. The full glass-shadow-stack-sm
-                      // (which has a 22px outer blur) was leaking past
-                      // the pill's 2px bottom padding and reading as
-                      // asymmetric padding on the active segment.
-                      "box-shadow":
-                        "inset 0 1px 0 var(--glass-highlight), 0 1px 1px var(--glass-shadow-contact)",
-                    }
+                    background: "var(--color-surface-raised)",
+                    // Contained shadow: a 1px inset highlight + a 1px
+                    // hairline drop. The full glass-shadow-stack-sm
+                    // (which has a 22px outer blur) was leaking past
+                    // the pill's 2px bottom padding and reading as
+                    // asymmetric padding on the active segment.
+                    "box-shadow":
+                      "inset 0 1px 0 var(--glass-highlight), 0 1px 1px var(--glass-shadow-contact)",
+                  }
                   : {}
               }
             >
@@ -3221,9 +3221,6 @@ function AboutTab() {
           </span>
           <span class="rounded-full bg-[var(--color-success)]/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-success)]">
             Local-first
-          </span>
-          <span class="rounded-full bg-[var(--color-control)] px-2 py-0.5 text-[10px] uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
-            Tauri 2
           </span>
         </div>
       </div>
