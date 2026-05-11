@@ -225,9 +225,13 @@ jobs:
             fi
           done
 
-          cp "$APP_TARGZ" "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz"
-          cp "$APP_SIG"   "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz.sig"
-          cp "$DMG"       "$STAGE/Vox_${VERSION}_aarch64.dmg"
+          # Use stable, version-agnostic filenames so the marketing site
+          # can link to `/releases/latest/download/Vox.dmg` and have it
+          # auto-resolve to the newest release. The release tag (v1.0.x)
+          # still encodes the version on the GitHub release page.
+          cp "$APP_TARGZ" "$STAGE/Vox.app.tar.gz"
+          cp "$APP_SIG"   "$STAGE/Vox.app.tar.gz.sig"
+          cp "$DMG"       "$STAGE/Vox.dmg"
 
           # Generate the Tauri updater manifest. The signature is the
           # contents of the .sig file (a single-line minisign signature
@@ -243,7 +247,7 @@ jobs:
             "platforms": {
               "darwin-aarch64": {
                 "signature": "${SIGNATURE}",
-                "url": "https://github.com/KlymSerhii/vox-releases/releases/download/v${VERSION}/Vox_${VERSION}_aarch64.app.tar.gz"
+                "url": "https://github.com/KlymSerhii/vox-releases/releases/download/v${VERSION}/Vox.app.tar.gz"
               }
             }
           }
@@ -279,7 +283,7 @@ jobs:
             --notes "Apple Silicon build of Vox ${VERSION}.
 
           ## Install
-          1. Download \`Vox_${VERSION}_aarch64.dmg\`.
+          1. Download \`Vox.dmg\`.
           2. Open the DMG and drag Vox into Applications.
           3. Launch from Applications. macOS will verify the signature & notarization on first launch — no \"unknown developer\" warning.
 
@@ -288,9 +292,9 @@ jobs:
 
           ## License
           Free for personal use. Commercial use requires a paid license — contact \`vox@rizenhq.com\`. See [LICENSE](https://github.com/KlymSerhii/vox-releases/blob/main/LICENSE)." \
-            "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz" \
-            "$STAGE/Vox_${VERSION}_aarch64.app.tar.gz.sig" \
-            "$STAGE/Vox_${VERSION}_aarch64.dmg" \
+            "$STAGE/Vox.app.tar.gz" \
+            "$STAGE/Vox.app.tar.gz.sig" \
+            "$STAGE/Vox.dmg" \
             "$STAGE/latest.json"
 
           echo "Released v${VERSION} to https://github.com/KlymSerhii/vox-releases/releases/tag/v${VERSION}"
