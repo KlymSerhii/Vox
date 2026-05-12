@@ -108,6 +108,7 @@ pub fn run() {
             commands::reveal_dev_binary_path,
             commands::cancel_session,
             commands::sessions_snapshot,
+            commands::re_polish_transcript,
         ])
         .setup(|app| {
             #[cfg(target_os = "macos")]

@@ -1110,3 +1110,133 @@ pub fn sessions_snapshot(app: AppHandle<Wry>) -> SessionsSnapshot {
         },
     }
 }
+
+/// Re-run the LLM polish on a Recent transcript with a different Voice
+/// Mode and copy the result to the clipboard.
+///
+/// Inputs:
+/// - `session_id` — id of a recent completed entry (the popover passes
+///   what `sessions_snapshot` returned).
+/// - `mode_id` — target Voice Mode for the new polish.
+///
+/// Behaviour:
+/// - Looks up the ring buffer entry; prefers its `raw_text` (the
+///   pre-polish Whisper output captured at dictation time) so the new
+///   polish starts from the original transcript. Entries that pre-date
+///   `raw_text` (or whose dictation pipeline fell through the
+///   LLM fail-open) fall back to `text`, which is still useful — the
+///   user gets the existing text re-shaped through the chosen mode's
+///   `case` / `punctuation` / `max_length_chars` rules and (for the
+///   real-text-available branch) a fresh LLM cleanup with the mode's
+///   prompt + dictionary.
+/// - Uses the current `Settings` `llm_engine` + `llm_model_id`. A
+///   user who's swapped engines since the original dictation gets the
+///   new engine for the re-polish, which is the right behaviour: the
+///   tray popover lives in the present, not a snapshot.
+/// - Fail-open: LLM error → raw input goes through mode
+///   post-processing instead. Clipboard is still updated. The frontend
+///   surfaces the warning via the response shape.
+/// - On success the ring buffer entry's `text` is updated in place
+///   and a `sessions:changed` event fires so every open window
+///   (popover / settings) reflects the new value.
+#[tauri::command]
+pub async fn re_polish_transcript(
+    app: AppHandle<Wry>,
+    session_id: u64,
+    mode_id: String,
+) -> Result<RePolishResult, String> {
+    let entry = transcripts::get_completed(session_id)
+        .ok_or_else(|| "transcript no longer in the recent list".to_string())?;
+    // Prefer raw_text; fall back to polished text for legacy entries
+    // and the LLM-fail-open path (where text already IS the raw output).
+    let input = entry.raw_text.clone().unwrap_or_else(|| entry.text.clone());
+    if input.trim().is_empty() {
+        return Err("transcript is empty".into());
+    }
+
+    let mode = crate::modes::get_mode(&app, &mode_id)
+        .ok_or_else(|| format!("Voice Mode '{mode_id}' not found"))?;
+
+    let prefs = settings::load(&app);
+    let (llm_engine_id, llm_model_id) = if prefs.polishing_enabled {
+        (prefs.llm_engine.clone(), prefs.llm_model_id.clone())
+    } else {
+        // The user has polishing disabled, but the explicit intent of
+        // "re-polish as ..." is to apply that mode's polish — so we
+        // re-enable the engine just for this call. If there's no
+        // engine selected at all (raw "none"), the helper degrades
+        // gracefully to mode post-processing only.
+        let fallback_engine = if prefs.llm_engine == "none" {
+            // Best guess: prefer apple-fm if compiled in and the user's
+            // model ids point at gemma. We can't probe availability
+            // here without an async hop; let the engine registry's
+            // None-return path drive the fail-open.
+            "gemma-local".to_string()
+        } else {
+            prefs.llm_engine.clone()
+        };
+        (fallback_engine, prefs.llm_model_id.clone())
+    };
+
+    let outcome = crate::session::polish_with_mode(
+        app.clone(),
+        input,
+        &mode,
+        llm_engine_id,
+        llm_model_id,
+        prefs.dictionary.clone(),
+        prefs.enable_thinking,
+    )
+    .await;
+
+    let text = outcome.text.clone();
+    // Clipboard write (blocking — same hop the live pipeline uses).
+    let copy_text = text.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::inject::copy_to_clipboard(&copy_text))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+
+    // Update the ring buffer entry in place so the popover's RECENT
+    // row reflects the new text. Re-emit sessions:changed so every
+    // window picks up the new snapshot.
+    let now_ts = chrono::Utc::now().timestamp();
+    transcripts::update_completed_text(
+        session_id,
+        text.clone(),
+        mode.id.clone(),
+        now_ts,
+        outcome.warning,
+    );
+    let _ = app.emit(
+        "sessions:changed",
+        match app.try_state::<Arc<SessionManager>>() {
+            Some(m) => m.inner().snapshot(),
+            None => SessionsSnapshot {
+                in_progress: Vec::new(),
+                recent: transcripts::snapshot_completed(),
+            },
+        },
+    );
+    // Legacy event for any consumer still on the older event shape.
+    let _ = app.emit("transcripts:changed", transcripts::snapshot());
+
+    Ok(RePolishResult {
+        text,
+        warning: outcome.warning,
+        mode_id: mode.id,
+        mode_name: mode.name,
+    })
+}
+
+/// Frontend-facing response for `re_polish_transcript`. Mirrors what
+/// the tray popover needs to render the post-action feedback:
+/// new text (so the row updates), a `warning` flag (so a "Raw copy"
+/// hint can be shown), and the mode label that was applied.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RePolishResult {
+    pub text: String,
+    pub warning: bool,
+    pub mode_id: String,
+    pub mode_name: String,
+}

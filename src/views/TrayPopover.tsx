@@ -11,9 +11,9 @@ import {
   onSessionsChanged,
   onSettingsChanged,
   onStatsChanged,
-  onTranscriptsChanged,
   openSettingsWindow,
   quitApp,
+  rePolishTranscript,
   sessionsSnapshot,
   setActiveMode,
   setAppearance,
@@ -21,10 +21,10 @@ import {
   setHandsFreeEnabled,
   setPolishingEnabled,
   setStreamingPillEnabled,
+  type CompletedEntry,
   type InProgressEntry,
   type ModelStatus,
   type Period,
-  type RecentTranscript,
   type SessionsSnapshot,
   type Settings,
   type Stage,
@@ -35,9 +35,49 @@ import {
 export default function TrayPopoverView() {
   const [loaded, setLoaded] = createSignal(false);
   const [s, setS] = createSignal<Settings | null>(null);
-  const [recents, setRecents] = createSignal<RecentTranscript[]>([]);
+  const [recents, setRecents] = createSignal<CompletedEntry[]>([]);
   const [inProgress, setInProgress] = createSignal<InProgressEntry[]>([]);
   const [copyFlash, setCopyFlash] = createSignal<number | null>(null);
+  // Per-row "Re-polished as X" hint timer keyed by session id. Cleared
+  // after a short delay so the row collapses back to the default look.
+  const [repolishFlash, setRepolishFlash] = createSignal<{
+    sessionId: number;
+    modeName: string;
+    warning: boolean;
+  } | null>(null);
+  // Sessions currently being re-polished (background LLM call in
+  // flight). Used to render a small spinner / disable the picker on
+  // the affected row.
+  const [repolishBusy, setRepolishBusy] = createSignal<Set<number>>(new Set());
+  // Per-row picker state. Only one row's picker is open at a time so
+  // the dense popover doesn't pile up flyouts. Stored as the row's
+  // session id (or null for closed).
+  const [repolishPickerSessionId, setRepolishPickerSessionId] = createSignal<
+    number | null
+  >(null);
+  let repolishPickerRef: HTMLDivElement | undefined;
+  const repolishTriggerRefs = new Map<number, HTMLButtonElement>();
+  const [repolishMenuPos, setRepolishMenuPos] = createSignal<{
+    placement: "below" | "above";
+    top: number;
+    bottom: number;
+    left: number;
+    minWidth: number;
+    maxHeight: number;
+  }>({
+    placement: "below",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    minWidth: 0,
+    maxHeight: 240,
+  });
+  // Per-row inline error (cleared on retry / outside-click). Keyed by
+  // session id so error from one row doesn't shadow another.
+  const [repolishError, setRepolishError] = createSignal<{
+    sessionId: number;
+    message: string;
+  } | null>(null);
   const [modes, setModes] = createSignal<VoiceMode[]>([]);
   const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
   // Header status uses these to detect "models not yet installed". A
@@ -83,7 +123,6 @@ export default function TrayPopoverView() {
     PERIOD_OPTIONS.find((o) => o.value === period())?.label ?? "Today";
 
   let unlistenSettings: (() => void) | null = null;
-  let unlistenTranscripts: (() => void) | null = null;
   let unlistenSessions: (() => void) | null = null;
   let unlistenStats: (() => void) | null = null;
 
@@ -98,16 +137,13 @@ export default function TrayPopoverView() {
 
   function applySnapshot(snap: SessionsSnapshot) {
     setInProgress(snap.in_progress);
-    // The popover renders the legacy "RECENT" list from `recents` for
-    // back-compat with the old transcripts:changed event, but we
-    // also project sessions:changed.recent into the same shape so
-    // both pathways converge on the same UI.
-    setRecents(
-      snap.recent.map((e) => ({
-        ts: e.ts,
-        text: e.text,
-      })),
-    );
+    // RECENT keeps the richer `CompletedEntry` shape so the per-row
+    // re-polish action has the `session_id` it needs to call back
+    // into the backend. The old `transcripts:changed` projection is
+    // still emitted by the Rust side, but we drop the legacy
+    // subscription here — `sessions:changed` carries the same data
+    // (and more), so there's no value in maintaining both wiring.
+    setRecents(snap.recent);
   }
 
   onMount(async () => {
@@ -144,7 +180,6 @@ export default function TrayPopoverView() {
     // across reopens; the focus handler is a backstop for events that
     // fire while the popover is hidden.
     unlistenSettings = await onSettingsChanged(setS);
-    unlistenTranscripts = await onTranscriptsChanged(setRecents);
     unlistenSessions = await onSessionsChanged(applySnapshot);
     unlistenStats = await onStatsChanged(refreshStats);
     void refreshStats();
@@ -175,6 +210,14 @@ export default function TrayPopoverView() {
           !!periodTriggerRef && periodTriggerRef.contains(target);
         if (!inMenu && !inTrigger) setPeriodMenuOpen(false);
       }
+      const openId = repolishPickerSessionId();
+      if (openId !== null) {
+        const inMenu =
+          !!repolishPickerRef && repolishPickerRef.contains(target);
+        const trigger = repolishTriggerRefs.get(openId);
+        const inTrigger = !!trigger && trigger.contains(target);
+        if (!inMenu && !inTrigger) setRepolishPickerSessionId(null);
+      }
     });
 
     // Tauri fires this when the popover loses key window status, e.g.
@@ -185,6 +228,7 @@ export default function TrayPopoverView() {
         if (!payload) {
           setModeMenuOpen(false);
           setPeriodMenuOpen(false);
+          setRepolishPickerSessionId(null);
         }
       });
     } catch (err) {
@@ -194,7 +238,6 @@ export default function TrayPopoverView() {
 
   onCleanup(() => {
     unlistenSettings?.();
-    unlistenTranscripts?.();
     unlistenSessions?.();
     unlistenStats?.();
   });
@@ -258,6 +301,105 @@ export default function TrayPopoverView() {
       setTimeout(() => setCopyFlash(null), 900);
     } catch (e) {
       console.error("copy failed:", e);
+    }
+  }
+
+  function openRepolishPicker(sessionId: number) {
+    const trigger = repolishTriggerRefs.get(sessionId);
+    if (trigger) {
+      const r = trigger.getBoundingClientRect();
+      // Right-align to the trigger via fixed coords so the dropdown
+      // can escape the popover root's overflow-hidden clipping. The
+      // tray popover is a small window — a Recent row near the bottom
+      // doesn't have room below for 6 modes, so flip the dropdown
+      // above when there's more headroom there. Either way, cap
+      // maxHeight to whichever side we land on so the list scrolls
+      // instead of clipping past the window edge.
+      const viewportH = window.innerHeight;
+      const menuW = Math.max(r.width, 200);
+      const left = Math.max(8, r.right - menuW);
+      const spaceBelow = viewportH - r.bottom - 8;
+      const spaceAbove = r.top - 8;
+      // ~28px header + 6 modes × ~32px row; below this threshold the
+      // flip-up branch is preferable if we have more room up there.
+      const desiredH = 220;
+      const placeBelow = spaceBelow >= desiredH || spaceBelow >= spaceAbove;
+      if (placeBelow) {
+        setRepolishMenuPos({
+          placement: "below",
+          top: r.bottom + 4,
+          bottom: 0,
+          left,
+          minWidth: menuW,
+          maxHeight: spaceBelow,
+        });
+      } else {
+        setRepolishMenuPos({
+          placement: "above",
+          top: 0,
+          bottom: viewportH - r.top + 4,
+          left,
+          minWidth: menuW,
+          maxHeight: spaceAbove,
+        });
+      }
+    }
+    // Clear any stale per-row error so the picker opens clean.
+    setRepolishError(null);
+    setRepolishPickerSessionId(sessionId);
+  }
+
+  async function runRepolish(sessionId: number, modeId: string) {
+    setRepolishPickerSessionId(null);
+    setRepolishError(null);
+    // Mark this session as busy so the row shows a spinner and the
+    // trigger is disabled (immutable Set replace so Solid re-runs).
+    setRepolishBusy((prev) => {
+      const next = new Set(prev);
+      next.add(sessionId);
+      return next;
+    });
+    try {
+      const result = await rePolishTranscript(sessionId, modeId);
+      setRecents((rs) =>
+        rs.map((r) =>
+          r.session_id === sessionId
+            ? {
+                ...r,
+                text: result.text,
+                mode_id: result.mode_id,
+                warning: result.warning,
+              }
+            : r,
+        ),
+      );
+      setRepolishFlash({
+        sessionId,
+        modeName: result.mode_name,
+        warning: result.warning,
+      });
+      // Match the existing copy-flash timing (~900ms) so success
+      // confirmations feel consistent. Re-polish takes longer to
+      // produce so the user actually sees the affirmation; we hold
+      // for a beat longer than copy.
+      setTimeout(() => {
+        setRepolishFlash((f) => (f && f.sessionId === sessionId ? null : f));
+      }, 2200);
+    } catch (e) {
+      const message = typeof e === "string" ? e : String(e);
+      console.error("rePolishTranscript failed:", message);
+      setRepolishError({ sessionId, message: shortRepolishError(message) });
+      setTimeout(() => {
+        setRepolishError((cur) =>
+          cur && cur.sessionId === sessionId ? null : cur,
+        );
+      }, 3200);
+    } finally {
+      setRepolishBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
     }
   }
 
@@ -713,48 +855,177 @@ export default function TrayPopoverView() {
                   Recent (cleared on quit)
                 </div>
                 <For each={recents()}>
-                  {(r, idx) => (
-                    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
-                      <span class="w-10 shrink-0 text-[11px] font-medium text-[var(--color-ink-faint)]">
-                        {ago(r.ts)}
-                      </span>
-                      <span class="flex-1 truncate text-[12px] text-[var(--color-ink)]">
-                        {r.text}
-                      </span>
-                      <button
-                        type="button"
-                        class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
-                        onClick={() => copyRecent(idx(), r.text)}
-                        title="Copy to clipboard (⌘V to paste)"
-                      >
-                        <Show
-                          when={copyFlash() === idx()}
-                          fallback={
-                            <svg
-                              width="14"
-                              height="14"
-                              viewBox="0 0 24 24"
-                              fill="none"
-                              stroke="currentColor"
-                              stroke-width="1.75"
-                              stroke-linecap="round"
-                              stroke-linejoin="round"
-                            >
-                              <rect x="9" y="9" width="12" height="12" rx="2" />
-                              <path d="M5 15V5a2 2 0 0 1 2-2h10" />
-                            </svg>
-                          }
-                        >
-                          <span class="text-[var(--color-success)] text-[11px]">
-                            ✓
+                  {(r, idx) => {
+                    const busy = () => repolishBusy().has(r.session_id);
+                    const flash = () => {
+                      const f = repolishFlash();
+                      return f && f.sessionId === r.session_id ? f : null;
+                    };
+                    const err = () => {
+                      const e = repolishError();
+                      return e && e.sessionId === r.session_id ? e : null;
+                    };
+                    return (
+                      <div class="group flex flex-col gap-1 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
+                        <div class="flex items-center gap-2">
+                          <span class="w-10 shrink-0 text-[11px] font-medium text-[var(--color-ink-faint)]">
+                            {ago(r.ts)}
                           </span>
+                          <span class="flex-1 truncate text-[12px] text-[var(--color-ink)]">
+                            {r.text}
+                          </span>
+                          <button
+                            ref={(el) => {
+                              if (el) repolishTriggerRefs.set(r.session_id, el);
+                              else repolishTriggerRefs.delete(r.session_id);
+                            }}
+                            type="button"
+                            disabled={busy()}
+                            class="repolish-trigger inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] opacity-0 transition-opacity duration-150 ease-out hover:bg-[var(--color-overlay)] hover:text-[var(--color-accent)] group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-100"
+                            classList={{
+                              "!opacity-100":
+                                busy() ||
+                                repolishPickerSessionId() === r.session_id,
+                            }}
+                            aria-haspopup="listbox"
+                            aria-expanded={
+                              repolishPickerSessionId() === r.session_id
+                            }
+                            aria-label={`Re-polish as another mode`}
+                            title="Re-polish as…"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (busy()) return;
+                              if (repolishPickerSessionId() === r.session_id) {
+                                setRepolishPickerSessionId(null);
+                              } else {
+                                openRepolishPicker(r.session_id);
+                              }
+                            }}
+                          >
+                            <Show
+                              when={!busy()}
+                              fallback={<SmallSpinner />}
+                            >
+                              <SparkleGlyph />
+                            </Show>
+                          </button>
+                          <button
+                            type="button"
+                            class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
+                            onClick={() => copyRecent(idx(), r.text)}
+                            title="Copy to clipboard (⌘V to paste)"
+                          >
+                            <Show
+                              when={copyFlash() === idx()}
+                              fallback={
+                                <svg
+                                  width="14"
+                                  height="14"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="1.75"
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                >
+                                  <rect x="9" y="9" width="12" height="12" rx="2" />
+                                  <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+                                </svg>
+                              }
+                            >
+                              <span class="text-[var(--color-success)] text-[11px]">
+                                ✓
+                              </span>
+                            </Show>
+                          </button>
+                        </div>
+                        <Show when={flash()}>
+                          {(f) => (
+                            <div
+                              class="ml-12 flex items-center gap-1 text-[10.5px] leading-none transition-opacity duration-150 ease-out"
+                              classList={{
+                                "text-[var(--color-success)]": !f().warning,
+                                "text-[var(--color-warning)]": f().warning,
+                              }}
+                            >
+                              <span aria-hidden="true">
+                                {f().warning ? "!" : "✓"}
+                              </span>
+                              <span>
+                                {f().warning
+                                  ? `Raw copy — ${f().modeName} polish failed`
+                                  : `Re-polished as ${f().modeName} — copied`}
+                              </span>
+                            </div>
+                          )}
                         </Show>
-                      </button>
-                    </div>
-                  )}
+                        <Show when={err()}>
+                          {(e) => (
+                            <div class="ml-12 flex items-center gap-1 text-[10.5px] leading-none text-[var(--color-danger)]">
+                              <span aria-hidden="true">!</span>
+                              <span>{e().message}</span>
+                            </div>
+                          )}
+                        </Show>
+                      </div>
+                    );
+                  }}
                 </For>
               </Show>
             </div>
+
+            <Show when={repolishPickerSessionId() !== null}>
+              <div
+                ref={(el) => (repolishPickerRef = el)}
+                class="liquid-glass z-50 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                role="listbox"
+                aria-label="Re-polish with mode"
+                style={{
+                  position: "fixed",
+                  ...(repolishMenuPos().placement === "above"
+                    ? { bottom: `${repolishMenuPos().bottom}px` }
+                    : { top: `${repolishMenuPos().top}px` }),
+                  left: `${repolishMenuPos().left}px`,
+                  "min-width": `${repolishMenuPos().minWidth}px`,
+                  "max-height": `${repolishMenuPos().maxHeight}px`,
+                }}
+              >
+                <div class="px-3 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+                  Re-polish as…
+                </div>
+                <For each={modes()}>
+                  {(m) => {
+                    const target = repolishPickerSessionId();
+                    const targetEntry = () =>
+                      recents().find((r) => r.session_id === target);
+                    const isCurrent = () => targetEntry()?.mode_id === m.id;
+                    return (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={isCurrent()}
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                        classList={{
+                          "text-[var(--color-accent)]": isCurrent(),
+                          "text-[var(--color-ink)]": !isCurrent(),
+                        }}
+                        onClick={() => {
+                          const sid = repolishPickerSessionId();
+                          if (sid !== null) void runRepolish(sid, m.id);
+                        }}
+                      >
+                        <span aria-hidden="true">{m.icon}</span>
+                        <span class="flex-1 truncate">{m.name}</span>
+                        <Show when={isCurrent()}>
+                          <span class="text-[10px]">●</span>
+                        </Show>
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
 
             </div>
             <div class="flex shrink-0 items-center justify-between border-t border-[var(--color-border)] px-4 py-3">
@@ -889,6 +1160,56 @@ function Spinner() {
       <path d="M12 3a9 9 0 1 0 9 9" />
     </svg>
   );
+}
+
+function SmallSpinner() {
+  // Sized to match the 14×14 svgs already used by the row actions so
+  // the spinner slots in without shifting layout.
+  return (
+    <svg
+      class="animate-spin"
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="var(--color-accent)"
+      stroke-width="2.5"
+      stroke-linecap="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3a9 9 0 1 0 9 9" />
+    </svg>
+  );
+}
+
+function SparkleGlyph() {
+  // Liquid-style 4-point sparkle — reads as "polish / refresh" without
+  // looking like a copy or refresh-arrow glyph (both of which already
+  // appear elsewhere in the popover).
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      stroke-width="1.75"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M12 3v4M12 17v4M3 12h4M17 12h4" />
+      <path d="M12 8c.5 2 1.5 3 4 3.5C13.5 12 12.5 13 12 16c-.5-3-1.5-4-4-4.5C10.5 11 11.5 10 12 8z" />
+    </svg>
+  );
+}
+
+function shortRepolishError(message: string): string {
+  // The backend returns string errors from `Result<_, String>`. Trim
+  // boilerplate (`anyhow` chain, IPC framing) for the dense popover.
+  const trimmed = message.replace(/^Error:\s*/i, "").trim();
+  if (trimmed.length <= 80) return trimmed;
+  return trimmed.slice(0, 77) + "…";
 }
 
 function LocalBadge() {

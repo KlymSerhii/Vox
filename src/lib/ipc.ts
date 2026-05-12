@@ -124,6 +124,13 @@ export interface CompletedEntry {
   session_id: number;
   ts: number;
   text: string;
+  /**
+   * Pre-polish Whisper transcript captured at dictation time. Used as
+   * the input for `rePolishTranscript`. Absent for entries that
+   * pre-date this field, or for any entry that fell through the LLM
+   * fail-open (in which case `text` is already the raw transcript).
+   */
+  raw_text?: string | null;
   mode_id: string;
   stage: Stage;
   warning: boolean;
@@ -526,6 +533,39 @@ export async function onStatsChanged(
 
 export async function cancelSession(sessionId: number): Promise<void> {
   await invoke("cancel_session", { sessionId });
+}
+
+export interface RePolishResult {
+  text: string;
+  /**
+   * True when the LLM step failed (or returned empty) and the new
+   * text is the unpolished raw transcript shaped only by the mode's
+   * post-processing. Callers should surface a "Raw copy" hint.
+   */
+  warning: boolean;
+  mode_id: string;
+  mode_name: string;
+}
+
+/**
+ * Re-run the LLM polish on a Recent transcript using a different
+ * Voice Mode. The result is copied to the clipboard and the matching
+ * `CompletedEntry` in the ring buffer is updated in place — every
+ * window subscribed to `sessions:changed` sees the new text.
+ *
+ * Fails with a string error when the entry is no longer in the
+ * ring (rotated out by newer captures), when the mode id is unknown,
+ * or when the clipboard write fails. LLM-step failures do NOT throw —
+ * they surface as `warning: true` in the response.
+ */
+export async function rePolishTranscript(
+  sessionId: number,
+  modeId: string,
+): Promise<RePolishResult> {
+  return invoke<RePolishResult>("re_polish_transcript", {
+    sessionId,
+    modeId,
+  });
 }
 
 export async function sessionsSnapshot(): Promise<SessionsSnapshot> {

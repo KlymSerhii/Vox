@@ -43,6 +43,15 @@ pub struct CompletedEntry {
     pub session_id: u64,
     pub ts: i64,
     pub text: String,
+    /// Pre-polish Whisper output captured before the LLM cleanup step
+    /// ran. Used by `re_polish_transcript` so a user can re-run polish
+    /// with a different Voice Mode without re-dictating. `None` for
+    /// entries whose pipeline pre-dates this field, or for any entry
+    /// that fell through the LLM fail-open path (in which case `text`
+    /// already IS the raw transcript). `#[serde(default)]` on the
+    /// frontend side: the field can simply be absent in older JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_text: Option<String>,
     pub mode_id: String,
     pub stage: Stage,
     pub warning: bool,
@@ -67,6 +76,7 @@ pub fn push(text: &str) {
         session_id: 0,
         ts: chrono::Utc::now().timestamp(),
         text: text.to_string(),
+        raw_text: None,
         mode_id: String::new(),
         stage: Stage::Done,
         warning: false,
@@ -81,6 +91,36 @@ pub fn push_completed(entry: CompletedEntry) {
         ring.pop_back();
     }
     ring.push_front(entry);
+}
+
+/// Look up a CompletedEntry by `session_id`. Used by
+/// `commands::re_polish_transcript` to fetch the stored raw transcript
+/// for a re-polish without holding the ring buffer's mutex across the
+/// async LLM call.
+pub fn get_completed(session_id: u64) -> Option<CompletedEntry> {
+    let ring = RING.lock();
+    ring.iter().find(|e| e.session_id == session_id).cloned()
+}
+
+/// Replace the visible `text` (and refresh `mode_id` / `ts`) of an
+/// existing completed entry in place. Used by re-polish to update the
+/// Recent list immediately after the new clipboard write lands.
+/// Returns the updated entry; `None` if the session id is no longer
+/// in the ring (rotated out by newer captures).
+pub fn update_completed_text(
+    session_id: u64,
+    new_text: String,
+    mode_id: String,
+    ts: i64,
+    warning: bool,
+) -> Option<CompletedEntry> {
+    let mut ring = RING.lock();
+    let entry = ring.iter_mut().find(|e| e.session_id == session_id)?;
+    entry.text = new_text;
+    entry.mode_id = mode_id;
+    entry.ts = ts;
+    entry.warning = warning;
+    Some(entry.clone())
 }
 
 /// Legacy snapshot — projects CompletedEntry to the older RecentTranscript

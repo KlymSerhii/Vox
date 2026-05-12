@@ -1425,6 +1425,16 @@ async fn run_pipeline(
         session_id: id,
         ts: chrono::Utc::now().timestamp(),
         text: cleaned.clone(),
+        // Keep the pre-polish Whisper transcript around so a user who
+        // re-polishes this entry via the tray popover can start from
+        // the original raw text rather than the already-cleaned output.
+        // Skipped when polish was disabled / fell open (cleaned IS the
+        // raw transcript already, no value in duplicating it).
+        raw_text: if polish_engine_active && polish_warning.is_none() {
+            Some(transcript.clone())
+        } else {
+            None
+        },
         mode_id: session.mode.id.clone(),
         stage: Stage::Done,
         warning: warning_flag,
@@ -1939,6 +1949,97 @@ fn merge_dictionaries(global: &[String], mode: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Result of [`polish_with_mode`]. Mirrors the fail-open shape of the
+/// live pipeline: on LLM error the raw input is returned and `warning`
+/// is set so the caller can surface a "Raw copy" hint to the user.
+pub struct PolishOutcome {
+    /// Post-processed text. Always non-empty unless the caller passed
+    /// in an empty string (we don't synthesise content out of nothing).
+    pub text: String,
+    /// True when the LLM step failed (or returned empty) and we fell
+    /// back to the raw input.
+    pub warning: bool,
+}
+
+/// Standalone polish step — same engine path, same dictionary merge,
+/// same mode post-processing as `run_pipeline`, but free of the
+/// `SessionState` / pill / clipboard plumbing so the
+/// `re_polish_transcript` IPC handler can reuse it.
+///
+/// Behaviour matches the live pipeline exactly:
+/// - When `llm_engine_id` is `"none"` or the registry returns `None`
+///   for the engine, the raw input goes through post-processing
+///   unchanged (and `warning` is false — that's by design, mirroring
+///   `polish_engine_active == false`).
+/// - LLM errors are fail-open: the raw input is post-processed and
+///   `warning` is set so the caller can surface the same "Raw copy"
+///   treatment used by the live pipeline.
+/// - Mode post-processing (`case` / `punctuation` / `max_length_chars`)
+///   runs on the final text regardless of which branch produced it,
+///   so the user sees a consistent shape across the dictation path
+///   and the re-polish path.
+pub async fn polish_with_mode(
+    app: AppHandle<Wry>,
+    transcript: String,
+    mode: &VoiceMode,
+    llm_engine_id: String,
+    llm_model_id: String,
+    global_dictionary: Vec<String>,
+    global_enable_thinking: bool,
+) -> PolishOutcome {
+    let mode_snapshot = ModeSnapshot::from_voice_mode(mode);
+    let merged_dictionary = merge_dictionaries(&global_dictionary, &mode_snapshot.dictionary);
+    // Per-mode override of `enable_thinking` wins; None inherits the
+    // global. Matches the resolution in `SessionManager::begin`.
+    let enable_thinking = mode.enable_thinking.unwrap_or(global_enable_thinking);
+
+    let registry = match app.try_state::<Registry>() {
+        Some(r) => r.inner().clone(),
+        None => {
+            log::warn!("polish_with_mode: engine registry missing; returning raw transcript");
+            return PolishOutcome {
+                text: mode_snapshot.apply_post_processing(&transcript),
+                warning: false,
+            };
+        }
+    };
+
+    let cleaned = match registry.llm(&app, &llm_engine_id, &llm_model_id) {
+        Some(engine) if engine.id() != "none" => {
+            match engine
+                .cleanup(
+                    &transcript,
+                    &mode_snapshot.system_prompt,
+                    &merged_dictionary,
+                    enable_thinking,
+                )
+                .await
+            {
+                Ok(t) if !t.trim().is_empty() => (t, false),
+                Ok(_) => {
+                    log::info!(
+                        "polish_with_mode: LLM returned empty content; falling back to raw"
+                    );
+                    (transcript.clone(), true)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "polish_with_mode: LLM cleanup failed: {e}; falling back to raw"
+                    );
+                    (transcript.clone(), true)
+                }
+            }
+        }
+        _ => (transcript.clone(), false),
+    };
+
+    let (raw_polished, warning) = cleaned;
+    PolishOutcome {
+        text: mode_snapshot.apply_post_processing(&raw_polished),
+        warning,
+    }
+}
+
 const SATURATED_TOAST_MS_PUB: u32 = SATURATED_TOAST_MS;
 
 /// Helper for the hotkey layer: emit a saturated toast through the pill.
@@ -2084,6 +2185,7 @@ mod tests {
             session_id: 99,
             ts: 1,
             text: "hello".into(),
+            raw_text: None,
             mode_id: "general".into(),
             stage: Stage::Done,
             warning: false,
