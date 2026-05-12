@@ -1,6 +1,6 @@
 [package]
 name = "vox"
-version = "1.0.4"
+version = "1.0.5"
 description = "Vox — talk to any app"
 authors = ["Vox"]
 edition = "2021"
@@ -48,12 +48,29 @@ tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-store = "2"
 tauri-plugin-autostart = "2"
-tauri-plugin-updater = "2"
+# `native-tls` makes the updater plugin route HTTPS through the
+# platform's native stack (Secure Transport on macOS, SChannel on
+# Windows). Both read the OS trust store, so a Netskope/Zscaler-style
+# TLS-intercepting proxy whose CA only lives in the keychain is
+# trusted. Default features (`rustls-tls`) pull a separate reqwest
+# tree with webpki-roots only — the keychain isn't consulted, so
+# every update check would fail behind a corporate proxy. The
+# `zip` feature is kept because the macOS .app install path needs
+# the tar/zip/flate2 extractors it pulls in.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls", "stream"] }
+# `rustls-tls-native-roots` is the load-bearing one on managed/work
+# Macs: it merges the system keychain trust store into rustls's
+# RootCertStore alongside webpki-roots. Without it, TLS-intercepting
+# proxies (Netskope, Zscaler, corporate MITM) that re-sign traffic with
+# a CA installed only in the macOS keychain cause every HTTPS download
+# (HF model weights, llama.cpp release archive) to fail with
+# `error sending request for url` while Chrome — which uses the system
+# trust store — works fine on the same network.
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
 futures-util = "0.3"
 cpal = "0.15"
 hound = "3.5"

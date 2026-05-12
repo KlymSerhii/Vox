@@ -474,6 +474,12 @@ pub async fn stream_to_file<R: Runtime>(
     use std::fs::OpenOptions;
     use std::io::Write;
 
+    // Root certs = webpki-roots ∪ macOS keychain trust store. The
+    // keychain half (via `rustls-tls-native-roots` in Cargo.toml) is
+    // what makes downloads work on work laptops behind a TLS-intercepting
+    // proxy like Netskope — that proxy re-signs HTTPS with a CA IT
+    // installed in the keychain, which webpki-roots alone does not know
+    // about.
     let client = reqwest::Client::builder()
         .https_only(true)
         .build()

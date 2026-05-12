@@ -630,20 +630,6 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
 
     let cur = app.package_info().version.to_string();
 
-    // Bundles ship with a placeholder endpoint + empty pubkey until
-    // signing/notarization is wired. Skip the network call: the host
-    // won't resolve (5-15 s DNS timeout leaks "Vox is running" to
-    // resolver watchers) and there's no pubkey to pin against.
-    if updater_is_stub(&app) {
-        return UpdateCheckResult {
-            status: "unconfigured".into(),
-            current_version: Some(cur),
-            available_version: None,
-            message: Some("Auto-update is not yet configured for this build.".into()),
-            release_notes: None,
-        };
-    }
-
     let updater = match app.updater() {
         Ok(u) => u,
         Err(e) => {
@@ -709,10 +695,6 @@ pub async fn check_for_updates<R: Runtime>(app: AppHandle<R>) -> UpdateCheckResu
 pub async fn download_and_install_update<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     use tauri_plugin_updater::UpdaterExt as _;
 
-    if updater_is_stub(&app) {
-        return Err("Auto-update is not configured for this build.".into());
-    }
-
     let updater = app
         .updater()
         .map_err(|e| format!("Auto-update not configured ({e})."))?;
@@ -767,30 +749,6 @@ pub async fn download_and_install_update<R: Runtime>(app: AppHandle<R>) -> Resul
     emit_progress(UpdaterProgress::Done);
     // `restart` does not return; the new binary takes over the process.
     app.restart();
-}
-
-/// True when running with the placeholder host or empty pubkey — the
-/// updater is unconfigured and we skip the network call.
-fn updater_is_stub<R: Runtime>(app: &AppHandle<R>) -> bool {
-    // Walk plugin config raw — tauri_plugin_updater::Config shape may shift.
-    let Some(plugins) = app.config().plugins.0.get("updater") else {
-        return true;
-    };
-    let pubkey = plugins.get("pubkey").and_then(|v| v.as_str()).unwrap_or("");
-    if pubkey.trim().is_empty() {
-        return true;
-    }
-    let Some(endpoints) = plugins.get("endpoints").and_then(|v| v.as_array()) else {
-        return true;
-    };
-    if endpoints.is_empty() {
-        return true;
-    }
-    endpoints.iter().any(|e| {
-        e.as_str()
-            .map(|s| s.contains("updates.vox.local") || s.contains("placeholder"))
-            .unwrap_or(false)
-    })
 }
 
 #[tauri::command]
