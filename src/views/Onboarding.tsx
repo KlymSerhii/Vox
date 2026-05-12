@@ -726,6 +726,15 @@ function LanguageCard(props: {
   );
 }
 
+/// Per-id rolling history of (timestamp, bytes_downloaded) samples used
+/// to derive a smoothed throughput estimate for the ETA. The window is
+/// the most recent samples within `ETA_WINDOW_MS`; older entries are
+/// dropped so the throughput reflects current speed, not a stale
+/// resumed-download baseline.
+type ProgressSample = { ts: number; bytes: number };
+const ETA_WINDOW_MS = 5_000;
+const ETA_MAX_SAMPLES = 12;
+
 function DownloadStep(props: {
   s: Settings | null;
   tier: TierRecommendation | null;
@@ -739,6 +748,12 @@ function DownloadStep(props: {
   const [progress, setProgress] = createSignal<
     Record<string, { downloaded: number; total: number }>
   >({});
+  // Per-id rolling samples. Stored as a flat Record (not nested in
+  // `progress`) so a ResizeObserver-style spread doesn't drop the
+  // history on each tick.
+  const [samples, setSamples] = createSignal<Record<string, ProgressSample[]>>(
+    {},
+  );
   const [completed, setCompleted] = createSignal<Set<string>>(new Set());
   const [started, setStarted] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
@@ -769,6 +784,21 @@ function DownloadStep(props: {
         ...prev,
         [p.id]: { downloaded: p.bytes_downloaded, total: p.total_bytes },
       }));
+      const now = Date.now();
+      setSamples((prev) => {
+        const history = prev[p.id] ?? [];
+        // Drop samples older than the smoothing window. The 200 ms
+        // emit cadence from `models::stream_to_file` yields ~25
+        // samples per 5 s, but a slow link can pace much slower —
+        // keep the cap at ETA_MAX_SAMPLES regardless so we always
+        // average over a few points instead of just one.
+        const cutoff = now - ETA_WINDOW_MS;
+        const trimmed = history
+          .filter((s) => s.ts >= cutoff)
+          .slice(-(ETA_MAX_SAMPLES - 1));
+        trimmed.push({ ts: now, bytes: p.bytes_downloaded });
+        return { ...prev, [p.id]: trimmed };
+      });
     };
     const handleDone = (p: { id: string }) => {
       setCompleted((prev) => new Set(prev).add(p.id));
@@ -809,6 +839,35 @@ function DownloadStep(props: {
       console.warn("onboarding probes failed", e);
     }
   });
+
+  /// Re-probe the filesystem and authoritatively update `completed`
+  /// with everything actually on disk. Used as a safety net after the
+  /// `Promise.all(downloads…)` resolves — the `model:done`/`binary:done`
+  /// events flow over a separate IPC channel from the command response,
+  /// and a slow listener can leave the readiness memo stale even after
+  /// `download_model` returned Ok. Probing disk directly is the source
+  /// of truth.
+  async function reconcileCompletedFromDisk() {
+    try {
+      const [all, bin] = await Promise.all([
+        listModels(),
+        inferenceServerStatus(),
+      ]);
+      setSttModels(all.filter((m) => m.descriptor.kind === "stt"));
+      setLlmModels(all.filter((m) => m.descriptor.kind === "llm"));
+      setBinaryStatus(bin);
+      setCompleted((prev) => {
+        const next = new Set(prev);
+        for (const m of all) {
+          if (m.installed) next.add(m.descriptor.id);
+        }
+        if (bin.installed) next.add(bin.id);
+        return next;
+      });
+    } catch (e) {
+      console.warn("post-download disk reconcile failed", e);
+    }
+  }
 
   // Filter the STT options shown in the form to the engine the user
   // picked in the Language step — there's no point in offering Whisper
@@ -917,6 +976,11 @@ function DownloadStep(props: {
       try {
         props.onInFlightChange(true);
         await downloadModel(sttId);
+        // Reconcile against disk before pre-warm — the `model:done`
+        // event arrives on a separate IPC channel from the command
+        // response, and we don't want Continue to wait on a slow event
+        // when the bytes are already on disk.
+        await reconcileCompletedFromDisk();
         await loadModelWarm(sttId);
       } catch (e) {
         setErr(String(e));
@@ -949,6 +1013,13 @@ function DownloadStep(props: {
         downloadModel(llmId),
         downloadInferenceServer(),
       ]);
+      // Reconcile against disk before pre-warm. Without this, a
+      // `model:done` or `binary:done` event that arrives slowly leaves
+      // `completed` stale, and the Continue gate stays disabled even
+      // though every artifact is on disk — that was the original "must
+      // click Back then Next" bug. Reading from `list_models` /
+      // `inference_server_status` is the source of truth.
+      await reconcileCompletedFromDisk();
       // Pre-warm so first dictation doesn't pay the cold-load tax. The
       // inference server is deferred until first polish — spawning it
       // now would burn RAM before the user even dictates.
@@ -1120,6 +1191,7 @@ function DownloadStep(props: {
                 label={shortModelName(d().name)}
                 done={completed().has(d().id)}
                 prog={progress()[d().id]}
+                samples={samples()[d().id]}
               />
             )}
           </Show>
@@ -1129,6 +1201,7 @@ function DownloadStep(props: {
                 label={shortModelName(d().name)}
                 done={completed().has(d().id)}
                 prog={progress()[d().id]}
+                samples={samples()[d().id]}
               />
             )}
           </Show>
@@ -1138,6 +1211,7 @@ function DownloadStep(props: {
                 label="Inference engine"
                 done={completed().has(b().id)}
                 prog={progress()[b().id]}
+                samples={samples()[b().id]}
               />
             )}
           </Show>
@@ -1328,16 +1402,62 @@ function shortModelName(name: string): string {
   return name.replace(/ —.*$/, "");
 }
 
+/// Compute remaining seconds from a rolling sample window. Returns
+/// `null` when there isn't enough signal yet — a single sample or a
+/// flat span gives a nonsense throughput, and showing "0s remaining"
+/// while a multi-GB GGUF still has 4 GB left to fetch would be worse
+/// than no ETA. Throughput is the byte delta across the oldest and
+/// newest sample in the window divided by their elapsed time, which is
+/// effectively a 3–5 s moving average given the 200 ms emit cadence.
+function etaSeconds(
+  prog: { downloaded: number; total: number } | undefined,
+  samples: ProgressSample[] | undefined,
+): number | null {
+  if (!prog || prog.total <= 0 || prog.downloaded >= prog.total) return null;
+  if (!samples || samples.length < 2) return null;
+  const oldest = samples[0];
+  const newest = samples[samples.length - 1];
+  const elapsedMs = newest.ts - oldest.ts;
+  const deltaBytes = newest.bytes - oldest.bytes;
+  if (elapsedMs <= 0 || deltaBytes <= 0) return null;
+  const bps = (deltaBytes / elapsedMs) * 1000;
+  const remaining = prog.total - prog.downloaded;
+  const eta = remaining / bps;
+  if (!isFinite(eta) || eta < 0) return null;
+  return Math.round(eta);
+}
+
+/// Format seconds as `12s remaining`, `1m 23s remaining`, or
+/// `1h 04m remaining`. Hours suppressed unless > 1h; minutes are
+/// zero-padded only in the hours branch where two-digit alignment
+/// keeps the eye from wobbling.
+function formatEta(secs: number): string {
+  if (secs < 60) return `${secs}s remaining`;
+  if (secs < 3600) {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}m ${s.toString().padStart(2, "0")}s remaining`;
+  }
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  return `${h}h ${m.toString().padStart(2, "0")}m remaining`;
+}
+
 function DownloadBar(props: {
   label: string;
   done: boolean;
   prog?: { downloaded: number; total: number };
+  samples?: ProgressSample[];
 }) {
   const pct = () => {
     if (props.done) return 100;
     if (!props.prog) return 0;
     if (props.prog.total <= 0) return 0;
     return Math.min(100, (props.prog.downloaded / props.prog.total) * 100);
+  };
+  const eta = () => {
+    if (props.done) return null;
+    return etaSeconds(props.prog, props.samples);
   };
   return (
     <div>
@@ -1351,6 +1471,11 @@ function DownloadBar(props: {
           style={{ width: `${pct()}%` }}
         />
       </div>
+      <Show when={eta() !== null}>
+        <div class="mt-1 text-[10px] text-[var(--color-ink-faint)]">
+          {formatEta(eta()!)}
+        </div>
+      </Show>
     </div>
   );
 }
