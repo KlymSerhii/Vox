@@ -1,26 +1,32 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import {
   cancelSession,
+  checkPermissions,
   closeTrayPopover,
   copyText,
   getPublicSettings,
   getTimeSavedStats,
   inferenceServerStatus,
+  listAudioInputDevices,
   listModels,
   listModes,
   onSessionsChanged,
   onSettingsChanged,
   onStatsChanged,
+  openAccessibilitySettings,
   openSettingsWindow,
   quitApp,
   rePolishTranscript,
   sessionsSnapshot,
   setActiveMode,
   setAppearance,
+  setAudioInputDevice,
+  setAutoPasteEnabled,
   setEnableThinking,
   setHandsFreeEnabled,
   setPolishingEnabled,
   setStreamingPillEnabled,
+  type AudioInputDevice,
   type CompletedEntry,
   type InProgressEntry,
   type ModelStatus,
@@ -94,6 +100,12 @@ export default function TrayPopoverView() {
     sessions: 0,
   });
   const [quickSettingsOpen, setQuickSettingsOpen] = createSignal(false);
+  // Accessibility grant status for the auto-paste toggle. `null` =
+  // not yet probed; treated as "ungranted" for nudging purposes until
+  // the first probe lands. Re-probed on mount and whenever the
+  // popover regains focus (the user may have flipped the grant in
+  // System Settings while the popover was hidden).
+  const [accessibility, setAccessibility] = createSignal<boolean | null>(null);
   // Anchor for the mode-picker dropdown. Used by Show-when-open to
   // position the listbox via fixed coordinates so it isn't clipped by
   // the popover root's `overflow-hidden`.
@@ -112,6 +124,32 @@ export default function TrayPopoverView() {
     left: number;
     minWidth: number;
   }>({ top: 0, left: 0, minWidth: 0 });
+  // Refreshed on popover mount + every time the window regains focus
+  // so plugging an AirPods doesn't leave the dropdown stale.
+  const [audioDevices, setAudioDevices] = createSignal<AudioInputDevice[]>([]);
+  const [micMenuOpen, setMicMenuOpen] = createSignal(false);
+  let micTriggerRef: HTMLButtonElement | undefined;
+  let micMenuRef: HTMLDivElement | undefined;
+  // The Mic row sits in the middle of the popover, so a long device
+  // list spills past the bottom edge. Mirror the repolish picker's
+  // flip-up logic — when there isn't room below, anchor by `bottom`
+  // and pin `max-height` to whichever side we landed on so the menu
+  // scrolls instead of clipping at the OS window edge.
+  const [micMenuPos, setMicMenuPos] = createSignal<{
+    placement: "below" | "above";
+    top: number;
+    bottom: number;
+    left: number;
+    minWidth: number;
+    maxHeight: number;
+  }>({
+    placement: "below",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    minWidth: 0,
+    maxHeight: 240,
+  });
   const PERIOD_OPTIONS: { value: Period; label: string }[] = [
     { value: "last_session", label: "Last session" },
     { value: "day", label: "Today" },
@@ -171,6 +209,14 @@ export default function TrayPopoverView() {
       } catch (err) {
         console.warn("model status probes failed:", err);
       }
+      try {
+        setAudioDevices(await listAudioInputDevices());
+      } catch (err) {
+        console.warn("listAudioInputDevices failed:", err);
+      }
+      // Probe Accessibility so the auto-paste nudge can render
+      // correctly on the very first popover open. Non-fatal.
+      void refreshAccessibility();
     } finally {
       setLoaded(true);
     }
@@ -186,6 +232,12 @@ export default function TrayPopoverView() {
 
     window.addEventListener("focus", () => {
       void sessionsSnapshot().then(applySnapshot);
+      void listAudioInputDevices()
+        .then(setAudioDevices)
+        .catch((err) => console.warn("listAudioInputDevices failed:", err));
+      // User may have flipped Accessibility in System Settings while
+      // the popover was hidden — keep the nudge in sync.
+      void refreshAccessibility();
     });
 
     document.addEventListener("keydown", (e) => {
@@ -210,6 +262,11 @@ export default function TrayPopoverView() {
           !!periodTriggerRef && periodTriggerRef.contains(target);
         if (!inMenu && !inTrigger) setPeriodMenuOpen(false);
       }
+      if (micMenuOpen()) {
+        const inMenu = !!micMenuRef && micMenuRef.contains(target);
+        const inTrigger = !!micTriggerRef && micTriggerRef.contains(target);
+        if (!inMenu && !inTrigger) setMicMenuOpen(false);
+      }
       const openId = repolishPickerSessionId();
       if (openId !== null) {
         const inMenu =
@@ -229,6 +286,7 @@ export default function TrayPopoverView() {
           setModeMenuOpen(false);
           setPeriodMenuOpen(false);
           setRepolishPickerSessionId(null);
+          setMicMenuOpen(false);
         }
       });
     } catch (err) {
@@ -252,6 +310,38 @@ export default function TrayPopoverView() {
     } catch (err) {
       console.error("setActiveMode failed:", err);
     }
+  }
+
+  // `set_settings` is gated to the settings/onboarding windows, so
+  // the tray uses the dedicated `set_audio_input_device` IPC — same
+  // path the Settings UI now goes through. The backend probes the
+  // device on a background thread to surface the macOS Continuity
+  // Microphone wake UI when the user picks an iPhone.
+  async function pickMic(name: string | null) {
+    const cur = s();
+    if (!cur) return;
+    setMicMenuOpen(false);
+    if ((cur.audio_input_device ?? null) === name) return;
+    const next = { ...cur, audio_input_device: name } as Settings;
+    setS(next);
+    try {
+      await setAudioInputDevice(name);
+    } catch (err) {
+      console.error("setAudioInputDevice failed:", err);
+      // Roll back the optimistic update so the dropdown reflects
+      // what's actually on disk.
+      setS(cur);
+    }
+  }
+
+  function micLabel(): string {
+    const v = s()?.audio_input_device;
+    if (!v) return "System default";
+    return v;
+  }
+
+  function micIsCustom(): boolean {
+    return !!s()?.audio_input_device;
   }
 
   function activeMode(): VoiceMode | undefined {
@@ -285,6 +375,26 @@ export default function TrayPopoverView() {
     if (!cur) return;
     setS({ ...cur, streaming_pill_enabled: v });
     await setStreamingPillEnabled(v);
+  }
+
+  async function refreshAccessibility() {
+    try {
+      const r = await checkPermissions();
+      setAccessibility(r.accessibility);
+    } catch (e) {
+      console.warn("checkPermissions failed:", e);
+      setAccessibility(false);
+    }
+  }
+
+  async function toggleAutoPaste(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, auto_paste_enabled: v });
+    await setAutoPasteEnabled(v);
+    // Re-probe on flip-on so the nudge surfaces immediately if
+    // Accessibility isn't granted yet.
+    if (v) await refreshAccessibility();
   }
 
   async function toggleEnableThinking(v: boolean) {
@@ -701,6 +811,41 @@ export default function TrayPopoverView() {
                     />
                   </div>
                 </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Paste into focused field
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        Vox sends ⌘V for you and restores your clipboard.
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().auto_paste_enabled}
+                      onChange={(v) => void toggleAutoPaste(v)}
+                    />
+                  </div>
+                  <Show
+                    when={
+                      st().auto_paste_enabled && accessibility() === false
+                    }
+                  >
+                    <div class="mt-2 flex items-center justify-between gap-3 rounded-[6px] bg-[var(--color-overlay)] px-3 py-2">
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        Needs Accessibility. Falls back to clipboard otherwise.
+                      </span>
+                      <button
+                        type="button"
+                        class="shrink-0 rounded-[6px] bg-[var(--color-control)] px-2.5 py-1 text-[11px] font-medium text-[var(--color-ink)] hover:bg-[var(--color-control-hover)]"
+                        onClick={() => void openAccessibilitySettings()}
+                      >
+                        Grant
+                      </button>
+                    </div>
+                  </Show>
+                </div>
               </div>
             </div>
 
@@ -817,6 +962,168 @@ export default function TrayPopoverView() {
                       </button>
                     )}
                   </For>
+                </div>
+              </Show>
+            </div>
+
+            <div class="relative border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Microphone
+                  </span>
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    {micIsCustom()
+                      ? "Custom input selected."
+                      : "Follows the macOS Sound input."}
+                  </span>
+                </div>
+                <button
+                  ref={(el) => (micTriggerRef = el)}
+                  type="button"
+                  class="liquid-card inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                  onClick={() => {
+                    const next = !micMenuOpen();
+                    if (next && micTriggerRef) {
+                      // Same fixed-position trick as the mode picker
+                      // so the dropdown can escape the popover root's
+                      // overflow-hidden. Cap the width at 280px so a
+                      // long device name doesn't stretch the menu
+                      // wider than the popover itself. Flip the menu
+                      // above the trigger when there's more headroom
+                      // up there — the Mic row lives mid-popover so a
+                      // 6-device list otherwise clips at the bottom
+                      // window edge.
+                      const r = micTriggerRef.getBoundingClientRect();
+                      const viewportH = window.innerHeight;
+                      const menuW = Math.min(280, Math.max(r.width, 240));
+                      const left = Math.max(8, r.right - menuW);
+                      const spaceBelow = viewportH - r.bottom - 8;
+                      const spaceAbove = r.top - 8;
+                      // ~"Follow system default" + divider + 6 rows.
+                      const desiredH = 220;
+                      const placeBelow =
+                        spaceBelow >= desiredH || spaceBelow >= spaceAbove;
+                      if (placeBelow) {
+                        setMicMenuPos({
+                          placement: "below",
+                          top: r.bottom + 4,
+                          bottom: 0,
+                          left,
+                          minWidth: menuW,
+                          maxHeight: spaceBelow,
+                        });
+                      } else {
+                        setMicMenuPos({
+                          placement: "above",
+                          top: 0,
+                          bottom: viewportH - r.top + 4,
+                          left,
+                          minWidth: menuW,
+                          maxHeight: spaceAbove,
+                        });
+                      }
+                    }
+                    setMicMenuOpen(next);
+                  }}
+                  aria-haspopup="listbox"
+                  aria-expanded={micMenuOpen()}
+                  title={micLabel()}
+                >
+                  <span class="max-w-[140px] truncate">{micLabel()}</span>
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+              </div>
+              <Show when={micMenuOpen()}>
+                <div
+                  ref={(el) => (micMenuRef = el)}
+                  class="liquid-glass z-50 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  role="listbox"
+                  aria-label="Audio input device"
+                  style={{
+                    position: "fixed",
+                    ...(micMenuPos().placement === "above"
+                      ? { bottom: `${micMenuPos().bottom}px` }
+                      : { top: `${micMenuPos().top}px` }),
+                    left: `${micMenuPos().left}px`,
+                    "min-width": `${micMenuPos().minWidth}px`,
+                    "max-height": `${micMenuPos().maxHeight}px`,
+                  }}
+                >
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={!micIsCustom()}
+                    class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                    classList={{
+                      "text-[var(--color-accent)]": !micIsCustom(),
+                      "text-[var(--color-ink)]": micIsCustom(),
+                    }}
+                    onClick={() => void pickMic(null)}
+                  >
+                    <span class="flex-1 truncate">Follow system default</span>
+                    <Show when={!micIsCustom()}>
+                      <span class="text-[10px]">●</span>
+                    </Show>
+                  </button>
+                  <Show when={audioDevices().length > 0}>
+                    <div class="my-1 mx-2 h-px bg-[var(--color-border)]" />
+                  </Show>
+                  <For each={audioDevices()}>
+                    {(d) => {
+                      const active = () => st().audio_input_device === d.name;
+                      return (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={active()}
+                          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                          classList={{
+                            "text-[var(--color-accent)]": active(),
+                            "text-[var(--color-ink)]": !active(),
+                          }}
+                          onClick={() => void pickMic(d.name)}
+                          title={d.name}
+                        >
+                          <span class="flex-1 truncate">
+                            {d.name}
+                            {d.is_default ? " · system default" : ""}
+                          </span>
+                          <Show when={active()}>
+                            <span class="text-[10px]">●</span>
+                          </Show>
+                        </button>
+                      );
+                    }}
+                  </For>
+                  <Show
+                    when={
+                      !!st().audio_input_device &&
+                      !audioDevices().some(
+                        (d) => d.name === st().audio_input_device,
+                      )
+                    }
+                  >
+                    <div class="my-1 mx-2 h-px bg-[var(--color-border)]" />
+                    <div class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-[var(--color-ink-mute)]">
+                      <span
+                        class="flex-1 truncate"
+                        title={st().audio_input_device ?? ""}
+                      >
+                        {st().audio_input_device} · not connected
+                      </span>
+                    </div>
+                  </Show>
                 </div>
               </Show>
             </div>

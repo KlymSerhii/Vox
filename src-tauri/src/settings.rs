@@ -32,9 +32,13 @@ const KEY_APPEARANCE: &str = "appearance";
 
 pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
 
+const KEY_AUTO_PASTE_ENABLED: &str = "auto_paste_enabled";
+
 const KEY_ENABLE_THINKING: &str = "enable_thinking";
 
 const KEY_TRY_PARAKEET_DISMISSED: &str = "try_parakeet_dismissed";
+
+const KEY_AUDIO_INPUT_DEVICE: &str = "audio_input_device";
 
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
@@ -85,6 +89,13 @@ fn default_appearance() -> String {
 }
 fn default_streaming_pill_enabled() -> bool {
     true
+}
+fn default_auto_paste_enabled() -> bool {
+    // Opt-in. Pasting requires Accessibility, which Vox's default
+    // pipeline deliberately doesn't need. Users who want the
+    // hands-off "speak straight into the focused field" flow flip
+    // this on in Settings → General.
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +152,16 @@ pub struct Settings {
     #[serde(default = "default_streaming_pill_enabled")]
     pub streaming_pill_enabled: bool,
 
+    /// Auto-paste the polished transcript into the focused text field
+    /// by synthesising ⌘V at the end of the pipeline. Requires
+    /// Accessibility permission; when the toggle is on but
+    /// Accessibility isn't granted, `session.rs` falls open to the
+    /// clipboard-only path and surfaces a warning in the pill. Off by
+    /// default — Vox's default pipeline deliberately doesn't require
+    /// Accessibility.
+    #[serde(default = "default_auto_paste_enabled")]
+    pub auto_paste_enabled: bool,
+
     /// Gemma 4 only. When true, the engine sends
     /// `chat_template_kwargs: { enable_thinking: true }` per request so
     /// the model emits a chain-of-thought pre-amble before the polished
@@ -161,6 +182,19 @@ pub struct Settings {
     /// regardless of language / availability state.
     #[serde(default)]
     pub try_parakeet_dismissed: bool,
+
+    /// Name of the audio input device Vox listens to. `None` (or
+    /// missing) means follow the macOS system default — re-resolved
+    /// every recording, so swapping the system input takes effect on
+    /// the next dictation. When `Some(name)` and that device isn't
+    /// connected at recording time, the session surfaces
+    /// `AudioError::ConfiguredDeviceUnavailable` and the pill shows
+    /// a clear error — we deliberately do NOT silently fall back to
+    /// the system default (that quiet fallback was the bug this
+    /// field was added to fix: a disconnected iPhone would route
+    /// Whisper onto the MacBook mic with no user-visible signal).
+    #[serde(default)]
+    pub audio_input_device: Option<String>,
 }
 
 impl Default for Settings {
@@ -185,9 +219,11 @@ impl Default for Settings {
             auto_suggest_modes: default_auto_suggest_modes(),
             appearance: default_appearance(),
             streaming_pill_enabled: default_streaming_pill_enabled(),
+            auto_paste_enabled: default_auto_paste_enabled(),
             enable_thinking: false,
             inference_api_key: String::new(),
             try_parakeet_dismissed: false,
+            audio_input_device: None,
         }
     }
 }
@@ -250,11 +286,19 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let streaming_pill_enabled =
         get_bool(KEY_STREAMING_PILL_ENABLED, default_streaming_pill_enabled());
 
+    let auto_paste_enabled =
+        get_bool(KEY_AUTO_PASTE_ENABLED, default_auto_paste_enabled());
+
     let enable_thinking = get_bool(KEY_ENABLE_THINKING, false);
 
     let inference_api_key = get_str(KEY_INFERENCE_API_KEY).unwrap_or_default();
 
     let try_parakeet_dismissed = get_bool(KEY_TRY_PARAKEET_DISMISSED, false);
+
+    let audio_input_device = store
+        .get(KEY_AUDIO_INPUT_DEVICE)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
 
     let _ = store.save();
 
@@ -278,9 +322,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         auto_suggest_modes,
         appearance,
         streaming_pill_enabled,
+        auto_paste_enabled,
         enable_thinking,
         inference_api_key,
         try_parakeet_dismissed,
+        audio_input_device,
     }
 }
 
@@ -325,11 +371,21 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     s(KEY_APPEARANCE, appearance);
 
     b(KEY_STREAMING_PILL_ENABLED, settings.streaming_pill_enabled);
+    b(KEY_AUTO_PASTE_ENABLED, settings.auto_paste_enabled);
     b(KEY_ENABLE_THINKING, settings.enable_thinking);
 
     s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
 
     b(KEY_TRY_PARAKEET_DISMISSED, settings.try_parakeet_dismissed);
+
+    match &settings.audio_input_device {
+        Some(name) if !name.is_empty() => {
+            s(KEY_AUDIO_INPUT_DEVICE, name);
+        }
+        _ => {
+            store.set(KEY_AUDIO_INPUT_DEVICE, serde_json::Value::Null);
+        }
+    }
 
     store
         .save()
@@ -368,10 +424,20 @@ pub struct Prefs {
     #[allow(dead_code)]
     pub streaming_pill_enabled: bool,
 
+    /// Mirror of `Settings::auto_paste_enabled`. Captured at session
+    /// start so a mid-pipeline toggle doesn't change the delivery
+    /// behaviour for an in-flight transcript.
+    pub auto_paste_enabled: bool,
+
     /// Mirror of `Settings::enable_thinking`. Per-Voice-Mode override
     /// (`VoiceMode::enable_thinking: Option<bool>`) takes precedence at
     /// session-begin time; this value is the global fallback.
     pub enable_thinking: bool,
+
+    /// Mirror of `Settings::audio_input_device`. `None` = follow macOS
+    /// system default; `Some(name)` is matched against
+    /// `cpal::Host::input_devices()` at `audio::begin_capture` time.
+    pub audio_input_device: Option<String>,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
@@ -389,7 +455,9 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         active_mode_id: s.active_mode_id,
         auto_suggest_modes: s.auto_suggest_modes,
         streaming_pill_enabled: s.streaming_pill_enabled,
+        auto_paste_enabled: s.auto_paste_enabled,
         enable_thinking: s.enable_thinking,
+        audio_input_device: s.audio_input_device,
     }
 }
 

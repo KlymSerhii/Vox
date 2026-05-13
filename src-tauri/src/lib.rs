@@ -9,6 +9,8 @@ mod inject;
 #[cfg(target_os = "macos")]
 mod mac_chord;
 #[cfg(target_os = "macos")]
+mod mac_paste;
+#[cfg(target_os = "macos")]
 mod mac_perm;
 mod mac_power;
 mod models;
@@ -53,6 +55,7 @@ pub fn run() {
             commands::set_hands_free_enabled,
             commands::set_polishing_enabled,
             commands::set_streaming_pill_enabled,
+            commands::set_auto_paste_enabled,
             commands::set_enable_thinking,
             commands::set_appearance,
             commands::copy_text,
@@ -63,6 +66,8 @@ pub fn run() {
             commands::quit_app,
             commands::open_accessibility_settings,
             commands::open_microphone_settings,
+            commands::list_audio_input_devices,
+            commands::set_audio_input_device,
             commands::open_external_url,
             commands::uninstall_app,
             commands::check_permissions,

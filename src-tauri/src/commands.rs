@@ -224,6 +224,24 @@ pub fn set_streaming_pill_enabled<R: Runtime>(
     Ok(())
 }
 
+/// Single-field setter for `Settings::auto_paste_enabled`. Mirrors the
+/// `set_streaming_pill_enabled` pattern so the tray popover can flip
+/// the toggle without going through `set_settings` (which is gated to
+/// the settings / onboarding webviews).
+#[tauri::command]
+pub fn set_auto_paste_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    s.auto_paste_enabled = enabled;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_enable_thinking<R: Runtime>(
     app: AppHandle<R>,
@@ -432,6 +450,68 @@ pub fn reveal_dev_binary_path<R: Runtime>(app: AppHandle<R>) -> DevBinaryInfo {
         is_dev_build,
         accessibility_granted: probe_accessibility(),
     }
+}
+
+/// Enumerate audio input devices the system currently exposes. Used
+/// by the Settings → General → Microphone dropdown and the tray
+/// popover's mic-picker row. Names are stable enough across plug /
+/// unplug cycles that persisting `Settings::audio_input_device` by
+/// name is fine; `audio::begin_capture` falls back to the system
+/// default if the saved device has gone away.
+#[tauri::command]
+pub fn list_audio_input_devices() -> Result<Vec<crate::audio::AudioInputDevice>, String> {
+    crate::audio::list_input_devices().map_err(|e| e.to_string())
+}
+
+/// Persist the user's chosen audio input device. Callable from any
+/// window — unlike `set_settings` (which is gated to the settings /
+/// onboarding webviews), this single-field setter is safe to expose
+/// to the tray popover so the mic-picker row there actually works.
+///
+/// `device == None` (or an empty string) means follow the macOS
+/// system default. Any non-empty name is matched against
+/// `cpal::Host::input_devices()` at recording time.
+///
+/// As a side-effect, briefly opens the selected device on a fresh
+/// background thread so the user gets immediate feedback — in
+/// particular, the macOS Continuity Microphone activation UI fires
+/// on the user's iPhone as soon as CoreAudio commits to opening
+/// the device. Without this probe, selecting the iPhone in the
+/// dropdown looks like a no-op until the user actually dictates.
+#[tauri::command]
+pub fn set_audio_input_device<R: Runtime>(
+    app: AppHandle<R>,
+    device: Option<String>,
+) -> Result<(), String> {
+    let normalized = device
+        .map(|d| d.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut s = settings::load(&app);
+    let changed = s.audio_input_device != normalized;
+    s.audio_input_device = normalized.clone();
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    // Probe only when the user picked an explicit device — opening
+    // the system default has no UI value (no wake banner, no
+    // visible feedback) and would just spin up a 300ms throwaway
+    // stream on every "Follow system default" click.
+    if changed {
+        if let Some(name) = normalized {
+            if let Err(e) = std::thread::Builder::new()
+                .name("vox-audio-probe".into())
+                .spawn(move || {
+                    if let Err(e) = crate::audio::probe_device(Some(&name)) {
+                        log::info!("audio device probe completed with error: {e}");
+                    }
+                })
+            {
+                log::warn!("failed to spawn audio probe thread: {e}");
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]

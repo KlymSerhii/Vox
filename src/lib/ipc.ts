@@ -26,6 +26,12 @@ export interface Settings {
   /// the hotkey is released. Default true; tray popover + Settings →
   /// General both flip it.
   streaming_pill_enabled: boolean;
+  /// Auto-paste the polished transcript into the focused text field by
+  /// synthesising ⌘V at the end of the pipeline. Requires Accessibility
+  /// permission; when the toggle is on but Accessibility isn't granted,
+  /// the pipeline falls open to the clipboard-only path and the pill
+  /// surfaces a warning. Off by default.
+  auto_paste_enabled: boolean;
   /// Let Gemma reason silently before polishing. Only affects
   /// `gemma-local`; ignored by Apple Intelligence and the no-op engine.
   /// Default false.
@@ -36,6 +42,16 @@ export interface Settings {
   /// User dismissed the "Try Parakeet" upgrade banner in
   /// Settings → Models. Sticky once true.
   try_parakeet_dismissed: boolean;
+  /// Name of the audio input device Vox should listen to. `null`
+  /// (or an empty string) means follow the macOS system default —
+  /// re-resolved every recording, so swapping inputs in System
+  /// Settings takes effect on the next dictation.
+  audio_input_device: string | null;
+}
+
+export interface AudioInputDevice {
+  name: string;
+  is_default: boolean;
 }
 
 export type PunctuationStyle = "Aggressive" | "Standard" | "Minimal" | "None";
@@ -209,6 +225,10 @@ export async function setStreamingPillEnabled(enabled: boolean): Promise<void> {
   await invoke("set_streaming_pill_enabled", { enabled });
 }
 
+export async function setAutoPasteEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_auto_paste_enabled", { enabled });
+}
+
 export async function setEnableThinking(enabled: boolean): Promise<void> {
   await invoke("set_enable_thinking", { enabled });
 }
@@ -256,6 +276,26 @@ export async function openAccessibilitySettings(): Promise<void> {
 
 export async function openMicrophoneSettings(): Promise<void> {
   await invoke("open_microphone_settings");
+}
+
+/// Enumerate the currently-connected audio input devices. The
+/// dropdown in Settings → General → Microphone and the tray popover's
+/// mic row both call this to populate their lists. `is_default`
+/// flags whichever device macOS would pick if `audio_input_device`
+/// is left as `null`/empty.
+export async function listAudioInputDevices(): Promise<AudioInputDevice[]> {
+  return invoke<AudioInputDevice[]>("list_audio_input_devices");
+}
+
+/// Persist the user's chosen audio input device. `null` (or empty)
+/// means follow the macOS system default. Callable from any window
+/// — `set_settings` is gated to the settings / onboarding webviews,
+/// but this single-field setter is the way the tray popover's mic
+/// picker actually persists. The backend also opens the device
+/// briefly on a background thread so the iPhone Continuity
+/// Microphone wake UI fires immediately on selection.
+export async function setAudioInputDevice(name: string | null): Promise<void> {
+  await invoke("set_audio_input_device", { device: name });
 }
 
 /// Open an http(s) URL in the user's default browser. Tauri webviews

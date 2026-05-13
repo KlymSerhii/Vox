@@ -13,6 +13,7 @@ import {
   cancelDownload,
   cancelInferenceServerDownload,
   checkForUpdates,
+  checkPermissions,
   deleteInferenceServer,
   deleteMode,
   deleteModel,
@@ -29,6 +30,7 @@ import {
   importModeJson,
   inferenceServerStatus,
   languageDisplayName,
+  listAudioInputDevices,
   listModels,
   listModes,
   onBinaryCanceled,
@@ -52,10 +54,12 @@ import {
   revealDevBinaryPath,
   saveMode,
   setAppearance,
+  setAudioInputDevice,
   setLaunchAtLogin,
   setSettings,
   uninstallApp,
   type AppleFmAvailability,
+  type AudioInputDevice,
   type CaseStyle,
   type DevBinaryInfo,
   type DiagnoseHotkeys,
@@ -610,6 +614,73 @@ function StaticValue(props: { children: any }) {
   );
 }
 
+/// Mic input picker for Settings → General → Microphone. Renders the
+/// same `<select>` styling as the language dropdown above. The empty
+/// value (`""`) means "follow the macOS system default" and is
+/// persisted as `null`. A saved device that isn't currently
+/// enumerated still renders ("not connected"), and the dictation
+/// pipeline surfaces `AudioError::ConfiguredDeviceUnavailable` rather
+/// than silently capturing from the default — so the user always
+/// knows whether their explicit selection is in effect.
+function MicrophonePicker(props: {
+  value: string | null;
+  onChange: (v: string | null) => void;
+}) {
+  const [devices, setDevices] = createSignal<AudioInputDevice[]>([]);
+
+  async function refresh() {
+    try {
+      setDevices(await listAudioInputDevices());
+    } catch (e) {
+      console.warn("listAudioInputDevices failed:", e);
+    }
+  }
+
+  onMount(() => {
+    void refresh();
+    // Re-enumerate when the Settings window regains focus so plugging
+    // in AirPods (or the user toggling Continuity on their iPhone)
+    // doesn't leave the dropdown stale. Tray popover does the same.
+    const onFocus = () => void refresh();
+    window.addEventListener("focus", onFocus);
+    onCleanup(() => window.removeEventListener("focus", onFocus));
+  });
+
+  const selected = () => props.value ?? "";
+  const savedMissing = () => {
+    const v = props.value;
+    if (!v) return false;
+    const list = devices();
+    return list.length > 0 && !list.some((d) => d.name === v);
+  };
+
+  return (
+    <select
+      class="max-w-[260px] truncate rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+      value={selected()}
+      onChange={(e) => {
+        const v = e.currentTarget.value;
+        props.onChange(v === "" ? null : v);
+      }}
+    >
+      <option value="">Follow system default</option>
+      <Show when={savedMissing()}>
+        <option value={props.value ?? ""}>
+          {props.value} (not connected)
+        </option>
+      </Show>
+      <For each={devices()}>
+        {(d) => (
+          <option value={d.name}>
+            {d.name}
+            {d.is_default ? " · system default" : ""}
+          </option>
+        )}
+      </For>
+    </select>
+  );
+}
+
 function GeneralTab(props: {
   s: Settings;
   update: (p: Partial<Settings>) => void;
@@ -631,6 +702,49 @@ function GeneralTab(props: {
       console.error("Appearance change failed:", err);
     }
   }
+
+  // Auto-paste needs Accessibility — surface the live grant status
+  // inline so the toggle UI stays honest about what's required.
+  // `null` means we haven't probed yet; we treat that as "ungranted"
+  // for nudging purposes until the first probe lands.
+  const [accessibility, setAccessibility] = createSignal<boolean | null>(null);
+
+  async function refreshAccessibility() {
+    try {
+      const r = await checkPermissions();
+      setAccessibility(r.accessibility);
+    } catch (e) {
+      console.warn("checkPermissions failed:", e);
+      setAccessibility(false);
+    }
+  }
+
+  onMount(() => {
+    void refreshAccessibility();
+    // Re-probe when the user comes back to the Settings window after
+    // (presumably) toggling Accessibility in System Settings. macOS
+    // delivers a 'focus' event on the BrowserWindow when the app
+    // regains key-window status.
+    const onFocus = () => void refreshAccessibility();
+    window.addEventListener("focus", onFocus);
+    onCleanup(() => window.removeEventListener("focus", onFocus));
+  });
+
+  async function toggleAutoPaste(v: boolean) {
+    props.update({ auto_paste_enabled: v });
+    // Re-probe on flip-on so the nudge surfaces immediately if the
+    // user enabled the toggle without granting Accessibility yet.
+    if (v) {
+      await refreshAccessibility();
+    }
+  }
+
+  // Show the "needs Accessibility" sub-row when the toggle is on AND
+  // we've confirmed the grant is missing. `accessibility() === null`
+  // (first render, before the probe lands) is treated as "don't nudge
+  // yet" to avoid a flash during normal use.
+  const showAccessibilityNudge = () =>
+    props.s.auto_paste_enabled && accessibility() === false;
 
   return (
     <>
@@ -682,10 +796,20 @@ function GeneralTab(props: {
         </Row>
         <Row
           label="Microphone"
-          hint="Vox follows the macOS default input — change it in System Settings → Sound."
+          hint="Pick which input Vox records. Following the system default tracks your macOS Sound input setting."
           last
         >
-          <StaticValue>System default</StaticValue>
+          <MicrophonePicker
+            value={props.s.audio_input_device}
+            onChange={(v) => {
+              // Dedicated IPC (not `props.update` / set_settings) so
+              // selecting a device also briefly opens it on the
+              // backend — that's what fires the iPhone Continuity
+              // Microphone activation banner. The settings:changed
+              // emit reconciles `props.s` for us.
+              void setAudioInputDevice(v);
+            }}
+          />
         </Row>
       </Card>
 
@@ -716,6 +840,44 @@ function GeneralTab(props: {
             onChange={(v) => props.update({ streaming_pill_enabled: v })}
           />
         </Row>
+      </Card>
+
+      <SectionHeader title="Text insertion" />
+      <Card>
+        <Row
+          label="Paste into focused field"
+          hint="Vox sends ⌘V for you after polishing and restores your clipboard right after. Requires Accessibility."
+          last={!showAccessibilityNudge()}
+        >
+          <Toggle
+            checked={props.s.auto_paste_enabled}
+            onChange={(v) => void toggleAutoPaste(v)}
+          />
+        </Row>
+        <Show when={showAccessibilityNudge()}>
+          <Row
+            label="Accessibility not granted"
+            hint="Open System Settings → Privacy & Security → Accessibility, then enable Vox. Vox falls back to clipboard-only until you do."
+            last
+          >
+            <div class="flex shrink-0 items-center gap-2">
+              <button
+                type="button"
+                class="rounded-[8px] bg-[var(--color-control)] px-3 py-1 text-[11px] font-medium text-[var(--color-ink)] hover:bg-[var(--color-control-hover)]"
+                onClick={() => void openAccessibilitySettings()}
+              >
+                Open System Settings
+              </button>
+              <button
+                type="button"
+                class="rounded-[6px] px-2 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+                onClick={() => void refreshAccessibility()}
+              >
+                Re-check
+              </button>
+            </div>
+          </Row>
+        </Show>
       </Card>
 
       <SectionHeader title="Startup" />

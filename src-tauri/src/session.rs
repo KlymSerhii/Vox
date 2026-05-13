@@ -138,6 +138,48 @@ pub enum Stage {
     Canceled,
 }
 
+/// Outcome of [`SessionManager::deliver_transcript`]. The session
+/// pipeline reads this to pick the right Done-stage message — and to
+/// set the warning flag when the paste fell back to clipboard-only,
+/// so the user notices that auto-paste didn't go through.
+#[derive(Debug)]
+pub enum DeliveryOutcome {
+    /// Auto-paste was off. The transcript is on the clipboard; the
+    /// user pastes manually. Matches Vox's default v1 behaviour.
+    CopiedOnly,
+    /// Auto-paste was on and the synthetic ⌘V was posted. A delayed
+    /// clipboard restore may be running on a background thread.
+    Pasted,
+    /// Auto-paste was on but the ⌘V post failed (typically because
+    /// Accessibility isn't granted). The transcript is still on the
+    /// clipboard, so the user can paste manually — we surface a
+    /// warning so they know to grant Accessibility or paste themselves.
+    /// The specific reason is logged at the moment of failure; we don't
+    /// carry it through to the UI because the toast is one-size-fits-all.
+    PasteFailedCopiedOnly,
+}
+
+/// In-flight clipboard restore — tracked on the [`SessionManager`] so
+/// a follow-up `deliver_transcript` (e.g. the user dictates again
+/// before the 250 ms restore lands) can cancel the previous restore
+/// and inherit its captured `prior_text`. Without this, two rapid
+/// pipelines race: pipeline B would snapshot pipeline A's polished
+/// text as if it were the user's clipboard, then schedule a "restore"
+/// that writes A's polished text back, permanently clobbering the
+/// user's true prior content.
+struct RestoreToken {
+    /// The clipboard text the user had BEFORE this pipeline (or before
+    /// the first pipeline in a rapid chain) clobbered it. The restore
+    /// thread writes this back when it fires.
+    prior_text: String,
+    /// Flipped to `true` when a subsequent pipeline takes responsibility
+    /// for the chain's restore. The waiting thread checks this both
+    /// before and after acquiring the pending-restore lock so a cancel
+    /// that lands during the sleep window or during lock acquisition
+    /// still wins.
+    cancel: Arc<AtomicBool>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModeSnapshot {
     pub id: String,
@@ -241,6 +283,11 @@ pub struct SessionState {
     /// the setting mid-utterance. Both sites read this field instead
     /// of re-loading settings.
     pub streaming_enabled: bool,
+    /// Snapshot of `Settings::auto_paste_enabled`. Captured at session
+    /// start so flipping the toggle mid-pipeline doesn't change
+    /// delivery behaviour for an in-flight transcript. Read by
+    /// `run_pipeline` at the clipboard-delivery step.
+    pub auto_paste_enabled: bool,
     /// Resolved at session start: per-mode override falls back to the global `Settings` value.
     pub enable_thinking: bool,
     /// RAII handle for the `SessionManager::busy_gate`. Held by the
@@ -318,6 +365,12 @@ pub struct SessionManager {
     /// "Last-finished-wins" still holds — whichever lock acquisition
     /// runs second writes last.
     clipboard_lock: Mutex<()>,
+    /// Tracks the in-flight auto-paste clipboard restore, if any. A
+    /// rapid second pipeline cancels the previous restore (so its
+    /// thread won't write stale data) and inherits the captured
+    /// `prior_text` so the chain's eventual restore still puts the
+    /// user's true pre-chain clipboard back. See [`RestoreToken`].
+    pending_restore: Mutex<Option<RestoreToken>>,
     /// Single-pipeline admission gate. `try_acquire` is the one
     /// admission point — a press while a previous pipeline is still
     /// in its post-recording stages (transcribe / polish / clipboard)
@@ -338,6 +391,7 @@ impl SessionManager {
             pill_owner: Mutex::new(None),
             max_concurrent: MAX_CONCURRENT_SESSIONS,
             clipboard_lock: Mutex::new(()),
+            pending_restore: Mutex::new(None),
             busy_gate: BusyGate::new(),
         }
     }
@@ -507,6 +561,7 @@ impl SessionManager {
             completion: Arc::new(Notify::new()),
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: settings::load(app).streaming_pill_enabled,
+            auto_paste_enabled: prefs.auto_paste_enabled,
             enable_thinking,
             busy_guard: Mutex::new(Some(busy_guard)),
         });
@@ -542,7 +597,7 @@ impl SessionManager {
             spawn_suggestion_probe(app.clone(), prefs.active_mode_id.clone());
         }
 
-        if let Err(e) = self.audio.start() {
+        if let Err(e) = self.audio.start(prefs.audio_input_device.clone()) {
             log::error!("failed to start audio: {e}");
             // Roll back: release the busy gate, remove session, clear
             // active_recording, and tear down the cancel grab so Escape
@@ -562,11 +617,26 @@ impl SessionManager {
                 }
             }
             crate::hotkey::disarm_cancel(app);
-            pill::emit_state(
-                app,
-                PillState::Error,
-                Some("No mic access — grant in System Settings.".into()),
-            );
+            // Branch on the typed error so a missing user-selected
+            // mic shows "iPhone Microphone isn't connected" instead
+            // of the generic "No mic access" line — the latter sends
+            // the user to System Settings → Privacy when the real
+            // fix is to reconnect the device or pick another input.
+            // The catchall stays neutral on purpose: a `Cpal` error
+            // spans TCC denial, sample-format mismatch, and CoreAudio
+            // backend failures, so we can't safely pin one fix-it.
+            let pill_msg = match &e {
+                crate::audio::AudioError::ConfiguredDeviceUnavailable { name } => {
+                    format!(
+                        "'{name}' not connected — reconnect it or pick another mic in Settings."
+                    )
+                }
+                crate::audio::AudioError::NoInputDevice => {
+                    "No microphone available — connect one and try again.".into()
+                }
+                _ => "Microphone unavailable — check System Settings and try again.".into(),
+            };
+            pill::emit_state(app, PillState::Error, Some(pill_msg));
             self.schedule_pill_hide_unless_taken(app, new_sid, 3000);
             emit_sessions_changed(app, self);
             return BeginOutcome::AudioError(e.to_string());
@@ -966,15 +1036,115 @@ impl SessionManager {
         });
     }
 
-    /// Last-finished-wins clipboard write, serialised across pipelines.
-    pub fn write_clipboard<R: Runtime>(
+    /// Deliver the polished transcript to the user. When `auto_paste`
+    /// is false this is the legacy "copy and let the user press ⌘V"
+    /// path; when true, we capture (or inherit) the user's prior
+    /// clipboard text, write the transcript, post a synthetic ⌘V at
+    /// the HID event tap, and schedule a delayed restore of that
+    /// prior text so the clipboard isn't permanently clobbered.
+    ///
+    /// **Chained pipelines.** If a second dictation lands before the
+    /// previous restore fires (250 ms window), the new call cancels
+    /// the previous restore and inherits its captured `prior_text` —
+    /// otherwise the new pipeline would snapshot the previous
+    /// transcript as if it were the user's clipboard, and the
+    /// "restore" would write the previous transcript back, losing the
+    /// user's true pre-chain content. See [`RestoreToken`].
+    ///
+    /// Returns a [`DeliveryOutcome`] describing what actually
+    /// happened, used by the caller to pick the right Done-stage pill
+    /// message. A `Pasted` outcome guarantees the clipboard was
+    /// written; the restore (if any) runs asynchronously on a fresh
+    /// thread.
+    pub fn deliver_transcript(
         self: &Arc<Self>,
-        _app: &AppHandle<R>,
-        _id: SessionId,
+        id: SessionId,
         text: &str,
-    ) -> Result<(), String> {
-        let _g = self.clipboard_lock.lock();
-        inject::copy_to_clipboard(text).map_err(|e| e.to_string())
+        auto_paste: bool,
+    ) -> Result<DeliveryOutcome, String> {
+        // Phase 1 — claim the previous chain's prior (cancelling its
+        // restore so its thread won't fire) or snapshot fresh, then
+        // write polished. Both locks held so a concurrent invocation
+        // can't slip in between.
+        let prior_text: Option<String> = {
+            let mut pending = self.pending_restore.lock();
+            let _clip = self.clipboard_lock.lock();
+            let prior = if auto_paste {
+                match pending.take() {
+                    Some(prev) => {
+                        prev.cancel.store(true, Ordering::SeqCst);
+                        Some(prev.prior_text)
+                    }
+                    None => inject::snapshot_clipboard_text(),
+                }
+            } else {
+                None
+            };
+            inject::copy_to_clipboard(text).map_err(|e| e.to_string())?;
+            prior
+        };
+
+        if !auto_paste {
+            return Ok(DeliveryOutcome::CopiedOnly);
+        }
+
+        // Phase 2 — ⌘V at the HID tap. Outside both locks since it
+        // doesn't touch the pasteboard.
+        #[cfg(target_os = "macos")]
+        let paste_result = crate::mac_paste::post_cmd_v().map_err(|e| e.to_string());
+        #[cfg(not(target_os = "macos"))]
+        let paste_result: Result<(), String> = Err("auto-paste is macOS-only".into());
+
+        match paste_result {
+            Ok(()) => {
+                // Phase 3 — register a new pending restore and spawn
+                // the thread. 250 ms is enough for Slack, Notion, VS
+                // Code, browsers, and Terminal to consume the paste;
+                // a clipboard manager polling every few hundred ms
+                // can still catch the transient state, but the
+                // user-visible end state is their prior clipboard.
+                if let Some(prior) = prior_text {
+                    let cancel = Arc::new(AtomicBool::new(false));
+                    *self.pending_restore.lock() = Some(RestoreToken {
+                        prior_text: prior.clone(),
+                        cancel: cancel.clone(),
+                    });
+                    let manager = self.clone();
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("vox-clipboard-restore".into())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(250));
+                            if cancel.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let mut pending = manager.pending_restore.lock();
+                            // Re-check after acquiring the lock — a
+                            // newer pipeline may have flipped cancel
+                            // while we were waiting.
+                            if cancel.load(Ordering::SeqCst) {
+                                return;
+                            }
+                            let _clip = manager.clipboard_lock.lock();
+                            if let Err(e) = inject::copy_to_clipboard(&prior) {
+                                log::warn!(
+                                    "clipboard restore (sid={id}) failed: {e}"
+                                );
+                            }
+                            *pending = None;
+                        })
+                    {
+                        log::warn!(
+                            "failed to spawn clipboard-restore thread (sid={id}): {e}"
+                        );
+                    }
+                }
+                Ok(DeliveryOutcome::Pasted)
+            }
+            Err(reason) => {
+                log::warn!("auto-paste (sid={id}) failed: {reason}");
+                Ok(DeliveryOutcome::PasteFailedCopiedOnly)
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1405,9 +1575,9 @@ async fn run_pipeline(
 
     let copy_text = cleaned.clone();
     let manager_for_copy = manager.clone();
-    let app_for_copy = app.clone();
+    let auto_paste = session.auto_paste_enabled;
     let copy_result = tauri::async_runtime::spawn_blocking(move || {
-        manager_for_copy.write_clipboard(&app_for_copy, id, &copy_text)
+        manager_for_copy.deliver_transcript(id, &copy_text, auto_paste)
     })
     .await;
 
@@ -1420,7 +1590,18 @@ async fn run_pipeline(
         return;
     }
 
-    let warning_flag = polish_warning.is_some();
+    // Promote a paste-failure to a warning so the user notices that
+    // auto-paste didn't go through (and that they need to ⌘V manually
+    // / grant Accessibility). The reason was already logged inside
+    // `deliver_transcript`; here we just need the boolean. A
+    // successful paste leaves the warning state unchanged — only
+    // polish_warning flips it.
+    let paste_failed = matches!(
+        &copy_result,
+        Ok(Ok(DeliveryOutcome::PasteFailedCopiedOnly))
+    );
+
+    let warning_flag = polish_warning.is_some() || paste_failed;
     let entry = CompletedEntry {
         session_id: id,
         ts: chrono::Utc::now().timestamp(),
@@ -1442,7 +1623,7 @@ async fn run_pipeline(
     };
 
     match copy_result {
-        Ok(Ok(())) => {
+        Ok(Ok(outcome)) => {
             transcripts::push_completed(entry);
             // Stats record covers both polish-succeeded and the
             // LLM fail-open path — both arms above set `cleaned` to
@@ -1472,26 +1653,39 @@ async fn run_pipeline(
                 pill::set_wide(&app, false);
             }
 
-            match polish_warning {
-                Some(msg) => {
-                    manager.set_stage(
-                        &app,
-                        id,
-                        Stage::Done,
-                        Some(msg.into()),
-                        true,
-                    );
+            // Done-stage message picks the worst outcome:
+            //   1. polish_warning — polish failed and we fell open to
+            //      the raw transcript. The user almost certainly cares
+            //      more about losing the polish than the delivery mode.
+            //   2. paste_failed — polish succeeded but auto-paste
+            //      didn't (typically Accessibility missing). The
+            //      transcript IS on the clipboard, so we nudge with
+            //      "grant Accessibility" while making it clear they
+            //      can still ⌘V manually right now.
+            //   3. clean success — pick the message that matches the
+            //      actual delivery: "Inserted" when we pasted for them,
+            //      the legacy "Copied — press ⌘V" otherwise.
+            let (message, warn) = if let Some(msg) = polish_warning {
+                (msg.into(), true)
+            } else if paste_failed {
+                (
+                    "Copied — grant Accessibility for auto-paste".into(),
+                    true,
+                )
+            } else {
+                match outcome {
+                    DeliveryOutcome::Pasted => ("Inserted".into(), false),
+                    DeliveryOutcome::CopiedOnly => {
+                        ("Copied — press \u{2318}V".into(), false)
+                    }
+                    // Already handled by the `paste_failed` branch
+                    // above; the arm exists for exhaustiveness.
+                    DeliveryOutcome::PasteFailedCopiedOnly => {
+                        ("Copied — press \u{2318}V".into(), true)
+                    }
                 }
-                None => {
-                    manager.set_stage(
-                        &app,
-                        id,
-                        Stage::Done,
-                        Some("Copied — press \u{2318}V".into()),
-                        false,
-                    );
-                }
-            }
+            };
+            manager.set_stage(&app, id, Stage::Done, Some(message), warn);
         }
         Ok(Err(e)) => {
             log::error!("copy failed (sid={id}): {e}");
@@ -2083,6 +2277,7 @@ mod tests {
             completion: Arc::new(Notify::new()),
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: false,
+            auto_paste_enabled: false,
             enable_thinking: false,
             busy_guard: Mutex::new(None),
         })

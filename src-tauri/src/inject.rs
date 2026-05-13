@@ -1,5 +1,26 @@
-//! Clipboard-only transcript delivery. The user pastes manually — no
-//! keystroke synthesis, no Accessibility permission required.
+//! Transcript delivery primitives.
+//!
+//! Two modes live here:
+//!
+//! * **Clipboard-only** (default, requires no Accessibility permission):
+//!   the polished transcript replaces the clipboard contents and the
+//!   user pastes manually with ⌘V.
+//! * **Auto-paste** (opt-in via `Settings::auto_paste_enabled`, requires
+//!   Accessibility): the polished transcript is briefly written to the
+//!   clipboard, ⌘V is synthesised at the OS event tap (see
+//!   `crate::mac_paste`), and the user's prior clipboard text is
+//!   restored on a delay so the paste round-trip doesn't permanently
+//!   clobber whatever they had copied.
+//!
+//! Non-text clipboards (images, files) aren't preserved across an
+//! auto-paste — `arboard`'s round-trip for those is lossy and not worth
+//! the complexity for the minority case. When the user's prior content
+//! isn't text, the polished transcript stays on the clipboard after the
+//! paste, matching the clipboard-only fallback behaviour.
+//!
+//! Orchestration (snapshot → write → ⌘V → restore) lives in
+//! `session::SessionManager::deliver_transcript` so the clipboard lock
+//! and the pending-restore tracking stay in one place.
 
 use arboard::Clipboard;
 
@@ -17,6 +38,19 @@ pub fn copy_to_clipboard(text: &str) -> Result<(), InjectError> {
     clip.set_text(text.to_string())
         .map_err(|e| InjectError::Clipboard(e.to_string()))?;
     Ok(())
+}
+
+/// Read the clipboard contents as text. Returns `None` when the
+/// clipboard holds a non-text payload (image, file refs, …) or is
+/// empty — the auto-paste flow then skips the restore step rather than
+/// rendering binary data as garbled text.
+///
+/// Errors from `arboard` collapse to `None` because they're typically
+/// "no string on the pasteboard" rather than a fatal condition; the
+/// caller treats `None` the same way (no restore needed).
+pub fn snapshot_clipboard_text() -> Option<String> {
+    let mut clip = Clipboard::new().ok()?;
+    clip.get_text().ok()
 }
 
 /// Fire-and-forget clipboard prewarm.

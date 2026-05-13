@@ -16,7 +16,7 @@ This file is the canonical project reference. The README that used to live at th
   - **Gemma 4** out-of-process via a downloaded `llama-server` binary we talk to over loopback HTTP (`engines::gemma_http`). Default fallback when Apple Intelligence is unavailable, and the only option on macOS < 26.
 - All inference is on-device: Metal / Core ML on Apple Silicon, plus the Apple Neural Engine and `modelinferenced` system daemon for Foundation Models. Models live on disk; nothing leaves the Mac.
 - **Cloud is gone.** No Groq, no Anthropic, no API keys, no telemetry, no analytics. The only network calls remaining are model + `llama-server` downloads from Hugging Face / GitHub and the auto-updater pulling release manifests from the `KlymSerhii/vox-releases` GitHub release (minisign-pinned, see `tauri.conf.json::plugins.updater`).
-- **Output is the clipboard.** The transcript replaces the clipboard contents and the user pastes manually — no synthetic `Cmd+V`, no Accessibility required for the default pipeline.
+- **Output is the clipboard by default.** The transcript replaces the clipboard contents and the user pastes manually — no synthetic `Cmd+V`, no Accessibility required for the default pipeline. Users who want hands-off insertion can opt into **auto-paste** in Settings → General → Text insertion; that path synthesises `⌘V` at the HID event tap (`mac_paste::post_cmd_v`) from inside `session::SessionManager::deliver_transcript` after polish completes, and restores the user's prior clipboard text ~250 ms later. A rapid second dictation that lands inside the restore window cancels the previous restore and inherits its captured prior text, so a chain of pipelines still ends with the user's true pre-chain clipboard. Auto-paste requires Accessibility; when the toggle is on but Accessibility isn't granted, `deliver_transcript` fail-opens to the clipboard-only path and the pill toast reads "Copied — grant Accessibility for auto-paste".
 
 ## Defaults
 
@@ -35,13 +35,14 @@ This file is the canonical project reference. The README that used to live at th
 | `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`, `summary`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
 | `appearance` | `dark` | `light` or `dark`; coerced to `dark` if unrecognised. |
+| `auto_paste_enabled` | `false` | Opt-in. When on, the pipeline synthesises `⌘V` after the clipboard write so the polished transcript lands in the focused text field; the user's prior clipboard text is restored 250 ms later. Requires Accessibility — when the toggle is on but `AXIsProcessTrusted()` is false, the paste step fails and the pipeline fail-opens to clipboard-only with a warning. Backed by `mac_paste.rs` (`CGEventCreateKeyboardEvent` + `CGEventPost(kCGHIDEventTap, …)` for both key-down and key-up of V with the Command flag set). |
 | `inference_api_key` | `""` | Random token generated lazily on first `llama-server` spawn (see `inference_proc::persistent_api_key`); reused so the startup-time orphan reaper can identify our child processes. Loopback-only — not a security secret. |
 
 ## Pipeline
 
-Hotkey down → **Listening** pill + live waveform → hotkey up → **Transcribing** (Whisper local) → optional **Polishing** (Apple Intelligence or Gemma local, with the active mode's system prompt + dictionary) → **Done** with `Copied — press ⌘V to paste.`
+Hotkey down → **Listening** pill + live waveform → hotkey up → **Transcribing** (Whisper local) → optional **Polishing** (Apple Intelligence or Gemma local, with the active mode's system prompt + dictionary) → **Done** with `Copied — press ⌘V to paste.` (or `Inserted` when `auto_paste_enabled` is on and Accessibility is granted).
 
-Errors surface in the pill: missing model, mic denied, audio device error, silence, polishing timeout. The pipeline is fail-open: any LLM error — including Apple Intelligence guardrail rejections and `LanguageModelSession.GenerationError` — logs `WARN` and the raw Whisper output is copied instead.
+Errors surface in the pill: missing model, mic denied, audio device error, silence, polishing timeout. The pipeline is fail-open: any LLM error — including Apple Intelligence guardrail rejections and `LanguageModelSession.GenerationError` — logs `WARN` and the raw Whisper output is copied instead. The auto-paste step has the same fail-open semantics: if `⌘V` synthesis fails (typically missing Accessibility), the transcript is still on the clipboard, the pill toast nudges the user to grant Accessibility, and the user can paste manually.
 
 ## Voice Modes
 
@@ -65,7 +66,7 @@ Each mode contributes:
 ## Permissions
 
 - **Microphone** — required, prompted lazily inside the onboarding wizard via `AVCaptureDevice.requestAccessForMediaType`. The non-prompting `authorizationStatusForMediaType:` is used everywhere else (so the tray icon doesn't trigger a TCC prompt at launch).
-- **Accessibility** — **not required in v1**. The `Cmd+Alt+Period` (⌘⌥.) push-to-talk goes through Carbon `RegisterEventHotKey`, which doesn't need a TCC grant. The `mac_chord.rs` / `CGEventTap` modifier-only chord path is dormant — no UI picker exposes it in v1, and the cancel/mode-cycle hotkey pickers only offer non-chord options (Escape, F13–F15, ⌥M, ⌥⇧M, ⌘⇧M). The chord plumbing is retained for a future "chord PTT" Settings option. About → Diagnostics → "Binary path for Accessibility" is a dev-build-only escape hatch (signature rotation makes the dev TCC entry stale).
+- **Accessibility** — **optional**, used only by the opt-in auto-paste path. The default `Cmd+Alt+Period` (⌘⌥.) push-to-talk goes through Carbon `RegisterEventHotKey`, which doesn't need a TCC grant, and the default pipeline ends at clipboard write. Flipping Settings → General → Text insertion → "Paste into focused field" on engages `mac_paste::post_cmd_v`, which calls `CGEventPost(kCGHIDEventTap, …)` — that path needs Accessibility, so the Settings UI surfaces an inline "Open System Settings / Re-check" row when the toggle is on but `AXIsProcessTrusted()` is false. The pipeline fail-opens to clipboard-only if the grant is missing at session time. The `mac_chord.rs` / `CGEventTap` modifier-only chord path is dormant — no UI picker exposes it in v1, and the cancel/mode-cycle hotkey pickers only offer non-chord options (Escape, F13–F15, ⌥M, ⌥⇧M, ⌘⇧M). The chord plumbing is retained for a future "chord PTT" Settings option. About → Diagnostics → "Binary path for Accessibility" is a dev-build-only escape hatch (signature rotation makes the dev TCC entry stale).
 
 ## Repository layout
 
@@ -92,9 +93,10 @@ Each mode contributes:
 │       ├── lib.rs, main.rs            ← entry + invoke_handler
 │       ├── audio.rs                   ← cpal capture + RMS levels
 │       ├── session.rs                 ← pipeline orchestrator + cancel/timeout
-│       ├── inject.rs                  ← clipboard write (no keystroke synth)
+│       ├── inject.rs                  ← clipboard write + snapshot/restore primitives
 │       ├── hotkey.rs                  ← global shortcuts + chord fallback chain
 │       ├── mac_chord.rs               ← CGEventTap modifier-only chord listener
+│       ├── mac_paste.rs               ← synthetic ⌘V via CGEventPost (opt-in auto-paste)
 │       ├── mac_perm.rs                ← AVFoundation auth FFI (non-prompting)
 │       ├── pill.rs                    ← pill window + state events
 │       ├── onboarding.rs              ← wizard window lifecycle
@@ -208,7 +210,7 @@ The default `Cmd+Alt+Period` shortcut sidesteps Accessibility entirely — it go
 
 ## Settings tabs
 
-- **General** — language, hotkey behaviour (toggle vs hold), launch at login, dictation toggle.
+- **General** — language, hotkey behaviour (toggle vs hold), launch at login, dictation toggle, streaming pill toggle, **Text insertion** ("Paste into focused field" auto-paste toggle, with an inline Accessibility nudge that only renders when the toggle is on and the grant is missing).
 - **Hotkeys** — push-to-talk, cancel, mode-cycle. Each row shows the configured value, the runtime-bound value (which can differ if a fallback kicked in), and an inline "Test" button that reads the live binding.
 - **Models** — STT engine info + Whisper model rows; the inference-server installer card; Polishing on/off toggle + Gemma model rows. Rows show installed-on-disk size, RAM peak estimate, tier, and Use/Download/Cancel/Delete actions.
 - **Modes** — list, edit, duplicate, export/import, reset built-ins.
