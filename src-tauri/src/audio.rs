@@ -11,6 +11,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use parking_lot::Mutex;
+use serde::Serialize;
 
 const TARGET_SR: u32 = 16_000;
 
@@ -19,10 +20,26 @@ const TARGET_SR: u32 = 16_000;
 /// audio is still recoverable.
 const MAX_BUFFER_SECS: usize = 30 * 60 + 5;
 
+/// Hold time for `probe_device`. CoreAudio needs ~250–300 ms after
+/// `stream.play()` to commit to opening a Continuity Microphone over
+/// Bluetooth/Lightning and surface the iPhone wake banner; dropping
+/// the stream sooner short-circuits the wake.
+const CONTINUITY_WAKE_HOLD_MS: u64 = 300;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error("no default input device")]
     NoInputDevice,
+    /// The user explicitly chose a microphone in Settings, and cpal
+    /// can't open it right now — typically because the device went
+    /// away (iPhone Continuity Mic disabled, USB mic unplugged,
+    /// Bluetooth headset out of range). We deliberately do NOT fall
+    /// back to the system default here: silently capturing from the
+    /// wrong mic (and trusting Whisper to transcribe it) is the
+    /// failure mode this variant exists to surface. Visible-device
+    /// diagnostics go in the log, not the payload.
+    #[error("selected audio input '{name}' isn't connected")]
+    ConfiguredDeviceUnavailable { name: String },
     #[error("cpal: {0}")]
     Cpal(String),
     #[error("wav: {0}")]
@@ -33,8 +50,202 @@ pub enum AudioError {
     SpawnFailed(String),
 }
 
+/// One enumerated macOS audio input. `is_default` flags whichever
+/// device `cpal::Host::default_input_device()` currently returns, so
+/// the picker can render "MacBook Pro Microphone (System default)".
+#[derive(Debug, Clone, Serialize)]
+pub struct AudioInputDevice {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Enumerate every input device cpal can see, in the order CoreAudio
+/// returns them. Errors on a single device's name probe are skipped
+/// (logged) rather than aborting the whole list — one misbehaving
+/// device shouldn't hide the rest. Pure enumeration; does NOT call
+/// `default_input_config` so it won't trip the macOS TCC prompt and
+/// is safe to call from the Settings window before microphone access
+/// has been granted.
+pub fn list_input_devices() -> Result<Vec<AudioInputDevice>, AudioError> {
+    let host = cpal::default_host();
+    let default_name = host
+        .default_input_device()
+        .and_then(|d| d.name().ok());
+    let iter = host
+        .input_devices()
+        .map_err(|e| AudioError::Cpal(e.to_string()))?;
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dev in iter {
+        match dev.name() {
+            Ok(name) => {
+                if !seen.insert(name.clone()) {
+                    // Same OS-level device can surface under both the
+                    // default CoreAudio host and an aggregate host on
+                    // some macOS versions, OR the user has two
+                    // physical devices with the same name (two USB
+                    // mics of the same model, two iPhones with the
+                    // same first name). Name-based selection can't
+                    // disambiguate, so the second one becomes
+                    // unselectable until we move to UID-based ids.
+                    log::warn!(
+                        "audio: duplicate input device name '{name}' — \
+                         second instance hidden from the picker"
+                    );
+                    continue;
+                }
+                let is_default = default_name.as_deref() == Some(name.as_str());
+                out.push(AudioInputDevice { name, is_default });
+            }
+            Err(e) => {
+                log::warn!("audio device name probe failed; skipping: {e}");
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Map a cpal `BuildStreamError::DeviceNotAvailable` (and the
+/// matching `DefaultStreamConfigError` / `PlayStreamError` variants)
+/// onto `AudioError::ConfiguredDeviceUnavailable` when the user has
+/// an explicit selection, so the pill says "iPhone Mic not connected"
+/// instead of leaking a cpal-shaped string. The `None` case (no
+/// explicit selection) collapses to `NoInputDevice` — there's no
+/// single "configured" name to blame.
+fn map_device_unavailable_error<T: std::fmt::Display>(
+    device_name: Option<&str>,
+    err: T,
+    is_device_unavailable: bool,
+) -> AudioError {
+    if !is_device_unavailable {
+        return AudioError::Cpal(err.to_string());
+    }
+    match device_name.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => AudioError::ConfiguredDeviceUnavailable {
+            name: name.to_string(),
+        },
+        None => AudioError::NoInputDevice,
+    }
+}
+
+/// Briefly open the named (or default) input device and immediately
+/// drop the stream. Called from `set_audio_input_device` after the
+/// user picks a new mic so they get instant feedback — most
+/// importantly, the macOS Continuity Microphone activation banner
+/// shows up on the user's iPhone as soon as CoreAudio commits to
+/// opening the device. Without this probe, the iPhone only wakes on
+/// the user's next dictation, which feels broken.
+///
+/// `cpal::Stream` is `!Send`, so this must be called on the same
+/// thread that drops it. Always invoke from a fresh
+/// `std::thread::spawn` — never the audio thread, which already owns
+/// a capture stream that we don't want to displace.
+///
+/// Errors are non-fatal: at recording time `begin_capture` does the
+/// same lookup-with-fallback dance, so a failed probe doesn't break
+/// future dictations.
+pub fn probe_device(device_name: Option<&str>) -> Result<(), AudioError> {
+    log::info!(
+        "audio::probe_device (requested: {})",
+        device_name.unwrap_or("<system default>")
+    );
+    let host = cpal::default_host();
+    let device = resolve_input_device(&host, device_name)?;
+    let resolved_name = device.name().ok();
+    log::info!(
+        "audio::probe_device opening '{}'",
+        resolved_name.as_deref().unwrap_or("<unknown>")
+    );
+    let default_cfg = device.default_input_config().map_err(|e| {
+        let unavailable = matches!(
+            e,
+            cpal::DefaultStreamConfigError::DeviceNotAvailable
+        );
+        map_device_unavailable_error(device_name, e, unavailable)
+    })?;
+    let sample_format = default_cfg.sample_format();
+    let config: StreamConfig = default_cfg.into();
+    let err_fn = |err| log::warn!("audio probe stream error: {err}");
+    let stream = match sample_format {
+        SampleFormat::F32 => device.build_input_stream(
+            &config,
+            move |_data: &[f32], _| {},
+            err_fn,
+            None,
+        ),
+        SampleFormat::I16 => device.build_input_stream(
+            &config,
+            move |_data: &[i16], _| {},
+            err_fn,
+            None,
+        ),
+        SampleFormat::U16 => device.build_input_stream(
+            &config,
+            move |_data: &[u16], _| {},
+            err_fn,
+            None,
+        ),
+        other => return Err(AudioError::Cpal(format!("unsupported sample format: {other:?}"))),
+    }
+    .map_err(|e| {
+        let unavailable = matches!(e, cpal::BuildStreamError::DeviceNotAvailable);
+        map_device_unavailable_error(device_name, e, unavailable)
+    })?;
+    stream.play().map_err(|e| {
+        let unavailable = matches!(e, cpal::PlayStreamError::DeviceNotAvailable);
+        map_device_unavailable_error(device_name, e, unavailable)
+    })?;
+    std::thread::sleep(std::time::Duration::from_millis(CONTINUITY_WAKE_HOLD_MS));
+    drop(stream);
+    Ok(())
+}
+
+fn resolve_input_device(
+    host: &cpal::Host,
+    device_name: Option<&str>,
+) -> Result<cpal::Device, AudioError> {
+    let requested = device_name.map(str::trim).filter(|s| !s.is_empty());
+    // No explicit selection — follow the macOS system default. This
+    // is the ONLY auto-fallback path; once the user picks a specific
+    // device we never silently swap them onto something else.
+    let Some(name) = requested else {
+        return host.default_input_device().ok_or(AudioError::NoInputDevice);
+    };
+    let mut iter = host.input_devices().map_err(|e| {
+        log::error!("audio: input device enumeration failed: {e}");
+        AudioError::Cpal(e.to_string())
+    })?;
+    let mut considered: Vec<String> = Vec::new();
+    while let Some(dev) = iter.next() {
+        let dev_name = dev.name().unwrap_or_default();
+        if dev_name == name {
+            log::info!("audio: resolved selected device '{name}'");
+            return Ok(dev);
+        }
+        considered.push(dev_name);
+    }
+    // Explicit selection that's no longer connected. Surface the
+    // structured error so `session.rs` can show "Selected mic isn't
+    // connected" in the pill — rather than silently recording from
+    // whatever cpal would have handed back as the default.
+    log::warn!(
+        "audio: selected device '{name}' is not currently connected. \
+         Visible inputs: [{}]",
+        considered.join(", ")
+    );
+    Err(AudioError::ConfiguredDeviceUnavailable {
+        name: name.to_string(),
+    })
+}
+
 enum Command {
-    Start(Sender<Result<(), AudioError>>),
+    /// `device_name` carries the user's `Settings::audio_input_device`
+    /// preference. `None`/empty = follow the macOS system default. A
+    /// non-empty name that doesn't match anything in
+    /// `cpal::Host::input_devices()` is surfaced as
+    /// `AudioError::ConfiguredDeviceUnavailable` — `begin_capture`
+    /// deliberately does NOT silently fall back to the system default.
+    Start(Option<String>, Sender<Result<(), AudioError>>),
     StopAndEncode(Sender<Result<Vec<u8>, AudioError>>),
     /// Returns a `(wav_bytes, pcm_secs)` snapshot of the current capture
     /// buffer WITHOUT stopping the stream. The WAV is the same shape
@@ -78,10 +289,10 @@ impl AudioHandle {
         Ok(Self { tx, rms_bits })
     }
 
-    pub fn start(&self) -> Result<(), AudioError> {
+    pub fn start(&self, device_name: Option<String>) -> Result<(), AudioError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
-            .send(Command::Start(reply_tx))
+            .send(Command::Start(device_name, reply_tx))
             .map_err(|_| AudioError::ThreadDied)?;
         reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
     }
@@ -151,12 +362,12 @@ fn audio_thread_inner(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
 
     for cmd in rx {
         match cmd {
-            Command::Start(reply) => {
+            Command::Start(device_name, reply) => {
                 if active.is_some() {
                     let _ = reply.send(Ok(()));
                     continue;
                 }
-                match begin_capture(Arc::clone(&rms_bits)) {
+                match begin_capture(Arc::clone(&rms_bits), device_name.as_deref()) {
                     Ok(cap) => {
                         active = Some(cap);
                         let _ = reply.send(Ok(()));
@@ -200,19 +411,32 @@ fn audio_thread_inner(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
     }
 }
 
-fn begin_capture(rms_bits: Arc<AtomicU32>) -> Result<ActiveCapture, AudioError> {
+fn begin_capture(
+    rms_bits: Arc<AtomicU32>,
+    device_name: Option<&str>,
+) -> Result<ActiveCapture, AudioError> {
     // cpal's default_input_config + build_input_stream WILL implicitly prompt
     // for mic TCC if status is NotDetermined — callers must have already
     // obtained authorization (see mac_perm).
-    log::info!("audio::begin_capture");
+    log::info!(
+        "audio::begin_capture (requested device: {})",
+        device_name.unwrap_or("<system default>")
+    );
     let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or(AudioError::NoInputDevice)?;
+    let device = resolve_input_device(&host, device_name)?;
+    let resolved_name = device.name().ok();
+    log::info!(
+        "audio::begin_capture opening '{}'",
+        resolved_name.as_deref().unwrap_or("<unknown>")
+    );
 
-    let default_cfg = device
-        .default_input_config()
-        .map_err(|e| AudioError::Cpal(e.to_string()))?;
+    let default_cfg = device.default_input_config().map_err(|e| {
+        let unavailable = matches!(
+            e,
+            cpal::DefaultStreamConfigError::DeviceNotAvailable
+        );
+        map_device_unavailable_error(device_name, e, unavailable)
+    })?;
     let input_sr = default_cfg.sample_rate().0;
     let input_channels = default_cfg.channels();
     let sample_format = default_cfg.sample_format();
@@ -274,9 +498,15 @@ fn begin_capture(rms_bits: Arc<AtomicU32>) -> Result<ActiveCapture, AudioError> 
         }
         other => return Err(AudioError::Cpal(format!("unsupported sample format: {other:?}"))),
     }
-    .map_err(|e| AudioError::Cpal(e.to_string()))?;
+    .map_err(|e| {
+        let unavailable = matches!(e, cpal::BuildStreamError::DeviceNotAvailable);
+        map_device_unavailable_error(device_name, e, unavailable)
+    })?;
 
-    stream.play().map_err(|e| AudioError::Cpal(e.to_string()))?;
+    stream.play().map_err(|e| {
+        let unavailable = matches!(e, cpal::PlayStreamError::DeviceNotAvailable);
+        map_device_unavailable_error(device_name, e, unavailable)
+    })?;
 
     log::info!(
         "audio capture started: {} Hz, {} ch, {:?}",
