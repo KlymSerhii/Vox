@@ -700,6 +700,11 @@ function DownloadStep(props: {
   const [progress, setProgress] = createSignal<
     Record<string, { downloaded: number; total: number }>
   >({});
+  /// Toggled after every download bar reads "Done" and stays on until
+  /// the engine pre-warm finishes. Drives the visible indicator under
+  /// the download bars so the 15-30 s silent wait between "Done" and
+  /// Continue-enabled stops looking like the app is hung.
+  const [prewarmInFlight, setPrewarmInFlight] = createSignal(false);
   // Per-id rolling samples. Stored as a flat Record (not nested in
   // `progress`) so a ResizeObserver-style spread doesn't drop the
   // history on each tick.
@@ -933,7 +938,12 @@ function DownloadStep(props: {
         // response, and we don't want Continue to wait on a slow event
         // when the bytes are already on disk.
         await reconcileCompletedFromDisk();
-        await loadModelWarm(sttId);
+        setPrewarmInFlight(true);
+        try {
+          await loadModelWarm(sttId);
+        } finally {
+          setPrewarmInFlight(false);
+        }
       } catch (e) {
         setErr(String(e));
       } finally {
@@ -975,10 +985,15 @@ function DownloadStep(props: {
       // Pre-warm so first dictation doesn't pay the cold-load tax. The
       // inference server is deferred until first polish — spawning it
       // now would burn RAM before the user even dictates.
-      await Promise.allSettled([
-        loadModelWarm(sttId),
-        loadModelWarm(llmId),
-      ]);
+      setPrewarmInFlight(true);
+      try {
+        await Promise.allSettled([
+          loadModelWarm(sttId),
+          loadModelWarm(llmId),
+        ]);
+      } finally {
+        setPrewarmInFlight(false);
+      }
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -1166,6 +1181,9 @@ function DownloadStep(props: {
                 samples={samples()[b().id]}
               />
             )}
+          </Show>
+          <Show when={prewarmInFlight()}>
+            <PrewarmCard />
           </Show>
         </div>
       </Show>
@@ -1428,6 +1446,57 @@ function DownloadBar(props: {
           {formatEta(eta()!)}
         </div>
       </Show>
+    </div>
+  );
+}
+
+/// Visible indicator that bridges the silent gap between every download
+/// bar reading "Done" and the pre-warm finishing. Mirrors the liquid-card
+/// surface used elsewhere on this step; the 3-bar audio-EQ loader is the
+/// same voice/audio language as the recording pill, so it reads as "the
+/// app is listening to its own models warm up" rather than a generic
+/// spinner. The shimmer on the headline ties the wait to the pill's
+/// `pill-shimmer` processing-state language without coupling to it.
+function PrewarmCard() {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      class="liquid-card mt-1 flex items-center gap-3 rounded-[10px] bg-[var(--color-surface-raised)] px-3 py-2.5 ring-1 ring-[var(--color-border)]"
+    >
+      <PrewarmBars />
+      <div class="flex min-w-0 flex-col gap-0.5">
+        <span class="pill-shimmer text-[13px] font-medium leading-tight">
+          Warming up models…
+        </span>
+        <span class="text-[11px] leading-tight text-[var(--color-ink-mute)]">
+          First launch only — usually 15-30 seconds.
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/// Three accent-coloured bars that bounce vertically in stagger. The
+/// 130 ms offset between bars puts the wave at ~1/8 cycle apart, which
+/// is enough to read as a travelling wave but tight enough that all
+/// three bars share visible motion at any given moment. Heights are
+/// driven by the keyframe in styles.css so a single CSS variable can
+/// tune cadence later.
+function PrewarmBars() {
+  return (
+    <div
+      aria-hidden="true"
+      class="flex h-5 w-7 shrink-0 items-center justify-between"
+    >
+      <For each={[0, 130, 260]}>
+        {(delay) => (
+          <span
+            class="prewarm-bar h-full w-[3px] rounded-full bg-[var(--color-accent)]"
+            style={{ "animation-delay": `${delay}ms` }}
+          />
+        )}
+      </For>
     </div>
   );
 }

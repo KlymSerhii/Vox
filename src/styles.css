@@ -367,6 +367,23 @@ body.translucent {
   animation: typing-dot-pulse 1.4s ease-in-out infinite;
 }
 
+/* 3-bar audio-EQ loader used in the onboarding pre-warm card. Each
+ * bar bounces vertically on a 1.05s sine; staggered animation-delays
+ * (set inline at the callsite) give the read of a wave rather than a
+ * unison pulse. Matches the pill's voice/audio language without
+ * coupling to RMS input — this loader runs indeterminately while the
+ * STT encoder compiles and the LLM weights page in. */
+@keyframes prewarm-bar-bounce {
+  0%, 100% { transform: scaleY(0.32); }
+  50% { transform: scaleY(1); }
+}
+
+.prewarm-bar {
+  display: inline-block;
+  transform-origin: center;
+  animation: prewarm-bar-bounce 1.05s ease-in-out infinite;
+}
+
 /* Streaming body: no visible scrollbar, top-fade mask so older text
  * dissolves rather than hard-clipping at the sticky header edge. */
 .streaming-body {
@@ -453,6 +470,13 @@ body.translucent {
   .typing-dot {
     animation: none !important;
     opacity: 1 !important;
+  }
+
+  /* Prewarm bars freeze at a mid-height so they still read as "three
+   * loading bars" without the bouncing motion. */
+  .prewarm-bar {
+    animation: none !important;
+    transform: scaleY(0.7) !important;
   }
 
   .pill-shimmer {
