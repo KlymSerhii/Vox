@@ -1023,6 +1023,17 @@ pub fn list_modes<R: Runtime>(app: AppHandle<R>) -> Vec<VoiceMode> {
     modes::list_modes(&app)
 }
 
+/// Broadcast the current mode list so every webview (Settings,
+/// Onboarding, Tray popover) stays in sync after a mutation. The
+/// originating window also receives this event and can rely on it
+/// instead of refetching manually.
+fn emit_modes_changed<R: Runtime>(app: &AppHandle<R>) {
+    let list = modes::list_modes(app);
+    if let Err(e) = app.emit("modes:changed", &list) {
+        log::warn!("failed to emit modes:changed: {e}");
+    }
+}
+
 #[tauri::command]
 pub fn get_mode<R: Runtime>(app: AppHandle<R>, id: String) -> Option<VoiceMode> {
     modes::get_mode(&app, &id)
@@ -1035,7 +1046,9 @@ pub fn save_mode<R: Runtime>(
     mode: VoiceMode,
 ) -> Result<(), String> {
     assert_secret_window(&webview)?;
-    modes::save_mode(&app, &mode).map_err(|e| e.to_string())
+    modes::save_mode(&app, &mode).map_err(|e| e.to_string())?;
+    emit_modes_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1045,7 +1058,9 @@ pub fn delete_mode<R: Runtime>(
     id: String,
 ) -> Result<(), String> {
     assert_secret_window(&webview)?;
-    modes::delete_mode(&app, &id).map_err(|e| e.to_string())
+    modes::delete_mode(&app, &id).map_err(|e| e.to_string())?;
+    emit_modes_changed(&app);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1055,7 +1070,9 @@ pub fn duplicate_mode<R: Runtime>(
     id: String,
 ) -> Result<VoiceMode, String> {
     assert_secret_window(&webview)?;
-    modes::duplicate_mode(&app, &id).map_err(|e| e.to_string())
+    let m = modes::duplicate_mode(&app, &id).map_err(|e| e.to_string())?;
+    emit_modes_changed(&app);
+    Ok(m)
 }
 
 #[tauri::command]
@@ -1077,7 +1094,9 @@ pub fn import_mode_json<R: Runtime>(
     json: String,
 ) -> Result<VoiceMode, String> {
     assert_secret_window(&webview)?;
-    modes::import_mode_json(&app, &json).map_err(|e| e.to_string())
+    let m = modes::import_mode_json(&app, &json).map_err(|e| e.to_string())?;
+    emit_modes_changed(&app);
+    Ok(m)
 }
 
 #[tauri::command]
@@ -1086,7 +1105,11 @@ pub fn reset_default_modes<R: Runtime>(
     webview: Webview<R>,
 ) -> Result<usize, String> {
     assert_secret_window(&webview)?;
-    modes::reset_defaults(&app).map_err(|e| e.to_string())
+    let n = modes::reset_defaults(&app).map_err(|e| e.to_string())?;
+    if n > 0 {
+        emit_modes_changed(&app);
+    }
+    Ok(n)
 }
 
 #[tauri::command]

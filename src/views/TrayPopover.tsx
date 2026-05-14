@@ -1,4 +1,5 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { HotkeyKeys } from "../components/HotkeyKeys";
 import {
   cancelSession,
   checkPermissions,
@@ -10,6 +11,7 @@ import {
   listAudioInputDevices,
   listModels,
   listModes,
+  onModesChanged,
   onSessionsChanged,
   onSettingsChanged,
   onStatsChanged,
@@ -163,6 +165,7 @@ export default function TrayPopoverView() {
   let unlistenSettings: (() => void) | null = null;
   let unlistenSessions: (() => void) | null = null;
   let unlistenStats: (() => void) | null = null;
+  let unlistenModes: (() => void) | null = null;
 
   async function refreshStats() {
     try {
@@ -228,6 +231,11 @@ export default function TrayPopoverView() {
     unlistenSettings = await onSettingsChanged(setS);
     unlistenSessions = await onSessionsChanged(applySnapshot);
     unlistenStats = await onStatsChanged(refreshStats);
+    // Keep the mode picker fresh when the user creates, edits, or
+    // deletes a Voice Mode in the Settings window. The popover
+    // webview is built once and reused on every tray click, so the
+    // initial `listModes()` call would otherwise go stale.
+    unlistenModes = await onModesChanged(setModes);
     void refreshStats();
 
     window.addEventListener("focus", () => {
@@ -298,6 +306,7 @@ export default function TrayPopoverView() {
     unlistenSettings?.();
     unlistenSessions?.();
     unlistenStats?.();
+    unlistenModes?.();
   });
 
   async function pickMode(id: string) {
@@ -855,11 +864,11 @@ export default function TrayPopoverView() {
                   <span class="text-[13px] font-semibold text-[var(--color-ink)]">
                     Press to talk
                   </span>
-                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                    Trigger with{" "}
-                    <span class="keycap">
-                      {hotkeyLabel(st().hotkey || "CommandOrControl+Alt+Period")}
-                    </span>
+                  <span class="inline-flex flex-wrap items-center gap-1 text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    Trigger with
+                    <HotkeyKeys
+                      spec={st().hotkey || "CommandOrControl+Alt+Period"}
+                    />
                   </span>
                 </div>
               </div>
@@ -871,11 +880,11 @@ export default function TrayPopoverView() {
                   <span class="text-[13px] font-semibold text-[var(--color-ink)]">
                     Voice mode
                   </span>
-                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                    Cycle with{" "}
-                    <span class="keycap">
-                      {hotkeyLabel(st().mode_cycle_hotkey || "Alt+M")}
-                    </span>
+                  <span class="inline-flex flex-wrap items-center gap-1 text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    Cycle with
+                    <HotkeyKeys
+                      spec={st().mode_cycle_hotkey || "Alt+M"}
+                    />
                   </span>
                 </div>
                 <button
@@ -1708,65 +1717,3 @@ function ago(tsSeconds: number): string {
   return `${Math.floor(delta / 86_400)}d`;
 }
 
-function hotkeyLabel(k: string): string {
-  switch (k) {
-    case "F13":
-      return "F13";
-    case "F14":
-      return "F14";
-    case "F15":
-      return "F15";
-    case "Alt+M":
-      return "⌥M";
-    case "Alt+Shift+M":
-      return "⌥⇧M";
-    case "CommandOrControl+Shift+M":
-    case "Cmd+Shift+M":
-      return "⌘⇧M";
-    case "CommandOrControl+Alt+Period":
-    case "Cmd+Alt+Period":
-      return "⌘⌥.";
-    default:
-      // Best-effort fallback so any user-configured chord at least
-      // shows its modifier glyphs instead of the raw "Alt+Shift+V"
-      // tokens. Mirrors the formatter in Onboarding.tsx without the
-      // shifted-glyph collapsing — the popover is content with the
-      // simpler rendering.
-      return k
-        .split("+")
-        .map((t) => {
-          const trimmed = t.trim();
-          switch (trimmed) {
-            case "Alt":
-            case "Option":
-              return "⌥";
-            case "Shift":
-              return "⇧";
-            case "Cmd":
-            case "Command":
-            case "CommandOrControl":
-            case "Meta":
-            case "Super":
-              return "⌘";
-            case "Ctrl":
-            case "Control":
-              return "⌃";
-            case "Period":
-              return ".";
-            case "Comma":
-              return ",";
-            case "Slash":
-              return "/";
-            case "Semicolon":
-              return ";";
-            case "Backslash":
-              return "\\";
-            case "Quote":
-              return "'";
-            default:
-              return trimmed;
-          }
-        })
-        .join("");
-  }
-}

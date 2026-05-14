@@ -41,6 +41,7 @@ import {
   onModelDone,
   onModelError,
   onModelProgress,
+  onModesChanged,
   onSettingsChanged,
   onUpdaterProgress,
   openAccessibilitySettings,
@@ -74,6 +75,7 @@ import {
   type VoiceMode,
 } from "../lib/ipc";
 import { VoxLogo } from "../components/VoxLogo";
+import { HotkeyKeys } from "../components/HotkeyKeys";
 
 type Tab =
   | "general"
@@ -145,10 +147,13 @@ const CANCEL_HOTKEY_OPTIONS: HotkeyOption[] = [
   { value: "F15", label: "F15" },
 ];
 
+// Labels carry both the macOS symbols and the short word forms so a
+// reader who doesn't recognise ⌘ / ⌥ / ⇧ still understands the chord.
+// `<option>` elements can't host rich HTML, hence the inline string.
 const MODE_CYCLE_HOTKEY_OPTIONS: HotkeyOption[] = [
-  { value: "Alt+M", label: "⌥M" },
-  { value: "Alt+Shift+M", label: "⌥⇧M" },
-  { value: "CommandOrControl+Shift+M", label: "⌘⇧M" },
+  { value: "Alt+M", label: "Opt+M  (⌥M)" },
+  { value: "Alt+Shift+M", label: "Opt+Shift+M  (⌥⇧M)" },
+  { value: "CommandOrControl+Shift+M", label: "Cmd+Shift+M  (⌘⇧M)" },
   { value: "F13", label: "F13" },
   { value: "F14", label: "F14" },
   { value: "F15", label: "F15" },
@@ -602,10 +607,6 @@ function SectionHeader(props: { title: string; hint?: string }) {
   );
 }
 
-function Keycap(props: { children: any }) {
-  return <span class="keycap">{props.children}</span>;
-}
-
 function StaticValue(props: { children: any }) {
   return (
     <span class="text-[12px] font-medium text-[var(--color-ink-mute)]">
@@ -967,13 +968,8 @@ function HotkeysTab(props: {
                 Built-in
               </span>
             </div>
-            <div class="flex items-center gap-1">
-              <Keycap>⌘</Keycap>
-              <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
-              <Keycap>⌥</Keycap>
-              <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
-              <Keycap>.</Keycap>
-            </div>
+            <HotkeyKeys spec="CommandOrControl+Alt+Period" />
+
             <span class="text-[11px] text-[var(--color-ink-mute)]">
               {pttHint(props.s.hands_free_enabled, ptt())}
             </span>
@@ -2180,9 +2176,11 @@ function ModesTab(props: {
     setConfirmReset(false);
     if (confirmResetTimer) clearTimeout(confirmResetTimer);
   }
+  let unlistenModes: (() => void) | null = null;
   onCleanup(() => {
     if (confirmDeleteTimer) clearTimeout(confirmDeleteTimer);
     if (confirmResetTimer) clearTimeout(confirmResetTimer);
+    unlistenModes?.();
   });
   let fileInput: HTMLInputElement | undefined;
 
@@ -2196,6 +2194,10 @@ function ModesTab(props: {
 
   onMount(async () => {
     await refresh();
+    // The backend re-broadcasts the list on every mutation. Subscribing
+    // here means a mode created from the Tray popover (future) or a
+    // second Settings window stays in sync without polling.
+    unlistenModes = await onModesChanged(setModes);
   });
 
   function onDragOver(e: DragEvent) {
@@ -2217,7 +2219,8 @@ function ModesTab(props: {
     setImportErr(null);
     try {
       await importModeJson(text);
-      await refresh();
+      // `modes:changed` fires from the backend on success; the
+      // listener below updates the local list.
     } catch (e) {
       setImportErr(String(e));
     }
@@ -2239,7 +2242,9 @@ function ModesTab(props: {
   async function onDuplicate(id: string) {
     try {
       const m = await duplicateMode(id);
-      await refresh();
+      // The local list refreshes via the `modes:changed` listener;
+      // `m` is the canonical backend object so the editor can open
+      // even before the event has been processed.
       setEditing(m);
     } catch (e) {
       console.error("duplicate:", e);
@@ -2250,7 +2255,6 @@ function ModesTab(props: {
     cancelDeleteConfirm();
     try {
       await deleteMode(id);
-      await refresh();
       if (editing()?.id === id) setEditing(null);
     } catch (e) {
       console.error("delete:", e);
@@ -2279,7 +2283,6 @@ function ModesTab(props: {
     setResetMsg(null);
     try {
       const n = await resetDefaultModes();
-      await refresh();
       if (n === 0) {
         setResetMsg("All defaults are already present.");
         setTimeout(() => setResetMsg(null), 4000);
@@ -2332,7 +2335,6 @@ function ModesTab(props: {
     const toSave: VoiceMode = { ...mode, id, auto_triggers: cleanedTriggers };
     try {
       await saveMode(toSave);
-      await refresh();
       setEditing(null);
     } catch (e) {
       console.error("save mode:", e);

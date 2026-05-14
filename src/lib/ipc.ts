@@ -559,6 +559,16 @@ export async function onSettingsChanged(
   return listen<Settings>("settings:changed", (e) => cb(e.payload));
 }
 
+/// Fired by the backend whenever the Voice Mode list changes (save,
+/// delete, duplicate, import, reset). Payload is the full current
+/// list. Subscribed by every window that displays a mode picker so
+/// custom modes show up without a Vox restart.
+export async function onModesChanged(
+  cb: (modes: VoiceMode[]) => void,
+): Promise<UnlistenFn> {
+  return listen<VoiceMode[]>("modes:changed", (e) => cb(e.payload));
+}
+
 export async function onTranscriptsChanged(
   cb: (rec: RecentTranscript[]) => void,
 ): Promise<UnlistenFn> {

@@ -47,6 +47,8 @@ import {
   type TierRecommendation,
 } from "../lib/ipc";
 import { VoxLogo } from "../components/VoxLogo";
+import { HotkeyKeys } from "../components/HotkeyKeys";
+import { formatHotkey as sharedFormatHotkey } from "../lib/hotkey";
 
 type PolishChoice = "apple-fm" | "gemma-local";
 
@@ -65,61 +67,11 @@ const NON_PARAKEET_COMMON: readonly string[] = [
   "zh", "ja", "ko", "ar", "hi", "tr", "vi", "th",
 ] as const;
 
-/** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a glyph
- *  string ("⌥⇧V", "F13"). Bare `AltRight`/`AltLeft` map to `⌥`.
- *
- *  When the trailing key is one whose shifted glyph is more readable
- *  than `Shift+<key>` (e.g. `Slash` → `?`, `Semicolon` → `:`), and
- *  `Shift` is in the modifier set, the rendering collapses `Shift+key`
- *  to the shifted glyph alone. This matches macOS menu conventions —
- *  `Cmd+Shift+/` is shown as `⌘?`, not `⌘⇧/`. */
-export function formatHotkey(spec: string | null | undefined): string {
-  if (!spec) return "";
-  const trimmed = spec.trim();
-  if (!trimmed) return "";
-  if (trimmed === "AltRight" || trimmed === "AltLeft") return "⌥";
-  const MODS: Record<string, string> = {
-    Alt: "⌥",
-    Option: "⌥",
-    Shift: "⇧",
-    Cmd: "⌘",
-    Command: "⌘",
-    Meta: "⌘",
-    Super: "⌘",
-    Ctrl: "⌃",
-    Control: "⌃",
-    CommandOrControl: "⌘",
-  };
-  const KEYS_UNSHIFTED: Record<string, string> = {
-    Slash: "/",
-    Semicolon: ";",
-    Backslash: "\\",
-    Comma: ",",
-    Period: ".",
-    Quote: "'",
-  };
-  const KEYS_SHIFTED: Record<string, string> = {
-    Slash: "?",
-    Semicolon: ":",
-    Backslash: "|",
-    Comma: "<",
-    Period: ">",
-    Quote: "\"",
-  };
-  const tokens = trimmed.split("+").map((t) => t.trim());
-  const last = tokens[tokens.length - 1];
-  const hasShift = tokens.includes("Shift");
-  if (hasShift && KEYS_SHIFTED[last]) {
-    const head = tokens
-      .slice(0, -1)
-      .filter((t) => t !== "Shift")
-      .map((t) => MODS[t] ?? t);
-    return head.join("") + KEYS_SHIFTED[last];
-  }
-  return tokens
-    .map((t) => MODS[t] ?? KEYS_UNSHIFTED[t] ?? t)
-    .join("");
-}
+/** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a
+ *  short word-style string ("Opt+Shift+V", "F13"). Re-exported from
+ *  the shared `lib/hotkey` formatter; kept as `formatHotkey` here so
+ *  the rest of this file doesn't have to know the new import path. */
+export const formatHotkey = sharedFormatHotkey;
 
 export default function OnboardingView() {
   const [step, setStep] = createSignal<Step>(0);
@@ -1500,14 +1452,12 @@ function HowToUseStep(props: { s: Settings | null }) {
   const ptt = () => diags().get("push-to-talk");
   const cycle = () => diags().get("mode-cycle");
 
-  const pttGlyph = () =>
-    formatHotkey(ptt()?.bound) ||
-    formatHotkey(props.s?.hotkey) ||
-    "⌘⌥.";
-  const cycleGlyph = () =>
-    formatHotkey(cycle()?.bound) ||
-    formatHotkey(props.s?.mode_cycle_hotkey) ||
-    "⌥M";
+  // Fall back chain: live-bound runtime value → user-configured spec
+  // → hardcoded default. The hardcoded defaults match `Settings::default`.
+  const pttSpec = () =>
+    ptt()?.bound || props.s?.hotkey || "CommandOrControl+Alt+Period";
+  const cycleSpec = () =>
+    cycle()?.bound || props.s?.mode_cycle_hotkey || "Alt+M";
 
   const handsFree = () => props.s?.hands_free_enabled ?? true;
   const pttVerb = () => (handsFree() ? "Press" : "Hold");
@@ -1530,7 +1480,7 @@ function HowToUseStep(props: { s: Settings | null }) {
 
       <ul class="flex flex-col gap-3">
         <TipRow
-          label={<>{pttVerb()} <span class="keycap">{pttGlyph()}</span></>}
+          label={<>{pttVerb()} <HotkeyKeys spec={pttSpec()} /></>}
           description={
             pttFailed(ptt())
               ? "— Vox can't listen yet, grant Accessibility to enable."
@@ -1545,7 +1495,7 @@ function HowToUseStep(props: { s: Settings | null }) {
           errorActionLabel={pttFailed(ptt()) ? "Grant Accessibility" : undefined}
         />
         <TipRow
-          label={<span class="keycap">{cycleGlyph()}</span>}
+          label={<HotkeyKeys spec={cycleSpec()} />}
           description="to cycle Voice Modes. Match your tone to the app you're in."
           fellBackNote={fellBackNote(cycle())}
         />

@@ -82,7 +82,13 @@ Each mode contributes:
 │   │   ├── Pill.tsx                   ← floating listening pill
 │   │   ├── Onboarding.tsx             ← 5-step first-run wizard
 │   │   └── TrayPopover.tsx            ← menu-bar popover
-│   ├── lib/ipc.ts                     ← typed bindings to Tauri commands + events
+│   ├── components/
+│   │   ├── VoxLogo.tsx                ← shared logo glyph
+│   │   └── HotkeyKeys.tsx             ← renders a Tauri shortcut spec as a row of keycap badges (`⌘ Cmd + ⌥ Opt + .`)
+│   ├── lib/
+│   │   ├── ipc.ts                     ← typed bindings to Tauri commands + events
+│   │   ├── hotkey.ts                  ← shared `formatHotkeyTokens` / `formatHotkey` for chord display
+│   │   └── theme.ts                   ← appearance bootstrap
 │   └── styles.css
 ├── src-tauri/
 │   ├── Cargo.toml                     ← `default = ["local-engines"]`
@@ -225,6 +231,7 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 ## Important conventions
 
 - **Settings are the source of truth**. The `commands::set_settings` handler diffs hotkey-relevant fields, calls `hotkey::register` to live-rebind, and emits `settings:changed` so the Settings window's diagnostic chips and the tray popover both refresh without a restart. Listen for `settings:changed` from any window via `onSettingsChanged` in `src/lib/ipc.ts`.
+- **Voice Mode list changes broadcast a `modes:changed` event.** Every mode-mutating command (`save_mode`, `delete_mode`, `duplicate_mode`, `import_mode_json`, `reset_default_modes` when `n > 0`) calls `commands::emit_modes_changed`, which re-reads the full list and fires `modes:changed` with `Vec<VoiceMode>` as payload. The Tray popover webview is built once and reused on every tray click, so it can't poll on open — subscribing to `onModesChanged` in `src/lib/ipc.ts` is the *only* way a custom mode created in Settings shows up in the popover's picker without restarting Vox. The Settings ModesTab subscribes too (instead of refetching after each mutation), so the event is the single source of truth for the in-memory mode list across windows.
 - **No audio touches disk.** Capture buffer lives in RAM, gets WAV-encoded in-place, then is freed.
 - **No transcript persists.** The "recent 5" tray list is `transcripts::snapshot()` from a process-lifetime ring buffer; it's gone on quit.
 - **Engine errors are fail-open.** STT errors abort the session; LLM errors log a warning and the raw transcript is copied. Both states surface a friendly pill.
@@ -232,6 +239,7 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - **Voice Mode IDs are validated** against `[a-z0-9-]{1,64}` with no edge dashes (`is_safe_mode_id`) to prevent path traversal in the JSON store.
 - **Engines pre-warm in the background at launch.** `lib.rs::run`'s setup hook spawns `inference_proc::prewarm_in_background` (boots `llama-server` only when `llm_engine == "gemma-local"` and the binary + Gemma model are installed — it's a no-op for `apple-fm`, which has no spawn cost to amortise; the OS's `modelinferenced` daemon handles its own warmup), `engines::prewarm_stt_in_background` (cold-loads the Whisper GGML weights), and `inject::prewarm_in_background` (a read-and-restore NSPasteboard round-trip that forces macOS's first-use source-app signature check to run during onboarding rather than on the user's first dictation, where it otherwise stalls the post-polish clipboard write for 30-60 s with a "Verifying com.vox…" system dialog; verification is cached by Gatekeeper so subsequent launches are sub-millisecond no-ops). All three are idempotent and no-op when their preconditions aren't met.
 - **`llama-server` orphans get reaped at startup.** macOS has no `prctl(PR_SET_PDEATHSIG)`, so a force-killed previous Vox parent can leave a `llama-server` child running. `inference_proc::reap_orphans_at_startup` walks the process table and SIGKILLs any whose `--api-key` argument matches the persisted `inference_api_key`. That's why the api key is persisted across launches even though it's not security-relevant.
+- **Hotkey display uses one shared formatter.** `src/lib/hotkey.ts::formatHotkeyTokens` parses a Tauri shortcut spec (`"CommandOrControl+Alt+Period"`, `"Alt+Shift+M"`, `"AltRight"`, `"F13"`, …) into an array of `{kind, symbol, label}` tokens. `<HotkeyKeys spec={…} />` in `src/components/HotkeyKeys.tsx` renders the tokens as keycap badges — each modifier shows **both** the macOS glyph and a short word (`⌘ Cmd`, `⌥ Opt`, `⇧ Shift`, `⌃ Ctrl`) so the chord stays legible to users who don't recognise the symbols. The shifted-glyph collapse for legibility (`Cmd+Shift+/` → `⌘?`, not `⌘⇧/`) lives in the same tokeniser. For plain-text contexts that can't host rich markup (the onboarding "couldn't be bound" warning, `<option>` labels in the Hotkeys picker dropdown), `formatHotkey(spec)` returns the word form joined with ` + ` (`"Cmd + Opt + ."`); the cycle-hotkey `<option>` labels also keep the symbol form in parens (`"Opt+M  (⌥M)"`). Do not roll a new symbol map at a new callsite — extend the shared tables instead.
 
 ## Known limitations
 
@@ -250,3 +258,5 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - New Voice Mode built-in: add a clone in `modes::builtins()` plus a brand new `*_PROMPT` constant, update tests in `modes::tests`.
 - New engine: implement `SttEngine` or `LlmEngine` in `engines/` and wire it into `engines::Registry`. The engine id is used as-is from the stored Settings doc — `Registry::stt`/`Registry::llm` return `None` for an unknown id, which `session.rs` surfaces as a clear error (STT) or fail-opens to the raw transcript (LLM).
 - New native FFI bridge (Swift / Objective-C / C++): mirror `swift/AppleFmBridge.swift` + `engines/apple_fm_bridge.rs` + `build.rs::build_apple_fm_bridge`. The pattern: hand-rolled `@_cdecl` exports with `strdup`'d return strings, a thread-local error slot, and a Cargo feature flag so non-macOS builds skip both the build.rs step and the engine module via `#[cfg(all(target_os = "macos", feature = "..."))]`.
+- New hotkey display surface: import `HotkeyKeys` from `src/components/HotkeyKeys.tsx` and pass the raw Tauri shortcut spec — do *not* hand-roll a `Keycap` chain or hard-code glyphs at the callsite. New modifier / key tokens (e.g. a future fn-row binding) go into the `MODIFIER_SYMBOLS` / `KEY_UNSHIFTED` / `KEY_SHIFTED` tables in `src/lib/hotkey.ts`, plus the matching `MODIFIER_LABELS` entry for the word form.
+- New cross-window broadcast: emit from `commands.rs` via `app.emit("namespace:changed", &payload)` (see `emit_modes_changed` / `settings:changed` for the pattern: re-read authoritative state, serialise the full snapshot, log on failure). Add a typed `onXxxChanged(cb)` listener in `src/lib/ipc.ts` and subscribe in every webview that displays the affected state — the Tray popover in particular is built once and reused, so it *requires* live events to stay current.
