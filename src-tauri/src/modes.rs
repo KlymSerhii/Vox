@@ -135,6 +135,43 @@ pub fn builtins() -> Vec<VoiceMode> {
             updated_at: now,
         },
         VoiceMode {
+            id: "minimal".into(),
+            name: "Minimal".into(),
+            icon: "✍️".into(),
+            description: "Minimal cleanup. Keeps every word; only removes fillers and adds punctuation.".into(),
+            system_prompt: MINIMAL_PROMPT.into(),
+            dictionary: vec![],
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: None,
+            enable_thinking: None,
+            auto_triggers: vec![
+                AutoTrigger {
+                    bundle_id_glob: Some("com.literatureandlatte.scrivener3".into()),
+                    window_title_substring: None,
+                },
+                AutoTrigger {
+                    bundle_id_glob: Some("com.literatureandlatte.scrivener".into()),
+                    window_title_substring: None,
+                },
+                AutoTrigger {
+                    bundle_id_glob: Some("com.ulyssesapp.mac".into()),
+                    window_title_substring: None,
+                },
+                AutoTrigger {
+                    bundle_id_glob: Some("pro.writer.mac".into()),
+                    window_title_substring: None,
+                },
+                AutoTrigger {
+                    bundle_id_glob: Some("com.bloombuilt.dayone-mac".into()),
+                    window_title_substring: None,
+                },
+            ],
+            built_in: true,
+            created_at: now,
+            updated_at: now,
+        },
+        VoiceMode {
             id: "email".into(),
             name: "Email".into(),
             icon: "📧".into(),
@@ -315,6 +352,38 @@ Examples:
    \"I need you to:\n1. Add tests.\n2. Verify the build passes.\"
 - \"so everything looks fine but now I need you to first of all add tests and then also to verify that the build passes appropriately\" →
    \"Everything looks fine. I need you to:\n1. Add tests.\n2. Verify that the build passes appropriately.\"";
+
+const MINIMAL_PROMPT: &str = "You clean up voice-dictation transcripts for users who want their exact words preserved — novelists drafting prose, journalers, interviewers transcribing speech, anyone who needs the speech captured as-said. Return plain text only — no preface, no quotes, no reasoning, no explanations.
+
+The hard rule: preserve every meaningful word from the transcript, in the order spoken. Do not paraphrase. Do not \"polish\" word choice. Do not reorder clauses. Do not merge sentences. Do not split sentences except where end-of-sentence punctuation naturally requires it.
+
+What you DO change:
+1. Remove obvious disfluencies only:
+   - Standalone \"um\", \"uh\", \"er\", \"ah\", \"mm\", \"hmm\" used as hesitations.
+   - Stutter repeats caused by speech disfluency: \"the the dog\" → \"the dog\", \"I— I think\" → \"I think\", \"we we we should\" → \"we should\".
+   - Trailing \"...\" or \"—\" that came from a mid-word cutoff with nothing after it.
+2. Add standard English punctuation and capitalization where the spoken cadence implies it. Sentence-case the first word of each sentence. Capitalize proper nouns the speaker pronounced as proper nouns.
+3. Apply paragraph breaks at long pauses or clear topic shifts. When in doubt, fewer breaks.
+
+What you DO NOT change — this list is exhaustive and overrides any instinct to \"improve\":
+- Word choice and register. If the speaker said \"gonna\", leave \"gonna\". If they said \"like\" as a discourse marker between clauses (\"it was, like, really good\"), leave it — it carries tone. Only remove \"like\" when it is a pure standalone hesitation (\"uh, like, um\").
+- Sentence fragments, run-ons, comma splices the speaker produced deliberately or stylistically. Punctuate them as said; do not rewrite into \"correct\" grammar.
+- Self-corrections, false starts, and changes of mind. \"I went to the store, no, the market\" stays as \"I went to the store, no, the market.\" — the speaker is showing their thinking and that belongs in the draft.
+- Retracted content. \"Send it to John. Actually, send it to Mary.\" stays as both sentences. If the user wanted the retraction removed, they would use General.
+- Enumerations. \"First we ship, then we test, then we deploy\" stays as one sentence. Do not bullet or number anything.
+- Nonsense words, placeholders, and repeated tokens the speaker said deliberately. \"blah blah blah\", \"yada yada\", \"lorem ipsum\", \"the whatever, you know what I mean\" — these are intentional and stay verbatim. The test: if the same word appears more than once with normal cadence between repetitions, it is deliberate; only back-to-back disfluent repeats get collapsed.
+- Profanity, slang, dialect, made-up words. Leave them exactly as said.
+- Every proper noun, name, identifier, number, and quoted phrase from the transcript must appear verbatim in the output. Do not \"correct\" a name to a similar-sounding one.
+
+When in doubt, keep the word. The user picked this mode specifically because they want their voice preserved.
+
+Examples:
+- \"um so I was thinking like maybe we could uh meet on Tuesday\" → \"So I was thinking, like, maybe we could meet on Tuesday.\"
+- \"the the dog ran ran across the the yard\" → \"The dog ran across the yard.\"
+- \"I went to the store, no, the market, to buy some bread\" → \"I went to the store, no, the market, to buy some bread.\"
+- \"she said blah blah blah and then walked out, you know\" → \"She said blah blah blah and then walked out, you know.\"
+- \"gonna grab coffee real quick brb\" → \"Gonna grab coffee real quick, brb.\"
+- \"first we ship the build then we run tests and finally we deploy\" → \"First we ship the build, then we run tests, and finally we deploy.\"";
 
 const EMAIL_PROMPT: &str = "You are formatting a dictated message as the BODY of a professional email. Return plain text only.
 
@@ -869,14 +938,22 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_seeds_six_builtins() {
+    fn first_launch_seeds_seven_builtins() {
         let (store, _tmp) = fresh_store();
         let modes = store.list();
-        assert_eq!(modes.len(), 6);
+        assert_eq!(modes.len(), 7);
         let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["general", "email", "chat", "code-comment", "notes", "summary"]
+            vec![
+                "general",
+                "minimal",
+                "email",
+                "chat",
+                "code-comment",
+                "notes",
+                "summary"
+            ]
         );
         assert!(modes.iter().all(|m| m.built_in));
     }
@@ -889,20 +966,20 @@ mod tests {
         // "Reset built-ins".
         let dir = ScratchDir::new();
         // Pre-populate the dir with everything *except* the new mode.
-        for mode in builtins().into_iter().filter(|m| m.id != "summary") {
+        for mode in builtins().into_iter().filter(|m| m.id != "minimal") {
             write_mode_file(&mode_path(dir.path(), &mode.id), &mode).unwrap();
         }
         // Sanity: the new built-in is missing before init runs.
-        assert!(!mode_path(dir.path(), "summary").exists());
+        assert!(!mode_path(dir.path(), "minimal").exists());
 
         let store = Arc::new(ModeStore::new());
         store.init_with_root(dir.path().to_path_buf()).unwrap();
 
         // After init, the missing built-in is on disk and listed.
-        assert!(mode_path(dir.path(), "summary").exists());
+        assert!(mode_path(dir.path(), "minimal").exists());
         let ids: Vec<String> = store.list().into_iter().map(|m| m.id).collect();
-        assert!(ids.contains(&"summary".to_string()));
-        assert_eq!(ids.len(), 6);
+        assert!(ids.contains(&"minimal".to_string()));
+        assert_eq!(ids.len(), 7);
     }
 
     #[test]

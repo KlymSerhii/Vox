@@ -32,7 +32,7 @@ This file is the canonical project reference. The README that used to live at th
 | `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
 | `enable_thinking` | `false` | Gemma 4 only. When on, Gemma reasons silently before producing the polished output (slower, can improve quality on complex inputs). Sent as `chat_template_kwargs: {"enable_thinking": true}` per request. Apple Intelligence has no equivalent knob and ignores the value. |
 | `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. |
-| `active_mode_id` | `general` | One of `general`, `email`, `chat`, `code-comment`, `notes`, `summary`. |
+| `active_mode_id` | `general` | One of `general`, `minimal`, `email`, `chat`, `code-comment`, `notes`, `summary`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
 | `appearance` | `dark` | `light` or `dark`; coerced to `dark` if unrecognised. |
 | `auto_paste_enabled` | `false` | Opt-in. When on, the pipeline synthesises `⌘V` after the clipboard write so the polished transcript lands in the focused text field; the user's prior clipboard text is restored 250 ms later. Requires Accessibility — when the toggle is on but `AXIsProcessTrusted()` is false, the paste step fails and the pipeline fail-opens to clipboard-only with a warning. Backed by `mac_paste.rs` (`CGEventCreateKeyboardEvent` + `CGEventPost(kCGHIDEventTap, …)` for both key-down and key-up of V with the Command flag set). |
@@ -46,9 +46,10 @@ Errors surface in the pill: missing model, mic denied, audio device error, silen
 
 ## Voice Modes
 
-Six built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch:
+Seven built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch:
 
 - `general` — Balanced cleanup. Default fallback.
+- `minimal` — Preserve every word in order; only strips obvious disfluencies (um/uh, stutter repeats) and adds punctuation/capitalization. For novel drafting, journaling, and interview transcription.
 - `email` — Formal tone, full punctuation.
 - `chat` — Casual, drops trailing periods, capped length.
 - `code-comment` — Lowercase, slash-prefixed.
