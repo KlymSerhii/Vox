@@ -36,10 +36,42 @@ import {
   type Period,
   type SessionsSnapshot,
   type Settings,
-  type Stage,
   type TimeSavedStats,
   type VoiceMode,
 } from "../lib/ipc";
+import { AppearanceToggle } from "./tray-popover/components/AppearanceToggle";
+import { InProgressRow } from "./tray-popover/components/InProgressRow";
+import { LocalBadge } from "./tray-popover/components/LocalBadge";
+import { SmallSpinner } from "./tray-popover/components/SmallSpinner";
+import { StatusDot } from "./tray-popover/components/StatusDot";
+import { Toggle } from "../components/Toggle";
+import { PERIOD_OPTIONS } from "./tray-popover/constants";
+import {
+  computeDropdownPosition,
+  type DropdownPosition,
+} from "./tray-popover/dropdownPosition";
+import {
+  ago,
+  formatDuration,
+  sessionsSubLine,
+  shortRepolishError,
+} from "./tray-popover/helpers";
+
+// All four dropdowns (mode, period, mic, re-polish) share the same
+// `DropdownPosition` shape so the rendering picks the anchor side
+// (top vs bottom) via `placement` without per-call-site branching.
+// Mode and period never flip up, but using the same shape keeps the
+// dropdown JSX uniform.
+function initialDropdownPos(): DropdownPosition {
+  return {
+    placement: "below",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    minWidth: 0,
+    maxHeight: 240,
+  };
+}
 
 export default function TrayPopoverView() {
   const [loaded, setLoaded] = createSignal(false);
@@ -66,21 +98,8 @@ export default function TrayPopoverView() {
   >(null);
   let repolishPickerRef: HTMLDivElement | undefined;
   const repolishTriggerRefs = new Map<number, HTMLButtonElement>();
-  const [repolishMenuPos, setRepolishMenuPos] = createSignal<{
-    placement: "below" | "above";
-    top: number;
-    bottom: number;
-    left: number;
-    minWidth: number;
-    maxHeight: number;
-  }>({
-    placement: "below",
-    top: 0,
-    bottom: 0,
-    left: 0,
-    minWidth: 0,
-    maxHeight: 240,
-  });
+  const [repolishMenuPos, setRepolishMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
   // Per-row inline error (cleared on retry / outside-click). Keyed by
   // session id so error from one row doesn't shadow another.
   const [repolishError, setRepolishError] = createSignal<{
@@ -114,19 +133,13 @@ export default function TrayPopoverView() {
   // the popover root's `overflow-hidden`.
   let modeTriggerRef: HTMLButtonElement | undefined;
   let modeMenuRef: HTMLDivElement | undefined;
-  const [modeMenuPos, setModeMenuPos] = createSignal<{
-    top: number;
-    left: number;
-    minWidth: number;
-  }>({ top: 0, left: 0, minWidth: 0 });
+  const [modeMenuPos, setModeMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
   const [periodMenuOpen, setPeriodMenuOpen] = createSignal(false);
   let periodTriggerRef: HTMLButtonElement | undefined;
   let periodMenuRef: HTMLDivElement | undefined;
-  const [periodMenuPos, setPeriodMenuPos] = createSignal<{
-    top: number;
-    left: number;
-    minWidth: number;
-  }>({ top: 0, left: 0, minWidth: 0 });
+  const [periodMenuPos, setPeriodMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
   // Refreshed on popover mount + every time the window regains focus
   // so plugging an AirPods doesn't leave the dropdown stale.
   const [audioDevices, setAudioDevices] = createSignal<AudioInputDevice[]>([]);
@@ -138,28 +151,8 @@ export default function TrayPopoverView() {
   // flip-up logic — when there isn't room below, anchor by `bottom`
   // and pin `max-height` to whichever side we landed on so the menu
   // scrolls instead of clipping at the OS window edge.
-  const [micMenuPos, setMicMenuPos] = createSignal<{
-    placement: "below" | "above";
-    top: number;
-    bottom: number;
-    left: number;
-    minWidth: number;
-    maxHeight: number;
-  }>({
-    placement: "below",
-    top: 0,
-    bottom: 0,
-    left: 0,
-    minWidth: 0,
-    maxHeight: 240,
-  });
-  const PERIOD_OPTIONS: { value: Period; label: string }[] = [
-    { value: "last_session", label: "Last session" },
-    { value: "day", label: "Today" },
-    { value: "week", label: "Week" },
-    { value: "month", label: "Month" },
-    { value: "year", label: "Year" },
-  ];
+  const [micMenuPos, setMicMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
   const periodLabel = () =>
     PERIOD_OPTIONS.find((o) => o.value === period())?.label ?? "Today";
 
@@ -167,6 +160,7 @@ export default function TrayPopoverView() {
   let unlistenSessions: (() => void) | null = null;
   let unlistenStats: (() => void) | null = null;
   let unlistenModes: (() => void) | null = null;
+  let unlistenFocus: (() => void) | null = null;
 
   async function refreshStats() {
     try {
@@ -290,7 +284,7 @@ export default function TrayPopoverView() {
     // when the user clicks outside the popover entirely.
     try {
       const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().onFocusChanged(({ payload }) => {
+      unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload }) => {
         if (!payload) {
           setModeMenuOpen(false);
           setPeriodMenuOpen(false);
@@ -308,6 +302,7 @@ export default function TrayPopoverView() {
     unlistenSessions?.();
     unlistenStats?.();
     unlistenModes?.();
+    unlistenFocus?.();
   });
 
   async function pickMode(id: string) {
@@ -427,7 +422,6 @@ export default function TrayPopoverView() {
   function openRepolishPicker(sessionId: number) {
     const trigger = repolishTriggerRefs.get(sessionId);
     if (trigger) {
-      const r = trigger.getBoundingClientRect();
       // Right-align to the trigger via fixed coords so the dropdown
       // can escape the popover root's overflow-hidden clipping. The
       // tray popover is a small window — a Recent row near the bottom
@@ -435,34 +429,22 @@ export default function TrayPopoverView() {
       // above when there's more headroom there. Either way, cap
       // maxHeight to whichever side we land on so the list scrolls
       // instead of clipping past the window edge.
-      const viewportH = window.innerHeight;
-      const menuW = Math.max(r.width, 200);
-      const left = Math.max(8, r.right - menuW);
-      const spaceBelow = viewportH - r.bottom - 8;
-      const spaceAbove = r.top - 8;
-      // ~28px header + 6 modes × ~32px row; below this threshold the
-      // flip-up branch is preferable if we have more room up there.
-      const desiredH = 220;
-      const placeBelow = spaceBelow >= desiredH || spaceBelow >= spaceAbove;
-      if (placeBelow) {
-        setRepolishMenuPos({
-          placement: "below",
-          top: r.bottom + 4,
-          bottom: 0,
-          left,
-          minWidth: menuW,
-          maxHeight: spaceBelow,
-        });
-      } else {
-        setRepolishMenuPos({
-          placement: "above",
-          top: 0,
-          bottom: viewportH - r.top + 4,
-          left,
-          minWidth: menuW,
-          maxHeight: spaceAbove,
-        });
-      }
+      setRepolishMenuPos(
+        computeDropdownPosition({
+          trigger: trigger.getBoundingClientRect(),
+          viewport: {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          },
+          minMenuWidth: 200,
+          // ~28px header + 6 modes × ~32px row; below this threshold
+          // the flip-up branch is preferable if we have more room up
+          // there.
+          desiredHeight: 220,
+          preferred: "auto",
+          align: "end",
+        }),
+      );
     }
     // Clear any stale per-row error so the picker opens clean.
     setRepolishError(null);
@@ -639,15 +621,18 @@ export default function TrayPopoverView() {
                   onClick={() => {
                     const next = !periodMenuOpen();
                     if (next && periodTriggerRef) {
-                      const r = periodTriggerRef.getBoundingClientRect();
-                      const menuW = Math.max(r.width, 140);
-                      const right = r.right;
-                      const left = Math.max(8, right - menuW);
-                      setPeriodMenuPos({
-                        top: r.bottom + 4,
-                        left,
-                        minWidth: menuW,
-                      });
+                      setPeriodMenuPos(
+                        computeDropdownPosition({
+                          trigger: periodTriggerRef.getBoundingClientRect(),
+                          viewport: {
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                          },
+                          minMenuWidth: 140,
+                          preferred: "below",
+                          align: "end",
+                        }),
+                      );
                     }
                     setPeriodMenuOpen(next);
                   }}
@@ -676,7 +661,9 @@ export default function TrayPopoverView() {
                   role="listbox"
                   style={{
                     position: "fixed",
-                    top: `${periodMenuPos().top}px`,
+                    ...(periodMenuPos().placement === "above"
+                      ? { bottom: `${periodMenuPos().bottom}px` }
+                      : { top: `${periodMenuPos().top}px` }),
                     left: `${periodMenuPos().left}px`,
                     "min-width": `${periodMenuPos().minWidth}px`,
                   }}
@@ -901,15 +888,18 @@ export default function TrayPopoverView() {
                       // trigger's bounding rect so the listbox can
                       // escape the clipped container without bringing
                       // a positioning library along for the ride.
-                      const r = modeTriggerRef.getBoundingClientRect();
-                      const menuW = Math.max(r.width, 224);
-                      const right = r.right;
-                      const left = Math.max(8, right - menuW);
-                      setModeMenuPos({
-                        top: r.bottom + 4,
-                        left,
-                        minWidth: menuW,
-                      });
+                      setModeMenuPos(
+                        computeDropdownPosition({
+                          trigger: modeTriggerRef.getBoundingClientRect(),
+                          viewport: {
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                          },
+                          minMenuWidth: 224,
+                          preferred: "below",
+                          align: "end",
+                        }),
+                      );
                     }
                     setModeMenuOpen(next);
                   }}
@@ -944,7 +934,9 @@ export default function TrayPopoverView() {
                   role="listbox"
                   style={{
                     position: "fixed",
-                    top: `${modeMenuPos().top}px`,
+                    ...(modeMenuPos().placement === "above"
+                      ? { bottom: `${modeMenuPos().bottom}px` }
+                      : { top: `${modeMenuPos().top}px` }),
                     left: `${modeMenuPos().left}px`,
                     "min-width": `${modeMenuPos().minWidth}px`,
                   }}
@@ -1004,35 +996,21 @@ export default function TrayPopoverView() {
                       // up there — the Mic row lives mid-popover so a
                       // 6-device list otherwise clips at the bottom
                       // window edge.
-                      const r = micTriggerRef.getBoundingClientRect();
-                      const viewportH = window.innerHeight;
-                      const menuW = Math.min(280, Math.max(r.width, 240));
-                      const left = Math.max(8, r.right - menuW);
-                      const spaceBelow = viewportH - r.bottom - 8;
-                      const spaceAbove = r.top - 8;
-                      // ~"Follow system default" + divider + 6 rows.
-                      const desiredH = 220;
-                      const placeBelow =
-                        spaceBelow >= desiredH || spaceBelow >= spaceAbove;
-                      if (placeBelow) {
-                        setMicMenuPos({
-                          placement: "below",
-                          top: r.bottom + 4,
-                          bottom: 0,
-                          left,
-                          minWidth: menuW,
-                          maxHeight: spaceBelow,
-                        });
-                      } else {
-                        setMicMenuPos({
-                          placement: "above",
-                          top: 0,
-                          bottom: viewportH - r.top + 4,
-                          left,
-                          minWidth: menuW,
-                          maxHeight: spaceAbove,
-                        });
-                      }
+                      setMicMenuPos(
+                        computeDropdownPosition({
+                          trigger: micTriggerRef.getBoundingClientRect(),
+                          viewport: {
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                          },
+                          minMenuWidth: 240,
+                          maxMenuWidth: 280,
+                          // ~"Follow system default" + divider + 6 rows.
+                          desiredHeight: 220,
+                          preferred: "auto",
+                          align: "end",
+                        }),
+                      );
                     }
                     setMicMenuOpen(next);
                   }}
@@ -1374,325 +1352,3 @@ export default function TrayPopoverView() {
     </div>
   );
 }
-
-function StatusDot(props: { tone: "ok" | "off" | "warn" }) {
-  const color =
-    props.tone === "ok"
-      ? "var(--color-success)"
-      : props.tone === "warn"
-        ? "var(--color-warning)"
-        : "var(--color-ink-faint)";
-  return (
-    <span
-      class="inline-block h-2 w-2 rounded-full"
-      style={{ background: color }}
-    />
-  );
-}
-
-function stageLabel(stage: Stage): string {
-  switch (stage) {
-    case "listening":
-      return "Listening…";
-    case "transcribing":
-      return "Transcribing…";
-    case "polishing":
-      return "Polishing…";
-    case "done":
-      return "Done";
-    case "error":
-      return "Error";
-    case "canceled":
-      return "Canceled";
-    default:
-      return "…";
-  }
-}
-
-function InProgressRow(props: {
-  entry: InProgressEntry;
-  onCancel: () => void;
-}) {
-  return (
-    <div class="group flex items-center gap-2 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
-      <span aria-hidden="true" class="text-[14px] leading-none">
-        {props.entry.mode_icon}
-      </span>
-      <Spinner />
-      <span
-        class="pill-shimmer flex-1 truncate text-[12px] font-medium leading-none"
-        style={{
-          "--shimmer-base": "var(--color-ink-mute)",
-          "--shimmer-tint": "var(--color-violet, #a78bfa)",
-          "letter-spacing": "0.01em",
-        }}
-      >
-        {stageLabel(props.entry.stage)}
-      </span>
-      <span class="shrink-0 text-[11px] text-[var(--color-ink-faint)]">
-        {props.entry.mode_name}
-      </span>
-      <button
-        type="button"
-        class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
-        title="Cancel session"
-        aria-label="Cancel session"
-        onClick={(e) => {
-          e.stopPropagation();
-          props.onCancel();
-        }}
-      >
-        <svg
-          width="14"
-          height="14"
-          viewBox="0 0 24 24"
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2"
-          stroke-linecap="round"
-          stroke-linejoin="round"
-          aria-hidden="true"
-        >
-          <line x1="6" y1="6" x2="18" y2="18" />
-          <line x1="6" y1="18" x2="18" y2="6" />
-        </svg>
-      </button>
-    </div>
-  );
-}
-
-function Spinner() {
-  return (
-    <svg
-      class="animate-spin"
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="var(--color-violet, #a78bfa)"
-      stroke-width="2.5"
-      stroke-linecap="round"
-      aria-hidden="true"
-    >
-      <path d="M12 3a9 9 0 1 0 9 9" />
-    </svg>
-  );
-}
-
-function SmallSpinner() {
-  // Sized to match the 14×14 svgs already used by the row actions so
-  // the spinner slots in without shifting layout.
-  return (
-    <svg
-      class="animate-spin"
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="var(--color-accent)"
-      stroke-width="2.5"
-      stroke-linecap="round"
-      aria-hidden="true"
-    >
-      <path d="M12 3a9 9 0 1 0 9 9" />
-    </svg>
-  );
-}
-
-function shortRepolishError(message: string): string {
-  // The backend returns string errors from `Result<_, String>`. Trim
-  // boilerplate (`anyhow` chain, IPC framing) for the dense popover.
-  const trimmed = message.replace(/^Error:\s*/i, "").trim();
-  if (trimmed.length <= 80) return trimmed;
-  return trimmed.slice(0, 77) + "…";
-}
-
-function LocalBadge() {
-  // Quiet reminder, no popover, no tooltip on the badge itself —
-  // if the user cares they'll click through to the Privacy tab.
-  // DESIGN.md §5.5.
-  return (
-    <button
-      type="button"
-      class="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
-      onClick={() => openSettingsWindow()}
-      title="Audio never leaves this Mac"
-    >
-      <svg
-        width="11"
-        height="11"
-        viewBox="0 0 24 24"
-        fill="none"
-        stroke="currentColor"
-        stroke-width="2"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-        aria-hidden="true"
-      >
-        <path d="M12 21s-7-4-7-10V6l7-3 7 3v5c0 6-7 10-7 10z" />
-      </svg>
-      <span>Local</span>
-    </button>
-  );
-}
-
-function Toggle(props: { checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={props.checked}
-      onClick={() => props.onChange(!props.checked)}
-      class="relative inline-flex h-[22px] w-[38px] shrink-0 items-center rounded-full ring-1 ring-inset transition-colors"
-      classList={{
-        "bg-[var(--color-accent)] ring-transparent": props.checked,
-        "bg-[var(--color-control)] ring-[var(--color-border-strong)]":
-          !props.checked,
-      }}
-    >
-      <span
-        class="toggle-knob inline-block h-[18px] w-[18px] transform rounded-full transition-transform"
-        classList={{
-          "translate-x-[18px]": props.checked,
-          "translate-x-[2px]": !props.checked,
-        }}
-      />
-    </button>
-  );
-}
-
-function AppearanceToggle(props: {
-  value: "light" | "dark";
-  onChange: (v: "light" | "dark") => void;
-}) {
-  return (
-    <div
-      class="inline-flex items-center rounded-full p-[3px] ring-1 ring-inset ring-[var(--color-border)]"
-      style={{ background: "var(--color-control)" }}
-      role="radiogroup"
-      aria-label="Appearance"
-    >
-      <AppearanceHalf
-        active={props.value === "light"}
-        label="Light"
-        onClick={() => props.onChange("light")}
-      >
-        <SunGlyph />
-      </AppearanceHalf>
-      <AppearanceHalf
-        active={props.value === "dark"}
-        label="Dark"
-        onClick={() => props.onChange("dark")}
-      >
-        <MoonGlyph />
-      </AppearanceHalf>
-    </div>
-  );
-}
-
-function AppearanceHalf(props: {
-  active: boolean;
-  label: string;
-  onClick: () => void;
-  children: any;
-}) {
-  return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={props.active}
-      aria-label={props.label}
-      class="inline-flex h-6 w-7 items-center justify-center rounded-full transition-all"
-      classList={{
-        "hover:text-[var(--color-ink)]": !props.active,
-      }}
-      style={{
-        background: props.active ? "var(--color-surface-raised)" : "transparent",
-        "backdrop-filter": props.active ? "var(--glass-blur)" : "none",
-        "-webkit-backdrop-filter": props.active ? "var(--glass-blur)" : "none",
-        "box-shadow": props.active ? "var(--glass-shadow-stack-sm)" : "none",
-        color: props.active
-          ? "var(--color-ink)"
-          : "var(--color-ink-mute)",
-      }}
-      onClick={props.onClick}
-    >
-      {props.children}
-    </button>
-  );
-}
-
-function SunGlyph() {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="1.5"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <circle cx="12" cy="12" r="3.5" />
-      <line x1="12" y1="2" x2="12" y2="4" />
-      <line x1="12" y1="20" x2="12" y2="22" />
-      <line x1="2" y1="12" x2="4" y2="12" />
-      <line x1="20" y1="12" x2="22" y2="12" />
-      <line x1="4.9" y1="4.9" x2="6.3" y2="6.3" />
-      <line x1="17.7" y1="17.7" x2="19.1" y2="19.1" />
-      <line x1="4.9" y1="19.1" x2="6.3" y2="17.7" />
-      <line x1="17.7" y1="6.3" x2="19.1" y2="4.9" />
-    </svg>
-  );
-}
-
-function MoonGlyph() {
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="1.5"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z" />
-    </svg>
-  );
-}
-
-function formatDuration(totalSeconds: number): string {
-  if (!Number.isFinite(totalSeconds)) return "0s";
-  const t = Math.round(totalSeconds);
-  if (t < 1) return "0s";
-  if (t < 60) return `${t}s`;
-  if (t < 3600) {
-    const m = Math.floor(t / 60);
-    const s = t - m * 60;
-    return s === 0 ? `${m}m` : `${m}m ${s}s`;
-  }
-  const h = Math.floor(t / 3600);
-  const m = Math.floor((t - h * 3600) / 60);
-  return m === 0 ? `${h}h` : `${h}h ${m}m`;
-}
-
-function sessionsSubLine(n: number): string {
-  if (n === 0) return "No sessions yet";
-  if (n === 1) return "1 session";
-  return `${n} sessions`;
-}
-
-function ago(tsSeconds: number): string {
-  const now = Date.now() / 1000;
-  const delta = Math.max(0, Math.floor(now - tsSeconds));
-  if (delta < 60) return `${delta}s`;
-  if (delta < 3600) return `${Math.floor(delta / 60)}m`;
-  if (delta < 86_400) return `${Math.floor(delta / 3600)}h`;
-  return `${Math.floor(delta / 86_400)}d`;
-}
-
