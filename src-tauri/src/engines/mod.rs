@@ -37,7 +37,7 @@ pub type ChunkCallback = Box<dyn Fn(&str) + Send + Sync + 'static>;
 
 #[async_trait::async_trait]
 pub trait SttEngine: Send + Sync {
-    /// `wav` is 16 kHz mono PCM-16 (the shape `audio::stop_and_encode`
+    /// `wav` is 16 kHz mono PCM-16 (the shape `audio::encode_recorded`
     /// produces). `language` is a Whisper code or `None` for auto.
     /// `on_segment` (if Some) receives cumulative transcript text as
     /// segments arrive — used by the streaming pill.

@@ -140,7 +140,7 @@ impl SttEngine for WhisperLocalEngine {
 
 // Re-validate spec defensively even though we produced the WAV ourselves.
 // `pub(crate)` because parakeet_local reuses this — both engines consume
-// the same 16 kHz mono PCM contract from `audio::stop_and_encode`.
+// the same 16 kHz mono PCM contract from `audio::encode_recorded`.
 #[cfg(feature = "local-engines")]
 pub(crate) fn decode_wav_to_f32_mono_16k(wav: &[u8]) -> anyhow::Result<Vec<f32>> {
     use std::io::Cursor;

@@ -662,6 +662,20 @@ impl SessionManager {
             }
         };
 
+        // Release the cpal input stream RIGHT NOW, on the calling
+        // thread, before any further bookkeeping or task spawn. Without
+        // this the mic stayed hot for the tokio scheduling latency of
+        // the spawned task plus any pending `SnapshotWav` from the
+        // speculative decoder — on top of macOS Control Center's own
+        // ~few-second mic-indicator release delay. Calling `stop` here
+        // makes that perceived latency a function of macOS alone.
+        // Synchronous and short: the audio thread only has to drop the
+        // stream; the heavier WAV encode runs in the spawned task below
+        // via `encode_recorded`.
+        if let Err(e) = self.audio.stop() {
+            log::warn!("end_recording: audio.stop failed: {e}");
+        }
+
         // Escape stays grabbed past the end of recording — the user can
         // still cancel during the transcribe / polish stages. Disarm is
         // owned by `PipelineGuard::Drop` (covers success, all error
@@ -673,6 +687,11 @@ impl SessionManager {
         let session = match self.sessions.lock().get(&sid).cloned() {
             Some(s) => s,
             None => {
+                // active_recording was cleared and the audio stream
+                // dropped above, so this defensive branch can return
+                // cleanly without leaking the mic. The stashed sample
+                // buffer goes with the next `Start` (or the next
+                // `encode_recorded`, whichever fires first).
                 log::warn!("end_recording: session {sid} missing from map");
                 return;
             }
@@ -687,12 +706,13 @@ impl SessionManager {
 
         tauri::async_runtime::spawn(async move {
             let wav_result: Result<Option<Vec<u8>>, String> = if too_short {
-                // Drain the audio buffer regardless so the next start()
-                // reaches `Some(cap)`-less state cleanly.
-                let _ = manager.audio.stop_and_encode();
+                // Drain the stashed buffer so the next start()'s
+                // `stashed = None` cleanup doesn't have to (cheap
+                // either way — it's just a take()).
+                let _ = manager.audio.encode_recorded();
                 Ok(None)
             } else {
-                match manager.audio.stop_and_encode() {
+                match manager.audio.encode_recorded() {
                     Ok(buf) => Ok(Some(buf)),
                     Err(e) => Err(format!("{e}")),
                 }
@@ -731,6 +751,31 @@ impl SessionManager {
 
     /// Cancel a specific session (popover X / cancel hotkey path).
     pub fn cancel_session(self: &Arc<Self>, id: SessionId, app: &AppHandle<Wry>) {
+        // Release the cpal input stream FIRST if this cancel targets
+        // the foreground recording, BEFORE the sessions-map lookup
+        // below. That ordering means even a defensive "session missing
+        // from map" early return can't leak the mic — every code path
+        // out of `cancel_session` that observed `active_recording ==
+        // Some(id)` has already dropped the stream by the time it
+        // returns. The stream drop is cheap (audio thread just calls
+        // `AudioOutputUnitStop` + `Dispose`); the WAV encode is
+        // skipped entirely on the cancel path.
+        let was_foreground = {
+            let mut active = self.active_recording.lock();
+            if active.as_ref() == Some(&id) {
+                *active = None;
+                true
+            } else {
+                false
+            }
+        };
+        if was_foreground {
+            if let Err(e) = self.audio.stop() {
+                log::warn!("cancel_session({id}): audio.stop failed: {e}");
+            }
+            crate::hotkey::disarm_cancel(app);
+        }
+
         let session = match self.sessions.lock().get(&id).cloned() {
             Some(s) => s,
             None => {
@@ -744,25 +789,6 @@ impl SessionManager {
         // Drop is a no-op once released.
         if let Some(g) = session.busy_guard.lock().take() {
             g.release();
-        }
-
-        // If this is the foreground recording, tear down the audio
-        // capture and the Escape grab. The pipeline task picks up the
-        // cancel flag and emits Canceled.
-        let was_foreground = {
-            let mut active = self.active_recording.lock();
-            if active.as_ref() == Some(&id) {
-                *active = None;
-                true
-            } else {
-                false
-            }
-        };
-
-        if was_foreground {
-            // Drain the audio buffer so cpal's input stream is freed.
-            let _ = self.audio.stop_and_encode();
-            crate::hotkey::disarm_cancel(app);
         }
 
         // Pill cleanup runs for both foreground (cancel during recording)

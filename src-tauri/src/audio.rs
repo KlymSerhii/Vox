@@ -245,13 +245,32 @@ enum Command {
     /// `cpal::Host::input_devices()` is surfaced as
     /// `AudioError::ConfiguredDeviceUnavailable` — `begin_capture`
     /// deliberately does NOT silently fall back to the system default.
+    ///
+    /// Any samples stashed by a previous [`Command::Stop`] that were
+    /// never consumed by [`Command::EncodeRecorded`] (e.g. cancel) are
+    /// discarded here so the next session can't accidentally pick up
+    /// stale audio.
     Start(Option<String>, Sender<Result<(), AudioError>>),
-    StopAndEncode(Sender<Result<Vec<u8>, AudioError>>),
+    /// Drop the cpal input stream (releasing the macOS mic indicator)
+    /// and stash the captured sample buffer for a follow-up
+    /// [`Command::EncodeRecorded`] call. Returns immediately after the
+    /// stream's `Drop` runs — does **not** pay for WAV encoding, so the
+    /// caller can release the mic before doing any heavier post-recording
+    /// work. Idempotent: a second `Stop` with no active capture replies
+    /// `Ok` and leaves the stash untouched.
+    Stop(Sender<Result<(), AudioError>>),
+    /// Encode the most-recently-stashed sample buffer (set by
+    /// [`Command::Stop`]) to a 16 kHz mono PCM-16 WAV. Consumes the
+    /// stash — a follow-up call with nothing stashed returns
+    /// `Ok(Vec::new())`, matching the previous `StopAndEncode` "no
+    /// active capture" arm so callers can no-op cheaply on the
+    /// too-short path.
+    EncodeRecorded(Sender<Result<Vec<u8>, AudioError>>),
     /// Returns a `(wav_bytes, pcm_secs)` snapshot of the current capture
     /// buffer WITHOUT stopping the stream. The WAV is the same shape
-    /// `stop_and_encode` produces (16 kHz mono PCM-16) so it can flow
-    /// straight into [`crate::engines::SttEngine::transcribe`]. Used by
-    /// the speculative streaming decoder
+    /// [`Command::EncodeRecorded`] produces (16 kHz mono PCM-16) so it
+    /// can flow straight into [`crate::engines::SttEngine::transcribe`].
+    /// Used by the speculative streaming decoder
     /// (`session.rs::spawn_speculative_decoder`) so we can run partial
     /// Whisper passes while the user is still talking. Returns
     /// `Ok(None)` when no capture is currently active.
@@ -297,17 +316,42 @@ impl AudioHandle {
         reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
     }
 
-    pub fn stop_and_encode(&self) -> Result<Vec<u8>, AudioError> {
+    /// Drop the active cpal stream so the macOS mic indicator can
+    /// start its release timer immediately. Captured samples are
+    /// stashed on the audio thread for a follow-up [`Self::encode_recorded`]
+    /// call. Cheap — does not pay for WAV encoding. Idempotent: a
+    /// second `stop` with no active capture is a clean no-op.
+    ///
+    /// Synchronous (waits for the audio thread to drop the stream)
+    /// so the caller can assume the mic is released the moment this
+    /// returns. The wait is short — the audio thread's only blocking
+    /// work between commands is a pending `SnapshotWav` from the
+    /// speculative decoder, which clones the sample buffer and encodes
+    /// a WAV.
+    pub fn stop(&self) -> Result<(), AudioError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.tx
-            .send(Command::StopAndEncode(reply_tx))
+            .send(Command::Stop(reply_tx))
+            .map_err(|_| AudioError::ThreadDied)?;
+        reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
+    }
+
+    /// Encode the stashed sample buffer left behind by [`Self::stop`]
+    /// to a 16 kHz mono PCM-16 WAV. Consumes the stash — a subsequent
+    /// call with nothing stashed (or before any `stop`) returns
+    /// `Ok(Vec::new())`, matching the empty-buffer semantics callers
+    /// rely on for the too-short / silent-cancel paths.
+    pub fn encode_recorded(&self) -> Result<Vec<u8>, AudioError> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.tx
+            .send(Command::EncodeRecorded(reply_tx))
             .map_err(|_| AudioError::ThreadDied)?;
         reply_rx.recv().map_err(|_| AudioError::ThreadDied)?
     }
 
     /// Take a non-destructive snapshot of the in-progress capture
     /// buffer, downmixed to mono and resampled to 16 kHz, encoded as a
-    /// 16 kHz mono PCM-16 WAV (the same shape `stop_and_encode`
+    /// 16 kHz mono PCM-16 WAV (the same shape `encode_recorded`
     /// produces). The capture stream keeps running so subsequent
     /// snapshots will see additional samples. Returns `Ok(None)` if no
     /// capture is active. Used by the speculative streaming decoder to
@@ -327,6 +371,20 @@ impl AudioHandle {
 
 struct ActiveCapture {
     stream: cpal::Stream,
+    samples: Arc<Mutex<Vec<f32>>>,
+    input_sr: u32,
+    input_channels: u16,
+}
+
+/// Stream-less snapshot of a just-stopped capture. The audio thread
+/// parks this between [`Command::Stop`] (which builds it from a moved
+/// [`ActiveCapture`]) and [`Command::EncodeRecorded`] (which encodes
+/// it to WAV and clears the slot). Holding it here lets the cpal
+/// `Stream` drop the moment `Stop` is processed — the macOS mic
+/// indicator can start its release timer without waiting on the
+/// WAV encode — while still keeping the captured samples available
+/// for the post-recording STT pass.
+struct StashedRecording {
     samples: Arc<Mutex<Vec<f32>>>,
     input_sr: u32,
     input_channels: u16,
@@ -359,10 +417,21 @@ fn audio_thread(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
 
 fn audio_thread_inner(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
     let mut active: Option<ActiveCapture> = None;
+    // Holds the most-recently-stopped recording between `Stop` and a
+    // follow-up `EncodeRecorded`. Cleared on the next `Start` so a
+    // canceled session that never asked for its WAV (cancel paths skip
+    // `encode_recorded`) doesn't leak its sample buffer into the next
+    // session's encode call.
+    let mut stashed: Option<StashedRecording> = None;
 
     for cmd in rx {
         match cmd {
             Command::Start(device_name, reply) => {
+                // A `Stop` without a matching `EncodeRecorded` (the
+                // cancel-mid-recording path) leaves samples in the
+                // stash. Drop them here so the next session can't
+                // observe stale audio through `encode_recorded`.
+                stashed = None;
                 if active.is_some() {
                     let _ = reply.send(Ok(()));
                     continue;
@@ -378,16 +447,33 @@ fn audio_thread_inner(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
                     }
                 }
             }
-            Command::StopAndEncode(reply) => {
-                let Some(cap) = active.take() else {
+            Command::Stop(reply) => {
+                if let Some(cap) = active.take() {
+                    // Drop the stream FIRST so the cpal `AudioUnit`'s
+                    // `Drop` (which calls `AudioOutputUnitStop` →
+                    // `AudioComponentInstanceDispose`) runs before
+                    // anything else. The macOS Control Center
+                    // mic-in-use indicator can only start its release
+                    // timer once that disposal happens.
+                    drop(cap.stream);
                     rms_bits.store(0, Ordering::Relaxed);
+                    stashed = Some(StashedRecording {
+                        samples: cap.samples,
+                        input_sr: cap.input_sr,
+                        input_channels: cap.input_channels,
+                    });
+                } else {
+                    rms_bits.store(0, Ordering::Relaxed);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Command::EncodeRecorded(reply) => {
+                let Some(s) = stashed.take() else {
                     let _ = reply.send(Ok(Vec::new()));
                     continue;
                 };
-                drop(cap.stream);
-                rms_bits.store(0, Ordering::Relaxed);
-                let raw = cap.samples.lock().clone();
-                let _ = reply.send(postprocess_to_wav(&raw, cap.input_sr, cap.input_channels));
+                let raw = s.samples.lock().clone();
+                let _ = reply.send(postprocess_to_wav(&raw, s.input_sr, s.input_channels));
             }
             Command::SnapshotWav(reply) => {
                 let Some(cap) = active.as_ref() else {
@@ -622,4 +708,49 @@ fn encode_wav_pcm16(samples: &[f32], sr: u32) -> Result<Vec<u8>, AudioError> {
         writer.finalize()?;
     }
     Ok(cursor.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Idle handle (no `Start` ever issued): both `stop` and
+    /// `encode_recorded` must be safe no-ops. `stop` returns `Ok(())`
+    /// — there's nothing to drop — and `encode_recorded` returns an
+    /// empty Vec, matching the contract callers rely on for the
+    /// too-short / silent-cancel paths.
+    #[test]
+    fn stop_and_encode_recorded_are_no_ops_when_idle() {
+        let handle = AudioHandle::spawn().expect("spawn audio thread");
+        handle.stop().expect("idle stop");
+        let wav = handle.encode_recorded().expect("idle encode");
+        assert!(wav.is_empty());
+    }
+
+    /// `stop` followed by `stop` must stay a no-op rather than
+    /// erroring or replaying state — the session-side defensive
+    /// paths rely on idempotence (cancel_session and end_recording
+    /// can both legitimately fire `stop` in rapid succession).
+    #[test]
+    fn double_stop_is_idempotent() {
+        let handle = AudioHandle::spawn().expect("spawn audio thread");
+        handle.stop().expect("first stop");
+        handle.stop().expect("second stop");
+        let wav = handle.encode_recorded().expect("encode after double-stop");
+        assert!(wav.is_empty());
+    }
+
+    /// `encode_recorded` consumes the stash, so a follow-up call
+    /// without an intervening `stop` returns empty. This is what lets
+    /// the cancel path's "skip encode entirely" choice be safe — the
+    /// next session's encode can't accidentally pick up stale samples.
+    #[test]
+    fn encode_recorded_is_consumed_once() {
+        let handle = AudioHandle::spawn().expect("spawn audio thread");
+        handle.stop().expect("stop");
+        let first = handle.encode_recorded().expect("first encode");
+        assert!(first.is_empty());
+        let second = handle.encode_recorded().expect("second encode");
+        assert!(second.is_empty());
+    }
 }

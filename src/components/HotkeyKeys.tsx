@@ -8,6 +8,10 @@ import { formatHotkeyTokens } from "../lib/hotkey";
  * `⇧ Shift`, `⌃ Ctrl` — so the chord is legible to users who don't
  * recognise the symbols. Trailing key glyphs (`.`, `M`, `?`) render
  * on their own.
+ *
+ * `Mods:Cmd+Alt` renders as the bare modifiers; `Tap2:Alt` renders
+ * the modifier followed by a small `×2` suffix attached to the last
+ * keycap so the double-tap is visually compact.
  */
 export function HotkeyKeys(props: { spec: string | null | undefined }) {
   const tokens = () => formatHotkeyTokens(props.spec);
@@ -15,8 +19,15 @@ export function HotkeyKeys(props: { spec: string | null | undefined }) {
     <span class="inline-flex items-center gap-1 align-middle">
       <For each={tokens()}>
         {(t, i) => (
-          <>
-            <Show when={i() > 0}>
+          <Show
+            when={t.kind !== "tap2"}
+            fallback={
+              <span class="text-[9px] font-medium text-[var(--color-ink-faint)]">
+                {t.label}
+              </span>
+            }
+          >
+            <Show when={i() > 0 && tokens()[i() - 1].kind !== "tap2"}>
               <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
             </Show>
             <span class="keycap">
@@ -27,7 +38,7 @@ export function HotkeyKeys(props: { spec: string | null | undefined }) {
                 </span>
               </Show>
             </span>
-          </>
+          </Show>
         )}
       </For>
     </span>

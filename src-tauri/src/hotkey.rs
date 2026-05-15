@@ -12,6 +12,7 @@
 //! - **Cancel / mode-cycle** walk a small fallback list and persist any
 //!   substitution back to settings; their pickers are visible in the UI.
 
+use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -113,27 +114,60 @@ impl ActiveHotkeyState {
     }
 }
 
+/// Parse a Tauri-style shortcut spec like `Cmd+Alt+Period` / `F13` /
+/// `Escape` into a `Shortcut`. Defers to `global_hotkey::HotKey::from_str`
+/// so the capture UI can emit any combination the underlying plugin
+/// already understands (letter / digit / punctuation / function keys
+/// gated by zero-or-more `Cmd|Ctrl|Alt|Shift|CommandOrControl` modifiers).
+///
+/// Defense in depth: refuses modifier-less specs unless the key is a
+/// function key or Escape, mirroring `validateHotkeySpec` in the capture
+/// UI. A hand-edited `vox-settings.json` containing `"hotkey": "M"`
+/// must not be able to install a bare-letter global hotkey. v2 wire
+/// formats (`Mods:` / `Tap2:`) bind via `mac_chord.rs` rather than the
+/// shortcut plugin — refuse them here so a stray callsite can't smuggle
+/// one through `tauri-plugin-global-shortcut`.
 fn shortcut_from_key(id: &str) -> Option<Shortcut> {
-    match id {
-        "F13" => Some(Shortcut::new(None, Code::F13)),
-        "F14" => Some(Shortcut::new(None, Code::F14)),
-        "F15" => Some(Shortcut::new(None, Code::F15)),
-        "Escape" | "Esc" => Some(Shortcut::new(None, Code::Escape)),
-        "Cmd+Alt+Period" => Some(Shortcut::new(
-            Some(Modifiers::META | Modifiers::ALT),
-            Code::Period,
-        )),
-        "Alt+M" => Some(Shortcut::new(Some(Modifiers::ALT), Code::KeyM)),
-        "Alt+Shift+M" => Some(Shortcut::new(
-            Some(Modifiers::ALT | Modifiers::SHIFT),
-            Code::KeyM,
-        )),
-        "CommandOrControl+Shift+M" | "Cmd+Shift+M" => Some(Shortcut::new(
-            Some(Modifiers::META | Modifiers::SHIFT),
-            Code::KeyM,
-        )),
-        _ => None,
+    if id.starts_with("Mods:") || id.starts_with("Tap2:") {
+        return None;
     }
+    let sc = Shortcut::from_str(id).ok()?;
+    if sc.mods.is_empty() && !is_safe_alone(sc.key) {
+        return None;
+    }
+    // Mirror the JS validator's other rule: lone Shift + key is not
+    // a valid global hotkey either.
+    if sc.mods == Modifiers::SHIFT && !is_safe_alone(sc.key) {
+        return None;
+    }
+    Some(sc)
+}
+
+fn is_safe_alone(code: Code) -> bool {
+    matches!(
+        code,
+        Code::F1
+            | Code::F2
+            | Code::F3
+            | Code::F4
+            | Code::F5
+            | Code::F6
+            | Code::F7
+            | Code::F8
+            | Code::F9
+            | Code::F10
+            | Code::F11
+            | Code::F12
+            | Code::F13
+            | Code::F14
+            | Code::F15
+            | Code::F16
+            | Code::F17
+            | Code::F18
+            | Code::F19
+            | Code::F20
+            | Code::Escape
+    )
 }
 
 /// Result of walking `[configured] + fallbacks` until one binds.
@@ -510,10 +544,44 @@ fn register_push_to_talk<R: Runtime>(
     }
 
     #[cfg(target_os = "macos")]
+    if let Some(target) = mac_chord::try_parse_double_tap(preferred) {
+        match install_double_tap(app, target, manager.clone()) {
+            Ok(()) => {
+                log::info!(
+                    "push-to-talk: double-tap '{preferred}' installed via CGEventTap"
+                );
+                return ActiveHotkey {
+                    configured: preferred.to_string(),
+                    bound: preferred.to_string(),
+                    fell_back: false,
+                    mechanism: "chord".to_string(),
+                    error: None,
+                    error_chain: Vec::new(),
+                };
+            }
+            Err(e) => {
+                let friendly = friendly_chord_error(&e);
+                log::error!(
+                    "push-to-talk: double-tap '{preferred}' install failed: {e}. \
+                     NOT falling back — user chose a double-tap. {friendly}"
+                );
+                return ActiveHotkey {
+                    configured: preferred.to_string(),
+                    bound: String::new(),
+                    fell_back: false,
+                    mechanism: String::new(),
+                    error: Some(friendly.clone()),
+                    error_chain: vec![format!("'{preferred}' (tap2): {e}"), friendly],
+                };
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     if let Some(spec) = mac_chord::try_parse_chord(preferred) {
         match install_chord(app, spec, manager.clone()) {
             Ok(()) => {
-                log::error!("push-to-talk: chord '{preferred}' installed via CGEventTap");
+                log::info!("push-to-talk: chord '{preferred}' installed via CGEventTap");
                 return ActiveHotkey {
                     configured: preferred.to_string(),
                     bound: preferred.to_string(),
@@ -724,8 +792,50 @@ fn install_chord<R: Runtime>(
         },
     )?;
 
-    // Keep the handle alive on the Tauri-managed state. Lazily-manage if
-    // the host hasn't installed `ActiveHotkeyState` yet.
+    store_chord_handle(app, handle);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install_double_tap<R: Runtime>(
+    app: &AppHandle<R>,
+    target: mac_chord::DoubleTapModifier,
+    manager: Arc<SessionManager>,
+) -> Result<(), mac_chord::ChordError> {
+    let app_press = app.clone();
+    let manager_press = manager.clone();
+    let app_release = app.clone();
+    let manager_release = manager.clone();
+    let handle = mac_chord::install_double_tap(
+        target,
+        move || {
+            if let Some(wry_app) = try_into_wry(&app_press) {
+                if settings::prefs(&app_press).hands_free_enabled {
+                    if manager_press.foreground_id().is_some() {
+                        manager_press.end_recording(wry_app);
+                    } else {
+                        handle_begin(&wry_app, &manager_press);
+                    }
+                } else {
+                    handle_begin(&wry_app, &manager_press);
+                }
+            }
+        },
+        move || {
+            if !settings::prefs(&app_release).hands_free_enabled {
+                if let Some(wry_app) = try_into_wry(&app_release) {
+                    manager_release.end_recording(wry_app);
+                }
+            }
+        },
+    )?;
+
+    store_chord_handle(app, handle);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn store_chord_handle<R: Runtime>(app: &AppHandle<R>, handle: mac_chord::ChordHandle) {
     if let Some(state) = app.try_state::<ActiveHotkeyState>() {
         if let Ok(mut g) = state.chord.lock() {
             *g = Some(handle);
@@ -737,7 +847,6 @@ fn install_chord<R: Runtime>(
         }
         app.manage(new_state);
     }
-    Ok(())
 }
 
 fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
@@ -779,4 +888,87 @@ fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
             crate::pill::hide(&app_clone);
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_default_ptt() {
+        assert!(shortcut_from_key("Cmd+Alt+Period").is_some());
+    }
+
+    #[test]
+    fn parses_cmd_shift_letter() {
+        assert!(shortcut_from_key("Cmd+Shift+J").is_some());
+    }
+
+    #[test]
+    fn parses_function_key() {
+        assert!(shortcut_from_key("F13").is_some());
+    }
+
+    #[test]
+    fn parses_escape() {
+        assert!(shortcut_from_key("Escape").is_some());
+    }
+
+    #[test]
+    fn parses_commandorcontrol_alias() {
+        assert_eq!(
+            shortcut_from_key("Cmd+Alt+Period"),
+            shortcut_from_key("CommandOrControl+Alt+Period"),
+        );
+    }
+
+    #[test]
+    fn rejects_bare_letter() {
+        assert!(shortcut_from_key("M").is_none());
+    }
+
+    #[test]
+    fn rejects_shift_only() {
+        // "Shift" alone has no key — `from_str` itself rejects it. Either
+        // way, the function must not return a Shortcut.
+        assert!(shortcut_from_key("Shift").is_none());
+    }
+
+    #[test]
+    fn rejects_shift_plus_letter() {
+        // Lone Shift + letter is not enough of a modifier — must be
+        // refused alongside bare letters.
+        assert!(shortcut_from_key("Shift+M").is_none());
+    }
+
+    #[test]
+    fn rejects_empty() {
+        assert!(shortcut_from_key("").is_none());
+    }
+
+    #[test]
+    fn rejects_garbage() {
+        assert!(shortcut_from_key("NotARealKey").is_none());
+    }
+
+    #[test]
+    fn accepts_cancel_default_escape() {
+        assert!(shortcut_from_key("Escape").is_some());
+    }
+
+    #[test]
+    fn rejects_mods_prefix() {
+        // `Mods:` specs go through `mac_chord::install`, not the
+        // shortcut plugin. Refusing here keeps a stray callsite from
+        // accidentally trying to bind a modifier-only chord as a
+        // Carbon hotkey.
+        assert!(shortcut_from_key("Mods:Cmd+Alt").is_none());
+        assert!(shortcut_from_key("Mods:Ctrl+Alt+Shift").is_none());
+    }
+
+    #[test]
+    fn rejects_tap2_prefix() {
+        assert!(shortcut_from_key("Tap2:Alt").is_none());
+        assert!(shortcut_from_key("Tap2:Cmd").is_none());
+    }
 }

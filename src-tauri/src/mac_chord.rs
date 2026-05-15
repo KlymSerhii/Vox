@@ -156,16 +156,37 @@ pub enum ChordError {
     EmptySpec,
 }
 
-/// Opaque handle. Drop to remove the chord listener.
-pub struct ChordHandle {
-    inner: *mut Inner,
-    thread: Option<JoinHandle<()>>,
+/// Shared scaffolding owned jointly by the install caller (via
+/// `ChordHandle`) and the worker thread. Carries the CF refs the worker
+/// fills in once the tap is live; the drop handler snapshots them out
+/// without touching the typed `Inner` so single-tap chord and
+/// double-tap handles can share one `ChordHandle` shape.
+struct TapHandles {
+    run_loop: Mutex<CFRunLoopRef>,
+    mach_port: Mutex<CFMachPortRef>,
+    run_loop_source: Mutex<CFRunLoopSourceRef>,
 }
 
-// SAFETY: `inner` is a `Box::into_raw` pointer never exposed outside the
-// impl, and the drop path joins the worker thread before freeing it.
-unsafe impl Send for ChordHandle {}
-unsafe impl Sync for ChordHandle {}
+impl TapHandles {
+    fn new() -> Self {
+        Self {
+            run_loop: Mutex::new(std::ptr::null()),
+            mach_port: Mutex::new(std::ptr::null()),
+            run_loop_source: Mutex::new(std::ptr::null()),
+        }
+    }
+}
+
+// SAFETY: the contained CF refs are kernel mach port pointers; the
+// Mutex guards make the cross-thread fills race-free.
+unsafe impl Send for TapHandles {}
+unsafe impl Sync for TapHandles {}
+
+/// Opaque handle. Drop to remove the chord listener.
+pub struct ChordHandle {
+    handles: Arc<TapHandles>,
+    thread: Option<JoinHandle<()>>,
+}
 
 /// Install a chord listener. Closures fire on the run-loop thread (or a
 /// short debounce thread) and must not block long — post a Tauri async
@@ -186,7 +207,7 @@ pub fn install(
     // versions but receives no events. Surface the error early so callers
     // can fall back to a regular shortcut.
     let trusted = unsafe { AXIsProcessTrusted() };
-    log::error!(
+    log::debug!(
         "mac_chord: AXIsProcessTrusted={trusted} spec={spec:?} required_mask={:#x}",
         spec.required_mask()
     );
@@ -205,20 +226,15 @@ pub fn install(
         log_window_count: AtomicU64::new(0),
     });
 
+    let handles = Arc::new(TapHandles::new());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ChordError>>();
+
     // Run-loop / mach port handles are filled in on the worker thread.
     let inner_ptr: *mut Inner = Box::into_raw(Box::new(Inner {
         shared: shared.clone(),
-        run_loop: Mutex::new(std::ptr::null()),
-        mach_port: Mutex::new(std::ptr::null()),
-        run_loop_source: Mutex::new(std::ptr::null()),
-        ready_tx: Mutex::new(None),
+        handles: handles.clone(),
+        ready_tx: Mutex::new(Some(ready_tx)),
     }));
-
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ChordError>>();
-    // SAFETY: only this function holds `inner_ptr` here.
-    if let Ok(mut slot) = unsafe { (*inner_ptr).ready_tx.lock() } {
-        *slot = Some(ready_tx);
-    }
 
     // Smuggle the pointer through `usize` to satisfy `Send` without a
     // wrapper type — nobody else touches it until the worker thread takes
@@ -235,7 +251,7 @@ pub fn install(
         .unwrap_or(Err(ChordError::RunLoopFailed));
     match result {
         Ok(()) => Ok(ChordHandle {
-            inner: inner_ptr,
+            handles,
             thread: Some(thread),
         }),
         Err(e) => {
@@ -254,30 +270,31 @@ pub fn install(
 
 impl Drop for ChordHandle {
     fn drop(&mut self) {
-        // The worker thread owns the `Box<Inner>` allocation and
-        // reclaims it at thread exit — see `run_loop_thread`. We must
-        // NOT call `Box::from_raw(self.inner)` here.
-        //
-        // To avoid racing the worker on `&*self.inner` we snapshot the
-        // CF refs out of the locked slots, ask the run loop to stop,
-        // join, and only THEN release the CF objects. Once the worker
-        // returns from `CFRunLoopRun` it frees the box in its tail —
-        // but the CF refs we snapshotted are CFRetain'd kernel mach
-        // ports unaffected by that free, so we can release them after
-        // the join.
-        let port_snap;
-        let rl_snap;
-        let src_snap;
-        // SAFETY: worker is still running at this point (we have not
-        // joined yet) and it only frees `inner` AFTER its run loop
-        // exits; we are about to ask the run loop to exit, so the
-        // borrow here is bounded.
-        unsafe {
-            let inner = &*self.inner;
-            port_snap = inner.mach_port.lock().ok().map(|g| *g).unwrap_or(std::ptr::null());
-            rl_snap = inner.run_loop.lock().ok().map(|g| *g).unwrap_or(std::ptr::null());
-            src_snap = inner.run_loop_source.lock().ok().map(|g| *g).unwrap_or(std::ptr::null());
-        }
+        // Snapshot the CF refs from the Arc — the worker writes them
+        // once it has the tap up, and they're stable for the lifetime
+        // of the run loop. Ask the run loop to stop, join the worker,
+        // then release the CF objects we still hold a reference to.
+        let port_snap = self
+            .handles
+            .mach_port
+            .lock()
+            .ok()
+            .map(|g| *g)
+            .unwrap_or(std::ptr::null());
+        let rl_snap = self
+            .handles
+            .run_loop
+            .lock()
+            .ok()
+            .map(|g| *g)
+            .unwrap_or(std::ptr::null());
+        let src_snap = self
+            .handles
+            .run_loop_source
+            .lock()
+            .ok()
+            .map(|g| *g)
+            .unwrap_or(std::ptr::null());
 
         unsafe {
             if !port_snap.is_null() {
@@ -292,12 +309,9 @@ impl Drop for ChordHandle {
         }
 
         if let Some(t) = self.thread.take() {
-            // After this returns, the worker has freed `self.inner`.
             let _ = t.join();
         }
 
-        // Worker is gone — safe to release CF objects we still hold
-        // a reference to.
         unsafe {
             if !port_snap.is_null() {
                 CFMachPortInvalidate(port_snap);
@@ -331,24 +345,14 @@ struct Shared {
 
 struct Inner {
     shared: Arc<Shared>,
-    run_loop: Mutex<CFRunLoopRef>,
-    mach_port: Mutex<CFMachPortRef>,
-    run_loop_source: Mutex<CFRunLoopSourceRef>,
+    handles: Arc<TapHandles>,
     ready_tx: Mutex<Option<std::sync::mpsc::Sender<Result<(), ChordError>>>>,
 }
 
 fn run_loop_thread(inner_ptr: *mut Inner) {
-    // The worker thread is the sole owner of the `Box<Inner>` allocated
-    // in `install`. Every exit path (early failure or run-loop return)
-    // funnels through the `Box::from_raw` at the bottom of this
-    // function so the install-side caller never has to reclaim it —
-    // which is what closes the use-after-free window the previous
-    // design had: the install-side `recv_timeout(2s)` could fire while
-    // the worker was still holding `&*inner_ptr` past the
-    // `CGEventTapCreate` decision.
     let mask: CGEventMask = 1 << K_CG_EVENT_FLAGS_CHANGED;
 
-    log::error!(
+    log::debug!(
         "mac_chord: run-loop thread started (tid={:?}); CGEventTapCreate mask={:#x}",
         thread::current().id(),
         mask,
@@ -365,18 +369,13 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
         )
     };
     if port.is_null() {
-        // Most likely Accessibility was revoked between the pre-check and now.
         log::error!("mac_chord: CGEventTapCreate returned NULL — Accessibility revoked?");
-        // SAFETY: still the unique reference; install caller never
-        // touches `inner_ptr` on its own.
         let inner: &Inner = unsafe { &*inner_ptr };
         notify_ready(inner, Err(ChordError::TapCreateFailed));
-        // Reclaim the box at thread exit so the install caller can
-        // remain "we never own this".
         unsafe { drop(Box::from_raw(inner_ptr)) };
         return;
     }
-    log::error!("mac_chord: CGEventTapCreate ok (port={:p})", port);
+    log::debug!("mac_chord: CGEventTapCreate ok (port={:p})", port);
 
     let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
     if source.is_null() {
@@ -396,33 +395,26 @@ fn run_loop_thread(inner_ptr: *mut Inner) {
         CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
         CGEventTapEnable(port, true);
     }
-    log::error!("mac_chord: tap enabled; entering CFRunLoopRun (rl={:p})", rl);
+    log::debug!("mac_chord: tap enabled; entering CFRunLoopRun (rl={:p})", rl);
 
-    // Borrow `inner` only inside scopes that don't outlive the run-loop
-    // body; the final `Box::from_raw` reclaim at the bottom is the
-    // single freer.
     {
         let inner: &Inner = unsafe { &*inner_ptr };
-        if let Ok(mut g) = inner.run_loop.lock() {
+        if let Ok(mut g) = inner.handles.run_loop.lock() {
             *g = rl;
         }
-        if let Ok(mut g) = inner.mach_port.lock() {
+        if let Ok(mut g) = inner.handles.mach_port.lock() {
             *g = port;
         }
-        if let Ok(mut g) = inner.run_loop_source.lock() {
+        if let Ok(mut g) = inner.handles.run_loop_source.lock() {
             *g = source;
         }
 
         notify_ready(inner, Ok(()));
     }
 
-    // Park on the run loop until `CFRunLoopStop` from the drop handler.
     unsafe { CFRunLoopRun() };
-    log::error!("mac_chord: CFRunLoopRun exited; thread terminating");
+    log::debug!("mac_chord: CFRunLoopRun exited; thread terminating");
 
-    // Worker is the sole freer of `Box<Inner>`. The Drop path joins us
-    // before observing `inner`, so reclaiming here is correct on every
-    // exit path (see `ChordHandle::drop` and the `install` error arm).
     unsafe { drop(Box::from_raw(inner_ptr)) };
 }
 
@@ -443,17 +435,15 @@ extern "C" fn tap_callback(
     if user_info.is_null() {
         return event;
     }
-    // SAFETY: `user_info` is the `Box::into_raw(Inner)` from `install`;
-    // `ChordHandle::drop` joins this thread before freeing it.
     let inner: &Inner = unsafe { &*(user_info as *const Inner) };
 
     if ty == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
         || ty == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
     {
-        if let Ok(g) = inner.mach_port.lock() {
+        if let Ok(g) = inner.handles.mach_port.lock() {
             if !g.is_null() {
                 unsafe { CGEventTapEnable(*g, true) };
-                log::error!("mac_chord: tap disabled by macOS ({:#x}); re-enabled", ty);
+                log::warn!("mac_chord: tap disabled by macOS ({:#x}); re-enabled", ty);
             }
         }
         return event;
@@ -481,7 +471,7 @@ extern "C" fn tap_callback(
             // 60ms debounce so brief Option/Control taps don't fire. Hand
             // off `Arc<Shared>` — debounce threads may outlive `Inner` but
             // never touch it, so no UAF.
-            log::error!(
+            log::trace!(
                 "mac_chord: raise (flags={flags:#x} required={required:#x}); debouncing seq={seq}"
             );
             thread::spawn(move || {
@@ -492,12 +482,12 @@ extern "C" fn tap_callback(
                 if shared.armed.swap(true, Ordering::SeqCst) {
                     return;
                 }
-                log::error!("mac_chord: debounce fired on_press (seq={seq})");
+                log::trace!("mac_chord: debounce fired on_press (seq={seq})");
                 (shared.on_press.lock())();
             });
         }
         (true, false) => {
-            log::error!(
+            log::trace!(
                 "mac_chord: release (flags={flags:#x} required={required:#x}); on_release"
             );
             shared.armed.store(false, Ordering::SeqCst);
@@ -523,16 +513,30 @@ fn log_throttled_flags(shared: &Shared, raw: u64, masked: u64, required: u64) {
         return;
     }
     let total = shared.log_counter.fetch_add(1, Ordering::Relaxed) + 1;
-    log::error!(
+    log::trace!(
         "mac_chord: flagsChanged #{total} raw={raw:#x} masked={masked:#x} required={required:#x}"
     );
 }
 
 /// Interpret a hotkey-id string as a modifier-only chord. `None` if it
 /// contains a non-modifier base key.
+///
+/// Accepts the explicit `Mods:Cmd+Alt` prefix (v2 wire format) and the
+/// legacy bare `Cmd+Alt` form. The legacy form is kept so any on-disk
+/// settings doc that hand-rolled a mod-only spec keeps working.
 pub fn try_parse_chord(spec: &str) -> Option<ChordSpec> {
-    let s = spec.trim();
-    if s.is_empty() {
+    let raw = spec.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Reject the `Tap2:` prefix here — double-tap goes through a
+    // different installer (see `try_parse_double_tap` /
+    // `install_double_tap`).
+    if raw.starts_with("Tap2:") {
+        return None;
+    }
+    let body = raw.strip_prefix("Mods:").unwrap_or(raw).trim();
+    if body.is_empty() {
         return None;
     }
     let mut out = ChordSpec {
@@ -542,7 +546,7 @@ pub fn try_parse_chord(spec: &str) -> Option<ChordSpec> {
         need_shift: false,
         strict_all_or_none: true,
     };
-    for tok in s.split('+') {
+    for tok in body.split('+') {
         match tok.trim() {
             "Alt" | "Option" => out.need_option = true,
             "Ctrl" | "Control" => out.need_control = true,
@@ -554,6 +558,348 @@ pub fn try_parse_chord(spec: &str) -> Option<ChordSpec> {
         }
     }
     if out.is_valid() { Some(out) } else { None }
+}
+
+/// Which single modifier a `Tap2:` spec targets. v2 supports
+/// single-modifier double-tap only (`Tap2:Alt`); `Tap2:Cmd+Alt` is
+/// out of scope per PM spec §9.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoubleTapModifier {
+    Command,
+    Option,
+    Control,
+    Shift,
+}
+
+impl DoubleTapModifier {
+    pub fn flag(self) -> u64 {
+        match self {
+            DoubleTapModifier::Command => FLAG_COMMAND,
+            DoubleTapModifier::Option => FLAG_ALTERNATE,
+            DoubleTapModifier::Control => FLAG_CONTROL,
+            DoubleTapModifier::Shift => FLAG_SHIFT,
+        }
+    }
+}
+
+/// Interpret a hotkey-id string as a `Tap2:<Modifier>` spec. Returns
+/// `None` for any other shape — multi-modifier double-tap, missing
+/// prefix, base keys, etc.
+pub fn try_parse_double_tap(spec: &str) -> Option<DoubleTapModifier> {
+    let raw = spec.trim();
+    let body = raw.strip_prefix("Tap2:")?.trim();
+    if body.is_empty() {
+        return None;
+    }
+    // Multi-modifier `Tap2:Cmd+Alt` is intentionally rejected — v2
+    // ships single-modifier only.
+    if body.contains('+') {
+        return None;
+    }
+    match body {
+        "Alt" | "Option" => Some(DoubleTapModifier::Option),
+        "Ctrl" | "Control" => Some(DoubleTapModifier::Control),
+        "Cmd" | "Command" | "Meta" | "Super" | "CommandOrControl" => {
+            Some(DoubleTapModifier::Command)
+        }
+        "Shift" => Some(DoubleTapModifier::Shift),
+        _ => None,
+    }
+}
+
+/// Window inside which a second tap of the same modifier triggers the
+/// double-tap. PM spec §4 / design spec §8 settle on 300 ms.
+pub const DOUBLE_TAP_TRIGGER_MS: u64 = 300;
+
+/// Pure-function state machine for the double-tap trigger. Lives next
+/// to the CGEventTap callback so the timing rules are testable without
+/// mocking the tap. The callback feeds it (`flags`, `now_ms`) on every
+/// `kCGEventFlagsChanged` event and acts on the returned `Action`.
+#[derive(Debug, Clone, Copy)]
+pub struct DoubleTapState {
+    pub target: DoubleTapModifier,
+    /// `Some(t)` after a clean "down, up" of the target with the rest
+    /// of the modifier set empty. Cleared when any other modifier
+    /// joins or when the trigger fires.
+    pub first_release_at: Option<u64>,
+    /// `true` while the target modifier is held above the baseline.
+    pub target_down: bool,
+    /// Set when another modifier joined the set while the target was
+    /// held. The subsequent target-release is the end of a chord, not
+    /// a fresh first-tap release — don't arm `first_release_at`. Cleared
+    /// once both target + other are baseline.
+    pub tainted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoubleTapAction {
+    /// Promote to the held state — fire `on_press`.
+    Press,
+    /// Cancel the held state — fire `on_release`.
+    Release,
+    /// Nothing visible to the caller.
+    Idle,
+}
+
+impl DoubleTapState {
+    pub fn new(target: DoubleTapModifier) -> Self {
+        Self {
+            target,
+            first_release_at: None,
+            target_down: false,
+            tainted: false,
+        }
+    }
+
+    /// Step the state machine on a `kCGEventFlagsChanged` event.
+    ///
+    /// `flags` is masked to `MOD_MASK` already; `armed` reports whether
+    /// `on_press` has been called and not yet released. The state
+    /// machine itself owns the trigger timing — `armed` is the caller's
+    /// side of the contract so we don't double-fire `Press`.
+    pub fn step(&mut self, flags: u64, armed: bool, now_ms: u64) -> DoubleTapAction {
+        let target_bit = self.target.flag();
+        let target_held = flags & target_bit != 0;
+        let other_held = flags & !target_bit & MOD_MASK != 0;
+
+        // When the user joins any other modifier into the set, the
+        // armed double-tap path is dead until the modifiers all drop.
+        if other_held {
+            self.first_release_at = None;
+            self.target_down = target_held;
+            self.tainted = true;
+            if armed {
+                return DoubleTapAction::Release;
+            }
+            return DoubleTapAction::Idle;
+        }
+
+        if armed {
+            if !target_held {
+                self.target_down = false;
+                self.first_release_at = None;
+                self.tainted = false;
+                return DoubleTapAction::Release;
+            }
+            self.target_down = true;
+            return DoubleTapAction::Idle;
+        }
+
+        // From the unarmed state, with nothing else held.
+        let prev_down = self.target_down;
+        let was_tainted = self.tainted;
+        self.target_down = target_held;
+
+        if !prev_down && target_held {
+            // Press transition. If we already saw a clean release of
+            // the target inside the window, that's a double-tap.
+            self.tainted = false;
+            if let Some(first) = self.first_release_at.take() {
+                if now_ms.saturating_sub(first) <= DOUBLE_TAP_TRIGGER_MS {
+                    return DoubleTapAction::Press;
+                }
+            }
+            return DoubleTapAction::Idle;
+        }
+        if prev_down && !target_held {
+            // Lone modifier released. If the press path was tainted by
+            // another modifier joining in, this isn't a fresh first-tap
+            // release — don't arm.
+            if !was_tainted {
+                self.first_release_at = Some(now_ms);
+            }
+            self.tainted = false;
+            return DoubleTapAction::Idle;
+        }
+        DoubleTapAction::Idle
+    }
+}
+
+/// Install a double-tap listener for a single modifier. Returns the
+/// same `ChordHandle` shape as `install` so `hotkey::register` can hold
+/// it on `ActiveHotkeyState::chord` and drop it on re-bind.
+pub fn install_double_tap(
+    target: DoubleTapModifier,
+    on_press: impl Fn() + Send + 'static,
+    on_release: impl Fn() + Send + 'static,
+) -> Result<ChordHandle, ChordError> {
+    let trusted = unsafe { AXIsProcessTrusted() };
+    log::debug!(
+        "mac_chord: install_double_tap target={target:?} AXIsProcessTrusted={trusted}"
+    );
+    if !trusted {
+        return Err(ChordError::PermissionDenied);
+    }
+
+    let shared = Arc::new(SharedTap2 {
+        target,
+        on_press: PMutex::new(Box::new(on_press)),
+        on_release: PMutex::new(Box::new(on_release)),
+        armed: AtomicBool::new(false),
+        state: PMutex::new(DoubleTapState::new(target)),
+    });
+
+    let handles = Arc::new(TapHandles::new());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), ChordError>>();
+
+    let inner_ptr: *mut Tap2Inner = Box::into_raw(Box::new(Tap2Inner {
+        shared: shared.clone(),
+        handles: handles.clone(),
+        ready_tx: Mutex::new(Some(ready_tx)),
+    }));
+    let inner_addr: usize = inner_ptr as usize;
+
+    let thread = thread::Builder::new()
+        .name("vox-tap2-tap".into())
+        .spawn(move || tap2_run_loop_thread(inner_addr as *mut Tap2Inner))
+        .map_err(|_| ChordError::RunLoopFailed)?;
+    let result = ready_rx
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap_or(Err(ChordError::RunLoopFailed));
+    match result {
+        Ok(()) => Ok(ChordHandle {
+            handles,
+            thread: Some(thread),
+        }),
+        Err(e) => {
+            let _ = thread.join();
+            Err(e)
+        }
+    }
+}
+
+struct SharedTap2 {
+    target: DoubleTapModifier,
+    on_press: PMutex<Callback>,
+    on_release: PMutex<Callback>,
+    armed: AtomicBool,
+    state: PMutex<DoubleTapState>,
+}
+
+struct Tap2Inner {
+    shared: Arc<SharedTap2>,
+    handles: Arc<TapHandles>,
+    ready_tx: Mutex<Option<std::sync::mpsc::Sender<Result<(), ChordError>>>>,
+}
+
+fn tap2_run_loop_thread(inner_ptr: *mut Tap2Inner) {
+    let mask: CGEventMask = 1 << K_CG_EVENT_FLAGS_CHANGED;
+    let port = unsafe {
+        CGEventTapCreate(
+            K_CG_SESSION_EVENT_TAP,
+            K_CG_HEAD_INSERT_EVENT_TAP,
+            K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+            mask,
+            tap2_callback,
+            inner_ptr as *mut std::ffi::c_void,
+        )
+    };
+    if port.is_null() {
+        let inner: &Tap2Inner = unsafe { &*inner_ptr };
+        tap2_notify_ready(inner, Err(ChordError::TapCreateFailed));
+        unsafe { drop(Box::from_raw(inner_ptr)) };
+        return;
+    }
+    let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
+    if source.is_null() {
+        unsafe {
+            CGEventTapEnable(port, false);
+            CFRelease(port);
+        }
+        let inner: &Tap2Inner = unsafe { &*inner_ptr };
+        tap2_notify_ready(inner, Err(ChordError::RunLoopFailed));
+        unsafe { drop(Box::from_raw(inner_ptr)) };
+        return;
+    }
+    let rl = unsafe { CFRunLoopGetCurrent() };
+    unsafe {
+        CFRunLoopAddSource(rl, source, kCFRunLoopCommonModes);
+        CGEventTapEnable(port, true);
+    }
+    {
+        let inner: &Tap2Inner = unsafe { &*inner_ptr };
+        if let Ok(mut g) = inner.handles.run_loop.lock() {
+            *g = rl;
+        }
+        if let Ok(mut g) = inner.handles.mach_port.lock() {
+            *g = port;
+        }
+        if let Ok(mut g) = inner.handles.run_loop_source.lock() {
+            *g = source;
+        }
+        tap2_notify_ready(inner, Ok(()));
+    }
+    unsafe { CFRunLoopRun() };
+    unsafe { drop(Box::from_raw(inner_ptr)) };
+}
+
+fn tap2_notify_ready(inner: &Tap2Inner, result: Result<(), ChordError>) {
+    if let Ok(mut slot) = inner.ready_tx.lock() {
+        if let Some(tx) = slot.take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+extern "C" fn tap2_callback(
+    _proxy: CGEventTapProxy,
+    ty: CGEventType,
+    event: CGEventRef,
+    user_info: *mut std::ffi::c_void,
+) -> CGEventRef {
+    if user_info.is_null() {
+        return event;
+    }
+    let inner: &Tap2Inner = unsafe { &*(user_info as *const Tap2Inner) };
+    if ty == K_CG_EVENT_TAP_DISABLED_BY_TIMEOUT
+        || ty == K_CG_EVENT_TAP_DISABLED_BY_USER_INPUT
+    {
+        if let Ok(g) = inner.handles.mach_port.lock() {
+            if !g.is_null() {
+                unsafe { CGEventTapEnable(*g, true) };
+            }
+        }
+        return event;
+    }
+    if ty != K_CG_EVENT_FLAGS_CHANGED {
+        return event;
+    }
+    let raw_flags = unsafe { CGEventGetFlags(event) };
+    let flags = raw_flags & MOD_MASK;
+    let shared = inner.shared.clone();
+    let now_ms = monotonic_ms();
+    let armed = shared.armed.load(Ordering::SeqCst);
+    let action = {
+        let mut state = shared.state.lock();
+        state.step(flags, armed, now_ms)
+    };
+    match action {
+        DoubleTapAction::Press => {
+            if !shared.armed.swap(true, Ordering::SeqCst) {
+                log::trace!(
+                    "mac_chord: double-tap fired on_press target={:?}",
+                    shared.target
+                );
+                (shared.on_press.lock())();
+            }
+        }
+        DoubleTapAction::Release => {
+            if shared.armed.swap(false, Ordering::SeqCst) {
+                log::trace!(
+                    "mac_chord: double-tap fired on_release target={:?}",
+                    shared.target
+                );
+                (shared.on_release.lock())();
+            }
+        }
+        DoubleTapAction::Idle => {}
+    }
+    event
+}
+
+fn monotonic_ms() -> u64 {
+    static BASELINE: once_cell::sync::OnceCell<Instant> = once_cell::sync::OnceCell::new();
+    BASELINE.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 #[cfg(test)]
@@ -584,5 +930,115 @@ mod tests {
     fn parse_alt_shift() {
         let s = try_parse_chord("Alt+Shift").unwrap();
         assert!(s.need_option && s.need_shift);
+    }
+
+    #[test]
+    fn parse_chord_accepts_mods_prefix() {
+        let s = try_parse_chord("Mods:Cmd+Alt").unwrap();
+        assert!(s.need_command && s.need_option);
+        assert!(!s.need_shift && !s.need_control);
+    }
+
+    #[test]
+    fn parse_chord_rejects_tap2_prefix() {
+        assert!(try_parse_chord("Tap2:Alt").is_none());
+        assert!(try_parse_chord("Tap2:Cmd+Alt").is_none());
+    }
+
+    #[test]
+    fn parse_chord_rejects_mods_with_base_key() {
+        assert!(try_parse_chord("Mods:Cmd+Alt+M").is_none());
+        assert!(try_parse_chord("Mods:").is_none());
+    }
+
+    #[test]
+    fn parse_double_tap_each_modifier() {
+        assert_eq!(try_parse_double_tap("Tap2:Alt"), Some(DoubleTapModifier::Option));
+        assert_eq!(try_parse_double_tap("Tap2:Cmd"), Some(DoubleTapModifier::Command));
+        assert_eq!(try_parse_double_tap("Tap2:Control"), Some(DoubleTapModifier::Control));
+        assert_eq!(try_parse_double_tap("Tap2:Shift"), Some(DoubleTapModifier::Shift));
+        assert_eq!(
+            try_parse_double_tap("Tap2:CommandOrControl"),
+            Some(DoubleTapModifier::Command),
+        );
+    }
+
+    #[test]
+    fn parse_double_tap_rejects_multi_mod() {
+        // Multi-modifier double-tap is out of scope per PM spec §9.
+        assert!(try_parse_double_tap("Tap2:Cmd+Alt").is_none());
+    }
+
+    #[test]
+    fn parse_double_tap_rejects_unprefixed_and_legacy() {
+        assert!(try_parse_double_tap("Alt").is_none());
+        assert!(try_parse_double_tap("Mods:Alt").is_none());
+        assert!(try_parse_double_tap("Cmd+Alt+Period").is_none());
+        assert!(try_parse_double_tap("").is_none());
+    }
+
+    #[test]
+    fn double_tap_state_fires_within_window() {
+        let mut s = DoubleTapState::new(DoubleTapModifier::Option);
+        // First press of Option only.
+        assert_eq!(s.step(FLAG_ALTERNATE, false, 0), DoubleTapAction::Idle);
+        // First release of Option only — sets first_release_at.
+        assert_eq!(s.step(0, false, 50), DoubleTapAction::Idle);
+        // Second press inside the 300 ms window — fires Press.
+        assert_eq!(
+            s.step(FLAG_ALTERNATE, false, 200),
+            DoubleTapAction::Press,
+        );
+        // The caller flips armed=true after Press fires; subsequent
+        // events without target_held release.
+        assert_eq!(s.step(0, true, 240), DoubleTapAction::Release);
+    }
+
+    #[test]
+    fn double_tap_state_misses_outside_window() {
+        let mut s = DoubleTapState::new(DoubleTapModifier::Option);
+        assert_eq!(s.step(FLAG_ALTERNATE, false, 0), DoubleTapAction::Idle);
+        assert_eq!(s.step(0, false, 50), DoubleTapAction::Idle);
+        // 400 ms later is well past the 300 ms window — no Press.
+        assert_eq!(s.step(FLAG_ALTERNATE, false, 450), DoubleTapAction::Idle);
+        assert_eq!(s.step(0, false, 500), DoubleTapAction::Idle);
+    }
+
+    #[test]
+    fn double_tap_state_cancels_on_other_modifier() {
+        let mut s = DoubleTapState::new(DoubleTapModifier::Option);
+        assert_eq!(s.step(FLAG_ALTERNATE, false, 0), DoubleTapAction::Idle);
+        assert_eq!(s.step(0, false, 50), DoubleTapAction::Idle);
+        // User folds Cmd into the set inside the window — no double-tap.
+        assert_eq!(
+            s.step(FLAG_ALTERNATE | FLAG_COMMAND, false, 100),
+            DoubleTapAction::Idle,
+        );
+        // Drop everything and tap Option again within 300 ms of the
+        // ORIGINAL release — still no Press because the tracker was
+        // cleared when Cmd joined.
+        assert_eq!(s.step(0, false, 150), DoubleTapAction::Idle);
+        assert_eq!(s.step(FLAG_ALTERNATE, false, 180), DoubleTapAction::Idle);
+    }
+
+    #[test]
+    fn double_tap_state_releases_when_armed_modifier_lifts() {
+        let mut s = DoubleTapState::new(DoubleTapModifier::Option);
+        // Skip past the arm transitions — the caller's armed=true is
+        // what gates the release path.
+        assert_eq!(s.step(0, true, 0), DoubleTapAction::Release);
+    }
+
+    #[test]
+    fn double_tap_state_fires_after_long_hold_release() {
+        let mut s = DoubleTapState::new(DoubleTapModifier::Option);
+        assert_eq!(s.step(FLAG_ALTERNATE, false, 0), DoubleTapAction::Idle);
+        // Held for 2 s, then released.
+        assert_eq!(s.step(0, false, 2000), DoubleTapAction::Idle);
+        // Tap within 300 ms of the release fires Press.
+        assert_eq!(
+            s.step(FLAG_ALTERNATE, false, 2100),
+            DoubleTapAction::Press,
+        );
     }
 }

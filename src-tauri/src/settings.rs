@@ -241,10 +241,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         |k: &str| store.get(k).and_then(|v| v.as_str().map(|s| s.to_string()));
     let get_bool = |k: &str, d: bool| store.get(k).and_then(|v| v.as_bool()).unwrap_or(d);
 
-    // Hotkey is currently hardcoded; always write the default so the
-    // picker reflects reality even if a stored value drifted.
-    let hotkey = default_hotkey();
-    store.set(KEY_HOTKEY, serde_json::Value::String(hotkey.clone()));
+    let hotkey = get_str(KEY_HOTKEY).unwrap_or_else(default_hotkey);
 
     let cancel_hotkey = get_str(KEY_CANCEL_HOTKEY).unwrap_or_else(default_cancel_hotkey);
     let language = get_str(KEY_LANGUAGE).unwrap_or_else(default_language);
@@ -529,5 +526,21 @@ mod tests {
         let bare = "{}";
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(restored.streaming_pill_enabled);
+    }
+
+    #[test]
+    fn hotkey_roundtrips_through_serde() {
+        // A user-picked PTT spec must survive serialize / deserialize
+        // without being silently replaced by the default.
+        let mut s = Settings::default();
+        s.hotkey = "Cmd+Shift+J".to_string();
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.hotkey, "Cmd+Shift+J");
+
+        // And verify the default kicks in when the field is absent.
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert_eq!(restored.hotkey, default_hotkey());
     }
 }

@@ -1,4 +1,5 @@
 import {
+  createEffect,
   createMemo,
   createResource,
   createSignal,
@@ -76,6 +77,18 @@ import {
 } from "../lib/ipc";
 import { VoxLogo } from "../components/VoxLogo";
 import { HotkeyKeys } from "../components/HotkeyKeys";
+import {
+  formatHotkey,
+  isModsSpec,
+  isTap2Spec,
+  modsSpecFromFlags,
+  parseSpec,
+  specsEqual,
+  tap2SpecFromModifier,
+  validateHotkeySpec,
+  type HotkeyRowKind,
+  type ValidationResult,
+} from "../lib/hotkey";
 
 type Tab =
   | "general"
@@ -131,33 +144,27 @@ const TABS: { id: Tab; label: string; icon: string; subtitle: string }[] = [
   },
 ];
 
-interface HotkeyOption {
-  value: string;
-  label: string;
-  /** When set, the picker renders a ⚠︎ glyph and tooltip. Right-Option
-   * falls in this bucket: `tauri-plugin-global-shortcut` reports an
-   * "Unknown scancode for AltRight" on most macOS keymaps. */
-  warn?: string;
-}
+// Defaults written by `settings::load` on every launch — kept in sync
+// with `src-tauri/src/settings.rs::default_hotkey` etc.
+const DEFAULT_PUSH_TO_TALK = "Cmd+Alt+Period";
+const DEFAULT_CANCEL_HOTKEY = "Escape";
+const DEFAULT_MODE_CYCLE_HOTKEY = "Alt+M";
 
-const CANCEL_HOTKEY_OPTIONS: HotkeyOption[] = [
-  { value: "Escape", label: "Esc" },
-  { value: "F13", label: "F13" },
-  { value: "F14", label: "F14" },
-  { value: "F15", label: "F15" },
-];
-
-// Labels carry both the macOS symbols and the short word forms so a
-// reader who doesn't recognise ⌘ / ⌥ / ⇧ still understands the chord.
-// `<option>` elements can't host rich HTML, hence the inline string.
-const MODE_CYCLE_HOTKEY_OPTIONS: HotkeyOption[] = [
-  { value: "Alt+M", label: "Opt+M  (⌥M)" },
-  { value: "Alt+Shift+M", label: "Opt+Shift+M  (⌥⇧M)" },
-  { value: "CommandOrControl+Shift+M", label: "Cmd+Shift+M  (⌘⇧M)" },
-  { value: "F13", label: "F13" },
-  { value: "F14", label: "F14" },
-  { value: "F15", label: "F15" },
-  { value: "", label: "Off" },
+// Common chords surfaced inside the capture panel for one-click pick.
+// Cancel-only specs are filtered out when the row isn't `cancel_hotkey`.
+// `pttOnly` flags Mods: / Tap2: shapes that only the push-to-talk row
+// can bind (cancel + mode-cycle go through `tauri-plugin-global-shortcut`,
+// not CGEventTap).
+const COMMON_CHORDS: { spec: string; cancelOnly?: boolean; pttOnly?: boolean }[] = [
+  { spec: "Escape", cancelOnly: true },
+  { spec: "F13" },
+  { spec: "F14" },
+  { spec: "F15" },
+  { spec: "Alt+M" },
+  { spec: "Alt+Shift+M" },
+  { spec: "Cmd+Shift+M" },
+  { spec: "Mods:Ctrl+Alt", pttOnly: true },
+  { spec: "Tap2:Alt", pttOnly: true },
 ];
 
 const PUNCTUATION_OPTIONS: { value: PunctuationStyle; label: string }[] = [
@@ -906,6 +913,32 @@ function HotkeysTab(props: {
     new Map(),
   );
   const [testStatus, setTestStatus] = createSignal<string | null>(null);
+  // When a cross-row collision is resolved with "Change other shortcut",
+  // we set this so the target row auto-enters capture on next render.
+  const [autoCapture, setAutoCapture] = createSignal<HotkeyKind | null>(null);
+  // When a conflict is resolved with "Use this and clear that one", we
+  // briefly flag the cleared row so its keycap chip flashes —
+  // otherwise the user only notices the row they kept and may miss
+  // that the other one was rewritten. Per design spec §5.
+  const [flashRow, setFlashRow] = createSignal<HotkeyKind | null>(null);
+  /// Cached `AXIsProcessTrusted()` result. Polled every 1.5 s from
+  /// `check_permissions` so a grant in System Settings unlocks Save
+  /// without re-entering capture. Optimistic default (`true`) so a
+  /// slow first probe doesn't flicker "needs AX" for users who never
+  /// touch mod-only / double-tap.
+  const [axGranted, setAxGranted] = createSignal<boolean>(true);
+  let flashTimer: ReturnType<typeof setTimeout> | null = null;
+  const triggerFlash = (k: HotkeyKind) => {
+    if (flashTimer != null) clearTimeout(flashTimer);
+    setFlashRow(k);
+    flashTimer = setTimeout(() => {
+      setFlashRow(null);
+      flashTimer = null;
+    }, 220);
+  };
+  onCleanup(() => {
+    if (flashTimer != null) clearTimeout(flashTimer);
+  });
 
   async function refreshDiagnostics() {
     try {
@@ -918,10 +951,54 @@ function HotkeysTab(props: {
     }
   }
 
+  async function refreshAx() {
+    try {
+      const p = await checkPermissions();
+      setAxGranted(p.accessibility);
+    } catch (e) {
+      console.warn("checkPermissions failed:", e);
+    }
+  }
+
   let unlistenSettings: (() => void) | null = null;
+  let axPoll: ReturnType<typeof setInterval> | null = null;
+  // Per-row "I'm capturing a Mods:/Tap2: spec right now" signal. Rows
+  // bubble this up via `onCapturingAxSpecChange`; the poll is gated on
+  // the union below.
+  const [rowCapturingAx, setRowCapturingAx] = createSignal<Set<HotkeyKind>>(
+    new Set(),
+  );
+  const setRowAx = (k: HotkeyKind, active: boolean) => {
+    setRowCapturingAx((prev) => {
+      const had = prev.has(k);
+      if (had === active) return prev;
+      const next = new Set(prev);
+      if (active) next.add(k);
+      else next.delete(k);
+      return next;
+    });
+  };
+
+  /// A row "needs AX answers" when it's mid-capture forming a
+  /// `Mods:`/`Tap2:` spec, OR when a saved `Mods:`/`Tap2:` spec is
+  /// configured and AX is currently denied. When no row needs the
+  /// answer, the poll does not run.
+  const pollActive = createMemo(() => {
+    if (rowCapturingAx().size > 0) return true;
+    if (!axGranted()) {
+      const specs = [
+        props.s.hotkey,
+        props.s.cancel_hotkey,
+        props.s.mode_cycle_hotkey,
+      ];
+      if (specs.some((s) => s && (isModsSpec(s) || isTap2Spec(s)))) return true;
+    }
+    return false;
+  });
 
   onMount(() => {
     void refreshDiagnostics();
+    void refreshAx();
     // Backend re-registers hotkeys on every save; refetch so the
     // picker reflects the OS truth (including fallback / "Not bound").
     void (async () => {
@@ -931,8 +1008,25 @@ function HotkeysTab(props: {
     })();
   });
 
+  // Per design spec §7: no spinner; on grant, the panel's slot 3
+  // collapses and Save enables. The poll only ticks while a row
+  // actually needs the answer — see `pollActive` above.
+  createEffect(() => {
+    if (pollActive()) {
+      if (axPoll == null) {
+        axPoll = setInterval(() => {
+          void refreshAx();
+        }, 1500);
+      }
+    } else if (axPoll != null) {
+      clearInterval(axPoll);
+      axPoll = null;
+    }
+  });
+
   onCleanup(() => {
     unlistenSettings?.();
+    if (axPoll != null) clearInterval(axPoll);
   });
 
   async function onTest() {
@@ -941,9 +1035,11 @@ function HotkeysTab(props: {
       if (!a.bound) {
         setTestStatus(`Failed: ${a.error ?? "no fallback succeeded"}`);
       } else if (a.fell_back) {
-        setTestStatus(`Bound to ${a.bound} (fallback from ${a.configured})`);
+        setTestStatus(
+          `Bound to ${formatHotkey(a.bound)} (fallback from ${formatHotkey(a.configured)})`,
+        );
       } else {
-        setTestStatus(`Bound to ${a.bound}`);
+        setTestStatus(`Bound to ${formatHotkey(a.bound)}`);
       }
     } catch (e) {
       setTestStatus(`Failed: ${String(e)}`);
@@ -954,69 +1050,134 @@ function HotkeysTab(props: {
   const cancel = () => diags().get("cancel") ?? null;
   const cycle = () => diags().get("mode-cycle") ?? null;
 
+  // Snapshot the other two rows so a captured spec can be validated
+  // against them without leaning on stale closure state.
+  const otherSpecs = (self: HotkeyKind): { kind: HotkeyKind; label: string; spec: string }[] => {
+    const rows: { kind: HotkeyKind; label: string; spec: string }[] = [
+      { kind: "ptt", label: "Push-to-talk", spec: props.s.hotkey },
+      { kind: "cancel", label: "Cancel", spec: props.s.cancel_hotkey },
+      { kind: "cycle", label: "Cycle voice mode", spec: props.s.mode_cycle_hotkey },
+    ];
+    return rows.filter((r) => r.kind !== self && r.spec !== "");
+  };
+
+  function patchFor(kind: HotkeyKind, value: string): Partial<Settings> {
+    if (kind === "ptt") return { hotkey: value };
+    if (kind === "cancel") return { cancel_hotkey: value };
+    return { mode_cycle_hotkey: value };
+  }
+  // Resolution "Use this and clear that one" path. PTT has no
+  // off-state — fall back to its default so the user is never left
+  // unable to dictate.
+  function clearValue(kind: HotkeyKind): string {
+    return kind === "ptt" ? DEFAULT_PUSH_TO_TALK : "";
+  }
+
   return (
     <>
       <SectionHeader title="Primary shortcut" />
       <Card>
-        <div class="flex items-start justify-between gap-4 px-4 py-3">
-          <div class="flex flex-col gap-1.5">
-            <div class="flex items-center gap-2">
-              <span class="text-[13px] font-medium text-[var(--color-ink)]">
-                Push-to-talk
-              </span>
-              <span class="rounded-full bg-[var(--color-ink-mute)]/15 px-2 py-0.5 text-[10px] uppercase tracking-[0.06em] text-[var(--color-ink-mute)]">
-                Built-in
-              </span>
-            </div>
-            <HotkeyKeys spec="CommandOrControl+Alt+Period" />
-
-            <span class="text-[11px] text-[var(--color-ink-mute)]">
-              {pttHint(props.s.hands_free_enabled, ptt())}
-            </span>
-          </div>
-          <div class="flex shrink-0 flex-col items-end gap-1">
-            <button
-              type="button"
-              onClick={() => void onTest()}
-              class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
-              title="Read the current binding from the runtime"
-            >
-              Test binding
-            </button>
-            <Show when={testStatus()}>
-              <span
-                class="text-[10px]"
-                classList={{
-                  "text-[var(--color-success)]":
-                    testStatus()?.startsWith("Bound") ?? false,
-                  "text-[var(--color-danger)]":
-                    testStatus()?.startsWith("Failed") ?? false,
-                }}
+        <HotkeyRow
+          kind="ptt"
+          label="Push-to-talk"
+          hint={pttHint(props.s.hands_free_enabled, ptt())}
+          configured={props.s.hotkey}
+          defaultSpec={DEFAULT_PUSH_TO_TALK}
+          allowEmpty={false}
+          diagnostic={ptt()}
+          others={otherSpecs("ptt")}
+          axGranted={axGranted()}
+          autoOpen={autoCapture() === "ptt"}
+          onAutoOpened={() => setAutoCapture(null)}
+          flash={flashRow() === "ptt"}
+          onChange={(v) => props.update({ hotkey: v })}
+          onResolveConflict={(self, other) => {
+            props.update({
+              ...patchFor("ptt", self),
+              ...patchFor(other, clearValue(other)),
+            });
+            triggerFlash(other);
+          }}
+          onChangeOther={(k) => setAutoCapture(k)}
+          onCapturingAxSpecChange={(a) => setRowAx("ptt", a)}
+          extra={
+            <div class="flex flex-col items-end gap-1">
+              <button
+                type="button"
+                onClick={() => void onTest()}
+                class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
+                title="Read the current binding from the runtime"
               >
-                {testStatus()}
-              </span>
-            </Show>
-          </div>
-        </div>
+                Test binding
+              </button>
+              <Show when={testStatus()}>
+                <span
+                  class="text-[10px]"
+                  classList={{
+                    "text-[var(--color-success)]":
+                      testStatus()?.startsWith("Bound") ?? false,
+                    "text-[var(--color-danger)]":
+                      testStatus()?.startsWith("Failed") ?? false,
+                  }}
+                >
+                  {testStatus()}
+                </span>
+              </Show>
+            </div>
+          }
+          last
+        />
       </Card>
 
       <SectionHeader title="Secondary shortcuts" />
       <Card>
         <HotkeyRow
+          kind="cancel"
           label="Cancel while recording"
           hint="Abort the pipeline without copying."
           configured={props.s.cancel_hotkey}
+          defaultSpec={DEFAULT_CANCEL_HOTKEY}
+          allowEmpty
           diagnostic={cancel()}
-          options={CANCEL_HOTKEY_OPTIONS}
+          others={otherSpecs("cancel")}
+          axGranted={axGranted()}
+          autoOpen={autoCapture() === "cancel"}
+          onAutoOpened={() => setAutoCapture(null)}
+          flash={flashRow() === "cancel"}
           onChange={(v) => props.update({ cancel_hotkey: v })}
+          onResolveConflict={(self, other) => {
+            props.update({
+              ...patchFor("cancel", self),
+              ...patchFor(other, clearValue(other)),
+            });
+            triggerFlash(other);
+          }}
+          onChangeOther={(k) => setAutoCapture(k)}
+          onCapturingAxSpecChange={(a) => setRowAx("cancel", a)}
         />
         <HotkeyRow
+          kind="cycle"
           label="Cycle voice mode"
           hint="Press to advance through Voice Modes in display order."
           configured={props.s.mode_cycle_hotkey}
+          defaultSpec={DEFAULT_MODE_CYCLE_HOTKEY}
+          allowEmpty
           diagnostic={cycle()}
-          options={MODE_CYCLE_HOTKEY_OPTIONS}
+          others={otherSpecs("cycle")}
+          axGranted={axGranted()}
+          autoOpen={autoCapture() === "cycle"}
+          onAutoOpened={() => setAutoCapture(null)}
+          flash={flashRow() === "cycle"}
           onChange={(v) => props.update({ mode_cycle_hotkey: v })}
+          onResolveConflict={(self, other) => {
+            props.update({
+              ...patchFor("cycle", self),
+              ...patchFor(other, clearValue(other)),
+            });
+            triggerFlash(other);
+          }}
+          onChangeOther={(k) => setAutoCapture(k)}
+          onCapturingAxSpecChange={(a) => setRowAx("cycle", a)}
           last
         />
       </Card>
@@ -1029,36 +1190,510 @@ function HotkeysTab(props: {
   );
 }
 
+type HotkeyKind = HotkeyRowKind;
+
+/// v2 collapses v1's `recording / preview / preview-invalid /
+/// preview-conflict` into one continuous `capturing` state carrying the
+/// in-progress set + verdict. The user commits with Save, wipes with
+/// Clear, or exits with Cancel.
+type Verdict =
+  | { tone: "empty" }
+  | { tone: "neutral"; message: string }
+  | { tone: "ok"; message: string }
+  | { tone: "danger"; message: string }
+  | { tone: "needs-ax"; message: string }
+  | { tone: "conflict"; message: string; with: { kind: HotkeyKind; label: string } };
+
+type CaptureSnapshot = {
+  /// Captured-so-far set, ready to round-trip as a wire spec. Empty
+  /// string means "set is empty".
+  spec: string;
+  verdict: Verdict;
+};
+
+type CaptureMode =
+  | { kind: "idle" }
+  | { kind: "capturing"; snap: CaptureSnapshot };
+
+const EMPTY_SNAP: CaptureSnapshot = {
+  spec: "",
+  verdict: { tone: "empty" },
+};
+
+const EMPTY_HINT = "Press the shortcut you want… Esc cancels.";
+const MODS_OK_HINT = "Hold a base key, or click Save to bind modifiers alone.";
+const TAP2_OK_HINT = "Looks good. Tap twice within 300 ms to trigger.";
+const TAP1_HINT = "Tap Opt again for double-tap, or hold for a chord.";
+
+/// Window inside which a second tap of the same modifier promotes the
+/// capture to a `Tap2:` spec.  PM spec §3c: 400 ms; the runtime trigger
+/// uses 300 ms in `mac_chord.rs`, but the capture window is more lenient
+/// so users don't have to nail the timing on first try.
+const DOUBLE_TAP_WINDOW_MS = 400;
+
 function HotkeyRow(props: {
+  kind: HotkeyKind;
   label: string;
   hint: string;
   configured: string;
+  defaultSpec: string;
+  /// True for cancel / cycle: an empty spec means "off" and is allowed.
+  /// PTT can't be off (the user would have no way to dictate), so reset
+  /// always writes the default.
+  allowEmpty: boolean;
   diagnostic: HotkeyDiagnostic | null;
-  options: HotkeyOption[];
+  others: { kind: HotkeyKind; label: string; spec: string }[];
+  /// Live result of `check_permissions().accessibility`. Polled at the
+  /// tab level so all three rows share a single 1.5 s poll cycle.
+  axGranted: boolean;
+  /// External request to auto-enter capture (used by "Change other
+  /// shortcut" conflict resolution).
+  autoOpen?: boolean;
+  onAutoOpened?: () => void;
+  /// Set briefly after a sibling row's "Use this and clear that one"
+  /// rewrites this row, so the keycap chip flashes once to confirm
+  /// the change is visible.
+  flash?: boolean;
   onChange: (v: string) => void;
+  /// One-shot "Use this and clear that one" handler. Writes both rows
+  /// in a single `setSettings` so the backend re-binds once.
+  onResolveConflict: (self: string, other: HotkeyKind) => void;
+  onChangeOther: (k: HotkeyKind) => void;
+  /// Bubbles up "I'm capturing a `Mods:` or `Tap2:` spec right now" so
+  /// the tab can gate the AX poll on the union of all three rows. The
+  /// callback fires only when the value flips, not on every keystroke.
+  onCapturingAxSpecChange?: (active: boolean) => void;
   extra?: JSX.Element;
   last?: boolean;
 }) {
-  const boundLabel = () => {
-    const d = props.diagnostic;
-    if (!d) return null;
-    if (!d.bound) return null;
-    return labelForValue(props.options, d.bound) ?? d.bound;
+  const [mode, setMode] = createSignal<CaptureMode>({ kind: "idle" });
+  let changeBtn: HTMLButtonElement | undefined;
+  let captureBox: HTMLDivElement | undefined;
+  let saveBtn: HTMLButtonElement | undefined;
+  /// Repeat-debounce: same `e.code` within 50 ms is treated as autorepeat.
+  let lastKey: { code: string; at: number } | null = null;
+  /// Records the most recent clean release of a single modifier with
+  /// nothing else held. A subsequent keydown of the same modifier
+  /// within 400 ms — while the set is still empty — promotes to
+  /// `Tap2:<Mod>`. Cleared whenever the captured set becomes non-empty
+  /// or a different modifier is pressed.
+  let lastSingleModRelease: {
+    mod: "Cmd" | "Ctrl" | "Alt" | "Shift";
+    at: number;
+  } | null = null;
+
+  const inCapture = () => mode().kind === "capturing";
+  const snapOf = (m: CaptureMode): CaptureSnapshot =>
+    m.kind === "capturing" ? m.snap : EMPTY_SNAP;
+
+  const enterCapture = (snap: CaptureSnapshot = EMPTY_SNAP) => {
+    lastKey = null;
+    lastSingleModRelease = null;
+    setMode({ kind: "capturing", snap });
+    queueMicrotask(() => captureBox?.focus());
   };
-  const configuredLabel = () =>
-    labelForValue(props.options, props.configured) ?? props.configured;
+
+  const exitToIdle = (restoreFocus: boolean) => {
+    lastKey = null;
+    lastSingleModRelease = null;
+    setMode({ kind: "idle" });
+    if (restoreFocus) queueMicrotask(() => changeBtn?.focus());
+  };
+
+  /// Run validation + conflict detection on a candidate spec and
+  /// return the resulting snapshot. Cross-row conflict is evaluated
+  /// here so the verdict line stays in lockstep with the set.
+  const evaluate = (spec: string): CaptureSnapshot => {
+    if (!spec) return EMPTY_SNAP;
+    const v: ValidationResult = validateHotkeySpec(spec, props.kind, props.axGranted);
+    if (v.kind === "invalid") {
+      return { spec, verdict: { tone: "danger", message: v.reason } };
+    }
+    if (v.kind === "ok-needs-ax") {
+      return {
+        spec,
+        verdict: {
+          tone: "needs-ax",
+          message: isTap2Spec(spec)
+            ? "Needs Accessibility — Vox can't hear double-tap chords."
+            : "Needs Accessibility — Vox can't hear modifier-only chords.",
+        },
+      };
+    }
+    const conflict = props.others.find((o) => specsEqual(o.spec, spec));
+    if (conflict) {
+      return {
+        spec,
+        verdict: {
+          tone: "conflict",
+          message: `Already used by ${conflict.label}.`,
+          with: { kind: conflict.kind, label: conflict.label },
+        },
+      };
+    }
+    if (isTap2Spec(spec)) {
+      return { spec, verdict: { tone: "ok", message: TAP2_OK_HINT } };
+    }
+    if (isModsSpec(spec)) {
+      return { spec, verdict: { tone: "ok", message: MODS_OK_HINT } };
+    }
+    return { spec, verdict: { tone: "ok", message: "Looks good." } };
+  };
+
+  /// Live re-evaluate when AX flips while in capture so a `Mods:` /
+  /// `Tap2:` spec unblocks Save without re-entering capture.
+  createEffect(() => {
+    const granted = props.axGranted;
+    const m = mode();
+    if (m.kind !== "capturing") return;
+    const s = m.snap;
+    if (!s.spec) return;
+    const isAxSpec = isModsSpec(s.spec) || isTap2Spec(s.spec);
+    if (!isAxSpec) return;
+    const needsAx = s.verdict.tone === "needs-ax";
+    if (needsAx && granted) {
+      setMode({ kind: "capturing", snap: evaluate(s.spec) });
+    } else if (!needsAx && !granted && s.verdict.tone === "ok") {
+      setMode({ kind: "capturing", snap: evaluate(s.spec) });
+    }
+  });
+
+  /// Tell the tab whether we're capturing a `Mods:` / `Tap2:` spec
+  /// right now — gates the parent's AX poll.
+  createEffect(() => {
+    const m = mode();
+    const active =
+      m.kind === "capturing" &&
+      !!m.snap.spec &&
+      (isModsSpec(m.snap.spec) || isTap2Spec(m.snap.spec));
+    props.onCapturingAxSpecChange?.(active);
+  });
+  onCleanup(() => {
+    props.onCapturingAxSpecChange?.(false);
+  });
+
+  /// Document-level / window-blur listeners — single pair per row, like
+  /// v1. The handlers no-op when idle.
+  const onDocPointer = (e: MouseEvent) => {
+    if (!inCapture()) return;
+    if (captureBox && e.target instanceof Node && !captureBox.contains(e.target)) {
+      exitToIdle(false);
+    }
+  };
+  const onWinBlur = () => {
+    if (inCapture()) exitToIdle(false);
+  };
+
+  onMount(() => {
+    document.addEventListener("mousedown", onDocPointer, true);
+    window.addEventListener("blur", onWinBlur);
+  });
+  onCleanup(() => {
+    document.removeEventListener("mousedown", onDocPointer, true);
+    window.removeEventListener("blur", onWinBlur);
+  });
+
+  createEffect(() => {
+    if (!props.autoOpen) return;
+    queueMicrotask(() => {
+      changeBtn?.scrollIntoView({ behavior: "smooth", block: "center" });
+      enterCapture();
+      props.onAutoOpened?.();
+    });
+  });
+
+  /// Translate a `KeyboardEvent.code` to a Tauri token (`M`, `Period`,
+  /// `F13`, …) or `null` for keys outside the parser vocabulary.
+  const baseTokenFromCode = (code: string): string | null => {
+    if (/^Key[A-Z]$/.test(code)) return code.slice(3);
+    if (/^Digit[0-9]$/.test(code)) return code.slice(5);
+    if (/^F([1-9]|1[0-9]|20)$/.test(code)) return code;
+    if (/^Arrow(Up|Down|Left|Right)$/.test(code)) return code;
+    switch (code) {
+      case "Period":
+      case "Slash":
+      case "Comma":
+      case "Semicolon":
+      case "Quote":
+      case "Backquote":
+      case "Minus":
+      case "Equal":
+      case "BracketLeft":
+      case "BracketRight":
+      case "Backslash":
+      case "Backspace":
+      case "Enter":
+      case "Space":
+      case "Delete":
+      case "Home":
+      case "End":
+      case "PageUp":
+      case "PageDown":
+      case "Insert":
+      case "Escape":
+        return code;
+      default:
+        return null;
+    }
+  };
+
+  const codeToModifier = (
+    code: string,
+  ): "Cmd" | "Ctrl" | "Alt" | "Shift" | null => {
+    if (code === "MetaLeft" || code === "MetaRight" || code === "OSLeft" || code === "OSRight") {
+      return "Cmd";
+    }
+    if (code === "ControlLeft" || code === "ControlRight") return "Ctrl";
+    if (code === "AltLeft" || code === "AltRight") return "Alt";
+    if (code === "ShiftLeft" || code === "ShiftRight") return "Shift";
+    return null;
+  };
+
+  /// Read the *currently-held* modifiers off a KeyboardEvent. Used at
+  /// every keydown to update the captured-so-far set.  Releases never
+  /// drop modifiers — per PM spec §3a the set is captured-so-far.
+  const heldFlags = (e: KeyboardEvent) => ({
+    cmd: e.metaKey,
+    ctrl: e.ctrlKey,
+    alt: e.altKey,
+    shift: e.shiftKey,
+  });
+
+  /// Merge a captured-so-far set with a fresh KeyboardEvent's held
+  /// modifiers — releasing a modifier never drops it.
+  const mergeFlags = (
+    snap: CaptureSnapshot,
+    e: KeyboardEvent,
+  ): { cmd: boolean; ctrl: boolean; alt: boolean; shift: boolean } => {
+    const p = parseSpec(snap.spec);
+    const live = heldFlags(e);
+    // Promote a held modifier into the set; never drop one.
+    return {
+      cmd: p.cmd || live.cmd,
+      ctrl: p.ctrl || live.ctrl,
+      alt: p.alt || live.alt,
+      shift: p.shift || live.shift,
+    };
+  };
+
+  const onCaptureKeyDown = (e: KeyboardEvent) => {
+    // Block Tab during capture so Shift+Tab can't be smuggled in as a
+    // binding.
+    if (e.code === "Tab") {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.code === "Enter" || e.code === "NumpadEnter") {
+      e.preventDefault();
+      e.stopPropagation();
+      save();
+      return;
+    }
+    // Esc is always cancel-capture, even on the cancel row — Esc is
+    // surfaced as an explicit suggestion chip there instead of being
+    // bindable through the key-press path.
+    if (e.code === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      exitToIdle(true);
+      return;
+    }
+    const m = mode();
+    if (m.kind !== "capturing") {
+      e.preventDefault();
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    // Repeat debounce.
+    if (lastKey && lastKey.code === e.code && Date.now() - lastKey.at < 50) {
+      return;
+    }
+    lastKey = { code: e.code, at: Date.now() };
+
+    const snap = m.snap;
+    const wasEmpty = !snap.spec;
+    const mod = codeToModifier(e.code);
+
+    if (mod) {
+      const now = Date.now();
+      // Double-tap promotion: this is a keydown of the same modifier
+      // we saw cleanly released within the window, with the set still
+      // empty in between. PM spec §3c / §4.
+      if (
+        props.kind === "ptt" &&
+        wasEmpty &&
+        lastSingleModRelease &&
+        lastSingleModRelease.mod === mod &&
+        now - lastSingleModRelease.at < DOUBLE_TAP_WINDOW_MS
+      ) {
+        lastSingleModRelease = null;
+        const spec = tap2SpecFromModifier(mod);
+        setMode({ kind: "capturing", snap: evaluate(spec) });
+        return;
+      }
+      // Any other modifier press invalidates the tap2 promotion path.
+      lastSingleModRelease = null;
+      // Compute the captured-so-far set as `Mods:<…>`. The browser's
+      // KeyboardEvent already reflects every currently-held modifier
+      // (e.altKey/metaKey/etc.), so this naturally handles the
+      // "hold ⌥ then press ⌘" case.
+      const flags = mergeFlags(snap, e);
+      const spec = modsSpecFromFlags(flags);
+      if (!spec) return;
+      // While only a single modifier is freshly held with nothing else
+      // before, show the TAP1 hint so users know about the double-tap
+      // option. Once the user adds anything else, we drop back to the
+      // normal "Mods:" verdict.
+      const parsedNew = parseSpec(spec);
+      const aloneCount =
+        (parsedNew.cmd ? 1 : 0) +
+        (parsedNew.ctrl ? 1 : 0) +
+        (parsedNew.alt ? 1 : 0) +
+        (parsedNew.shift ? 1 : 0);
+      if (props.kind === "ptt" && wasEmpty && aloneCount === 1) {
+        setMode({
+          kind: "capturing",
+          snap: {
+            spec,
+            verdict: { tone: "neutral", message: TAP1_HINT },
+          },
+        });
+      } else {
+        setMode({ kind: "capturing", snap: evaluate(spec) });
+      }
+      return;
+    }
+
+    // Non-modifier base key. Drop the tap tracker — a base key
+    // disqualifies the double-tap branch.
+    lastSingleModRelease = null;
+    const tok = baseTokenFromCode(e.code);
+    if (!tok) return;
+    const flags = mergeFlags(snap, e);
+    const parts: string[] = [];
+    if (flags.cmd) parts.push("Cmd");
+    if (flags.ctrl) parts.push("Ctrl");
+    if (flags.alt) parts.push("Alt");
+    if (flags.shift) parts.push("Shift");
+    parts.push(tok);
+    // Soft hint for the user mashing a second base key: keep last-wins
+    // but tell them once.
+    const oldParsed = parseSpec(snap.spec);
+    const hasOldKey = oldParsed.shape === "single" && !!oldParsed.key;
+    const spec = parts.join("+");
+    const newSnap = evaluate(spec);
+    if (
+      hasOldKey &&
+      newSnap.verdict.tone === "ok" &&
+      oldParsed.key !== parseSpec(spec).key
+    ) {
+      const friendlyKey = parseSpec(spec).key;
+      setMode({
+        kind: "capturing",
+        snap: {
+          spec,
+          verdict: {
+            tone: "neutral",
+            message: `One base key only — using ${friendlyKey}. Click Clear to start over.`,
+          },
+        },
+      });
+      return;
+    }
+    setMode({ kind: "capturing", snap: newSnap });
+  };
+
+  /// On modifier release we generally DO NOT drop it from the captured
+  /// set — per design spec §1 the set is captured-so-far. The single
+  /// exception: a quick lone-modifier tap on the PTT row, with no
+  /// other modifier joining the set and no base key pressed, rewinds
+  /// the set to empty so a follow-up tap of the same modifier within
+  /// 400 ms can promote to `Tap2:<Mod>`. PM spec §3c / §4.
+  const onCaptureKeyUp = (e: KeyboardEvent) => {
+    if (!inCapture()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const m = mode();
+    if (m.kind !== "capturing") return;
+    if (props.kind !== "ptt") return;
+    const mod = codeToModifier(e.code);
+    if (!mod) return;
+    // Only when the OS reports no modifiers still held — otherwise the
+    // user is mid-chord.
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) {
+      lastSingleModRelease = null;
+      return;
+    }
+    // Speculative-tap rewind: a captured set that consists of just
+    // this lone modifier gets dropped so the next press of the same
+    // mod within 400 ms can promote to Tap2.
+    const parsed = parseSpec(m.snap.spec);
+    if (parsed.shape !== "mods") {
+      lastSingleModRelease = null;
+      return;
+    }
+    const aloneCount =
+      (parsed.cmd ? 1 : 0) +
+      (parsed.ctrl ? 1 : 0) +
+      (parsed.alt ? 1 : 0) +
+      (parsed.shift ? 1 : 0);
+    const matchesReleased =
+      (mod === "Cmd" && parsed.cmd) ||
+      (mod === "Ctrl" && parsed.ctrl) ||
+      (mod === "Alt" && parsed.alt) ||
+      (mod === "Shift" && parsed.shift);
+    if (aloneCount === 1 && matchesReleased) {
+      lastSingleModRelease = { mod, at: Date.now() };
+      setMode({ kind: "capturing", snap: EMPTY_SNAP });
+    } else {
+      lastSingleModRelease = null;
+    }
+  };
+
+  const pickCommon = (spec: string) => {
+    lastSingleModRelease = null;
+    setMode({ kind: "capturing", snap: evaluate(spec) });
+  };
+
+  const clear = () => {
+    lastSingleModRelease = null;
+    setMode({ kind: "capturing", snap: EMPTY_SNAP });
+  };
+
+  const save = () => {
+    const m = mode();
+    if (m.kind !== "capturing") return;
+    const s = m.snap;
+    if (s.verdict.tone !== "ok") return;
+    props.onChange(s.spec);
+    exitToIdle(true);
+  };
+
+  const reset = () => {
+    props.onChange(props.defaultSpec);
+  };
+
+  // Diagnostic chips — kept from v1 so the fallback signal stays visible.
   const showBoundOverride = () => {
     const d = props.diagnostic;
-    return d && d.fell_back && d.bound && d.bound !== props.configured;
+    return d && d.fell_back && d.bound && !specsEqual(d.bound, props.configured);
   };
   const failed = () => {
     const d = props.diagnostic;
     return d != null && !d.bound && props.configured !== "";
   };
-  // v1 picker options never include modifier-only chords, so the
-  // chord-Accessibility branch is unreachable. Keep the helper for the
-  // diagnostic snapshot but render a single "Not bound" chip.
-  const failedChip = () => "Not bound";
+
+  /// Move focus to Save when the verdict flips to `ok`, per design §6.
+  createEffect(() => {
+    const m = mode();
+    if (m.kind !== "capturing") return;
+    if (m.snap.verdict.tone === "ok") {
+      queueMicrotask(() => saveBtn?.focus());
+    }
+  });
+
   return (
     <div
       class="flex items-start justify-between gap-4 px-4 py-3"
@@ -1066,17 +1701,17 @@ function HotkeyRow(props: {
         "border-b border-[var(--color-border)]": !props.last,
       }}
     >
-      <div class="flex flex-col">
+      <div class="flex min-w-0 flex-col gap-1">
         <div class="flex items-center gap-2">
           <span class="text-[13px] text-[var(--color-ink)]">{props.label}</span>
           <Show when={showBoundOverride()}>
             <span class="rounded-full bg-[var(--color-accent)]/20 px-2 py-0.5 text-[10px] text-[var(--color-accent)]">
-              Bound to {boundLabel()}
+              Bound to {formatHotkey(props.diagnostic?.bound)}
             </span>
           </Show>
           <Show when={failed()}>
             <span class="rounded-full bg-[var(--color-danger)]/20 px-2 py-0.5 text-[10px] text-[var(--color-danger)]">
-              {failedChip()}
+              Not bound
             </span>
           </Show>
         </div>
@@ -1085,8 +1720,8 @@ function HotkeyRow(props: {
         </span>
         <Show when={showBoundOverride()}>
           <span class="text-[11px] text-[var(--color-ink-faint)]">
-            Configured {configuredLabel()} couldn't be bound on this
-            Mac — Vox is using {boundLabel()}.
+            Configured {formatHotkey(props.configured)} couldn't be bound on this
+            Mac — Vox is using {formatHotkey(props.diagnostic?.bound)}.
           </span>
         </Show>
         <Show when={failed() && props.diagnostic?.error}>
@@ -1095,30 +1730,246 @@ function HotkeyRow(props: {
           </span>
         </Show>
       </div>
-      <div class="flex shrink-0 items-center gap-2">
-        <select
-          class="rounded-[6px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-          value={props.configured}
-          onChange={(e) => props.onChange(e.currentTarget.value)}
-        >
-          <For each={props.options}>
-            {(o) => (
-              <option value={o.value}>
-                {o.warn ? "⚠︎ " : ""}
-                {o.label}
-              </option>
-            )}
-          </For>
-        </select>
-        {props.extra}
+      <div class="flex shrink-0 flex-col items-end gap-2">
+        <Show when={mode().kind === "idle"}>
+          <div class="flex flex-col items-end gap-1">
+            <Show
+              when={props.configured !== ""}
+              fallback={
+                <span
+                  class="text-[11px] italic text-[var(--color-ink-faint)]"
+                  classList={{ "animate-flash-done": !!props.flash }}
+                >
+                  Off
+                </span>
+              }
+            >
+              <span classList={{ "animate-flash-done": !!props.flash }}>
+                <HotkeyKeys spec={props.configured} />
+              </span>
+            </Show>
+            <div class="flex items-center gap-1.5">
+              <Show when={failed()}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    // Re-enter capture pre-populated with the failing
+                    // spec so the user sees what was refused and can
+                    // re-record over it. Per PM §5b.
+                    enterCapture(evaluate(props.configured));
+                  }}
+                  class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent-strong)]"
+                >
+                  Try another
+                </button>
+              </Show>
+              <button
+                ref={changeBtn}
+                type="button"
+                onClick={() => enterCapture()}
+                class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
+              >
+                Change
+              </button>
+              <button
+                type="button"
+                onClick={reset}
+                disabled={specsEqual(props.configured, props.defaultSpec)}
+                class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)] disabled:opacity-40 disabled:hover:bg-[var(--color-control)]"
+                title={`Reset to ${formatHotkey(props.defaultSpec)}`}
+              >
+                Reset
+              </button>
+              <Show when={props.allowEmpty && props.configured !== ""}>
+                <button
+                  type="button"
+                  onClick={() => props.onChange("")}
+                  class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:bg-[var(--color-control-hover)] hover:text-[var(--color-ink)]"
+                  title="Disable this shortcut"
+                >
+                  Off
+                </button>
+              </Show>
+            </div>
+          </div>
+        </Show>
+
+        <Show when={inCapture()}>
+          {(() => {
+            const snap = () => snapOf(mode());
+            const v = () => snap().verdict;
+            const tone = () => v().tone;
+            const canSave = () => tone() === "ok";
+            const verdictMessage = () => {
+              const cur = v();
+              if (cur.tone === "empty") return EMPTY_HINT;
+              return "message" in cur ? cur.message : "";
+            };
+            const verdictClass = () => {
+              const t = tone();
+              if (t === "ok" || t === "neutral") return "text-[var(--color-ink-mute)]";
+              if (t === "empty") return "text-[var(--color-ink)] animate-pulse-mic";
+              return "text-[var(--color-danger)]";
+            };
+            const verdictId = `hotkey-capture-${props.kind}-verdict`;
+            return (
+              <div
+                ref={captureBox}
+                role="dialog"
+                aria-label={`Capture ${props.label} shortcut`}
+                aria-describedby={verdictId}
+                tabIndex={-1}
+                onKeyDown={onCaptureKeyDown}
+                onKeyUp={onCaptureKeyUp}
+                class="liquid-glass flex w-[260px] flex-col gap-2 rounded-[10px] p-2.5 ring-1 ring-[var(--color-accent)] outline-none animate-pill-in"
+              >
+                {/* Slot 1 — keycaps or placeholder */}
+                <div class="flex min-h-[20px] flex-wrap items-center gap-1">
+                  <Show
+                    when={!!snap().spec}
+                    fallback={
+                      <span class="text-[11px] italic text-[var(--color-ink-faint)]">
+                        —
+                      </span>
+                    }
+                  >
+                    <HotkeyKeys spec={snap().spec} />
+                  </Show>
+                </div>
+                {/* Slot 2 — verdict */}
+                <span id={verdictId} class={`text-[11px] ${verdictClass()}`} aria-live="polite">
+                  {verdictMessage()}
+                </span>
+                {/* Slot 3 — permission / conflict resolution */}
+                <Show when={tone() === "needs-ax"}>
+                  <div class="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        void openAccessibilitySettings();
+                      }}
+                      class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
+                    >
+                      Open System Settings
+                    </button>
+                  </div>
+                </Show>
+                <Show when={tone() === "conflict"}>
+                  {(() => {
+                    const cur = v();
+                    if (cur.tone !== "conflict") return null;
+                    return (
+                      <div class="flex flex-col gap-1">
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            props.onResolveConflict(snap().spec, cur.with.kind);
+                            exitToIdle(true);
+                          }}
+                          class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent-strong)]"
+                        >
+                          Use this & clear that one
+                        </button>
+                        <button
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            const target = cur.with.kind;
+                            exitToIdle(false);
+                            props.onChangeOther(target);
+                          }}
+                          class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)]"
+                        >
+                          Change other shortcut
+                        </button>
+                      </div>
+                    );
+                  })()}
+                </Show>
+                {/* Slot 4 — Save / Clear / Cancel */}
+                <div class="flex items-center gap-1.5">
+                  <button
+                    ref={saveBtn}
+                    type="button"
+                    disabled={!canSave()}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      save();
+                    }}
+                    title={
+                      tone() === "needs-ax"
+                        ? "Needs Accessibility — open System Settings to grant."
+                        : undefined
+                    }
+                    class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1 text-[11px] font-medium text-[var(--color-on-accent)] hover:bg-[var(--color-accent-strong)] disabled:opacity-40 disabled:hover:bg-[var(--color-accent)]"
+                  >
+                    Save
+                  </button>
+                  <button
+                    type="button"
+                    disabled={!snap().spec}
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      clear();
+                    }}
+                    class="rounded-[6px] bg-[var(--color-control)] px-3 py-1 text-[11px] hover:bg-[var(--color-control-hover)] disabled:opacity-40 disabled:hover:bg-[var(--color-control)]"
+                  >
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      exitToIdle(true);
+                    }}
+                    class="rounded-[6px] px-3 py-1 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
+        </Show>
+        <Show when={inCapture()}>
+          <div class="flex flex-wrap items-center gap-1">
+            <span class="text-[10px] text-[var(--color-ink-faint)]">Or pick:</span>
+            <For
+              each={COMMON_CHORDS.filter(
+                (c) =>
+                  (!c.cancelOnly || props.kind === "cancel") &&
+                  (!c.pttOnly || props.kind === "ptt"),
+              )}
+            >
+              {(c) => (
+                <button
+                  type="button"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    pickCommon(c.spec);
+                  }}
+                  class="rounded-[6px] bg-[var(--color-control)] px-2 py-0.5 text-[10px] hover:bg-[var(--color-control-hover)]"
+                  aria-label={`Use ${formatHotkey(c.spec)}`}
+                >
+                  <HotkeyKeys spec={c.spec} />
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+        <Show when={!inCapture()}>{props.extra}</Show>
       </div>
     </div>
   );
-}
-
-function labelForValue(opts: HotkeyOption[], value: string): string | null {
-  const m = opts.find((o) => o.value === value);
-  return m?.label ?? null;
 }
 
 function friendlySttEngineName(engine: string): string {
@@ -1674,11 +2525,6 @@ function AppleFmEngineRow(props: {
                 Active
               </span>
             </Show>
-            <Show when={!props.isActive && reachable()}>
-              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
-                Recommended
-              </span>
-            </Show>
           </div>
           <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
             On-device, no download. Uses Apple's Foundation Models on
@@ -1735,6 +2581,11 @@ function GemmaEngineRow(props: { isActive: boolean; onUse: () => void }) {
             <Show when={props.isActive}>
               <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
                 Active
+              </span>
+            </Show>
+            <Show when={!props.isActive}>
+              <span class="rounded-full bg-[var(--color-accent)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-accent)]">
+                Recommended
               </span>
             </Show>
           </div>
