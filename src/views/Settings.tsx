@@ -155,14 +155,22 @@ const DEFAULT_MODE_CYCLE_HOTKEY = "Alt+M";
 // `pttOnly` flags Mods: / Tap2: shapes that only the push-to-talk row
 // can bind (cancel + mode-cycle go through `tauri-plugin-global-shortcut`,
 // not CGEventTap).
-const COMMON_CHORDS: { spec: string; cancelOnly?: boolean; pttOnly?: boolean }[] = [
+// `wide` chords render with 3+ keycaps (e.g. Cmd+Shift+M) and don't fit
+// inside a single column of the 2-col picker grid — they span both cols
+// so the glyph+word labels stay inside the button border.
+const COMMON_CHORDS: {
+  spec: string;
+  cancelOnly?: boolean;
+  pttOnly?: boolean;
+  wide?: boolean;
+}[] = [
   { spec: "Escape", cancelOnly: true },
   { spec: "F13" },
   { spec: "F14" },
   { spec: "F15" },
   { spec: "Alt+M" },
-  { spec: "Alt+Shift+M" },
-  { spec: "Cmd+Shift+M" },
+  { spec: "Alt+Shift+M", wide: true },
+  { spec: "Cmd+Shift+M", wide: true },
   { spec: "Mods:Ctrl+Alt", pttOnly: true },
   { spec: "Tap2:Alt", pttOnly: true },
 ];
@@ -1940,30 +1948,39 @@ function HotkeyRow(props: {
           })()}
         </Show>
         <Show when={inCapture()}>
-          <div class="flex flex-wrap items-center gap-1">
-            <span class="text-[10px] text-[var(--color-ink-faint)]">Or pick:</span>
-            <For
-              each={COMMON_CHORDS.filter(
-                (c) =>
-                  (!c.cancelOnly || props.kind === "cancel") &&
-                  (!c.pttOnly || props.kind === "ptt"),
-              )}
-            >
-              {(c) => (
-                <button
-                  type="button"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    pickCommon(c.spec);
-                  }}
-                  class="rounded-[6px] bg-[var(--color-control)] px-2 py-0.5 text-[10px] hover:bg-[var(--color-control-hover)]"
-                  aria-label={`Use ${formatHotkey(c.spec)}`}
-                >
-                  <HotkeyKeys spec={c.spec} />
-                </button>
-              )}
-            </For>
+          {/* Picker matches the capture popover width (260px) above so the
+              chord chips form a tidy column under it instead of a ragged
+              flex-wrap row. Two columns keep the tallest list (8 chips
+              for PTT) at 4 rows. */}
+          <div class="flex w-[260px] flex-col gap-1.5">
+            <span class="text-[10px] uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+              Or pick
+            </span>
+            <div class="grid grid-cols-2 gap-1">
+              <For
+                each={COMMON_CHORDS.filter(
+                  (c) =>
+                    (!c.cancelOnly || props.kind === "cancel") &&
+                    (!c.pttOnly || props.kind === "ptt"),
+                )}
+              >
+                {(c) => (
+                  <button
+                    type="button"
+                    onMouseDown={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      pickCommon(c.spec);
+                    }}
+                    class="flex items-center justify-center rounded-[6px] bg-[var(--color-control)] px-2 py-1 text-[10px] hover:bg-[var(--color-control-hover)]"
+                    classList={{ "col-span-2": !!c.wide }}
+                    aria-label={`Use ${formatHotkey(c.spec)}`}
+                  >
+                    <HotkeyKeys spec={c.spec} />
+                  </button>
+                )}
+              </For>
+            </div>
           </div>
         </Show>
         <Show when={!inCapture()}>{props.extra}</Show>

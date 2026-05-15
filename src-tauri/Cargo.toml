@@ -1,6 +1,6 @@
 [package]
 name = "vox"
-version = "1.3.0"
+version = "1.4.0"
 description = "Vox — talk to any app"
 authors = ["Vox"]
 edition = "2021"
