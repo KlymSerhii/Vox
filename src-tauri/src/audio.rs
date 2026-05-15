@@ -26,6 +26,40 @@ const MAX_BUFFER_SECS: usize = 30 * 60 + 5;
 /// the stream sooner short-circuits the wake.
 const CONTINUITY_WAKE_HOLD_MS: u64 = 300;
 
+/// Release the underlying `AudioUnit`'s OS-level device hold by
+/// explicitly pausing the stream before dropping it.
+///
+/// **Why this can't just be `drop(stream)`:** cpal 0.15.3's CoreAudio
+/// backend installs a device-disconnect property listener whenever the
+/// stream is built against a non-default device (`host/coreaudio/macos/mod.rs`
+/// gates `add_disconnect_listener` on `!self.is_default`). That listener's
+/// callback captures a clone of the `Stream` — i.e. a second `Arc` on the
+/// same `StreamInner` — and the listener itself lives *inside* that
+/// `StreamInner`. The Arcs form a cycle, so the original `drop` only
+/// decrements the refcount from 2 to 1; `StreamInner::Drop` (and therefore
+/// `AudioUnit::Drop`, which calls `AudioOutputUnitStop` →
+/// `AudioComponentInstanceDispose`) never runs, and macOS keeps the
+/// orange mic-in-use indicator on forever — even after the user switches
+/// back to the system default, because the leaked AudioUnit from the
+/// previous custom-device session is still holding the device.
+///
+/// Calling `StreamTrait::pause` synchronously invokes `AudioOutputUnitStop`
+/// via `coreaudio::AudioUnit::stop`, which is what actually tells the OS
+/// the app has released the device. The cpal `Stream` / `AudioUnit`
+/// objects themselves still leak (the Arc cycle is unreachable from us),
+/// but that's a few KB per non-default capture — bounded by the user's
+/// device-switch + recording rate and irrelevant compared to the mic
+/// indicator staying lit.
+///
+/// Errors are swallowed: there is no recovery, and the caller is about
+/// to drop the stream anyway.
+fn release_stream(stream: cpal::Stream) {
+    if let Err(e) = stream.pause() {
+        log::warn!("audio: cpal pause before drop failed: {e}");
+    }
+    drop(stream);
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
     #[error("no default input device")]
@@ -196,7 +230,7 @@ pub fn probe_device(device_name: Option<&str>) -> Result<(), AudioError> {
         map_device_unavailable_error(device_name, e, unavailable)
     })?;
     std::thread::sleep(std::time::Duration::from_millis(CONTINUITY_WAKE_HOLD_MS));
-    drop(stream);
+    release_stream(stream);
     Ok(())
 }
 
@@ -449,13 +483,14 @@ fn audio_thread_inner(rx: Receiver<Command>, rms_bits: Arc<AtomicU32>) {
             }
             Command::Stop(reply) => {
                 if let Some(cap) = active.take() {
-                    // Drop the stream FIRST so the cpal `AudioUnit`'s
-                    // `Drop` (which calls `AudioOutputUnitStop` →
-                    // `AudioComponentInstanceDispose`) runs before
-                    // anything else. The macOS Control Center
-                    // mic-in-use indicator can only start its release
-                    // timer once that disposal happens.
-                    drop(cap.stream);
+                    // Release the stream FIRST so the OS-level mic hold
+                    // drops before anything else. See `release_stream`
+                    // for the cpal Arc-cycle reason this can't just be
+                    // `drop(cap.stream)` — `AudioOutputUnitStop` would
+                    // otherwise never fire for non-default devices and
+                    // the macOS Control Center mic-in-use indicator
+                    // would stay lit until the next app restart.
+                    release_stream(cap.stream);
                     rms_bits.store(0, Ordering::Relaxed);
                     stashed = Some(StashedRecording {
                         samples: cap.samples,
