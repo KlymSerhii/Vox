@@ -384,6 +384,20 @@ body.translucent {
   animation: prewarm-bar-bounce 1.05s ease-in-out infinite;
 }
 
+/* Once-only attention pulse on the onboarding Repolish illustration's
+ * sparkle button. Plays after a short delay so the user has time to
+ * read the card title first, then a single double-bounce that draws
+ * the eye to the affordance. */
+@keyframes onboarding-sparkle-pulse {
+  0%, 60%, 100% { transform: scale(1); }
+  10%, 30% { transform: scale(1.08); }
+}
+
+.onboarding-sparkle-pulse {
+  animation: onboarding-sparkle-pulse 2s ease-out 0.6s 1;
+  transform-origin: center;
+}
+
 /* Streaming body: no visible scrollbar, top-fade mask so older text
  * dissolves rather than hard-clipping at the sticky header edge. */
 .streaming-body {

@@ -48,14 +48,16 @@ import {
 } from "../lib/ipc";
 import { VoxLogo } from "../components/VoxLogo";
 import { HotkeyKeys } from "../components/HotkeyKeys";
+import { SparkleGlyph } from "../components/SparkleGlyph";
 import { formatHotkey as sharedFormatHotkey } from "../lib/hotkey";
 
 type PolishChoice = "apple-fm" | "gemma-local";
 
-type Step = 0 | 1 | 2 | 3 | 4;
+type Step = 0 | 1 | 2 | 3 | 4 | 5;
 
-const STEP_COUNT = 5;
-const LAST_STEP: Step = 4;
+const STEP_COUNT = 6;
+const LAST_STEP: Step = 5;
+const TIPS_STEP: Step = 4;
 const MODELS_STEP: Step = 3;
 const MIC_STEP: Step = 2;
 const LANGUAGE_STEP: Step = 1;
@@ -230,6 +232,9 @@ export default function OnboardingView() {
               onInFlightChange={setDownloadInFlight}
               onReadyChange={setModelsReady}
             />
+          </Show>
+          <Show when={step() === TIPS_STEP}>
+            <TipsStep />
           </Show>
           <Show when={step() === LAST_STEP}>
             <HowToUseStep s={s()} />
@@ -1497,6 +1502,235 @@ function PrewarmBars() {
           />
         )}
       </For>
+    </div>
+  );
+}
+
+function TipsStep() {
+  return (
+    <div class="flex w-full max-w-[440px] flex-col gap-4 animate-pill-in">
+      <header class="flex flex-col gap-1.5">
+        <h2 class="text-[20px] font-semibold text-[var(--color-ink)]">
+          Try a few tricks before you go.
+        </h2>
+        <p class="text-[13px] text-[var(--color-ink-mute)]">
+          You can keep going without these — but they're what makes Vox feel personal.
+        </p>
+      </header>
+      <VoiceModesShowcase />
+      <RepolishShowcase />
+      <p class="text-[11px] text-[var(--color-ink-faint)] mt-1">
+        Edit, clone, or write your own modes in Settings → Modes.
+      </p>
+    </div>
+  );
+}
+
+function VoiceModesShowcase() {
+  return (
+    <div class="liquid-card flex flex-col gap-3 rounded-[10px] bg-[var(--color-surface-raised)] px-4 py-4 ring-1 ring-[var(--color-border)]">
+      <VoiceModesFan />
+      <div class="flex flex-col gap-1">
+        <h3 class="text-[14px] font-semibold leading-tight text-[var(--color-ink)]">
+          Match your tone to the moment.
+        </h3>
+        <p class="text-[12px] leading-[17px] text-[var(--color-ink-mute)]">
+          Seven built-in modes — Email, Chat, Notes, Code comment, Summary, and more — change how your transcript gets cleaned up.
+        </p>
+      </div>
+      <div class="flex flex-wrap items-center gap-1 text-[12px] text-[var(--color-ink-mute)]">
+        <span>Cycle anytime with</span>
+        <HotkeyKeys spec="Alt+M" />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Three angled liquid-glass chips that preview how the same dictation
+ * reads in three different voice modes. Center chip leads (no rotation,
+ * soft accent ring) so the eye lands there first; the side chips fan
+ * out at ±16° to suggest "there are more". Emoji glyphs are mirrored
+ * from `modes.rs::builtins()` so this card and the tray popover's
+ * mode picker show the same icon per mode.
+ */
+function VoiceModesFan() {
+  const chip = (
+    body: string,
+    style: { transform: string; "z-index": number; center?: boolean },
+    emoji: string,
+    label: string,
+  ) => (
+    <div
+      class="liquid-glass absolute flex flex-col gap-1 px-2.5 py-2"
+      classList={{
+        "ring-1 ring-[var(--color-accent-soft)]": !!style.center,
+      }}
+      style={{
+        width: "170px",
+        height: "96px",
+        "border-radius": "10px",
+        "box-shadow": "var(--glass-shadow-stack-sm)",
+        left: "50%",
+        top: "12px",
+        transform: style.transform,
+        "z-index": style["z-index"],
+      }}
+    >
+      <div class="flex items-center gap-1.5">
+        <span
+          aria-hidden="true"
+          style={{ "font-size": "14px", "line-height": "14px" }}
+        >
+          {emoji}
+        </span>
+        <span class="text-[10px] font-medium text-[var(--color-ink-mute)]">
+          {label}
+        </span>
+      </div>
+      <p class="text-[10px] leading-[14px] text-[var(--color-ink)]">
+        {body}
+      </p>
+    </div>
+  );
+  return (
+    <div class="relative h-[120px] w-full" aria-hidden="true">
+      {chip(
+        "Hi — just wanted to check in about the deck. Thanks!",
+        {
+          transform:
+            "translateX(calc(-50% - 78px)) translateY(8px) rotate(-16deg)",
+          "z-index": 10,
+        },
+        "📧",
+        "Email",
+      )}
+      {chip(
+        "• Check in on deck status",
+        {
+          transform: "translateX(calc(-50% + 78px)) translateY(8px) rotate(16deg)",
+          "z-index": 10,
+        },
+        "📝",
+        "Notes",
+      )}
+      {chip(
+        "hey just checking in on the deck",
+        {
+          transform: "translateX(-50%) translateY(-2px) rotate(0deg)",
+          "z-index": 30,
+          center: true,
+        },
+        "💭",
+        "Chat",
+      )}
+    </div>
+  );
+}
+
+function RepolishShowcase() {
+  return (
+    <div class="liquid-card flex flex-col gap-3 rounded-[10px] bg-[var(--color-surface-raised)] px-4 py-4 ring-1 ring-[var(--color-border)]">
+      <RepolishMini />
+      <div class="flex flex-col gap-1">
+        <h3 class="text-[14px] font-semibold leading-tight text-[var(--color-ink)]">
+          Wrong mode? Repolish it.
+        </h3>
+        <p class="text-[12px] leading-[17px] text-[var(--color-ink-mute)]">
+          Dictated a casual note but realized it should've been an email? Open the Vox menu-bar icon, hover any recent transcript, and tap the sparkle to re-clean it with a different Voice Mode — the new version lands on your clipboard instantly.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Mini popover + connector + re-polish picker. Mirrors the real tray
+ * popover's Recent row and "Re-polish as…" menu so the user recognises
+ * both surfaces when they actually open the menu bar icon. The dashed
+ * arrow visually links the sparkle button to the mode picker that pops
+ * out of it.
+ */
+function RepolishMini() {
+  return (
+    <div class="relative h-[120px] w-full" aria-hidden="true">
+      <div
+        class="liquid-glass rounded-[14px] px-2.5 py-2 flex flex-col gap-1"
+        style={{
+          position: "absolute",
+          left: "8px",
+          top: "12px",
+          width: "240px",
+          height: "96px",
+        }}
+      >
+        <div class="px-1.5 pt-0.5 pb-1 text-[9px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+          Recent
+        </div>
+        <div class="flex items-center gap-2 rounded-[8px] bg-[var(--color-overlay)] px-2 py-1.5">
+          <span class="w-8 shrink-0 text-[9px] font-medium text-[var(--color-ink-faint)]">
+            2m
+          </span>
+          <span class="flex-1 truncate text-[10px] text-[var(--color-ink)]">
+            hey just checking in on the deck
+          </span>
+          <span class="inline-flex h-5 w-5 items-center justify-center rounded bg-[var(--color-accent-soft)] text-[var(--color-accent)] onboarding-sparkle-pulse">
+            <SparkleGlyph width={12} height={12} />
+          </span>
+        </div>
+      </div>
+      <svg
+        style={{
+          position: "absolute",
+          top: "44px",
+          left: "200px",
+          width: "80px",
+          height: "30px",
+          "pointer-events": "none",
+          overflow: "visible",
+        }}
+      >
+        <path
+          d="M0 12 C 24 12, 36 4, 64 4"
+          stroke="var(--color-ink-faint)"
+          stroke-width="1"
+          stroke-dasharray="2 3"
+          fill="none"
+        />
+        <polyline
+          points="58 -1 64 4 58 9"
+          fill="none"
+          stroke="var(--color-ink-faint)"
+          stroke-width="1"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        />
+      </svg>
+      <div
+        class="liquid-glass rounded-[10px] py-1 flex flex-col"
+        style={{
+          position: "absolute",
+          right: "6px",
+          top: "6px",
+          width: "148px",
+        }}
+      >
+        <div class="px-2 pb-0.5 pt-1 text-[8px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+          Re-polish as…
+        </div>
+        <div class="flex items-center gap-1.5 px-2 py-1 text-[10px] bg-[var(--color-accent-soft)] text-[var(--color-accent)]">
+          <span aria-hidden="true">📧</span>
+          <span>Email</span>
+        </div>
+        <div class="flex items-center gap-1.5 px-2 py-1 text-[10px] text-[var(--color-ink)]">
+          <span aria-hidden="true">💭</span>
+          <span>Chat</span>
+        </div>
+        <div class="flex items-center gap-1.5 px-2 py-1 text-[10px] text-[var(--color-ink)]">
+          <span aria-hidden="true">📝</span>
+          <span>Notes</span>
+        </div>
+      </div>
     </div>
   );
 }

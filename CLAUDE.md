@@ -22,7 +22,7 @@ This file is the canonical project reference. The README that used to live at th
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `hotkey` | `Cmd+Alt+Period` (⌘⌥.) | Hardcoded — `settings::load` always writes the default into the persisted store on every launch. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
+| `hotkey` | `Cmd+Alt+Period` (⌘⌥.) | User-pickable in Settings → Hotkeys; defaults apply on first launch via `default_hotkey()` and `#[serde(default)]`. Bound via `tauri-plugin-global-shortcut` (Carbon `RegisterEventHotKey`). No Accessibility required. |
 | `cancel_hotkey` | `Escape` | Aborts the in-flight session. The OS grab is acquired only while a session is active (`hotkey::arm_cancel` at `session::begin_recording`, `hotkey::disarm_cancel` from `PipelineGuard::drop`) so Escape works normally in every other app when Vox isn't dictating. |
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
@@ -81,11 +81,12 @@ Each mode contributes:
 │   ├── views/
 │   │   ├── Settings.tsx               ← tabbed settings window
 │   │   ├── Pill.tsx                   ← floating listening pill
-│   │   ├── Onboarding.tsx             ← 5-step first-run wizard
+│   │   ├── Onboarding.tsx             ← 6-step first-run wizard
 │   │   └── TrayPopover.tsx            ← menu-bar popover
 │   ├── components/
 │   │   ├── VoxLogo.tsx                ← shared logo glyph
-│   │   └── HotkeyKeys.tsx             ← renders a Tauri shortcut spec as a row of keycap badges (`⌘ Cmd + ⌥ Opt + .`)
+│   │   ├── HotkeyKeys.tsx             ← renders a Tauri shortcut spec as a row of keycap badges (`⌘ Cmd + ⌥ Opt + .`)
+│   │   └── SparkleGlyph.tsx           ← 4-point sparkle SVG; shared by the tray popover's re-polish trigger and the onboarding tips step
 │   ├── lib/
 │   │   ├── ipc.ts                     ← typed bindings to Tauri commands + events
 │   │   ├── hotkey.ts                  ← shared `formatHotkeyTokens` / `formatHotkey` for chord display
@@ -153,7 +154,7 @@ cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --feature
 
 In that mode `commands::apple_fm_availability` returns `framework_missing`, the onboarding wizard's Apple Intelligence card is disabled, and only the Gemma 4 path is reachable.
 
-Onboarding fires automatically when `onboarded == false`: Welcome → Language → Microphone → Download local models → How to use. (Five steps. No Accessibility step — the default ⌘⌥. hotkey doesn't need it, and chord PTT isn't user-pickable in v1.)
+Onboarding fires automatically when `onboarded == false`: Welcome → Language → Microphone → Download local models → Try a few tricks (Voice Modes + Repolish showcase) → How to use. (Six steps. The Tips step is index 4 (`TIPS_STEP`) and lands *after* the model downloads finish so users feel rewarded rather than gated; it's optional (Skip link). No Accessibility step — the default ⌘⌥. hotkey doesn't need it, and chord PTT isn't user-pickable in v1.)
 
 ### Reset for a clean first-launch experience
 

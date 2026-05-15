@@ -1,5 +1,6 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { HotkeyKeys } from "../components/HotkeyKeys";
+import { SparkleGlyph } from "../components/SparkleGlyph";
 import {
   cancelSession,
   checkPermissions,
@@ -1494,28 +1495,6 @@ function SmallSpinner() {
       aria-hidden="true"
     >
       <path d="M12 3a9 9 0 1 0 9 9" />
-    </svg>
-  );
-}
-
-function SparkleGlyph() {
-  // Liquid-style 4-point sparkle — reads as "polish / refresh" without
-  // looking like a copy or refresh-arrow glyph (both of which already
-  // appear elsewhere in the popover).
-  return (
-    <svg
-      width="14"
-      height="14"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      stroke-width="1.75"
-      stroke-linecap="round"
-      stroke-linejoin="round"
-      aria-hidden="true"
-    >
-      <path d="M12 3v4M12 17v4M3 12h4M17 12h4" />
-      <path d="M12 8c.5 2 1.5 3 4 3.5C13.5 12 12.5 13 12 16c-.5-3-1.5-4-4-4.5C10.5 11 11.5 10 12 8z" />
     </svg>
   );
 }
