@@ -349,11 +349,13 @@ public func vox_apple_fm_polish_blocking(
 // session yields them, then signals completion. Blocks the calling
 // pthread on a DispatchSemaphore (callers run from `spawn_blocking`).
 //
-// The `streamResponse(to:)` API on macOS 26 yields partial snapshots of
-// the in-progress response. For a String-typed session each yielded
-// element is a partial string we forward straight to Rust. We stringify
-// via `String(describing:)` defensively so this still compiles if the
-// SDK changes the partial wrapper shape between betas.
+// The `streamResponse(to:)` API on macOS 26 yields `Snapshot` values
+// with `content` (the cumulative partial of the session's `Content`
+// type) and `rawContent`. For our String-typed session, `content` is
+// the partial String — we read that directly. Using
+// `String(describing:)` on the whole `Snapshot` would emit its struct
+// debug form (`Snapshot(content: "...", rawContent: "...")`) and ship
+// that gibberish to the user.
 //
 // Use-after-free safety on timeout: if the deadline fires while the
 // detached Task is still iterating the stream, the Rust caller will
@@ -414,16 +416,16 @@ public func vox_apple_fm_polish_stream(
             let userMessage =
                 "Clean this transcript. Output only the cleaned text.\n\n```\n\(transcript)\n```"
 
-            // The session yields cumulative snapshots; we coerce each
-            // element to a String defensively so a beta-SDK shape
-            // change doesn't break compilation.
+            // The session yields cumulative `Snapshot` values; read
+            // `partial.content` to get just the partial String for a
+            // String-typed session (not the struct's debug form).
             var lastSnapshot = ""
             let stream = session.streamResponse(to: userMessage, options: options)
             for try await partial in stream {
                 // Cooperative cancellation check — fires when the
                 // timeout path called task.cancel().
                 if Task.isCancelled { break }
-                let snapshot = String(describing: partial)
+                let snapshot = partial.content
                 if snapshot != lastSnapshot {
                     lastSnapshot = snapshot
                     // Hold the lock across the trampoline call so a
