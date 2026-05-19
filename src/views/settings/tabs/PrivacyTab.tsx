@@ -27,6 +27,14 @@ export function PrivacyTab(_props: { s: Settings }) {
       detail:
         "There are no API keys to store, because there are no third-party services.",
     },
+    {
+      // Only network access outside model + binary downloads. Worth
+      // disclosing because it's a recurring background call — the
+      // toggle for it lives in Settings → General.
+      title: "Update check",
+      detail:
+        "Vox checks GitHub once a day for new releases. No identifiers are sent.",
+    },
   ];
 
   return (

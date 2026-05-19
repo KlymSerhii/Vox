@@ -6,8 +6,11 @@ import {
   checkPermissions,
   closeTrayPopover,
   copyText,
+  dismissUpdate,
+  downloadAndInstallUpdate,
   getPublicSettings,
   getTimeSavedStats,
+  getUpdateState,
   inferenceServerStatus,
   listAudioInputDevices,
   listModels,
@@ -16,6 +19,8 @@ import {
   onSessionsChanged,
   onSettingsChanged,
   onStatsChanged,
+  onUpdateState,
+  onUpdaterProgress,
   openAccessibilitySettings,
   openSettingsWindow,
   quitApp,
@@ -37,6 +42,7 @@ import {
   type SessionsSnapshot,
   type Settings,
   type TimeSavedStats,
+  type UpdateState,
   type VoiceMode,
 } from "../lib/ipc";
 import { AppearanceToggle } from "./tray-popover/components/AppearanceToggle";
@@ -44,6 +50,7 @@ import { InProgressRow } from "./tray-popover/components/InProgressRow";
 import { LocalBadge } from "./tray-popover/components/LocalBadge";
 import { SmallSpinner } from "./tray-popover/components/SmallSpinner";
 import { StatusDot } from "./tray-popover/components/StatusDot";
+import { UpdateBanner } from "./tray-popover/components/UpdateBanner";
 import { Toggle } from "../components/Toggle";
 import { PERIOD_OPTIONS } from "./tray-popover/constants";
 import {
@@ -161,6 +168,17 @@ export default function TrayPopoverView() {
   let unlistenStats: (() => void) | null = null;
   let unlistenModes: (() => void) | null = null;
   let unlistenFocus: (() => void) | null = null;
+  let unlistenUpdates: (() => void) | null = null;
+  let unlistenUpdaterProgress: (() => void) | null = null;
+  // Updater state is shared with the tray-icon dot (via the backend
+  // emit) and the Settings → About row. We mirror it here only for
+  // the banner — the banner gates on `state.status === "available"`
+  // AND `dismissed_version !== available_version`. The popover
+  // webview is built once and reused, so the live subscription is
+  // load-bearing for "Later" to take effect on this surface without
+  // needing the user to re-open the popover.
+  const [updateState, setUpdateState] = createSignal<UpdateState | null>(null);
+  const [installingUpdate, setInstallingUpdate] = createSignal(false);
 
   async function refreshStats() {
     try {
@@ -231,6 +249,28 @@ export default function TrayPopoverView() {
     // webview is built once and reused on every tray click, so the
     // initial `listModes()` call would otherwise go stale.
     unlistenModes = await onModesChanged(setModes);
+    // Updater banner: snapshot on first mount, then subscribe to
+    // live state. Same pattern as `onSessionsChanged` — without the
+    // live event, a check that completes while the popover is
+    // hidden would only land on the next reopen.
+    try {
+      setUpdateState(await getUpdateState());
+    } catch (err) {
+      console.warn("getUpdateState failed:", err);
+    }
+    unlistenUpdates = await onUpdateState(setUpdateState);
+    // Track installer progress so the banner button can show its
+    // "Installing…" state. The Settings → About row owns the
+    // detailed progress bar; the tray banner just disables the
+    // button — the app restarts on success so a long-running
+    // progress UI in the popover would never be read.
+    unlistenUpdaterProgress = await onUpdaterProgress((p) => {
+      if (p.phase === "error" || p.phase === "done") {
+        setInstallingUpdate(false);
+      } else {
+        setInstallingUpdate(true);
+      }
+    });
     void refreshStats();
 
     window.addEventListener("focus", () => {
@@ -303,6 +343,8 @@ export default function TrayPopoverView() {
     unlistenStats?.();
     unlistenModes?.();
     unlistenFocus?.();
+    unlistenUpdates?.();
+    unlistenUpdaterProgress?.();
   });
 
   async function pickMode(id: string) {
@@ -416,6 +458,45 @@ export default function TrayPopoverView() {
       setTimeout(() => setCopyFlash(null), 900);
     } catch (e) {
       console.error("copy failed:", e);
+    }
+  }
+
+  // Mirror of `UpdateState::banner_visible` on the Rust side. Hides
+  // the banner when there's no pending update, or when the user
+  // dismissed the current version. Settings → About is the dedicated
+  // surface for the pending state and is intentionally NOT gated on
+  // the dismissal — that's why this predicate lives on the banner,
+  // not in Settings.
+  function showUpdateBanner(): boolean {
+    const u = updateState();
+    if (!u) return false;
+    if (u.status !== "available") return false;
+    const av = u.available_version;
+    if (!av) return false;
+    const dv = u.dismissed_version;
+    return !dv || dv !== av;
+  }
+
+  async function onUpdateInstall() {
+    if (installingUpdate()) return;
+    setInstallingUpdate(true);
+    try {
+      // Resolves only on failure — success ends with `app.restart()`
+      // on the Rust side. The updater:progress listener drives the
+      // button's disabled state in either direction.
+      await downloadAndInstallUpdate();
+    } catch (err) {
+      console.error("install failed:", err);
+      setInstallingUpdate(false);
+    }
+  }
+
+  async function onUpdateLater() {
+    try {
+      const next = await dismissUpdate();
+      setUpdateState(next);
+    } catch (err) {
+      console.error("dismissUpdate failed:", err);
     }
   }
 
@@ -1117,6 +1198,14 @@ export default function TrayPopoverView() {
             </div>
 
             <div class="flex min-h-[180px] flex-1 flex-col px-2 py-2">
+              <Show when={showUpdateBanner()}>
+                <UpdateBanner
+                  availableVersion={updateState()?.available_version ?? ""}
+                  installing={installingUpdate()}
+                  onInstall={() => void onUpdateInstall()}
+                  onLater={() => void onUpdateLater()}
+                />
+              </Show>
               <Show when={inProgress().length > 0}>
                 <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-violet,#a78bfa)]">
                   In progress

@@ -831,6 +831,83 @@ pub async fn download_and_install_update<R: Runtime>(app: AppHandle<R>) -> Resul
     app.restart();
 }
 
+/// Snapshot the in-process `UpdaterState`. The tray popover banner +
+/// Settings → About + tray-icon dot subscribe to `updates:state` for
+/// live updates, but the windows still call this on mount so the
+/// initial render doesn't have to wait for the next emit.
+///
+/// Returns a payload that mirrors `updates:state` so the consumers
+/// can reuse the same TS type for both code paths.
+#[tauri::command]
+pub fn get_update_state<R: Runtime>(app: AppHandle<R>) -> crate::updater::UpdateState {
+    match app.try_state::<Arc<crate::updater::UpdaterState>>() {
+        Some(state) => state.current.lock().clone(),
+        None => {
+            // Setup hasn't installed the state yet — return an idle
+            // shape so the frontend can render without special-casing.
+            let mut idle = crate::updater::UpdateState {
+                status: "idle".into(),
+                current_version: app.package_info().version.to_string(),
+                available_version: None,
+                release_notes: None,
+                last_check_at: None,
+                last_error: None,
+                dismissed_version: None,
+            };
+            // Hydrate from disk so a tray click during the brief
+            // setup window still sees the persisted dismissal.
+            let s = settings::load(&app);
+            idle.last_check_at = s.last_update_check_at;
+            idle.dismissed_version = s.dismissed_update_version;
+            idle
+        }
+    }
+}
+
+/// "Later" — per-version dismissal of the tray banner + dot. The
+/// Settings → About row is the dedicated update surface and is
+/// deliberately NOT hidden by this dismissal (per spec).
+#[tauri::command]
+pub fn dismiss_update<R: Runtime>(app: AppHandle<R>) -> crate::updater::UpdateState {
+    crate::updater::dismiss_current_version(&app)
+}
+
+/// Manual "Check now" trigger from Settings → About. Bypasses the 6 h
+/// cooldown by design — a user clicking "Check now" wants an answer
+/// right now, not a stale cached result. Re-emits `updates:state` on
+/// completion so every subscribed window stays in sync. Returns the
+/// resulting state so the caller can also block on the result if it
+/// wants synchronous feedback.
+#[tauri::command]
+pub async fn check_for_updates_now<R: Runtime>(
+    app: AppHandle<R>,
+) -> crate::updater::UpdateState {
+    crate::updater::perform_check(&app, /*manual=*/ true).await
+}
+
+/// Persist the `auto_update_check_enabled` toggle without touching the
+/// other Settings fields. Mirrors the other single-field setters
+/// (`set_streaming_pill_enabled`, etc.) and is callable from any
+/// window — Settings → General is the only consumer today but the
+/// command is gated by the same `app.emit` reconciliation so a
+/// future tray-popover toggle would just work.
+#[tauri::command]
+pub fn set_auto_update_check_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    if s.auto_update_check_enabled == enabled {
+        return Ok(());
+    }
+    s.auto_update_check_enabled = enabled;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn list_models(app: AppHandle<Wry>) -> Vec<models::ModelStatus> {
     models::list(&app)

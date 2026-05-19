@@ -4,6 +4,7 @@ import {
   openAccessibilitySettings,
   setAppearance,
   setAudioInputDevice,
+  setAutoUpdateCheckEnabled,
   setLaunchAtLogin,
   type Settings,
 } from "@/lib/ipc";
@@ -220,11 +221,25 @@ export function GeneralTab(props: {
         <Row
           label="Launch at login"
           hint="Vox starts quietly in your menu bar after sign-in."
-          last
         >
           <Toggle
             checked={props.s.launch_at_login}
             onChange={(v) => void toggleLaunchAtLogin(v)}
+          />
+        </Row>
+        <Row
+          label="Automatically check for updates"
+          hint="Vox checks GitHub once a day in the background. Turn off to disable the periodic check; the manual button in About still works."
+          last
+        >
+          <Toggle
+            checked={props.s.auto_update_check_enabled}
+            onChange={(v) => {
+              props.update({ auto_update_check_enabled: v });
+              void setAutoUpdateCheckEnabled(v).catch((err) =>
+                console.error("setAutoUpdateCheckEnabled failed:", err),
+              );
+            }}
           />
         </Row>
       </Card>

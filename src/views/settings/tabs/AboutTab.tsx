@@ -1,10 +1,13 @@
 import { createResource, createSignal, onCleanup, onMount, Show } from "solid-js";
 import { VoxLogo } from "@/components/VoxLogo";
+import { SparkleGlyph } from "@/components/SparkleGlyph";
 import {
-  checkForUpdates,
+  checkForUpdatesNow,
   diagnoseHotkeys,
   downloadAndInstallUpdate,
   getAppVersion,
+  getUpdateState,
+  onUpdateState,
   onUpdaterProgress,
   openAccessibilitySettings,
   openExternalUrl,
@@ -13,7 +16,7 @@ import {
   uninstallApp,
   type DevBinaryInfo,
   type DiagnoseHotkeys,
-  type UpdateCheckResult,
+  type UpdateState,
   type UpdaterProgress,
 } from "@/lib/ipc";
 import { Card } from "../components/Card";
@@ -25,13 +28,19 @@ import { useConfirm } from "../useConfirm";
 export function AboutTab() {
   const [version] = createResource(() => getAppVersion());
   const [checking, setChecking] = createSignal(false);
-  const [updateResult, setUpdateResult] = createSignal<UpdateCheckResult | null>(
-    null,
-  );
+  // `update` is the authoritative state — sourced from the in-process
+  // `UpdaterState` on the Rust side, hydrated on mount, and refreshed
+  // by the `onUpdateState` subscription so a background check that
+  // lands while Settings is open updates the row in real time.
+  const [update, setUpdate] = createSignal<UpdateState | null>(null);
   const [installing, setInstalling] = createSignal(false);
   const [installError, setInstallError] = createSignal<string | null>(null);
   const [installProgress, setInstallProgress] =
     createSignal<UpdaterProgress | null>(null);
+  // Toggle for the release notes section in the highlighted pending
+  // state. Off by default so the row stays compact; "Release notes"
+  // button expands it.
+  const [showReleaseNotes, setShowReleaseNotes] = createSignal(false);
   const [diag, setDiag] = createSignal<DiagnoseHotkeys | null>(null);
   const [diagErr, setDiagErr] = createSignal<string | null>(null);
   const [devInfo, setDevInfo] = createSignal<DevBinaryInfo | null>(null);
@@ -57,6 +66,7 @@ export function AboutTab() {
   // `installing` → `done`/`error`; on success the process restarts so
   // `done` may not be observed.
   let unlistenProgress: (() => void) | undefined;
+  let unlistenUpdate: (() => void) | undefined;
   onMount(async () => {
     try {
       unlistenProgress = await onUpdaterProgress((p) => {
@@ -69,8 +79,29 @@ export function AboutTab() {
     } catch (err) {
       console.warn("onUpdaterProgress failed:", err);
     }
+    // Snapshot the in-process updater state, then subscribe to live
+    // changes. The state is shared with the tray popover banner +
+    // tray-icon dot; this is where Settings → About participates in
+    // that single source of truth so a background check landing
+    // while the window is open updates the row in real time.
+    try {
+      setUpdate(await getUpdateState());
+    } catch (err) {
+      console.warn("getUpdateState failed:", err);
+    }
+    try {
+      unlistenUpdate = await onUpdateState((s) => {
+        setUpdate(s);
+        if (s.status !== "checking") setChecking(false);
+      });
+    } catch (err) {
+      console.warn("onUpdateState failed:", err);
+    }
   });
-  onCleanup(() => unlistenProgress?.());
+  onCleanup(() => {
+    unlistenProgress?.();
+    unlistenUpdate?.();
+  });
 
   // Open System Settings only when the user actually needs it: a dev
   // build (sig rotates, Accessibility entry stale) or Accessibility
@@ -120,18 +151,37 @@ export function AboutTab() {
   }
 
   async function onCheckUpdates() {
+    // Manual check bypasses the 6 h cooldown by design. The
+    // checkForUpdatesNow IPC routes through `updater::perform_check`
+    // which also emits `updates:state`, so we don't have to set the
+    // local signal manually — the listener subscribed in onMount
+    // does it. We still flip `checking` here for the immediate
+    // button feedback (the listener clears it when the resulting
+    // state arrives).
     setChecking(true);
-    setUpdateResult(null);
     setInstallError(null);
     setInstallProgress(null);
     try {
-      const r = await checkForUpdates();
-      setUpdateResult(r);
+      const r = await checkForUpdatesNow();
+      setUpdate(r);
     } catch (err) {
-      setUpdateResult({
-        status: "error",
-        message: String(err),
-      });
+      // Most failure paths surface via the emitted `error` status,
+      // but a transport-level rejection can throw here. Reflect it
+      // in the local state so the UI doesn't get stuck on
+      // "Checking…". Preserve `available_version`, `release_notes`,
+      // and `dismissed_version` from the previous successful check —
+      // an offline manual click shouldn't make a previously-found
+      // pending release disappear from the UI.
+      const msg = String(err);
+      setUpdate((prev) =>
+        prev
+          ? { ...prev, status: "error", last_error: msg }
+          : {
+              status: "error",
+              current_version: version() ?? "?",
+              last_error: msg,
+            },
+      );
     } finally {
       setChecking(false);
     }
@@ -174,6 +224,26 @@ export function AboutTab() {
     return Math.min(100, Math.round((p.downloaded / total) * 100));
   }
 
+  /// Render a Unix-epoch seconds timestamp as a short relative
+  /// English phrase ("just now", "5 min ago", "today", "yesterday",
+  /// "3 days ago"). The "Released ___" body line uses this; the
+  /// "Last checked ___" demotion-row uses it too.
+  function relativeTime(secs: number): string {
+    const nowMs = Date.now();
+    const thenMs = secs * 1000;
+    const diff = Math.max(0, nowMs - thenMs);
+    const min = Math.round(diff / 60_000);
+    if (min < 1) return "just now";
+    if (min < 60) return `${min} min ago`;
+    const hr = Math.round(min / 60);
+    if (hr < 24) return `${hr} hr ago`;
+    const day = Math.round(hr / 24);
+    if (day === 1) return "yesterday";
+    if (day < 7) return `${day} days ago`;
+    if (day < 30) return `${Math.round(day / 7)} wk ago`;
+    return `${Math.round(day / 30)} mo ago`;
+  }
+
   async function onUninstall() {
     if (uninstalling()) return;
     setUninstalling(true);
@@ -214,109 +284,148 @@ export function AboutTab() {
 
       <SectionHeader title="Updates" />
       <Card>
-        <Row
-          label="Check for updates"
-          hint="Vox will download and install the latest release."
-          last={!updateResult() && !installing() && !installError()}
-        >
-          <button
-            type="button"
-            onClick={onCheckUpdates}
-            disabled={checking() || installing()}
-            class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)] disabled:opacity-40"
-          >
-            {checking() ? "Checking…" : "Check now"}
-          </button>
-        </Row>
-        <Show when={updateResult()}>
-          {(r) => (
-            <div class="flex flex-col gap-2 px-4 py-3">
-              <div class="flex items-center justify-between gap-3">
-                <span
-                  class="inline-flex items-center gap-1.5 text-[12px]"
-                  classList={{
-                    "text-[var(--color-success)]": r().status === "available",
-                    "text-[var(--color-ink-mute)]":
-                      r().status === "up-to-date" ||
-                      r().status === "unconfigured",
-                    "text-[var(--color-danger)]": r().status === "error",
-                  }}
-                >
-                  <Show when={r().status === "unconfigured"}>
-                    <svg
-                      width="11"
-                      height="11"
-                      viewBox="0 0 24 24"
-                      fill="none"
-                      stroke="currentColor"
-                      stroke-width="2.25"
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      aria-hidden="true"
-                    >
-                      <circle cx="12" cy="12" r="9" />
-                      <line x1="12" y1="16" x2="12" y2="12" />
-                      <line x1="12" y1="8" x2="12.01" y2="8" />
-                    </svg>
-                  </Show>
-                  {r().message ?? r().status}
-                </span>
-                <Show when={r().status === "available" && !installing()}>
-                  <button
-                    type="button"
-                    onClick={onInstallUpdate}
-                    class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-white hover:opacity-90"
-                  >
-                    Install update
-                  </button>
-                </Show>
-              </div>
-              <Show
-                when={
-                  r().status === "available" && r().release_notes && !installing()
-                }
+        <Show
+          when={update()?.status === "available" && update()?.available_version}
+          fallback={
+            // No pending update. Keep the legacy compact "Check now"
+            // row + transient response state. The body text mentions
+            // the last-checked timestamp so the user has *some*
+            // signal that the background scheduler is doing its job.
+            <Row
+              label="Check for updates"
+              hint={
+                update()?.last_check_at
+                  ? `Last checked ${relativeTime(update()!.last_check_at!)}. Vox checks once a day in the background.`
+                  : "Vox checks once a day in the background. Click to check now."
+              }
+              last={!update()?.last_error && update()?.status !== "up-to-date"}
+            >
+              <button
+                type="button"
+                onClick={onCheckUpdates}
+                disabled={checking() || installing()}
+                class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] hover:bg-[var(--color-control-hover)] disabled:opacity-40"
               >
-                <div class="rounded-[8px] bg-[var(--color-control)]/60 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
-                  <div class="mb-1 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
-                    What's new
-                  </div>
-                  <pre class="m-0 max-h-40 overflow-auto whitespace-pre-wrap font-sans text-[12px] leading-[1.5] text-[var(--color-ink)]">{r().release_notes}</pre>
-                </div>
-              </Show>
-              <Show when={installing() && installProgress()}>
-                {(p) => (
-                  <div class="flex flex-col gap-1.5">
-                    <div class="text-[11px] text-[var(--color-ink-mute)]">
-                      {progressLabel(p())}
-                    </div>
-                    <div class="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-control)]">
-                      <Show
-                        when={progressPercent(p()) !== null}
-                        fallback={
-                          <div class="h-full w-1/3 animate-pulse rounded-full bg-[var(--color-accent)]" />
-                        }
-                      >
-                        <div
-                          class="h-full rounded-full bg-[var(--color-accent)] transition-[width] duration-200"
-                          style={{ width: `${progressPercent(p())}%` }}
-                        />
-                      </Show>
-                    </div>
-                  </div>
-                )}
-              </Show>
-              <Show when={installing() && !installProgress()}>
-                <div class="text-[11px] text-[var(--color-ink-mute)]">
-                  Preparing download…
-                </div>
-              </Show>
-              <Show when={installError()}>
-                <div class="text-[11px] text-[var(--color-danger)]">
-                  {installError()}
-                </div>
-              </Show>
+                {checking() || update()?.status === "checking"
+                  ? "Checking…"
+                  : "Check now"}
+              </button>
+            </Row>
+          }
+        >
+          {/* Highlighted pending state. The card itself stays
+              `liquid-card`-styled (inherited from Card); the
+              accent-soft background washes the row so it reads as
+              "primary surface". Tokens reused: --color-accent,
+              --color-accent-soft, --color-on-accent. */}
+          <div class="flex flex-col gap-3 bg-[var(--color-accent-soft)] px-4 py-4">
+            <div class="flex items-start gap-3">
+              <span
+                class="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-[var(--color-accent)] text-[var(--color-on-accent)]"
+                aria-hidden="true"
+              >
+                <SparkleGlyph width={16} height={16} />
+              </span>
+              <div class="flex min-w-0 flex-1 flex-col gap-1">
+                <span class="text-[14px] font-semibold text-[var(--color-ink)]">
+                  Vox v{update()!.available_version} is ready
+                </span>
+                <span class="text-[12px] leading-[1.5] text-[var(--color-ink-mute)]">
+                  You're on v{update()!.current_version}.
+                  <Show when={update()?.last_check_at}>
+                    {" "}
+                    Last checked {relativeTime(update()!.last_check_at!)}.
+                  </Show>
+                </span>
+              </div>
             </div>
-          )}
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={onInstallUpdate}
+                disabled={installing()}
+                class="rounded-[6px] bg-[var(--color-accent)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-on-accent)] hover:brightness-110 disabled:cursor-wait disabled:opacity-70"
+              >
+                {installing() ? "Installing…" : "Install update"}
+              </button>
+              <Show when={update()?.release_notes}>
+                <button
+                  type="button"
+                  onClick={() => setShowReleaseNotes(!showReleaseNotes())}
+                  class="rounded-[6px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] text-[var(--color-ink)] hover:bg-[var(--color-control-hover)]"
+                  aria-expanded={showReleaseNotes()}
+                >
+                  Release notes
+                </button>
+              </Show>
+              <button
+                type="button"
+                onClick={onCheckUpdates}
+                disabled={checking() || installing()}
+                class="rounded-[6px] px-2 py-1.5 text-[11px] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)] disabled:opacity-40"
+                title="Re-check for updates"
+              >
+                {checking() || update()?.status === "checking"
+                  ? "Checking…"
+                  : "Check again"}
+              </button>
+            </div>
+            <Show when={showReleaseNotes() && update()?.release_notes}>
+              <div class="rounded-[8px] bg-[var(--color-control)]/60 px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+                <div class="mb-1 text-[10px] font-medium uppercase tracking-[0.08em] text-[var(--color-ink-mute)]">
+                  What's new
+                </div>
+                <pre class="m-0 max-h-40 overflow-auto whitespace-pre-wrap font-sans text-[12px] leading-[1.5] text-[var(--color-ink)]">{update()!.release_notes}</pre>
+              </div>
+            </Show>
+            <Show when={installing() && installProgress()}>
+              {(p) => (
+                <div class="flex flex-col gap-1.5">
+                  <div class="text-[11px] text-[var(--color-ink-mute)]">
+                    {progressLabel(p())}
+                  </div>
+                  <div class="h-1.5 w-full overflow-hidden rounded-full bg-[var(--color-control)]">
+                    <Show
+                      when={progressPercent(p()) !== null}
+                      fallback={
+                        <div class="h-full w-1/3 animate-pulse rounded-full bg-[var(--color-accent)]" />
+                      }
+                    >
+                      <div
+                        class="h-full rounded-full bg-[var(--color-accent)] transition-[width] duration-200"
+                        style={{ width: `${progressPercent(p())}%` }}
+                      />
+                    </Show>
+                  </div>
+                </div>
+              )}
+            </Show>
+            <Show when={installing() && !installProgress()}>
+              <div class="text-[11px] text-[var(--color-ink-mute)]">
+                Downloading… Vox will relaunch.
+              </div>
+            </Show>
+            <Show when={installError()}>
+              <div class="text-[11px] text-[var(--color-danger)]">
+                {installError()}
+              </div>
+            </Show>
+          </div>
+        </Show>
+        <Show when={update()?.status === "up-to-date"}>
+          <div class="border-t border-[var(--color-border)] px-4 py-3 text-[12px] text-[var(--color-ink-mute)]">
+            Vox is up to date.
+          </div>
+        </Show>
+        <Show when={update()?.status === "unconfigured"}>
+          <div class="border-t border-[var(--color-border)] px-4 py-3 text-[12px] text-[var(--color-ink-mute)]">
+            {update()?.last_error ?? "Auto-update isn't configured for this build."}
+          </div>
+        </Show>
+        <Show when={update()?.status === "error" && update()?.last_error}>
+          <div class="border-t border-[var(--color-border)] px-4 py-3 text-[12px] text-[var(--color-danger)]">
+            {update()!.last_error}
+          </div>
         </Show>
       </Card>
 

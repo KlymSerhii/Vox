@@ -319,6 +319,48 @@ fn bang_badge(rgba: &mut [u8], w: i32) {
     circle(rgba, bcx, bcy + 1.75 * s, 0.7 * s, w, 255);
 }
 
+/// Small accent-coloured dot in the upper-right corner — marks an
+/// available app update on the otherwise-template Idle glyph. Mirrors
+/// the lock / bang badge pattern but anchors top-right so it doesn't
+/// collide with the mic stand at the bottom of the canvas.
+///
+/// Baked as an RGBA write because the dot needs to render in the
+/// accent colour regardless of menu-bar tint — a template-mode dot
+/// would inherit the same fill as the mic outline and read as part of
+/// the glyph rather than an attention cue. We accept the one-frame
+/// `setTemplate(NO)` flicker described in `put_colour` as the price
+/// of having a colour-stable badge. The Idle state is static (no
+/// animation loop) so the flicker is only visible for a single frame
+/// on a state transition — invisible in practice.
+#[allow(dead_code)] // referenced by the runtime via `idle_with_update`; build.rs's PNG dump doesn't include it.
+fn update_badge(rgba: &mut [u8], w: i32, ink: [u8; 3]) {
+    let s = w as f32 / 16.0;
+    // Anchor in the top-right corner, far enough from the mic body's
+    // capsule head that the dot reads as separate.
+    let bcx = w as f32 - 3.5 * s;
+    let bcy = 3.5 * s;
+    let r = (1.6 * s).max(2.0);
+    let r2 = r * r;
+    let xmin = (bcx - r - 1.0).floor() as i32;
+    let xmax = (bcx + r + 1.0).ceil() as i32;
+    let ymin = (bcy - r - 1.0).floor() as i32;
+    let ymax = (bcy + r + 1.0).ceil() as i32;
+    for y in ymin..=ymax {
+        for x in xmin..=xmax {
+            let dx = x as f32 + 0.5 - bcx;
+            let dy = y as f32 + 0.5 - bcy;
+            let d2 = dx * dx + dy * dy;
+            if d2 <= r2 {
+                put_colour(rgba, x, y, w, ink, 255);
+            } else if d2 <= (r + 1.0) * (r + 1.0) {
+                let dist = d2.sqrt() - r;
+                let a = ((1.0 - dist).clamp(0.0, 1.0) * 255.0) as u8;
+                put_colour(rgba, x, y, w, ink, a);
+            }
+        }
+    }
+}
+
 // ---- public per-state renderers ---------------------------------------
 
 fn canvas(w: i32) -> Vec<u8> {
@@ -329,6 +371,18 @@ fn canvas(w: i32) -> Vec<u8> {
 pub fn idle(w: i32) -> Vec<u8> {
     let mut rgba = canvas(w);
     mic_outline(&mut rgba, w);
+    rgba
+}
+
+/// Idle glyph with a small accent-coloured dot in the upper-right
+/// corner. Used when a Vox update is pending AND the user hasn't
+/// dismissed it for this version. The mic outline stays template
+/// (alpha-only) so the body still tints with the menu bar; the dot
+/// is baked colour so the attention cue reads regardless of theme.
+#[allow(dead_code)] // build.rs's PNG dump doesn't reference this variant.
+pub fn idle_with_update(w: i32, ink: [u8; 3]) -> Vec<u8> {
+    let mut rgba = idle(w);
+    update_badge(&mut rgba, w, ink);
     rgba
 }
 

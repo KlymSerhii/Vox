@@ -19,6 +19,14 @@ use crate::tray_glyphs;
 /// explicit user preference after the first run.
 const PROCESSING_INK: [u8; 3] = [255, 255, 255];
 
+/// Accent colour for the update-pending dot. Matches the teal
+/// `--color-accent` token in `src/styles.css` (#3fb8b0) so the
+/// in-menu-bar cue is visually consistent with the in-window banner.
+/// Baked colour, not template, because a template dot would tint to
+/// match the mic outline and read as part of the glyph rather than
+/// an attention cue.
+const UPDATE_DOT_INK: [u8; 3] = [0x3f, 0xb8, 0xb0];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayState {
     Idle,
@@ -71,6 +79,12 @@ struct TrayStateInner {
     // Lock-free guard so we never spawn two animation loops; the loop
     // itself clears it on exit.
     anim_running: AtomicBool,
+    // Update-pending flag. Drives the Idle glyph variant — when true,
+    // the icon renders with a small accent-coloured dot in the
+    // upper-right corner. Deliberately suppressed during the animated
+    // Recording / Processing states so the dot doesn't compete with
+    // the active-dictation glyph.
+    update_pending: AtomicBool,
     tooltip: Mutex<String>,
 }
 
@@ -79,6 +93,7 @@ impl Default for TrayStateInner {
         Self {
             state: AtomicU8::new(TrayState::Idle.as_u8()),
             anim_running: AtomicBool::new(false),
+            update_pending: AtomicBool::new(false),
             tooltip: Mutex::new(default_tooltip(TrayState::Idle).into()),
         }
     }
@@ -98,11 +113,19 @@ fn default_tooltip(state: TrayState) -> &'static str {
     }
 }
 
-fn image_for_state(state: TrayState, phase: f32) -> Image<'static> {
+fn image_for_state(state: TrayState, phase: f32, update_pending: bool) -> Image<'static> {
     // 32 px keeps the icon sharp on Retina menu bars (rendered at 2x);
     // macOS down-samples to 16 px on non-Retina automatically.
     const W: u32 = 32;
     let buf = match state {
+        // Update dot only renders on Idle so it doesn't compete with
+        // the active-dictation glyphs (Recording / Processing) or the
+        // attention-demanding ones (Error / Permission). Idle is the
+        // only "you're not doing anything else" surface, which is
+        // also where a "by the way, there's an update" cue belongs.
+        TrayState::Idle if update_pending => {
+            tray_glyphs::idle_with_update(W as i32, UPDATE_DOT_INK)
+        }
         TrayState::Idle => tray_glyphs::idle(W as i32),
         TrayState::Recording => tray_glyphs::recording(W as i32, phase),
         TrayState::Processing => tray_glyphs::processing(W as i32, phase, PROCESSING_INK),
@@ -144,7 +167,8 @@ fn apply_frame<R: Runtime>(app: &AppHandle<R>, state: TrayState, phase: f32) {
     let Some(tray) = app.tray_by_id("vox-tray") else {
         return;
     };
-    let img = image_for_state(state, phase);
+    let update_pending = inner().update_pending.load(Ordering::SeqCst);
+    let img = image_for_state(state, phase, update_pending);
     let _ = tray.set_icon(Some(img));
     // Re-assert the template flag on every install for alpha-only
     // states. tray-icon 0.21's `set_icon` hardcodes `setTemplate(NO)`
@@ -156,8 +180,36 @@ fn apply_frame<R: Runtime>(app: &AppHandle<R>, state: TrayState, phase: f32) {
     // their colour into RGBA up front so the hardcoded `false` is what
     // they want; they skip the flip to keep the per-frame loop free of
     // the two-call redraw flicker.
+    //
+    // The update-pending Idle variant carries baked RGBA pixels for
+    // the dot but stays template overall — AppKit happily tints the
+    // alpha-only mic body around them. We keep the template flip for
+    // the Idle case because skipping it would turn the body to a
+    // black silhouette on every state transition while preserving the
+    // dot colour.
     if state.is_template() {
         let _ = tray.set_icon_as_template(true);
+    }
+}
+
+/// Toggle the "update available" badge on the Idle glyph. Idempotent:
+/// re-asserts the flag and only triggers a redraw when the value
+/// actually changes. Cross-window — called from the updater state
+/// emitter so the tray icon and the in-window banner stay in sync.
+pub fn set_update_pending<R: Runtime>(app: &AppHandle<R>, pending: bool) {
+    let inner = inner();
+    let prev = inner.update_pending.swap(pending, Ordering::SeqCst);
+    if prev == pending {
+        return;
+    }
+    // Only redraw immediately when the current state is Idle —
+    // Recording / Processing have their own animation loop and would
+    // pick up the new flag on the next frame anyway, while the
+    // permission / error states deliberately don't show the dot. The
+    // dot shows up the next time Vox returns to Idle.
+    let cur = TrayState::from_u8(inner.state.load(Ordering::SeqCst));
+    if matches!(cur, TrayState::Idle) {
+        apply_frame(app, cur, 0.0);
     }
 }
 

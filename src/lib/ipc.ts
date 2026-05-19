@@ -47,6 +47,19 @@ export interface Settings {
   /// re-resolved every recording, so swapping inputs in System
   /// Settings takes effect on the next dictation.
   audio_input_device: string | null;
+  /// Periodic auto-update check. On by default. When off, the
+  /// background scheduler in `updater.rs` is a no-op but the manual
+  /// "Check now" button in Settings → About still works.
+  auto_update_check_enabled: boolean;
+  /// Unix epoch seconds of the most recent SUCCESSFUL update check.
+  /// `null` until the first check lands. Used in Settings → About
+  /// to surface "Last checked X ago" beside the manual button.
+  last_update_check_at?: number | null;
+  /// Version the user "Later"-dismissed in the tray banner. While
+  /// this equals the current available version, the tray banner +
+  /// tray-icon dot stay hidden. Settings → About still surfaces the
+  /// pending state regardless.
+  dismissed_update_version?: string | null;
 }
 
 export interface AudioInputDevice {
@@ -90,6 +103,26 @@ export interface UpdateCheckResult {
   /// bullet list of commit subjects since the previous tag. Only
   /// populated when `status === "available"`.
   release_notes?: string;
+}
+
+/// Mirrors the Rust `updater::UpdateState` shape. Emitted on
+/// `updates:state` whenever any field changes; also returned
+/// synchronously by `getUpdateState()` for initial render.
+/// `status: "checking"` is a transient state set while an HTTPS
+/// round-trip is in flight.
+export interface UpdateState {
+  status: "idle" | "checking" | "available" | "up-to-date" | "error" | "unconfigured";
+  current_version: string;
+  available_version?: string | null;
+  release_notes?: string | null;
+  /// Unix epoch seconds. `null` until the first successful check.
+  last_check_at?: number | null;
+  /// Last error message from a failed check. Cleared on the next
+  /// successful check.
+  last_error?: string | null;
+  /// Version the user "Later"-dismissed. While this equals
+  /// `available_version`, the banner + dot stay hidden.
+  dismissed_version?: string | null;
 }
 
 /// Mirrors the `UpdaterProgress` enum emitted on `updater:progress`.
@@ -342,6 +375,48 @@ export async function copyText(text: string): Promise<void> {
 
 export async function checkForUpdates(): Promise<UpdateCheckResult> {
   return invoke<UpdateCheckResult>("check_for_updates");
+}
+
+/// Manual "Check now" trigger from Settings → About. Bypasses the 6 h
+/// cooldown by design — a user clicking "Check now" wants an answer
+/// right now, not a stale cached result. The result is also re-emitted
+/// on `updates:state` for every subscribed window.
+export async function checkForUpdatesNow(): Promise<UpdateState> {
+  return invoke<UpdateState>("check_for_updates_now");
+}
+
+/// Snapshot the in-process updater state. Used by windows that mount
+/// fresh (Settings, tray popover) so the initial render doesn't have
+/// to wait for the next `updates:state` emit. Live updates still flow
+/// through `onUpdateState`.
+export async function getUpdateState(): Promise<UpdateState> {
+  return invoke<UpdateState>("get_update_state");
+}
+
+/// "Later" — per-version dismissal of the tray banner + dot.
+/// Settings → About remains visible regardless. Resolves with the
+/// resulting state for callers that want to update local UI
+/// optimistically.
+export async function dismissUpdate(): Promise<UpdateState> {
+  return invoke<UpdateState>("dismiss_update");
+}
+
+/// Persist the periodic-check toggle. When `false`, the background
+/// scheduler in `updater.rs` no-ops but the manual button still
+/// works. Mirrors `setStreamingPillEnabled` etc.
+export async function setAutoUpdateCheckEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_auto_update_check_enabled", { enabled });
+}
+
+/// Subscribe to the cross-window `updates:state` event. Fires on
+/// every transition (checking → available / up-to-date / error) and
+/// on every "Later" dismissal or successful install (the latter
+/// rarely observed since the app restarts on install). Returns the
+/// unsubscribe function.
+export async function onUpdateState(
+  cb: (s: UpdateState) => void,
+): Promise<UnlistenFn> {
+  return listen<UpdateState>("updates:state", (e) => cb(e.payload));
 }
 
 /// Kick off the actual download + install. Resolves only on failure —

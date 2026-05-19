@@ -44,6 +44,18 @@ const KEY_AUDIO_INPUT_DEVICE: &str = "audio_input_device";
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
 
+// Auto-update scheduler keys. `last_update_check_at` is wall-clock
+// Unix seconds of the most recent SUCCESSFUL background or manual
+// check; the scheduler in `updater.rs` uses it to enforce the 6 h
+// cooldown and 24 h cadence across relaunches.
+// `dismissed_update_version` is the version a user "Later"-dismissed
+// in the tray banner; while it equals the current available version,
+// the banner + tray-icon dot stay hidden. Settings → About still
+// surfaces the pending state regardless.
+const KEY_AUTO_UPDATE_CHECK_ENABLED: &str = "auto_update_check_enabled";
+const KEY_LAST_UPDATE_CHECK_AT: &str = "last_update_check_at";
+const KEY_DISMISSED_UPDATE_VERSION: &str = "dismissed_update_version";
+
 fn default_hotkey() -> String {
     // ⌘⌥. — Cmd + Option + Period. Bound via Carbon
     // `RegisterEventHotKey` through `tauri-plugin-global-shortcut`, so
@@ -96,6 +108,13 @@ fn default_auto_paste_enabled() -> bool {
     // hands-off "speak straight into the focused field" flow flip
     // this on in Settings → General.
     false
+}
+fn default_auto_update_check_enabled() -> bool {
+    // On by default. The PM-decided behaviour is "check once a day,
+    // never auto-install". Flipping this off disables the periodic
+    // scheduler in `updater.rs`; the manual button in
+    // Settings → About still works.
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,6 +214,28 @@ pub struct Settings {
     /// Whisper onto the MacBook mic with no user-visible signal).
     #[serde(default)]
     pub audio_input_device: Option<String>,
+
+    /// Periodic auto-update scheduler. ON by default; turning it off
+    /// disables the daily background check while keeping the manual
+    /// "Check now" button in Settings → About working. Mirrored to
+    /// disk via `set_settings` like every other top-level field.
+    #[serde(default = "default_auto_update_check_enabled")]
+    pub auto_update_check_enabled: bool,
+
+    /// Unix epoch seconds of the most recent SUCCESSFUL update check
+    /// (background or manual). Used by `updater::should_check_now`
+    /// to gate the 24 h cadence and 6 h cooldown across relaunches.
+    /// `None` until the first check lands.
+    #[serde(default)]
+    pub last_update_check_at: Option<i64>,
+
+    /// Version the user "Later"-dismissed in the tray banner. While
+    /// this equals the current available version, the banner +
+    /// tray-icon dot stay hidden; Settings → About still surfaces
+    /// the pending state. Cleared automatically once the available
+    /// version moves past this string (a new release auto-rearms).
+    #[serde(default)]
+    pub dismissed_update_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -224,6 +265,9 @@ impl Default for Settings {
             inference_api_key: String::new(),
             try_parakeet_dismissed: false,
             audio_input_device: None,
+            auto_update_check_enabled: default_auto_update_check_enabled(),
+            last_update_check_at: None,
+            dismissed_update_version: None,
         }
     }
 }
@@ -297,6 +341,21 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .filter(|s| !s.is_empty());
 
+    let auto_update_check_enabled = get_bool(
+        KEY_AUTO_UPDATE_CHECK_ENABLED,
+        default_auto_update_check_enabled(),
+    );
+
+    let last_update_check_at = store
+        .get(KEY_LAST_UPDATE_CHECK_AT)
+        .and_then(|v| v.as_i64())
+        .filter(|n| *n > 0);
+
+    let dismissed_update_version = store
+        .get(KEY_DISMISSED_UPDATE_VERSION)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+
     let _ = store.save();
 
     Settings {
@@ -324,6 +383,9 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         inference_api_key,
         try_parakeet_dismissed,
         audio_input_device,
+        auto_update_check_enabled,
+        last_update_check_at,
+        dismissed_update_version,
     }
 }
 
@@ -384,6 +446,73 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         }
     }
 
+    b(KEY_AUTO_UPDATE_CHECK_ENABLED, settings.auto_update_check_enabled);
+    match settings.last_update_check_at {
+        Some(n) if n > 0 => {
+            store.set(KEY_LAST_UPDATE_CHECK_AT, serde_json::Value::from(n));
+        }
+        _ => {
+            store.set(KEY_LAST_UPDATE_CHECK_AT, serde_json::Value::Null);
+        }
+    }
+    match &settings.dismissed_update_version {
+        Some(v) if !v.is_empty() => {
+            s(KEY_DISMISSED_UPDATE_VERSION, v);
+        }
+        _ => {
+            store.set(KEY_DISMISSED_UPDATE_VERSION, serde_json::Value::Null);
+        }
+    }
+
+    store
+        .save()
+        .map_err(|e| anyhow::anyhow!("save store: {e}"))?;
+    Ok(())
+}
+
+/// Persist just the `last_update_check_at` field. Used by
+/// `updater::perform_check` to update the wall-clock timestamp
+/// without rewriting the rest of the Settings document on every
+/// background tick. Mirrors `set_hotkey_field`.
+pub fn set_last_update_check_at<R: Runtime>(
+    app: &AppHandle<R>,
+    secs: i64,
+) -> anyhow::Result<()> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
+    if secs > 0 {
+        store.set(KEY_LAST_UPDATE_CHECK_AT, serde_json::Value::from(secs));
+    } else {
+        store.set(KEY_LAST_UPDATE_CHECK_AT, serde_json::Value::Null);
+    }
+    store
+        .save()
+        .map_err(|e| anyhow::anyhow!("save store: {e}"))?;
+    Ok(())
+}
+
+/// Persist just the `dismissed_update_version` field. `None` /
+/// empty string clears the dismissal so the next "Later" press
+/// can be re-applied without a settings round-trip.
+pub fn set_dismissed_update_version<R: Runtime>(
+    app: &AppHandle<R>,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
+    match value {
+        Some(v) if !v.is_empty() => {
+            store.set(
+                KEY_DISMISSED_UPDATE_VERSION,
+                serde_json::Value::String(v.to_string()),
+            );
+        }
+        _ => {
+            store.set(KEY_DISMISSED_UPDATE_VERSION, serde_json::Value::Null);
+        }
+    }
     store
         .save()
         .map_err(|e| anyhow::anyhow!("save store: {e}"))?;

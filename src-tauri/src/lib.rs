@@ -13,6 +13,7 @@ mod mac_paste;
 #[cfg(target_os = "macos")]
 mod mac_perm;
 mod mac_power;
+mod mac_wake;
 mod models;
 mod modes;
 mod onboarding;
@@ -24,6 +25,7 @@ mod transcripts;
 mod tray;
 mod tray_glyphs;
 mod tray_icon;
+mod updater;
 
 use std::sync::Arc;
 
@@ -81,8 +83,12 @@ pub fn run() {
             commands::get_launch_at_login,
             commands::set_launch_at_login,
             commands::check_for_updates,
+            commands::check_for_updates_now,
             commands::download_and_install_update,
             commands::get_app_version,
+            commands::get_update_state,
+            commands::dismiss_update,
+            commands::set_auto_update_check_enabled,
             commands::list_models,
             commands::download_model,
             commands::cancel_download,
@@ -203,6 +209,24 @@ pub fn run() {
             // post-polish clipboard write for 30-60 s with a
             // "Verifying com.vox…" system dialog.
             crate::inject::prewarm_in_background();
+
+            // Auto-update scheduler. State is installed BEFORE the
+            // scheduler spawn so the first emitted `updates:state` event
+            // (60 s in) finds the in-process state container. Hydration
+            // from disk seeds the persisted `dismissed_version` and
+            // `last_check_at` so the cooldown survives relaunches.
+            let updater_state =
+                Arc::new(crate::updater::UpdaterState::new(
+                    app_handle.package_info().version.to_string(),
+                ));
+            app.manage(updater_state);
+            crate::updater::hydrate_from_disk(app_handle);
+            crate::updater::spawn_scheduler(app_handle);
+            // NSWorkspace wake notification → re-evaluate the cadence
+            // immediately after the Mac wakes from sleep. The
+            // 30 s debounce + 6 h cooldown in `updater.rs` ensure a
+            // burst of wake events doesn't translate into burst HTTPS.
+            crate::updater::subscribe_wake(app_handle);
 
             if !s.onboarded {
                 if let Err(e) = onboarding::show(app_handle) {
