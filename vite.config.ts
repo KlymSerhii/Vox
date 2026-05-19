@@ -9,6 +9,12 @@ const r = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 export default defineConfig({
   plugins: [solid(), tailwindcss()],
 
+  resolve: {
+    alias: {
+      "@": r("./src"),
+    },
+  },
+
   // Vite options tailored for Tauri
   clearScreen: false,
   server: {
