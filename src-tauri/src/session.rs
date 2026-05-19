@@ -43,6 +43,16 @@ pub const MAX_CONCURRENT_SESSIONS: usize = 3;
 /// "RECENT".
 const TERMINAL_LINGER_MS: u64 = 1500;
 
+/// How long an Error pill stays visible before auto-hiding. The Done
+/// path schedules its own hide from `run_pipeline`'s tail with a custom
+/// duration; Canceled is hidden ~600 ms after `cancel_session`. Error
+/// is reached from several early-return paths in `run_pipeline` that
+/// each skip the tail — without a central hide schedule the message
+/// (e.g. "No audio detected — check your mic.") stays on screen until
+/// the next dictation starts. Matches the warning-treatment Done
+/// duration so the message can be read comfortably.
+const ERROR_LINGER_MS: u64 = 3500;
+
 /// Toast duration for the saturated state.
 const SATURATED_TOAST_MS: u32 = 1500;
 
@@ -916,6 +926,14 @@ impl SessionManager {
                 }
             }
             self.spawn_terminal_cleanup(app, id);
+            // Error has no other code path that schedules the pill
+            // hide — Done is hidden by `run_pipeline`'s tail, and
+            // Canceled by `cancel_session`. Without this, Error
+            // pills (silence, audio failure, STT failure, etc.) stay
+            // on screen until the next dictation starts.
+            if matches!(stage, Stage::Error) {
+                self.schedule_pill_hide_unless_taken(app, id, ERROR_LINGER_MS);
+            }
         }
     }
 
