@@ -258,6 +258,50 @@ export function ModelsTab(props: {
 
   return (
     <>
+      {/*
+        Troubleshooting sits near the top of the tab — users who land
+        here with a broken download shouldn't have to scroll past
+        engine cards to find help. Collapsed by default so it stays
+        quiet for the ~95% of users with no issue.
+      */}
+      <SectionHeader title="Troubleshooting" />
+      <Card>
+        <details class="group">
+          <summary class="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-[12px] text-[var(--color-ink)] [&::-webkit-details-marker]:hidden">
+            <span>Downloads failing or stalling?</span>
+            <svg
+              class="h-3 w-3 text-[var(--color-ink-faint)] transition-transform group-open:rotate-90"
+              viewBox="0 0 12 12"
+              fill="currentColor"
+              aria-hidden="true"
+            >
+              <path d="M4 2l4 4-4 4V2z" />
+            </svg>
+          </summary>
+          <div class="flex flex-col gap-2 border-t border-[var(--color-border)] px-4 py-3 text-[12px] leading-[1.55] text-[var(--color-ink-mute)]">
+            <p>
+              A VPN, firewall, or proxy may be rerouting Hugging Face or
+              GitHub traffic. Models are fetched directly from those
+              hosts, so a connection that blocks or slows them will hold
+              downloads at 0% or cause them to fail.
+            </p>
+            <p>
+              Still stuck or have other questions? Ask in the{" "}
+              <a
+                class="underline"
+                href="https://discord.gg/W5nDZFeY"
+                onClick={(e) => {
+                  e.preventDefault();
+                  void openExternalUrl("https://discord.gg/W5nDZFeY");
+                }}
+              >
+                Vox Discord
+              </a>
+              .
+            </p>
+          </div>
+        </details>
+      </Card>
       <SectionHeader
         title="Speech recognition"
         hint={

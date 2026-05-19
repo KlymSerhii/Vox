@@ -67,6 +67,14 @@ export function DownloadStep(props: {
   const [completed, setCompleted] = createSignal<Set<string>>(new Set());
   const [started, setStarted] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
+  // Wall-clock timestamp of when the user kicked off the downloads.
+  // Combined with the rolling `samples` history to detect a download
+  // that never produced a single progress event (the VPN/firewall
+  // case) — distinct from one that started fine and then stalled.
+  const [startedAt, setStartedAt] = createSignal<number | null>(null);
+  // 1 Hz ticker that drives the stall check. Stays inert until
+  // `started()` flips on; cleaned up when the step unmounts.
+  const [nowMs, setNowMs] = createSignal(Date.now());
   const [sttModels, setSttModels] = createSignal<ModelStatus[]>([]);
   const [llmModels, setLlmModels] = createSignal<ModelStatus[]>([]);
   const [selectedSttId, setSelectedSttId] = createSignal<string | null>(null);
@@ -234,6 +242,60 @@ export function DownloadStep(props: {
 
   createEffect(() => {
     props.onReadyChange(requirementsMet());
+  });
+
+  // Drive the stall-hint clock only while a session of downloads is
+  // actually in flight, so an idle wizard tab isn't waking the event
+  // loop every second.
+  createEffect(() => {
+    if (!started()) return;
+    if (startedAt() === null) setStartedAt(Date.now());
+    const tick = window.setInterval(() => setNowMs(Date.now()), 1000);
+    onCleanup(() => window.clearInterval(tick));
+  });
+
+  // IDs of artifacts the user's current engine choice expects to
+  // pull down. Used to single out which downloads "should be moving"
+  // when checking for a stall.
+  const expectedIds = createMemo(() => {
+    const ids: string[] = [];
+    const sId = selectedSttId();
+    if (sId) ids.push(sId);
+    if (polishChoice() === "gemma-local") {
+      const lId = selectedLlmId();
+      if (lId) ids.push(lId);
+      const b = binaryStatus();
+      if (b) ids.push(b.id);
+    }
+    return ids;
+  });
+
+  // A download is "stuck" if it's been > STALL_WINDOW_MS since the
+  // last progress event for any artifact still pending — or, for the
+  // worst case where no event has ever arrived, since `started()`
+  // flipped on. The classic VPN failure mode is the second one: the
+  // request never gets past TLS, so 0 bytes ever land.
+  //
+  // Suppressed while an error is already on screen so we don't stack
+  // two notes; the error paragraph carries the same diagnostic weight.
+  const STALL_WINDOW_MS = 15_000;
+  const showStalledHint = createMemo(() => {
+    if (!started()) return false;
+    if (err()) return false;
+    const startTs = startedAt();
+    if (startTs === null) return false;
+    const done = completed();
+    const samp = samples();
+    const tNow = nowMs();
+    for (const id of expectedIds()) {
+      if (done.has(id)) continue;
+      const hist = samp[id];
+      const lastTs = hist && hist.length > 0
+        ? hist[hist.length - 1].ts
+        : startTs;
+      if (tNow - lastTs > STALL_WINDOW_MS) return true;
+    }
+    return false;
   });
 
   onCleanup(() => {
@@ -537,6 +599,28 @@ export function DownloadStep(props: {
           </Show>
           <Show when={prewarmInFlight()}>
             <PrewarmCard />
+          </Show>
+          <Show when={showStalledHint()}>
+            <div class="flex flex-col gap-1 text-[11px] leading-[1.45] text-[var(--color-ink-mute)]">
+              <p>
+                Slow or stuck? A VPN, firewall, or proxy can block downloads
+                from Hugging Face and GitHub.
+              </p>
+              <p>
+                Still stuck? Ask in the{" "}
+                <a
+                  class="underline"
+                  href="https://discord.gg/W5nDZFeY"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    void openExternalUrl("https://discord.gg/W5nDZFeY");
+                  }}
+                >
+                  Vox Discord
+                </a>
+                .
+              </p>
+            </div>
           </Show>
         </div>
       </Show>
