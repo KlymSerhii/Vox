@@ -34,6 +34,8 @@ pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
 
 const KEY_AUTO_PASTE_ENABLED: &str = "auto_paste_enabled";
 
+const KEY_LIVE_TRANSCRIPT_ENABLED: &str = "live_transcript_enabled";
+
 const KEY_ENABLE_THINKING: &str = "enable_thinking";
 
 const KEY_TRY_PARAKEET_DISMISSED: &str = "try_parakeet_dismissed";
@@ -109,6 +111,15 @@ fn default_auto_paste_enabled() -> bool {
     // this on in Settings → General.
     false
 }
+fn default_live_transcript_enabled() -> bool {
+    // Opt-in. Reveals the speculative transcript inside the
+    // pill while the user is still speaking (instead of the default
+    // waveform-only listening view). Off by default because it
+    // forces the speculative decoder to run even on battery and
+    // changes the listening silhouette — users who explicitly want
+    // a live caption flip this on.
+    false
+}
 fn default_auto_update_check_enabled() -> bool {
     // On by default. The PM-decided behaviour is "check once a day,
     // never auto-install". Flipping this off disables the periodic
@@ -180,6 +191,17 @@ pub struct Settings {
     /// Accessibility.
     #[serde(default = "default_auto_paste_enabled")]
     pub auto_paste_enabled: bool,
+
+    /// Show a live transcript inside the pill while the user is still
+    /// speaking, in place of the default waveform. Driven by the same
+    /// speculative transcription decoder that already feeds the
+    /// post-stop reveal — flipping this on simply reveals what was
+    /// previously buffered silently. Forces the speculative pass to run
+    /// on battery (it would otherwise bail to save power). Off by
+    /// default; the listening silhouette stays compact for users who
+    /// don't opt in.
+    #[serde(default = "default_live_transcript_enabled")]
+    pub live_transcript_enabled: bool,
 
     /// Gemma 4 only. When true, the engine sends
     /// `chat_template_kwargs: { enable_thinking: true }` per request so
@@ -261,6 +283,7 @@ impl Default for Settings {
             appearance: default_appearance(),
             streaming_pill_enabled: default_streaming_pill_enabled(),
             auto_paste_enabled: default_auto_paste_enabled(),
+            live_transcript_enabled: default_live_transcript_enabled(),
             enable_thinking: false,
             inference_api_key: String::new(),
             try_parakeet_dismissed: false,
@@ -330,6 +353,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let auto_paste_enabled =
         get_bool(KEY_AUTO_PASTE_ENABLED, default_auto_paste_enabled());
 
+    let live_transcript_enabled = get_bool(
+        KEY_LIVE_TRANSCRIPT_ENABLED,
+        default_live_transcript_enabled(),
+    );
+
     let enable_thinking = get_bool(KEY_ENABLE_THINKING, false);
 
     let inference_api_key = get_str(KEY_INFERENCE_API_KEY).unwrap_or_default();
@@ -379,6 +407,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         appearance,
         streaming_pill_enabled,
         auto_paste_enabled,
+        live_transcript_enabled,
         enable_thinking,
         inference_api_key,
         try_parakeet_dismissed,
@@ -431,6 +460,10 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
 
     b(KEY_STREAMING_PILL_ENABLED, settings.streaming_pill_enabled);
     b(KEY_AUTO_PASTE_ENABLED, settings.auto_paste_enabled);
+    b(
+        KEY_LIVE_TRANSCRIPT_ENABLED,
+        settings.live_transcript_enabled,
+    );
     b(KEY_ENABLE_THINKING, settings.enable_thinking);
 
     s(KEY_INFERENCE_API_KEY, &settings.inference_api_key);
@@ -555,6 +588,13 @@ pub struct Prefs {
     /// behaviour for an in-flight transcript.
     pub auto_paste_enabled: bool,
 
+    /// Mirror of `Settings::live_transcript_enabled`. Captured at
+    /// session start so a mid-utterance toggle can't swap the pill
+    /// silhouette under the user. Drives the speculative decoder's
+    /// battery override and opens the post-release transcript stream
+    /// even when `streaming_pill_enabled` is off.
+    pub live_transcript_enabled: bool,
+
     /// Mirror of `Settings::enable_thinking`. Per-Voice-Mode override
     /// (`VoiceMode::enable_thinking: Option<bool>`) takes precedence at
     /// session-begin time; this value is the global fallback.
@@ -582,6 +622,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         auto_suggest_modes: s.auto_suggest_modes,
         streaming_pill_enabled: s.streaming_pill_enabled,
         auto_paste_enabled: s.auto_paste_enabled,
+        live_transcript_enabled: s.live_transcript_enabled,
         enable_thinking: s.enable_thinking,
         audio_input_device: s.audio_input_device,
     }
@@ -655,6 +696,25 @@ mod tests {
         let bare = "{}";
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(restored.streaming_pill_enabled);
+    }
+
+    #[test]
+    fn live_transcript_enabled_defaults_to_false() {
+        let s = Settings::default();
+        assert!(!s.live_transcript_enabled);
+    }
+
+    #[test]
+    fn live_transcript_enabled_roundtrips_through_serde() {
+        let mut s = Settings::default();
+        s.live_transcript_enabled = true;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.live_transcript_enabled);
+
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert!(!restored.live_transcript_enabled);
     }
 
     #[test]

@@ -242,6 +242,30 @@ pub fn set_auto_paste_enabled<R: Runtime>(
     Ok(())
 }
 
+/// Single-field setter for `Settings::live_transcript_enabled`. Lets
+/// the tray popover flip the toggle without going through
+/// `set_settings` (which is gated to the settings / onboarding
+/// webviews). The pill webview reacts to the resulting
+/// `settings:changed` broadcast — no per-session re-bind is needed
+/// because in-flight sessions are already pinned on
+/// `SessionState::live_transcript_enabled`.
+#[tauri::command]
+pub fn set_live_transcript_enabled<R: Runtime>(
+    app: AppHandle<R>,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut s = settings::load(&app);
+    if s.live_transcript_enabled == enabled {
+        return Ok(());
+    }
+    s.live_transcript_enabled = enabled;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn set_enable_thinking<R: Runtime>(
     app: AppHandle<R>,

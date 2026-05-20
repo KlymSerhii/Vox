@@ -7,7 +7,12 @@ import {
   Show,
 } from "solid-js";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { pillResize } from "../lib/ipc";
+import {
+  getPublicSettings,
+  onSettingsChanged,
+  pillResize,
+  type Settings,
+} from "../lib/ipc";
 
 type PillState =
   | "listening"
@@ -131,6 +136,14 @@ export default function PillView() {
     "transcript" | "polish" | null
   >(null);
   let currentSessionId: number | null = null;
+  // Opt-in toggle from Settings → General / tray popover. When true the
+  // pill paints the speculative transcript while the user is
+  // still speaking, in place of the default waveform-only listening
+  // silhouette. Settings load is async — `false` until the first
+  // `getPublicSettings()` lands, which matches the default and means
+  // a user who hasn't opted in never sees a flash of the wide layout.
+  const [liveTranscriptEnabled, setLiveTranscriptEnabled] =
+    createSignal(false);
   // Reduced-motion users get the existing stage-label experience —
   // streaming animation is purely cosmetic and the rate-limited
   // reveal would feel sluggish without the smooth transition.
@@ -139,8 +152,8 @@ export default function PillView() {
   // stale answer for the rest of the process lifetime.
   const [reducedMotion, setReducedMotion] = createSignal(
     typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(prefers-reduced-motion: reduce)").matches,
   );
   // Gates bar-height transitions during pill width animation. The pill
   // div runs a `transition-[width,box-shadow,padding,border-radius]
@@ -318,6 +331,22 @@ export default function PillView() {
 
     targetText = payload.text;
 
+    // Same-mode shrink. A re-decoding engine (Parakeet) re-runs the
+    // whole growing buffer each speculative pass and can return a
+    // cumulative transcript SHORTER than what's already visible — it
+    // re-segments and may drop a trailing word between passes. The
+    // rate-limited revealer only ever EXTENDS visible text (it caps at
+    // `targetText.length` but never rewinds), so without this it would
+    // freeze on the stale longer text until a later pass grew past it.
+    // Snap down to the shorter target and rebase the reveal origin so
+    // the correction surfaces immediately. This is a no-op right after
+    // a mode change (the block above already reconciled the length) and
+    // during normal monotonic growth (target ≥ visible).
+    if (targetText.length < streamingText().length) {
+      setStreamingText(targetText);
+      revealStartLen = targetText.length;
+    }
+
     if (payload.final) {
       // Polish stream finals still snap immediately — the polishing UI
       // already paced the reveal, and a polish snap reads as "done"
@@ -366,15 +395,16 @@ export default function PillView() {
       return;
     }
 
-    // Defer the visible reveal until the user releases the hotkey.
-    // Speculative Whisper output keeps streaming during `listening` for
-    // the CPU win, but we don't show it — the brief: "I want that
-    // initial transcription to be revealed smoothly during the first
-    // two seconds" *after* the user finishes speaking. When the
-    // pill:state listener fires `listening → transcribing` it will
-    // kick the deliberate slow reveal that consumes whatever's piled
-    // up in `targetText`.
-    if (state() === "listening") {
+    // Defer the visible reveal until the user releases the hotkey
+    // UNLESS the user opted into the live-transcript view. With the
+    // opt-in on, the speculative buffer surfaces at the default
+    // reveal rate as it grows (no slow-walk — the user explicitly
+    // asked for a live caption, not a delayed one). With the opt-in
+    // off we keep the original behaviour: buffer silently and let
+    // the listening → transcribing transition kick the slow 2 s
+    // reveal so the brief's "smoothly reveal during the first two
+    // seconds" promise holds.
+    if (state() === "listening" && !liveTranscriptEnabled()) {
       return;
     }
 
@@ -397,8 +427,27 @@ export default function PillView() {
   let unlisten: UnlistenFn[] = [];
   let toastTimer: number | null = null;
 
+  // Apply live-transcript-relevant fields from a Settings snapshot.
+  // The tray popover / Settings UI broadcast `settings:changed` after
+  // every flip so this stays in lockstep without a Vox restart.
+  function applySettingsToPill(next: Settings) {
+    setLiveTranscriptEnabled(!!next.live_transcript_enabled);
+  }
+
   onMount(async () => {
     document.body.classList.add("translucent");
+
+    // First read is async so the pill paints in its default
+    // (compact, waveform) silhouette until settings land — matches
+    // what a user who never flipped the toggle will always see.
+    // Failure is non-fatal: the pill stays in default mode.
+    try {
+      const initial = await getPublicSettings();
+      applySettingsToPill(initial);
+    } catch (e) {
+      console.warn("pill: getPublicSettings failed:", e);
+    }
+    unlisten.push(await onSettingsChanged(applySettingsToPill));
 
     // Live `prefers-reduced-motion`: macOS users can toggle "Reduce
     // motion" in System Settings → Accessibility → Display while Vox
@@ -478,6 +527,12 @@ export default function PillView() {
           prevState === "listening" &&
           e.payload.state === "transcribing" &&
           !reducedMotion() &&
+          // Live-transcript users have already seen the speculative
+          // buffer surface in real time during listening — kicking
+          // the deliberate slow reveal here would re-throttle the
+          // next chars for ~2 s and feel like a stutter. Let the
+          // default reveal continue.
+          !liveTranscriptEnabled() &&
           targetText.length > 0 &&
           revealTimer === null
         ) {
@@ -652,8 +707,21 @@ export default function PillView() {
     effectiveState() === "transcribing" ||
     effectiveState() === "polishing";
   const isSaturated = () => state() === "saturated";
+  // True only when the user opted in AND we're actively in the
+  // listening phase. The reduced-motion bail in `applyStreamPayload`
+  // already drops speculative chunks, so we gate the wide layout on
+  // the same flag here — a reduced-motion user keeps the compact
+  // waveform silhouette during listening even with the toggle on.
+  const isLiveListening = () =>
+    state() === "listening" && liveTranscriptEnabled() && !reducedMotion();
+  // Body slot shows StreamingText whenever there's actual text to
+  // paint; OR otherwise gates to TypingDots inside the same body.
+  // Broadened to cover the live-listening case so the body switches
+  // on as soon as the first speculative chunk arrives.
   const isStreaming = () =>
-    isProcessing() && streamingMode() !== null && streamingText().length > 0;
+    (isProcessing() || isLiveListening()) &&
+    streamingMode() !== null &&
+    streamingText().length > 0;
   // True when the transcript stream finalised, the backend flipped the
   // stage to Polishing, but the LLM hasn't emitted its first chunk yet
   // (TTFT — model is processing the prompt). Without this signal the
@@ -719,7 +787,12 @@ export default function PillView() {
   // right outer dimensions.
   const WINDOW_PADDING_W = 16;
   const WINDOW_PADDING_H = 10;
-  const STREAM_GROW_ENABLED = () => isStreaming() || isWaitingForPolish();
+  // Wide layout active during processing AND during live-listening so
+  // the ResizeObserver / dynamic min-width / column flexbox all
+  // engage as soon as the listening phase opens, instead of waiting
+  // for the listening → transcribing flip.
+  const STREAM_GROW_ENABLED = () =>
+    isStreaming() || isWaitingForPolish() || isLiveListening();
 
   // ─── Dynamic width-floor lerp ──────────────────────────────────────
   // Couples width to height so a tall, narrow pill never happens. As
@@ -857,9 +930,22 @@ export default function PillView() {
           ? pillRef.getBoundingClientRect().height
           : last.contentRect.height;
         applyDynamicWidthFloor(pillHeight);
+        // Report the LARGER of the measured content width and the floor
+        // we just applied. When a line wrap bumps the height, the floor
+        // lerp widens `min-width` — but that widening only materialises
+        // on the NEXT layout pass, so `contentRect.width` here still
+        // holds the pre-widen value. Sizing the OS window to that stale
+        // (narrower) width leaves the pill div rendering wider than its
+        // window for a frame or two → the text clips at the sides until
+        // the next observer tick catches up. Feeding the floor in now
+        // closes that gap so the window never trails a floor jump.
         // reportPillSize still gets the wrapper's full height so the
         // OS window accounts for the chip when it's visible.
-        reportPillSize(last.contentRect.width, last.contentRect.height);
+        const effectiveWidth = Math.max(
+          last.contentRect.width,
+          dynamicMinWidth(),
+        );
+        reportPillSize(effectiveWidth, last.contentRect.height);
       });
     });
     resizeObserver.observe(wrapperRef);
@@ -903,12 +989,37 @@ export default function PillView() {
   // Toggle the observer with the streaming lifecycle so we don't push
   // height updates for the compact Listening/Done states (Rust handles
   // those via set_wide).
+  //
+  // `wasStreaming` doubles as the edge-trigger guard: the createEffect
+  // re-fires on every streamingText / streamingMode change while the
+  // wide layout is up (because those are tracked dependencies of
+  // STREAM_GROW_ENABLED). Without this guard the pre-emptive widen
+  // would re-fire ~30 times/sec during the reveal, racing with the
+  // ResizeObserver's content-driven pillResize and snapping the OS
+  // window back to 196 px every tick — visibly clipping the right
+  // edge of any transcript wider than 156 px of interior.
   let wasStreaming = false;
   createEffect(() => {
     const streamingNow = STREAM_GROW_ENABLED();
     if (streamingNow) {
-      wasStreaming = true;
       setupResizeObserver();
+      // Pre-emptive widen ONLY on the false→true edge so the OS
+      // window catches up to the CSS layout in the same frame the
+      // wide silhouette renders. Without this, transitioning into
+      // the wide layout from a compact 116 px OS window would clip
+      // the inner pill (which is already laid out at the 180 px
+      // floor) for one frame. Live-listening relies on this path
+      // entirely — Rust no longer widens on session-begin since it
+      // has no view of the user's reduced-motion preference. The
+      // ResizeObserver follows immediately with the real content
+      // size and is the only thing that should resize the window
+      // after this initial widen.
+      if (!wasStreaming) {
+        wasStreaming = true;
+        void pillResize({
+          width: W_MIN + WINDOW_PADDING_W,
+        }).catch(() => { });
+      }
     } else {
       teardownResizeObserver();
       if (wasStreaming) {
@@ -926,7 +1037,7 @@ export default function PillView() {
         void pillResize({
           width: COMPACT_W,
           height: COMPACT_H,
-        }).catch(() => {});
+        }).catch(() => { });
       }
     }
   });
@@ -943,207 +1054,230 @@ export default function PillView() {
     if (state() !== "listening") return;
     if (chip) {
       // Pill (36px) + drawer (25px) + WINDOW_PADDING_H (10px) = 71 → round to 72.
-      void pillResize({ height: 72 }).catch(() => {});
+      void pillResize({ height: 72 }).catch(() => { });
     } else if (!fading) {
       // Drawer gone — restore compact height.
-      void pillResize({ height: 36 + WINDOW_PADDING_H }).catch(() => {});
+      void pillResize({ height: 36 + WINDOW_PADDING_H }).catch(() => { });
     }
   });
 
   return (
     <div class="flex h-screen w-screen items-center justify-center bg-transparent">
       <div ref={(el) => (wrapperRef = el)} class="flex flex-col items-center">
-      <div
-        ref={(el) => (pillRef = el)}
-        class="animate-pill-in pointer-events-none relative flex min-h-[26px] items-center rounded-[14px] px-3 py-1.5 transition-[width,box-shadow,padding,border-radius] duration-200 ease-out"
-        classList={{ "pill-transitioning": pillTransitioning() }}
-        style={{
-          // Column layout during any processing stage so the sticky
-          // header sits above the scrollable streaming body. Other
-          // states stay row-centred.
-          "flex-direction":
-            isProcessing() ? "column" : "row",
-          "justify-content":
-            isProcessing() ? "flex-start" : "center",
-          "align-items":
-            isProcessing() ? "stretch" : "center",
-          // Compact pill sits at 116 px. While streaming we use
-          // `fit-content` so the pill div sizes itself to the actual
-          // text width; min/max clamp the box at a 180 px floor
-          // (single-line streaming feels intentional) and a 360 px
-          // ceiling (matches WIDE_WIDTH_MAX − 40 px so the pill div
-          // can fully fill the OS window's interior at the cap). The
-          // ResizeObserver above watches `pillRef.contentRect.width`
-          // and pushes that back to Rust so the OS window grows in
-          // lockstep, and also drives the dynamic min-width lerp so
-          // tall content forces the box wider rather than narrower.
-          width: STREAM_GROW_ENABLED() ? "fit-content" : "116px",
-          // Streaming uses the floor signal so the ResizeObserver-driven
-          // width-floor lerp survives Solid re-renders triggered by
-          // unrelated style changes (e.g. box-shadow flipping on Done).
-          // 0 sentinel = floor untouched, fall back to the static W_MIN.
-          "min-width": STREAM_GROW_ENABLED()
-            ? `${Math.max(W_MIN, dynamicMinWidth())}px`
-            : "116px",
-          "max-width": STREAM_GROW_ENABLED() ? `${W_MAX}px` : "116px",
-          // Clip streaming-mode children to the rounded boundary.
-          // Without this, tall pills painted square corners because
-          // StreamingText / ShimmerWord painted past the rim radius.
-          // Restricted to streaming mode so the QueueDot (which
-          // anchors at right:-3px in compact mode) stays visible —
-          // box-shadow / inner-rim glows live OUTSIDE the box and
-          // are unaffected either way.
-          overflow: STREAM_GROW_ENABLED() ? "hidden" : "visible",
-          // Multi-line streaming makes a pure pill (border-radius:
-          // 9999px) look squashed at the corners — soften to a 14 px
-          // rounded rect when wide and let the compact mode keep its
-          // round-end silhouette via a higher value.
-          // When the mode drawer is attached below, flatten the bottom
-          // corners so the pill and drawer share a seamless continuous edge.
-          "border-radius": STREAM_GROW_ENABLED()
-            ? "14px"
-            : modeChip()
-              ? "9999px 9999px 0 0"
-              : "9999px",
-          background: "var(--color-pill-surface)",
-          "backdrop-filter": "var(--glass-blur)",
-          "-webkit-backdrop-filter": "var(--glass-blur)",
-          border: "1px solid var(--glass-rim)",
-          "box-shadow": isDoneSuccess()
-            ? "inset 0 0 0 1.5px var(--color-success), 0 0 18px var(--pill-glow-success), var(--glass-shadow-pill)"
-            : isDoneWarning()
-              ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px var(--pill-glow-warning), var(--glass-shadow-pill)"
-              : isSaturated()
-                ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px var(--pill-glow-saturated), var(--glass-shadow-pill)"
-                : "var(--glass-shadow-pill)",
-        }}
-        role="status"
-        aria-live="off"
-      >
-        {/* Stage-only live region. The pill body mutates per token
+        <div
+          ref={(el) => (pillRef = el)}
+          class="animate-pill-in pointer-events-none relative flex min-h-[26px] items-center rounded-[14px] px-3 py-1.5 transition-[width,box-shadow,padding,border-radius] duration-200 ease-out"
+          classList={{ "pill-transitioning": pillTransitioning() }}
+          style={{
+            // Column layout during any wide-layout stage so the sticky
+            // header sits above the scrollable streaming body. Other
+            // states stay row-centred. Live-listening shares the same
+            // header + body shape as transcribing/polishing, so it
+            // has to share the column flex direction too — gating
+            // only on `isProcessing()` left the listening header and
+            // body sitting horizontally and clipping each other.
+            "flex-direction":
+              isProcessing() || isLiveListening() ? "column" : "row",
+            "justify-content":
+              isProcessing() || isLiveListening() ? "flex-start" : "center",
+            "align-items":
+              isProcessing() || isLiveListening() ? "stretch" : "center",
+            // Compact pill sits at 116 px. While streaming we use
+            // `fit-content` so the pill div sizes itself to the actual
+            // text width; min/max clamp the box at a 180 px floor
+            // (single-line streaming feels intentional) and a 360 px
+            // ceiling (matches WIDE_WIDTH_MAX − 40 px so the pill div
+            // can fully fill the OS window's interior at the cap). The
+            // ResizeObserver above watches `pillRef.contentRect.width`
+            // and pushes that back to Rust so the OS window grows in
+            // lockstep, and also drives the dynamic min-width lerp so
+            // tall content forces the box wider rather than narrower.
+            width: STREAM_GROW_ENABLED() ? "fit-content" : "116px",
+            // Streaming uses the floor signal so the ResizeObserver-driven
+            // width-floor lerp survives Solid re-renders triggered by
+            // unrelated style changes (e.g. box-shadow flipping on Done).
+            // 0 sentinel = floor untouched, fall back to the static W_MIN.
+            "min-width": STREAM_GROW_ENABLED()
+              ? `${Math.max(W_MIN, dynamicMinWidth())}px`
+              : "116px",
+            "max-width": STREAM_GROW_ENABLED() ? `${W_MAX}px` : "116px",
+            // Clip streaming-mode children to the rounded boundary.
+            // Without this, tall pills painted square corners because
+            // StreamingText / ShimmerWord painted past the rim radius.
+            // Restricted to streaming mode so the QueueDot (which
+            // anchors at right:-3px in compact mode) stays visible —
+            // box-shadow / inner-rim glows live OUTSIDE the box and
+            // are unaffected either way.
+            overflow: STREAM_GROW_ENABLED() ? "hidden" : "visible",
+            // Multi-line streaming makes a pure pill (border-radius:
+            // 9999px) look squashed at the corners — soften to a 14 px
+            // rounded rect when wide and let the compact mode keep its
+            // round-end silhouette via a higher value.
+            // When the mode drawer is attached below, flatten the bottom
+            // corners so the pill and drawer share a seamless edge.
+            // Live-listening can host the mode chip too (the user can
+            // still cycle modes mid-utterance), so the bottom-flatten
+            // branch has to win over the wide-rounded-rect branch when
+            // both are active.
+            "border-radius": modeChip()
+              ? STREAM_GROW_ENABLED()
+                ? "14px 14px 0 0"
+                : "9999px 9999px 0 0"
+              : STREAM_GROW_ENABLED()
+                ? "14px"
+                : "9999px",
+            background: "var(--color-pill-surface)",
+            "backdrop-filter": "var(--glass-blur)",
+            "-webkit-backdrop-filter": "var(--glass-blur)",
+            border: "1px solid var(--glass-rim)",
+            "box-shadow": isDoneSuccess()
+              ? "inset 0 0 0 1.5px var(--color-success), 0 0 18px var(--pill-glow-success), var(--glass-shadow-pill)"
+              : isDoneWarning()
+                ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px var(--pill-glow-warning), var(--glass-shadow-pill)"
+                : isSaturated()
+                  ? "inset 0 0 0 1.5px var(--color-warning), 0 0 18px var(--pill-glow-saturated), var(--glass-shadow-pill)"
+                  : "var(--glass-shadow-pill)",
+          }}
+          role="status"
+          aria-live="off"
+        >
+          {/* Stage-only live region. The pill body mutates per token
             during streaming, which would spam screen readers if the
             outer container were polite. We keep the outer container
             silent (aria-live="off") and announce stage transitions
             (Listening/Transcribing/Polishing/Done) through this
             visually-hidden child region instead. */}
-        <span
-          aria-live="polite"
-          aria-atomic="true"
-          style={{
-            position: "absolute",
-            width: "1px",
-            height: "1px",
-            padding: 0,
-            margin: "-1px",
-            overflow: "hidden",
-            clip: "rect(0, 0, 0, 0)",
-            "white-space": "nowrap",
-            border: 0,
-          }}
-        >
-          {(() => {
-            const hud = modeHud();
-            if (hud) return `Mode: ${hud.name}`;
-            const st = effectiveState();
-            if (st === "listening") return "Listening";
-            if (st === "transcribing") return "Transcribing";
-            if (st === "polishing") return "Polishing";
-            if (st === "done") return message() ?? (warning() ? "Raw copy" : "Done");
-            if (st === "error") return message() ?? "Error";
-            if (st === "canceled") return message() ?? "Canceled";
-            if (st === "saturated") return toastMessage() ?? message() ?? "Too many in flight";
-            return "";
-          })()}
-        </span>
-        <Show when={modeHud()}>
-          <ModeHudView mode={modeHud()!} />
-        </Show>
-        <Show when={state() === "listening" && !modeHud()}>
-          <Waveform levels={levels()} color={meterColor()} />
-        </Show>
-
-        {/* Unified processing layout: sticky header + scrollable body.
-            Active for both transcribing and polishing so the stage
-            label never scrolls off as text grows. */}
-        <Show when={isProcessing() && !modeHud()}>
-          {/* Sticky header — always visible for the entire stage. */}
-          <div class="processing-header" style={{ "padding-bottom": "2px" }}>
-            <Show when={effectiveState() === "polishing"}>
-              <PolishingLabelRow visible={true} />
-            </Show>
-            <Show when={effectiveState() === "transcribing"}>
-              <TranscribingLabelRow />
-            </Show>
-          </div>
-
-          {/* Scrollable body: auto-scrolls to bottom, fades top edge,
-              never grows past H_MAX minus header height. */}
-          <div
-            ref={(el) => (streamingBodyRef = el)}
-            class="streaming-body"
+          <span
+            aria-live="polite"
+            aria-atomic="true"
             style={{
-              flex: "1",
-              "max-height": `${H_MAX - 28}px`,
-              "mask-image": bodyOverflowing()
-                ? "linear-gradient(to bottom, transparent 0%, black 24px)"
-                : "none",
-              "-webkit-mask-image": bodyOverflowing()
-                ? "linear-gradient(to bottom, transparent 0%, black 24px)"
-                : "none",
+              position: "absolute",
+              width: "1px",
+              height: "1px",
+              padding: 0,
+              margin: "-1px",
+              overflow: "hidden",
+              clip: "rect(0, 0, 0, 0)",
+              "white-space": "nowrap",
+              border: 0,
             }}
           >
-            <Show when={isStreaming()}>
-              <StreamingText
-                text={streamingText()}
-                mode={streamingMode() ?? "transcript"}
-                waitingForPolish={isWaitingForPolish()}
-                transcribingStreaming={
-                  effectiveState() === "transcribing" &&
-                  streamingMode() === "transcript"
-                }
-              />
-            </Show>
-            <Show when={!isStreaming()}>
-              <TypingDots color={meterColor()} />
-            </Show>
-          </div>
-        </Show>
+            {(() => {
+              const hud = modeHud();
+              if (hud) return `Mode: ${hud.name}`;
+              const st = effectiveState();
+              if (st === "listening") {
+                return isLiveListening()
+                  ? "Listening — live transcript"
+                  : "Listening";
+              }
+              if (st === "transcribing") return "Transcribing";
+              if (st === "polishing") return "Polishing";
+              if (st === "done") return message() ?? (warning() ? "Raw copy" : "Done");
+              if (st === "error") return message() ?? "Error";
+              if (st === "canceled") return message() ?? "Canceled";
+              if (st === "saturated") return toastMessage() ?? message() ?? "Too many in flight";
+              return "";
+            })()}
+          </span>
+          <Show when={modeHud()}>
+            <ModeHudView mode={modeHud()!} />
+          </Show>
+          {/* Waveform is the default listening silhouette. Suppressed
+            when the live-transcript opt-in is on — that path renders
+            the wide layout below with the caption body instead. */}
+          <Show when={state() === "listening" && !modeHud() && !isLiveListening()}>
+            <Waveform levels={levels()} color={meterColor()} />
+          </Show>
 
-        <Show when={state() === "done" && !modeHud()}>
-          <TerminalLine
-            tone={warning() ? "warning" : "success"}
-            label={message() ?? (warning() ? "Raw copy" : "Done")}
-          />
-        </Show>
+          {/* Unified wide layout: sticky header + scrollable body.
+            Active for transcribing and polishing always, and for
+            listening when the user opted into live transcript so the
+            speculative caption renders in the same slot the post-stop
+            reveal will inherit (no layout reflow on hotkey release). */}
+          <Show when={(isProcessing() || isLiveListening()) && !modeHud()}>
+            {/* Sticky header — always visible for the entire stage. */}
+            <div class="processing-header" style={{ "padding-bottom": "2px" }}>
+              <Show when={effectiveState() === "polishing"}>
+                <PolishingLabelRow visible={true} />
+              </Show>
+              <Show when={effectiveState() === "transcribing"}>
+                <TranscribingLabelRow />
+              </Show>
+              <Show when={isLiveListening() && effectiveState() === "listening"}>
+                <ListeningLabelRow />
+              </Show>
+            </div>
 
-        <Show when={state() === "error" && !modeHud()}>
-          <TerminalLine
-            tone="error"
-            label={message() ?? "Error"}
-          />
-        </Show>
+            {/* Scrollable body: auto-scrolls to bottom, fades top edge,
+              never grows past H_MAX minus header height. */}
+            <div
+              ref={(el) => (streamingBodyRef = el)}
+              class="streaming-body"
+              style={{
+                flex: "1",
+                "max-height": `${H_MAX - 28}px`,
+                "mask-image": bodyOverflowing()
+                  ? "linear-gradient(to bottom, transparent 0%, black 24px)"
+                  : "none",
+                "-webkit-mask-image": bodyOverflowing()
+                  ? "linear-gradient(to bottom, transparent 0%, black 24px)"
+                  : "none",
+              }}
+            >
+              <Show when={isStreaming()}>
+                <StreamingText
+                  text={streamingText()}
+                  mode={streamingMode() ?? "transcript"}
+                  waitingForPolish={isWaitingForPolish()}
+                  transcribingStreaming={
+                    effectiveState() === "transcribing" &&
+                    streamingMode() === "transcript"
+                  }
+                  listening={isLiveListening()}
+                />
+              </Show>
+              <Show when={!isStreaming()}>
+                <TypingDots color={meterColor()} />
+              </Show>
+            </div>
+          </Show>
 
-        <Show when={state() === "canceled" && !modeHud()}>
-          <TerminalLine tone="muted" label={message() ?? "Canceled"} />
-        </Show>
+          <Show when={state() === "done" && !modeHud()}>
+            <TerminalLine
+              tone={warning() ? "warning" : "success"}
+              label={message() ?? (warning() ? "Raw copy" : "Done")}
+            />
+          </Show>
 
-        <Show when={isSaturated() && !modeHud()}>
-          <TerminalLine
-            tone="warning"
-            label={toastMessage() ?? message() ?? "Too many in flight"}
-          />
-        </Show>
+          <Show when={state() === "error" && !modeHud()}>
+            <TerminalLine
+              tone="error"
+              label={message() ?? "Error"}
+            />
+          </Show>
 
-        <Show when={backgroundCount() > 0 && !isSaturated() && !modeHud()}>
-          <QueueDot count={backgroundCount()} />
-        </Show>
-      </div>
+          <Show when={state() === "canceled" && !modeHud()}>
+            <TerminalLine tone="muted" label={message() ?? "Canceled"} />
+          </Show>
 
-      {/* Mode drawer: attached half-pill that grows downward from the
+          <Show when={isSaturated() && !modeHud()}>
+            <TerminalLine
+              tone="warning"
+              label={toastMessage() ?? message() ?? "Too many in flight"}
+            />
+          </Show>
+
+          <Show when={backgroundCount() > 0 && !isSaturated() && !modeHud()}>
+            <QueueDot count={backgroundCount()} />
+          </Show>
+        </div>
+
+        {/* Mode drawer: attached half-pill that grows downward from the
           main pill when the mode-cycle hotkey fires during a recording
           session. No gap — the flat bottom edge of the main pill and
           the flat top edge of the drawer share a seamless seam. */}
-      <ModeDrawer mode={modeChip()} fading={modeChipFading()} />
+        <ModeDrawer mode={modeChip()} fading={modeChipFading()} />
       </div>
     </div>
   );
@@ -1247,30 +1381,46 @@ function StreamingText(props: {
   /// requires `effectiveState === "polishing"`, transcribingStreaming
   /// requires `effectiveState === "transcribing"`).
   transcribingStreaming: boolean;
+  /// True while the live-transcript opt-in is rendering the
+  /// speculative buffer during the listening phase. The caret + body
+  /// shimmer tint to coral (matching the listening meter colour) so
+  /// the stage flip listening → transcribing reads as a colour
+  /// hand-off rather than two strangers in the same slot.
+  listening?: boolean;
 }) {
-  // Caret colour: violet during the polish stage (and during the
-  // transcript→polish handoff via `waitingForPolish`), cyan during the
-  // active transcribing stage. Cyan was specifically called out by
-  // design so the transcribing stage no longer reuses the teal accent.
+  // Caret colour layers: listening (coral) > polish (violet) >
+  // transcribing (cyan). Listening wins because the user is still
+  // mid-utterance — the speculative text is *living*, not settled,
+  // and the warm tint marks that.
   const caretColor = () =>
-    props.mode === "polish" ? "var(--color-violet)" : "var(--color-cyan)";
-  // Glow points at the theme-aware token so light vs dark themes pick
-  // up rgbas tuned for each surface — the previous hardcoded rgba
-  // strings produced an off-hue ring on the cream pill in light mode.
+    props.listening
+      ? "var(--color-coral)"
+      : props.mode === "polish"
+        ? "var(--color-violet)"
+        : "var(--color-cyan)";
+  // Glow points at theme-aware tokens so light vs dark themes pick
+  // up rgbas tuned for each surface. Falls back to a cyan-strength
+  // glow for the listening case so the coral caret stays haloed.
   const caretGlow = () =>
-    props.mode === "polish"
-      ? "var(--caret-glow-violet)"
-      : "var(--caret-glow-cyan)";
-  // Shimmer is active throughout both transcribing and polishing streaming
-  // phases so the user always sees the animated sweep on live text.
+    props.listening
+      ? "var(--caret-glow-coral, var(--caret-glow-cyan))"
+      : props.mode === "polish"
+        ? "var(--caret-glow-violet)"
+        : "var(--caret-glow-cyan)";
+  // Shimmer runs whenever live text is flowing — listening,
+  // transcribing, or polishing. The tint follows the stage so the
+  // band visibly carries the active phase's colour.
   const shimmerActive = () =>
+    props.listening ||
     props.waitingForPolish ||
     props.transcribingStreaming ||
     props.mode === "polish";
   const shimmerTint = () =>
-    props.waitingForPolish || props.mode === "polish"
-      ? "var(--color-violet)"
-      : "var(--color-cyan)";
+    props.listening
+      ? "var(--color-coral)"
+      : props.waitingForPolish || props.mode === "polish"
+        ? "var(--color-violet)"
+        : "var(--color-cyan)";
   return (
     <div
       class="flex w-full select-none items-start"
@@ -1389,6 +1539,52 @@ function PolishingLabelRow(props: { visible: boolean }) {
         }}
       >
         Polishing…
+      </span>
+    </div>
+  );
+}
+
+/// Sticky header for the listening stage when the live-transcript opt-in
+/// is on. Mirrors PolishingLabelRow / TranscribingLabelRow with coral
+/// instead of violet/cyan — the pulsing dot doubles as the recording
+/// indicator so the user can tell at a glance that the mic is hot even
+/// when nobody is speaking yet.
+function ListeningLabelRow() {
+  return (
+    <div
+      class="polishing-label-row pointer-events-none"
+      style={{
+        display: "flex",
+        "align-items": "center",
+        gap: "6px",
+        "margin-bottom": "4px",
+        opacity: 1,
+        transition: "opacity 180ms ease-out",
+      }}
+      aria-hidden="true"
+    >
+      <span
+        class="polishing-dot"
+        style={{
+          width: "6px",
+          height: "6px",
+          "border-radius": "9999px",
+          background: "var(--color-coral)",
+          "box-shadow": "0 0 8px var(--color-coral)",
+          display: "inline-block",
+        }}
+      />
+      <span
+        style={{
+          "font-size": "10.5px",
+          "font-weight": 600,
+          "letter-spacing": "0.04em",
+          color: "var(--color-coral)",
+          opacity: 0.85,
+          "line-height": "1",
+        }}
+      >
+        Listening…
       </span>
     </div>
   );

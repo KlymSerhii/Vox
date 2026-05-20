@@ -169,11 +169,20 @@ export function GeneralTab(props: {
         <Row
           label="Show streaming pill"
           hint="See the transcript appear live in the pill after you release the hotkey."
-          last
         >
           <Toggle
             checked={props.s.streaming_pill_enabled}
             onChange={(v) => props.update({ streaming_pill_enabled: v })}
+          />
+        </Row>
+        <Row
+          label="Live transcript while speaking"
+          hint="Replace the waveform with a live caption inside the pill. Uses more battery since it transcribes as you speak."
+          last
+        >
+          <Toggle
+            checked={props.s.live_transcript_enabled}
+            onChange={(v) => props.update({ live_transcript_enabled: v })}
           />
         </Row>
       </Card>

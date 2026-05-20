@@ -38,6 +38,7 @@
    * doesn't hot-spot against the cream pill background. */
   --caret-glow-cyan: rgba(91, 214, 224, 0.55);
   --caret-glow-violet: rgba(180, 155, 255, 0.55);
+  --caret-glow-coral: rgba(255, 142, 106, 0.55);
   --polishing-dot-glow: rgba(180, 155, 255, 0.6);
   /* Pill outer glows for terminal states. Theme-tokenised so the
    * Done/Warning/Saturated halos pick up alpha tuned for each surface
@@ -126,6 +127,7 @@
    * the visual weight. */
   --caret-glow-cyan: rgba(10, 181, 194, 0.50);
   --caret-glow-violet: rgba(138, 109, 255, 0.48);
+  --caret-glow-coral: rgba(255, 117, 86, 0.50);
   --polishing-dot-glow: rgba(138, 109, 255, 0.55);
   /* Light-mode pill glows: hue shifted darker + alpha softened so the
    * halo reads as elevation against the cream pill instead of a

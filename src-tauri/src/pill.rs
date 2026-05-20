@@ -293,23 +293,45 @@ pub fn set_wide<R: Runtime>(app: &AppHandle<R>, wide: bool) {
         })
     });
 
-    let target_w = if wide {
-        // Start small — the frontend will push the actual content size
-        // back via `set_size` as soon as the first chunk renders. This
-        // way short polishes never widen past their text and only long
-        // ones grow to the cap.
-        let screen_cap = frame.map(|(_, _, w, _)| (w - 64.0).max(WIDE_WIDTH_MIN));
-        match screen_cap {
-            Some(cap) => WIDE_WIDTH_MIN_DYNAMIC.min(cap),
-            None => WIDE_WIDTH_MIN_DYNAMIC,
-        }
+    let (target_w, target_h) = if wide {
+        // Non-shrinking widen. The frontend's ResizeObserver owns the
+        // fine-grained streaming size; this coarse Rust call only needs
+        // to GUARANTEE the window is at least the wide floor before the
+        // first chunk renders. Crucially it must NOT snap a window the
+        // frontend already grew back down to the floor.
+        //
+        // That snap was the cause of the intermittent side-clipping on
+        // the listening→transcribing edge when live transcript is on:
+        // the pill is already wide and tall (the live caption grew it
+        // during listening), and a fixed 180×36 reset shrank the OS
+        // window under content that was still wide. The ResizeObserver
+        // can't undo it — the pill div's min-width keeps the measured
+        // content size unchanged, so no resize event fires and the
+        // window stays small while the pill overflows it.
+        //
+        // Reading the live window size and taking the max fixes both
+        // paths from one place: compact→wide (live off, or reduced
+        // motion) still widens to the floor, while an already-wide
+        // window (live on) is preserved. Clamp width to the screen so a
+        // grown window never bleeds off a small display.
+        let scale = win.scale_factor().unwrap_or(1.0);
+        let cur = win.inner_size().ok();
+        let cur_w = cur
+            .as_ref()
+            .map(|s| s.width as f64 / scale)
+            .unwrap_or(WIDTH);
+        let cur_h = cur.map(|s| s.height as f64 / scale).unwrap_or(HEIGHT);
+        let screen_cap = frame
+            .map(|(_, _, w, _)| (w - 64.0).max(WIDE_WIDTH_MIN))
+            .unwrap_or(WIDE_WIDTH_MAX);
+        let w = cur_w.max(WIDE_WIDTH_MIN_DYNAMIC).min(screen_cap);
+        let h = cur_h.max(HEIGHT).min(HEIGHT_MAX);
+        (w, h)
     } else {
-        WIDTH
+        // Snapping non-wide always resets to the compact frame so the
+        // Done/Error/Canceled labels render at the original silhouette.
+        (WIDTH, HEIGHT)
     };
-
-    // Snapping non-wide always resets height to the compact frame so
-    // the Done/Error/Canceled labels render at the original silhouette.
-    let target_h = HEIGHT;
 
     apply_size(&win, frame, target_w, target_h);
 }

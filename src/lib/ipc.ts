@@ -32,6 +32,12 @@ export interface Settings {
   /// the pipeline falls open to the clipboard-only path and the pill
   /// surfaces a warning. Off by default.
   auto_paste_enabled: boolean;
+  /// Show a live transcript inside the pill while the user is still
+  /// speaking, in place of the default waveform. Driven by the same
+  /// speculative transcription decoder that already feeds the post-stop
+  /// reveal — flipping this on reveals what was previously buffered
+  /// silently. Off by default.
+  live_transcript_enabled: boolean;
   /// Let Gemma reason silently before polishing. Only affects
   /// `gemma-local`; ignored by Apple Intelligence and the no-op engine.
   /// Default false.
@@ -260,6 +266,10 @@ export async function setStreamingPillEnabled(enabled: boolean): Promise<void> {
 
 export async function setAutoPasteEnabled(enabled: boolean): Promise<void> {
   await invoke("set_auto_paste_enabled", { enabled });
+}
+
+export async function setLiveTranscriptEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_live_transcript_enabled", { enabled });
 }
 
 export async function setEnableThinking(enabled: boolean): Promise<void> {

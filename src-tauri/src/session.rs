@@ -293,6 +293,13 @@ pub struct SessionState {
     /// the setting mid-utterance. Both sites read this field instead
     /// of re-loading settings.
     pub streaming_enabled: bool,
+    /// Snapshot of `Settings::live_transcript_enabled`. Captured at
+    /// session start so a mid-utterance toggle can't swap the pill
+    /// silhouette under the user. When true, the speculative decoder
+    /// bypasses its battery-saver bail and `stream_to_pill` opens up
+    /// the transcript-stream emit even if `streaming_enabled` is
+    /// false — the opt-in implies the user wants the live caption.
+    pub live_transcript_enabled: bool,
     /// Snapshot of `Settings::auto_paste_enabled`. Captured at session
     /// start so flipping the toggle mid-pipeline doesn't change
     /// delivery behaviour for an in-flight transcript. Read by
@@ -570,7 +577,8 @@ impl SessionManager {
             completed: AtomicBool::new(false),
             completion: Arc::new(Notify::new()),
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
-            streaming_enabled: settings::load(app).streaming_pill_enabled,
+            streaming_enabled: prefs.streaming_pill_enabled,
+            live_transcript_enabled: prefs.live_transcript_enabled,
             auto_paste_enabled: prefs.auto_paste_enabled,
             enable_thinking,
             busy_guard: Mutex::new(Some(busy_guard)),
@@ -1378,7 +1386,12 @@ async fn run_pipeline(
     // recomputed at every emit site below, so a session that loses
     // ownership (e.g. a newer recording started) stops painting into
     // someone else's pill mid-stream.
-    let streaming_enabled = session.streaming_enabled;
+    //
+    // `live_transcript_enabled` is the listening-phase opt-in; if
+    // the user asked for a live caption they want it through
+    // completion, so either flag opens the post-release transcript
+    // stream.
+    let streaming_enabled = session.streaming_enabled || session.live_transcript_enabled;
     let owns_pill = manager.owns_pill_emit(id);
     // Closure used at every emit site so an in-flight session that
     // gets pre-empted by a newer recording stops writing to the pill.
@@ -1419,15 +1432,23 @@ async fn run_pipeline(
     };
 
     let transcript = {
-        // Block on any in-flight speculative decode before starting
-        // the authoritative pass — both share the same WhisperContext
-        // and `WhisperState::full` is not safe to drive concurrently.
-        // Awaiting the lock here is what realises the speculative
-        // savings: the speculative pass already chewed through ~all of
-        // the audio captured before the user released the hotkey, so
-        // by the time this `lock()` returns the only audio still to
-        // decode here is whatever was captured between the last
-        // speculative snapshot and end-of-recording.
+        // Block on any in-flight speculative decode before starting the
+        // authoritative pass — both share the same engine instance
+        // (WhisperContext / Parakeet AsrManager) and neither is safe to
+        // drive concurrently, so the lock serialises them.
+        //
+        // For whisper-local this wait also *pays for itself*: the
+        // speculative pass primes the WhisperContext cache, so by the
+        // time the lock is free the only audio left to decode is the
+        // sliver captured after the last speculative snapshot.
+        //
+        // For parakeet-local there's no such cache — the final pass
+        // re-decodes the whole buffer regardless — so if a live-caption
+        // pass is in flight at release we simply wait it out (bounded by
+        // one Parakeet decode; the length-aware cadence above keeps that
+        // bounded on long takes). Acceptable for an opt-in caption; the
+        // alternative (cancelling an uninterruptible in-flight decode)
+        // isn't available.
         let speculative_lock = session.speculative_decode.clone();
         let dict = session.dictionary.clone();
         let stt_engine_for_call = stt_engine.clone();
@@ -1888,17 +1909,30 @@ fn spawn_max_record_guard(
 }
 
 /// Pre-emptively decode the in-progress capture buffer while the user
-/// is still speaking. Throttling rules:
-///   * Don't start the first speculative pass until the buffer holds at
-///     least [`SPEC_MIN_FIRST_SECS`] of audio (otherwise we burn cycles
-///     on a tiny utterance the user is about to release the hotkey on).
-///   * Each subsequent pass needs the buffer to have grown by at least
-///     [`SPEC_MIN_DELTA_SECS`] vs the snapshot the previous pass started
-///     from.
-///   * Only one Whisper decode runs at a time; while one is in flight
-///     the next iteration just polls. We don't queue — when the
-///     in-flight pass finishes we re-evaluate against the *current*
-///     buffer (so we always work on the latest data, not stale).
+/// is still speaking. Two purposes: prime the engine cache so the final
+/// pass is cheaper (whisper-local), and — when `live_transcript_enabled`
+/// is on — paint a live caption into the pill as the user speaks.
+///
+/// Engine eligibility differs (see the match in the body): whisper-local
+/// always speculates when streaming is on; parakeet-local only when the
+/// live caption is requested, because it has no cache to prime and emits
+/// no mid-decode partials, so a speculative pass is pure overhead unless
+/// the caption needs it.
+///
+/// Throttling rules:
+///   * Don't start the first pass until the buffer holds at least
+///     [`SPEC_MIN_FIRST_SECS`] of audio (or [`SPEC_MIN_FIRST_SECS_LIVE`]
+///     on the live-caption path) — otherwise we burn cycles on a tiny
+///     utterance the user is about to release the hotkey on.
+///   * Each subsequent pass needs the buffer to have grown by a minimum
+///     delta vs the previous snapshot: [`SPEC_MIN_DELTA_SECS`] normally,
+///     or a length-aware gap on the live path (`SPEC_LIVE_DELTA_GROWTH`
+///     × buffer length, floored at [`SPEC_MIN_DELTA_SECS_LIVE`]) so a
+///     no-incremental-API engine re-decoding the whole buffer doesn't
+///     pin a core on a long take.
+///   * Only one decode runs at a time; while one is in flight the next
+///     iteration just polls. We don't queue — when the in-flight pass
+///     finishes we re-evaluate against the *current* buffer.
 ///   * Stops as soon as the recording ends (`foreground_id() != Some(id)`)
 ///     or the session is canceled. The final authoritative pass in
 ///     `run_pipeline` will run independently against the final buffer.
@@ -1919,31 +1953,69 @@ fn spawn_speculative_decoder(
 ) {
     /// Don't speculate on anything shorter than this — small utterances
     /// finalise faster than a speculative pass would complete anyway.
+    /// Live-transcript users explicitly asked for a caption *while*
+    /// they speak, so the threshold drops so the first chunk shows up
+    /// within ~1 s instead of making them wait two seconds staring at
+    /// typing dots before any text appears.
     const SPEC_MIN_FIRST_SECS: f32 = 2.0;
+    const SPEC_MIN_FIRST_SECS_LIVE: f32 = 0.8;
     /// Minimum new audio (vs the last snapshot we decoded) before we
-    /// kick off another speculative pass.
+    /// kick off another speculative pass. Tighter cadence on the
+    /// live-caption path so the visible text trails actual speech by
+    /// a fraction of a second instead of 1.5 s.
     const SPEC_MIN_DELTA_SECS: f32 = 1.5;
+    const SPEC_MIN_DELTA_SECS_LIVE: f32 = 0.5;
+    /// Fraction of the current buffer length used as the live-caption
+    /// re-decode gap once a take runs long. Engines with no incremental
+    /// API re-decode the whole buffer each pass, so the gap grows with
+    /// duration (gap = buffer_secs × this, floored at the LIVE delta) to
+    /// keep total decode work ~linear instead of quadratic. 0.15 ≈ a
+    /// 1.5 s gap at 10 s and ~4.5 s at 30 s.
+    const SPEC_LIVE_DELTA_GROWTH: f32 = 0.15;
     /// Polling cadence — small enough that cancel/stop reacts within
     /// ~one tick, large enough that we don't pin a CPU.
     const SPEC_POLL_MS: u64 = 100;
-    /// Only run speculative decoding for whisper-local. Other STT
-    /// engines either don't exist yet or wouldn't benefit from this
-    /// shape of pre-emptive call.
-    const ELIGIBLE_STT_ENGINE: &str = "whisper-local";
 
-    if session.stt_engine_id != ELIGIBLE_STT_ENGINE {
+    // Engine eligibility.
+    //
+    // `whisper-local` benefits from speculative decoding two ways: it
+    // primes the WhisperContext cache so the final pass is cheaper, AND
+    // it emits per-segment partials that feed the streaming pill. So we
+    // always spin it up when streaming is on.
+    //
+    // `parakeet-local` is different. It's already fast enough (~96 ms
+    // for a 4 s clip) that priming the final pass is moot, and it emits
+    // NO mid-decode partials — `transcribe` returns the whole string in
+    // one shot. The only way to paint text *before* the hotkey is
+    // released is to re-run the engine against the growing audio
+    // snapshot and surface each cumulative result. That's pure overhead
+    // unless the user actually asked for the live caption, so we gate it
+    // on `live_transcript_enabled` rather than running it for the
+    // post-release reveal (which is instant for Parakeet anyway).
+    let eligible = match session.stt_engine_id.as_str() {
+        "whisper-local" => true,
+        "parakeet-local" => session.live_transcript_enabled,
+        _ => false,
+    };
+    if !eligible {
         return;
     }
 
-    // Battery-aware bail: speculative decoding runs full Whisper passes
-    // on a 1.5s cadence while the user is still speaking, which is
-    // measurable battery drain on laptops on the unplugged path. When
-    // the Mac is unplugged we fall back to the original "decode entirely
-    // after hotkey release" behaviour. AC adapter, UPS, and any desktop
-    // (no battery at all) keep the streaming pass. Single check at
-    // task-start is sufficient — session lifetime is short and a user
-    // (un)plugging mid-utterance is a non-event.
-    if mac_power::on_battery() {
+    // Battery-aware bail: speculative decoding runs full transcription
+    // passes on a recurring cadence while the user is still speaking,
+    // which is measurable battery drain on laptops on the unplugged
+    // path. When the Mac is unplugged we fall back to the original
+    // "decode entirely after hotkey release" behaviour. AC adapter,
+    // UPS, and any desktop (no battery at all) keep the streaming pass.
+    // Single check at task-start is sufficient — session lifetime is
+    // short and a user (un)plugging mid-utterance is a non-event.
+    //
+    // `live_transcript_enabled` overrides the bail: the user has
+    // explicitly asked to see a caption while speaking, so silently
+    // disabling the underlying decoder would defeat the toggle. (The
+    // length-aware cadence below keeps the on-battery cost bounded on
+    // long takes.)
+    if mac_power::on_battery() && !session.live_transcript_enabled {
         log::info!("speculative decode skipped: on battery");
         return;
     }
@@ -1957,7 +2029,12 @@ fn spawn_speculative_decoder(
         // settings here — both this task and `run_pipeline`'s final
         // pass must agree on the same value, and a settings reload
         // after a mid-utterance toggle would cause them to diverge.
-        let streaming_enabled_at_begin = session.streaming_enabled;
+        // Either streaming-pill or live-transcript implies the user
+        // wants segment text painted into the pill. The pill UI
+        // itself gates *when* to reveal it (listening vs post-
+        // release); the backend just needs to hand the data over.
+        let streaming_enabled_at_begin =
+            session.streaming_enabled || session.live_transcript_enabled;
         let mut ticker = tokio::time::interval(Duration::from_millis(SPEC_POLL_MS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -1999,7 +2076,24 @@ fn spawn_speculative_decoder(
 
             let delta = snap.duration_secs - last_decoded_secs;
             let need = if last_decoded_secs == 0.0 {
-                SPEC_MIN_FIRST_SECS
+                if session.live_transcript_enabled {
+                    SPEC_MIN_FIRST_SECS_LIVE
+                } else {
+                    SPEC_MIN_FIRST_SECS
+                }
+            } else if session.live_transcript_enabled {
+                // Length-aware cadence for the live caption. Engines with
+                // no incremental API (Parakeet) re-decode the WHOLE
+                // growing buffer every pass, so a fixed 0.5s gap pins a
+                // core on a long take — the per-pass cost climbs with
+                // duration until passes run back-to-back. Stretch the gap
+                // as the buffer grows so total work stays roughly linear
+                // instead of quadratic: ~0.5s early, widening past that
+                // once the take runs long. Keeps the caption responsive
+                // when it matters (the first several seconds) without
+                // continuously re-decoding a 30s clip.
+                (snap.duration_secs * SPEC_LIVE_DELTA_GROWTH)
+                    .max(SPEC_MIN_DELTA_SECS_LIVE)
             } else {
                 SPEC_MIN_DELTA_SECS
             };
@@ -2321,6 +2415,7 @@ mod tests {
             completion: Arc::new(Notify::new()),
             speculative_decode: Arc::new(tokio::sync::Mutex::new(())),
             streaming_enabled: false,
+            live_transcript_enabled: false,
             auto_paste_enabled: false,
             enable_thinking: false,
             busy_guard: Mutex::new(None),

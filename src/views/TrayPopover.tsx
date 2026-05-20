@@ -32,6 +32,7 @@ import {
   setAutoPasteEnabled,
   setEnableThinking,
   setHandsFreeEnabled,
+  setLiveTranscriptEnabled,
   setPolishingEnabled,
   setStreamingPillEnabled,
   type AudioInputDevice,
@@ -422,6 +423,18 @@ export default function TrayPopoverView() {
     if (!cur) return;
     setS({ ...cur, streaming_pill_enabled: v });
     await setStreamingPillEnabled(v);
+  }
+
+  async function toggleLiveTranscript(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, live_transcript_enabled: v });
+    try {
+      await setLiveTranscriptEnabled(v);
+    } catch (err) {
+      console.error("setLiveTranscriptEnabled failed:", err);
+      setS(cur);
+    }
   }
 
   async function refreshAccessibility() {
@@ -886,6 +899,20 @@ export default function TrayPopoverView() {
                     <Toggle
                       checked={st().streaming_pill_enabled}
                       onChange={(v) => void toggleStreamingPill(v)}
+                    />
+                  </div>
+                  <div class="mt-3 flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Live transcript
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        Show a caption inside the pill while you speak.
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().live_transcript_enabled}
+                      onChange={(v) => void toggleLiveTranscript(v)}
                     />
                   </div>
                 </div>
