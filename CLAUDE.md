@@ -80,7 +80,16 @@ Each mode contributes:
 │   ├── entries/                       ← one entry per Tauri webview
 │   ├── views/
 │   │   ├── Settings.tsx               ← tabbed settings window
-│   │   ├── Pill.tsx                   ← floating listening pill
+│   │   ├── Pill.tsx                   ← floating listening pill — slim orchestrator (base signals, `pill:*` event listeners, derived memos, JSX)
+│   │   ├── pill/                      ← Pill.tsx internals (same `Foo.tsx` + `foo/` split Settings/Onboarding/TrayPopover use)
+│   │   │   ├── types.ts               ← PillState + `pill:*` event payload interfaces
+│   │   │   ├── constants.ts           ← reveal/hold/HUD timings + width-floor / window-padding layout constants
+│   │   │   ├── helpers.ts             ← clamp, edgeEnvelope
+│   │   │   ├── useReveal.ts           ← rate-limited streaming-text reveal ticker; owns transcript/polish stream buffers
+│   │   │   ├── useTranscriptHold.ts   ← post-final "keep showing transcribing for ≥2 s" timer
+│   │   │   ├── useModeHud.ts          ← voice-mode HUD (idle) / companion chip (mid-session) presenter
+│   │   │   ├── usePillResize.ts       ← ResizeObserver + dynamic width-floor lerp; owns the wrapper/pill DOM refs
+│   │   │   └── components/            ← Waveform, StreamingText, StageLabels, TypingDots, ModeDrawer, ModeHudView, TerminalLine, QueueDot, icons
 │   │   ├── Onboarding.tsx             ← 6-step first-run wizard
 │   │   └── TrayPopover.tsx            ← menu-bar popover
 │   ├── components/
@@ -262,3 +271,4 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - New native FFI bridge (Swift / Objective-C / C++): mirror `swift/AppleFmBridge.swift` + `engines/apple_fm_bridge.rs` + `build.rs::build_apple_fm_bridge`. The pattern: hand-rolled `@_cdecl` exports with `strdup`'d return strings, a thread-local error slot, and a Cargo feature flag so non-macOS builds skip both the build.rs step and the engine module via `#[cfg(all(target_os = "macos", feature = "..."))]`.
 - New hotkey display surface: import `HotkeyKeys` from `src/components/HotkeyKeys.tsx` and pass the raw Tauri shortcut spec — do *not* hand-roll a `Keycap` chain or hard-code glyphs at the callsite. New modifier / key tokens (e.g. a future fn-row binding) go into the `MODIFIER_SYMBOLS` / `KEY_UNSHIFTED` / `KEY_SHIFTED` tables in `src/lib/hotkey.ts`, plus the matching `MODIFIER_LABELS` entry for the word form.
 - New cross-window broadcast: emit from `commands.rs` via `app.emit("namespace:changed", &payload)` (see `emit_modes_changed` / `settings:changed` for the pattern: re-read authoritative state, serialise the full snapshot, log on failure). Add a typed `onXxxChanged(cb)` listener in `src/lib/ipc.ts` and subscribe in every webview that displays the affected state — the Tray popover in particular is built once and reused, so it *requires* live events to stay current.
+- Pill UI / dictation overlay changes: `src/views/Pill.tsx` is a thin orchestrator — it owns only the base reactive state (`state`, `message`, `levels`, `sessionActive`, …), the `pill:*` Tauri event listeners in `onMount`, the derived memos (`effectiveState`, `meterColor`, `isStreaming`, …), and the JSX. All stateful behaviour lives in single-purpose hooks under `src/views/pill/`: `useReveal` (the rate-limited streaming-text ticker + `applyStreamPayload` / `kickSlowRevealForTranscribing`), `useTranscriptHold` (the post-final ≥2 s hold), `useModeHud` (HUD vs companion-chip), and `usePillResize` (ResizeObserver + width-floor; owns the wrapper/pill DOM refs and hands back `setWrapperRef` / `setPillRef` for `ref={…}`). Cross-hook needs are injected as **getter references** (`useReveal({ state, reducedMotion, … })`) so reactivity survives; never snapshot a signal at call time. Each hook owns its own signals, timers, and `onCleanup` — add new pill state to the relevant hook, not inline in the component. Pure presentational pieces (no signals) go in `src/views/pill/components/`; shared timing/layout numbers in `src/views/pill/constants.ts`.
