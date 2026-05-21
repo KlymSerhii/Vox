@@ -859,22 +859,28 @@ fn spawn_cycle_active_mode<R: Runtime>(app: AppHandle<R>) {
             log::warn!("failed to persist mode cycle: {e}");
             return;
         }
-        // Skip the pill HUD if a dictation session already owns the
-        // pill — otherwise we'd `pill::show` over a live `Listening`
-        // pill and override its waveform with a mode label, then
-        // `pill::hide` it 800 ms later mid-session. The mode change
-        // still applies to the next utterance (per the CLAUDE.md
+        // A live dictation session already owns the pill. Emit the new
+        // mode anyway so the pill surfaces it as a companion chip below
+        // the waveform — the frontend's `useModeHud` routes
+        // `pill:active_mode` to the self-clearing chip path (≈2 s, then
+        // fade) whenever a session is active, exactly like the chip shown
+        // at session start. Crucially we do NOT `pill::show` or schedule a
+        // `pill::hide` here: the pill is already visible and belongs to
+        // the session, so a HUD takeover would clobber the waveform and a
+        // delayed hide would dismiss the pill mid-session. The mode change
+        // still only affects the NEXT utterance (the in-flight one
+        // snapshotted its mode at session start, per the CLAUDE.md
         // "switching modes mid-pipeline does not affect the current
-        // utterance" contract); the user sees it via the tray
-        // popover / Settings window through `settings:changed`.
+        // utterance" contract).
         let session_active = app
             .try_state::<Arc<SessionManager>>()
             .map(|mgr| mgr.is_recording() || mgr.has_active_pipeline())
             .unwrap_or(false);
         if session_active {
+            crate::pill::emit_active_mode(&app, &next);
             return;
         }
-        // 800 ms HUD so the user sees the new mode.
+        // Idle: 800 ms full-takeover HUD so the user sees the new mode.
         crate::pill::show(&app);
         crate::pill::emit_active_mode(&app, &next);
         let app_clone = app.clone();
