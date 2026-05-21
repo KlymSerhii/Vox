@@ -31,7 +31,7 @@ This file is the canonical project reference. The README that used to live at th
 | `llm_engine` / `llm_model_id` | `gemma-local` / tier-recommended on disk; onboarding flips to `apple-fm` when `apple_fm_availability` reports `available` | `apple-fm` ignores the `llm_model_id` field but we still keep a tier-matched Gemma id there so a later switch in Settings doesn't have to re-pick one. |
 | `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
 | `enable_thinking` | `false` | Gemma 4 only. When on, Gemma reasons silently before producing the polished output (slower, can improve quality on complex inputs). Sent as `chat_template_kwargs: {"enable_thinking": true}` per request. Apple Intelligence has no equivalent knob and ignores the value. |
-| `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. |
+| `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. Also forwarded to the cleanup LLM: when pinned (not `auto`), `session::with_language_directive` appends an explicit "write the output in <language>" instruction to the system prompt so polish stays in the spoken language. Built-in prompts are language-agnostic regardless — they instruct the model to detect the transcript's language and never translate (the prior English-hardcoded prompts caused non-English dictation to come back in English). |
 | `active_mode_id` | `general` | One of `general`, `minimal`, `email`, `chat`, `code-comment`, `notes`, `summary`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
 | `appearance` | `dark` | `light` or `dark`; coerced to `dark` if unrecognised. |
@@ -56,7 +56,7 @@ Seven built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch
 - `notes` — Sentence-case bullet style.
 - `summary` — Condenses the dictation into a short summary of key points.
 
-Modes are JSON files under `~/Library/Application Support/com.vox.app/modes/`. Built-ins re-seed if deleted (`reset_default_modes`). Users can clone via `duplicate_mode`, edit via `save_mode`, export/import as JSON, or auto-trigger by bundle id glob / window-title substring.
+Modes are JSON files under `~/Library/Application Support/com.vox.app/modes/`. Built-ins re-seed if deleted; `reset_default_modes` also force-overwrites a built-in whose on-disk copy has drifted from the shipped definition (so a prompt change in an app update reaches existing installs), skipping files that already match so its returned count stays meaningful. Launch-time seeding (`init_with_root`) still never overwrites — only the explicit reset does. Users can clone via `duplicate_mode`, edit via `save_mode`, export/import as JSON, or auto-trigger by bundle id glob / window-title substring.
 
 Each mode contributes:
 - `system_prompt` — given to the cleanup engine.

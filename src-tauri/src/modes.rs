@@ -41,7 +41,7 @@ pub struct AutoTrigger {
     pub window_title_substring: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VoiceMode {
     pub id: String,
     pub name: String,
@@ -324,9 +324,11 @@ pub fn builtins() -> Vec<VoiceMode> {
 
 const GENERAL_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Return plain text only — no preface, no quotes, no reasoning, no explanations.
 
+Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate. The rules and examples below are written in English only for illustration — apply the equivalent cleanup in the speaker's language (e.g. German fillers \"äh\"/\"ähm\", French \"euh\").
+
 Rules:
-1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler). Keep them when meaningful.
-2. Apply standard English punctuation and capitalization. For longer passages, group related ideas into paragraphs separated by blank lines.
+1. Remove filler (\"um\", \"uh\", \"like\" as filler, \"you know\", \"sort of\", \"kind of\", \"basically\", \"I mean\" as filler — and their equivalents in the speaker's language). Keep them when meaningful.
+2. Apply standard punctuation and capitalization for that language. For longer passages, group related ideas into paragraphs separated by blank lines.
 3. Fix mid-sentence self-corrections.
    - \"go to the — I mean, the store\" → \"go to the store\"
    - \"we ship Friday, no Thursday\" → \"we ship Thursday\"
@@ -355,6 +357,8 @@ Examples:
 
 const MINIMAL_PROMPT: &str = "You clean up voice-dictation transcripts for users who want their exact words preserved — novelists drafting prose, journalers, interviewers transcribing speech, anyone who needs the speech captured as-said. Return plain text only — no preface, no quotes, no reasoning, no explanations.
 
+Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate. The rules and examples below are written in English only for illustration — apply the equivalent cleanup in the speaker's language.
+
 The hard rule: preserve every meaningful word from the transcript, in the order spoken. Do not paraphrase. Do not \"polish\" word choice. Do not reorder clauses. Do not merge sentences. Do not split sentences except where end-of-sentence punctuation naturally requires it.
 
 What you DO change:
@@ -362,7 +366,7 @@ What you DO change:
    - Standalone \"um\", \"uh\", \"er\", \"ah\", \"mm\", \"hmm\" used as hesitations.
    - Stutter repeats caused by speech disfluency: \"the the dog\" → \"the dog\", \"I— I think\" → \"I think\", \"we we we should\" → \"we should\".
    - Trailing \"...\" or \"—\" that came from a mid-word cutoff with nothing after it.
-2. Add standard English punctuation and capitalization where the spoken cadence implies it. Sentence-case the first word of each sentence. Capitalize proper nouns the speaker pronounced as proper nouns.
+2. Add standard punctuation and capitalization for the transcript's language where the spoken cadence implies it, following that language's conventions (e.g. German capitalizes all nouns). Sentence-case the first word of each sentence. Capitalize proper nouns the speaker pronounced as proper nouns.
 3. Apply paragraph breaks at long pauses or clear topic shifts. When in doubt, fewer breaks.
 
 What you DO NOT change — this list is exhaustive and overrides any instinct to \"improve\":
@@ -388,6 +392,7 @@ Examples:
 const EMAIL_PROMPT: &str = "You are formatting a dictated message as the BODY of a professional email. Return plain text only.
 
 Rules:
+- Write the output in the same language the speaker used. Detect the input language and respond in that language; never translate.
 - Use complete, well-punctuated sentences. Apply paragraph breaks where the speaker pauses or shifts topic.
 - Maintain a polite, professional tone — but do NOT add a salutation (\"Hi\", \"Dear\") or sign-off (\"Best\", \"Thanks\") that the user did not say.
 - Remove fillers (um, uh, like, you know).
@@ -398,6 +403,7 @@ Rules:
 const CHAT_PROMPT: &str = "You are formatting a dictated message for a casual chat (Slack, Discord, iMessage). Return plain text only.
 
 Rules:
+- Write the output in the same language the speaker used. Detect the input language and respond in that language; never translate.
 - Keep it short and conversational. Trim filler ruthlessly.
 - Preserve the speaker's casual register — contractions are fine, sentence fragments are fine.
 - Use minimal punctuation. One terminal mark per sentence; no Oxford-comma fussiness.
@@ -409,6 +415,7 @@ Rules:
 const CODE_COMMENT_PROMPT: &str = "You are rewriting dictation as a technical code comment or PR comment. Return plain text only.
 
 Rules:
+- Write the comment in the same language the speaker used. Detect the input language and respond in that language; never translate.
 - Be concise, present-tense, third-person (\"adjusts the cache\", not \"I adjusted the cache\").
 - Preserve identifier names verbatim — CamelCase, snake_case, kebab-case, dotted paths, file names.
 - Preserve technical terms exactly as said (HTTP, API, GPU, gRPC, KV-cache).
@@ -420,6 +427,7 @@ Rules:
 const NOTES_PROMPT: &str = "You are formatting dictation as structured notes (Apple Notes, Notion, Obsidian). Return plain text only.
 
 Rules:
+- Write the notes in the same language the speaker used. Detect the input language and respond in that language; never translate.
 - Use full sentences with complete punctuation.
 - If the speaker signals a list (\"first…, second…, third…\" or \"one…, two…, three…\"), format as a bullet list (one item per line, prefixed with \"- \").
 - Otherwise, use newline-separated paragraphs at natural topic breaks.
@@ -428,6 +436,8 @@ Rules:
 - Output only the note body.";
 
 const SUMMARY_PROMPT: &str = "You are summarizing a voice-dictation transcript. Produce a concise summary that captures the speaker's key points and intent. Return plain text only — no preface, no quotes, no reasoning, no explanations.
+
+Write the summary in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate. The rules and examples below are written in English only for illustration.
 
 Rules:
 1. Identify the core ideas, decisions, action items, and conclusions. Drop filler, false starts, and tangents that don't add information.
@@ -622,13 +632,27 @@ impl ModeStore {
         Ok(mode)
     }
 
-    /// Re-seed any deleted built-in; never overwrites an existing file.
+    /// Restore the shipped built-ins to their factory definitions:
+    /// re-seeds any deleted built-in *and* force-overwrites one whose
+    /// on-disk copy has drifted from the shipped version (e.g. an older
+    /// app shipped a different prompt). Built-ins aren't editable in the
+    /// UI, so the only drift is a stale factory version or a rare
+    /// power-user hand-edit, both of which an explicit "Reset built-ins"
+    /// is expected to discard. Files that already match are left
+    /// untouched so the returned count — and the UI's "already present"
+    /// message — stays meaningful on a repeat click. Unlike
+    /// [`Self::init_with_root`] (launch-time seeding, which never
+    /// overwrites), this is the one path that refreshes existing files.
     pub fn reset_defaults(&self) -> Result<usize> {
         let root = self.root_or_err()?;
         let mut count = 0;
         for mode in builtins() {
             let path = mode_path(&root, &mode.id);
-            if !path.exists() {
+            let needs_write = match read_mode_file(&path) {
+                Ok(existing) => !builtin_matches(&existing, &mode),
+                Err(_) => true, // missing or unreadable → (re)write
+            };
+            if needs_write {
                 write_mode_file(&path, &mode)?;
                 count += 1;
             }
@@ -743,6 +767,18 @@ fn write_mode_file(path: &Path, mode: &VoiceMode) -> Result<()> {
     let json = serde_json::to_string_pretty(mode)?;
     fs::write(path, json).with_context(|| format!("write mode file {:?}", path))?;
     Ok(())
+}
+
+/// True if an on-disk built-in already matches the shipped definition,
+/// ignoring the seed timestamps (`created_at` / `updated_at` differ on
+/// every run since `builtins()` stamps them with `now`). Used by
+/// [`ModeStore::reset_defaults`] to skip rewriting files that are
+/// already at the factory version.
+fn builtin_matches(existing: &VoiceMode, shipped: &VoiceMode) -> bool {
+    let mut normalized = existing.clone();
+    normalized.created_at = shipped.created_at;
+    normalized.updated_at = shipped.updated_at;
+    &normalized == shipped
 }
 
 fn read_mode_file(path: &Path) -> Result<VoiceMode> {
@@ -959,6 +995,34 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_prompt_preserves_input_language() {
+        // Regression guard for the German→English bug: every built-in
+        // must instruct the model to write in the speaker's language
+        // and not translate. Without this, the all-English prompts
+        // pushed Gemma / Apple FM to "clean up" non-English dictation
+        // into English.
+        for mode in builtins() {
+            let p = mode.system_prompt.to_lowercase();
+            assert!(
+                p.contains("same language"),
+                "mode '{}' prompt lacks a same-language instruction",
+                mode.id
+            );
+            assert!(
+                p.contains("never translate") || p.contains("not translate"),
+                "mode '{}' prompt lacks a no-translate instruction",
+                mode.id
+            );
+            // The old hard-coded directive must be gone everywhere.
+            assert!(
+                !p.contains("english punctuation"),
+                "mode '{}' still hard-codes English punctuation",
+                mode.id
+            );
+        }
+    }
+
+    #[test]
     fn init_seeds_new_builtin_into_existing_dir() {
         // Simulates an upgrade: user already has the older built-ins
         // on disk from a prior launch, and we ship a new built-in.
@@ -1088,6 +1152,36 @@ mod tests {
         let n = store.reset_defaults().unwrap();
         assert_eq!(n, 1);
         assert!(store.get("email").is_some());
+    }
+
+    #[test]
+    fn reset_defaults_skips_unchanged_builtins() {
+        // A fresh store already has every built-in at the factory
+        // version, so reset is a no-op and returns 0 — which drives the
+        // UI's "All defaults are already present." message.
+        let (store, _tmp) = fresh_store();
+        assert_eq!(store.reset_defaults().unwrap(), 0);
+    }
+
+    #[test]
+    fn reset_defaults_overwrites_stale_builtin_prompt() {
+        // The German→English fix ships new built-in prompts. Existing
+        // installs cache the old prompt on disk; a built-in is not
+        // UI-editable, so "Reset built-ins" must force-overwrite the
+        // stale file rather than leave it (the old re-seed-only
+        // behaviour would never deliver the new prompt).
+        let (store, tmp) = fresh_store();
+        let mut stale = store.get("general").unwrap();
+        stale.system_prompt = "OLD English-only prompt".into();
+        write_mode_file(&mode_path(tmp.path(), "general"), &stale).unwrap();
+        store.invalidate();
+        assert_eq!(store.get("general").unwrap().system_prompt, "OLD English-only prompt");
+
+        // Only the drifted file is rewritten; the rest already match.
+        let n = store.reset_defaults().unwrap();
+        assert_eq!(n, 1);
+        let shipped = builtins().into_iter().find(|m| m.id == "general").unwrap();
+        assert_eq!(store.get("general").unwrap().system_prompt, shipped.system_prompt);
     }
 
     #[test]

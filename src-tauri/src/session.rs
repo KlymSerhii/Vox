@@ -1528,7 +1528,7 @@ async fn run_pipeline(
         return;
     }
 
-    let mode_system_prompt = session.mode.system_prompt.clone();
+    let mode_system_prompt = with_language_directive(&session.mode.system_prompt, &session.language);
     let merged_dictionary = merge_dictionaries(&session.dictionary, &session.mode.dictionary);
 
     let mut polish_warning: Option<&'static str> = None;
@@ -2281,6 +2281,71 @@ fn merge_dictionaries(global: &[String], mode: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Map an ISO 639-1 language code (the values the Settings language
+/// picker stores) to its English name. Covers the finite set the UI
+/// offers — Parakeet's 25 languages plus the common non-Parakeet ones
+/// (see `LANGUAGE_OPTIONS` in the frontend). Returns `None` for any
+/// code we don't name, so an exotic / legacy value falls back to the
+/// prompt's own detect-and-match rule rather than feeding the model a
+/// bare code it might misread.
+fn language_name(code: &str) -> Option<&'static str> {
+    Some(match code {
+        "bg" => "Bulgarian",
+        "hr" => "Croatian",
+        "cs" => "Czech",
+        "da" => "Danish",
+        "nl" => "Dutch",
+        "en" => "English",
+        "et" => "Estonian",
+        "fi" => "Finnish",
+        "fr" => "French",
+        "de" => "German",
+        "el" => "Greek",
+        "hu" => "Hungarian",
+        "it" => "Italian",
+        "lv" => "Latvian",
+        "lt" => "Lithuanian",
+        "mt" => "Maltese",
+        "pl" => "Polish",
+        "pt" => "Portuguese",
+        "ro" => "Romanian",
+        "sk" => "Slovak",
+        "sl" => "Slovenian",
+        "es" => "Spanish",
+        "sv" => "Swedish",
+        "ru" => "Russian",
+        "uk" => "Ukrainian",
+        "zh" => "Chinese",
+        "ja" => "Japanese",
+        "ko" => "Korean",
+        "ar" => "Arabic",
+        "hi" => "Hindi",
+        "tr" => "Turkish",
+        "vi" => "Vietnamese",
+        "th" => "Thai",
+        _ => return None,
+    })
+}
+
+/// Append an explicit "respond in <language>" directive to a system
+/// prompt when the user has pinned a specific spoken language. The
+/// prompts already tell the model to detect and match the transcript's
+/// language; this is reinforcement for the pinned case (short or
+/// code-switched utterances where detection is shakier). A no-op for
+/// `auto` / empty / unrecognised codes — those rely on detection alone.
+fn with_language_directive(system_prompt: &str, language: &str) -> String {
+    let code = language.trim();
+    if code.is_empty() || code == "auto" {
+        return system_prompt.to_string();
+    }
+    match language_name(code) {
+        Some(name) => format!(
+            "{system_prompt}\n\nThe speaker is dictating in {name}. Write the entire output in {name}. Do not translate to any other language."
+        ),
+        None => system_prompt.to_string(),
+    }
+}
+
 /// Result of [`polish_with_mode`]. Mirrors the fail-open shape of the
 /// live pipeline: on LLM error the raw input is returned and `warning`
 /// is set so the caller can surface a "Raw copy" hint to the user.
@@ -2318,8 +2383,11 @@ pub async fn polish_with_mode(
     llm_model_id: String,
     global_dictionary: Vec<String>,
     global_enable_thinking: bool,
+    language: String,
 ) -> PolishOutcome {
-    let mode_snapshot = ModeSnapshot::from_voice_mode(mode);
+    let mut mode_snapshot = ModeSnapshot::from_voice_mode(mode);
+    mode_snapshot.system_prompt =
+        with_language_directive(&mode_snapshot.system_prompt, &language);
     let merged_dictionary = merge_dictionaries(&global_dictionary, &mode_snapshot.dictionary);
     // Per-mode override of `enable_thinking` wins; None inherits the
     // global. Matches the resolution in `SessionManager::begin`.
@@ -2426,6 +2494,30 @@ mod tests {
     fn manager_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Arc<SessionManager>>();
+    }
+
+    #[test]
+    fn language_directive_appends_for_pinned_language() {
+        let out = with_language_directive("BASE PROMPT", "de");
+        assert!(out.starts_with("BASE PROMPT"));
+        assert!(out.contains("German"));
+        assert!(out.to_lowercase().contains("do not translate"));
+    }
+
+    #[test]
+    fn language_directive_noop_for_auto_and_empty() {
+        // `auto` (the default) and blanks rely on the prompt's own
+        // detect-and-match rule — no pinned directive appended.
+        assert_eq!(with_language_directive("BASE", "auto"), "BASE");
+        assert_eq!(with_language_directive("BASE", ""), "BASE");
+        assert_eq!(with_language_directive("BASE", "   "), "BASE");
+    }
+
+    #[test]
+    fn language_directive_noop_for_unknown_code() {
+        // An exotic / legacy code we don't name falls back to detection
+        // rather than feeding the model a bare code it might misread.
+        assert_eq!(with_language_directive("BASE", "xx"), "BASE");
     }
 
     #[test]

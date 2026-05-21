@@ -1390,6 +1390,7 @@ pub async fn re_polish_transcript(
         llm_model_id,
         prefs.dictionary.clone(),
         prefs.enable_thinking,
+        prefs.language.clone(),
     )
     .await;
 

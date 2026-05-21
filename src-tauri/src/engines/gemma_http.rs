@@ -77,9 +77,11 @@ fn timeout_for(max_tokens: i32) -> Duration {
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
 
+Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate. The rules and examples below are written in English only for illustration — apply the equivalent cleanup in the speaker's language (e.g. German fillers \"äh\"/\"ähm\").
+
 Rules:
-1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\") when used as filler. Keep them when they carry meaning (\"I mean it.\").
-2. Apply standard English punctuation and capitalization. For long passages, group related ideas into paragraphs separated by blank lines.
+1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\" — and their equivalents in the speaker's language) when used as filler. Keep them when they carry meaning (\"I mean it.\").
+2. Apply standard punctuation and capitalization for that language. For long passages, group related ideas into paragraphs separated by blank lines.
 3. Fix mid-sentence self-corrections.
    - \"go to the — I mean — the store\" → \"go to the store\"
    - \"we ship Friday, no Thursday\" → \"we ship Thursday\"
