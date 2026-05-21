@@ -9,14 +9,18 @@
 //!
 //! ## Cadence (decided by PM)
 //!
-//! - Initial check: 60 s after launch.
+//! - Initial check: 60 s after every launch. The launch check always
+//!   runs (subject only to the `auto_update_check_enabled` toggle) —
+//!   a relaunch is an explicit user action, so it bypasses both the
+//!   24 h recurring cadence and the 6 h cooldown to surface a pending
+//!   release right away.
 //! - Recurring: every 24 h while the app stays open.
 //! - Wake-from-sleep: re-check if the last successful background
 //!   check was >24 h ago, with a 30 s debounce so a flurry of
 //!   wake events doesn't burst-check.
-//! - Cooldown: never check more than once per 6 h regardless of
-//!   trigger. The manual button in Settings → About bypasses the
-//!   cooldown.
+//! - Cooldown: background recurring + wake checks never fire more
+//!   than once per 6 h. The launch check and the manual button in
+//!   Settings → About both bypass the cooldown.
 //! - Timer source: wall-clock `SystemTime`, not `tokio::Instant`,
 //!   so sleeping a Mac for two days while the app is open doesn't
 //!   silently skip a check. `should_check_now()` is the pure
@@ -217,25 +221,26 @@ pub fn should_check_now(
 /// startup — we don't track whether a loop is already running because
 /// `lib.rs::run` only calls this once during `setup()`.
 ///
-/// The first check fires after `INITIAL_DELAY`, subsequent checks
-/// every `POLL_INTERVAL` ticks, with `should_check_now` deciding
-/// whether each tick translates into an actual HTTPS round-trip.
-/// `auto_update_check_enabled = false` in Settings turns the check
-/// step into a no-op without stopping the loop — flipping the toggle
-/// back on resumes immediately on the next tick.
+/// The first check fires after `INITIAL_DELAY` and always runs (it's
+/// the launch trigger — see `run_scheduled_check`'s `on_launch` flag);
+/// subsequent checks every `POLL_INTERVAL` ticks gate on
+/// `should_check_now` so the long-running app only re-checks once the
+/// 24 h cadence elapses. `auto_update_check_enabled = false` in
+/// Settings turns the check step into a no-op without stopping the
+/// loop — flipping the toggle back on resumes on the next tick.
 pub fn spawn_scheduler<R: Runtime>(app: &AppHandle<R>) {
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         // Hold the initial delay before the first check so the user
         // isn't competing with onboarding-time network use.
         tokio::time::sleep(INITIAL_DELAY).await;
-        // First check eagerly (subject to cooldown — a relaunch
-        // within 6 h of the last check sees the cooldown short-circuit
-        // and waits for the next interval).
-        run_scheduled_check(&handle).await;
+        // Launch check: always fire (modulo the auto-update toggle) so
+        // a relaunch surfaces a pending release immediately instead of
+        // waiting out the 24 h cadence persisted from the prior run.
+        run_scheduled_check(&handle, /*on_launch=*/ true).await;
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
-            run_scheduled_check(&handle).await;
+            run_scheduled_check(&handle, /*on_launch=*/ false).await;
         }
     });
 }
@@ -272,27 +277,38 @@ pub fn subscribe_wake<R: Runtime>(app: &AppHandle<R>) {
             // notification arriving during the (possibly long) HTTPS
             // round-trip can rearm for the next fire.
             state.wake_armed.store(false, Ordering::Release);
-            run_scheduled_check(&handle).await;
+            // Wake keeps the 24 h cadence gate (not the launch
+            // bypass): a wake-from-sleep that's <24 h since the last
+            // check shouldn't burst a redundant round-trip.
+            run_scheduled_check(&handle, /*on_launch=*/ false).await;
         });
     });
 }
 
 /// One scheduler tick. Reads the latest Settings ONCE per call so the
 /// `auto_update_check_enabled` toggle takes effect within a poll
-/// cycle (no need to restart the loop). Skips on disabled, on
-/// cooldown, or when the cadence hasn't elapsed yet.
-async fn run_scheduled_check<R: Runtime>(app: &AppHandle<R>) {
+/// cycle (no need to restart the loop). Always skips when auto-update
+/// is disabled.
+///
+/// `on_launch = true` is the post-launch initial check: it bypasses
+/// the cadence/cooldown gate so a relaunch surfaces a pending release
+/// immediately (the persisted `last_check_at` would otherwise block it
+/// for up to 24 h). `on_launch = false` is the recurring loop + wake
+/// trigger, which gate on `should_check_now` so a long-running app
+/// only re-checks once the 24 h cadence has elapsed.
+async fn run_scheduled_check<R: Runtime>(app: &AppHandle<R>, on_launch: bool) {
     let s = settings::load(app);
     if !s.auto_update_check_enabled {
         return;
     }
-    let last_check_at = s
-        .last_update_check_at
-        .filter(|n| *n > 0)
-        .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64));
-    let now = SystemTime::now();
-    if !should_check_now(last_check_at, now, COOLDOWN) {
-        return;
+    if !on_launch {
+        let last_check_at = s
+            .last_update_check_at
+            .filter(|n| *n > 0)
+            .map(|secs| SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64));
+        if !should_check_now(last_check_at, SystemTime::now(), COOLDOWN) {
+            return;
+        }
     }
     perform_check(app, /*manual=*/ false).await;
 }
