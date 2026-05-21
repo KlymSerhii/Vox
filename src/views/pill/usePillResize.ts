@@ -130,6 +130,34 @@ export function usePillResize() {
     });
   }
 
+  /// Force an immediate measure + report to Rust, bypassing the
+  /// no-size-change dedup in `reportPillSize`. The ResizeObserver only
+  /// fires on an actual content-box change, so a transition where the
+  /// pill stays the same width produces no observer tick — e.g. a short
+  /// streamed transcript giving way to the terminal success label, both
+  /// pinned to the same width floor. Rust meanwhile snaps the window to
+  /// the compact 144 px frame on that edge (`set_wide(false)`), so
+  /// without a forced report the wider (≥180 px) pill stays clipped
+  /// inside the compact window. Callers invoke this on the terminal
+  /// state edge to guarantee the window catches up to the rendered pill.
+  function flushSize() {
+    if (!wrapperRef) return;
+    const wrapRect = wrapperRef.getBoundingClientRect();
+    const pillHeight = pillRef
+      ? pillRef.getBoundingClientRect().height
+      : wrapRect.height;
+    applyDynamicWidthFloor(pillHeight);
+    // Clear the dedup cache so a width identical to the last report
+    // still goes through — that "no change" is exactly the case the
+    // ResizeObserver misses.
+    lastReportedWidth = null;
+    lastReportedHeight = null;
+    reportPillSize(
+      Math.max(wrapRect.width, dynamicMinWidth()),
+      wrapRect.height,
+    );
+  }
+
   function setupResizeObserver() {
     if (resizeObserver || !wrapperRef) return;
     resizeObserver = new ResizeObserver((entries) => {
@@ -195,5 +223,6 @@ export function usePillResize() {
     dynamicMinWidth,
     setupResizeObserver,
     teardownResizeObserver,
+    flushSize,
   };
 }

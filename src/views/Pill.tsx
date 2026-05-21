@@ -130,6 +130,7 @@ export default function PillView() {
     dynamicMinWidth,
     setupResizeObserver,
     teardownResizeObserver,
+    flushSize,
   } = usePillResize();
 
   // Apply live-transcript-relevant fields from a Settings snapshot.
@@ -288,6 +289,10 @@ export default function PillView() {
       clearTimeout(pillTransitionTimer);
       pillTransitionTimer = null;
     }
+    if (terminalFlushRaf !== null) {
+      cancelAnimationFrame(terminalFlushRaf);
+      terminalFlushRaf = null;
+    }
     if (reducedMotionMql && reducedMotionListener) {
       reducedMotionMql.removeEventListener("change", reducedMotionListener);
       reducedMotionMql = null;
@@ -376,6 +381,27 @@ export default function PillView() {
   const STREAM_GROW_ENABLED = () =>
     isStreaming() || isWaitingForPolish() || isLiveListening();
 
+  // Terminal states (done / error / canceled / saturated) each render a
+  // single TerminalLine. They opt into the SAME content-driven width
+  // growth the streaming states use so a long message — e.g.
+  // "Microphone unavailable — check System Settings and try again." —
+  // lays out on ≤2 lines instead of wrapping into a cramped 4-line
+  // column inside the 116 px compact silhouette. They stay in ROW
+  // layout though: the column header/body block is gated on
+  // isProcessing()/isLiveListening() and deliberately excludes these.
+  const isTerminalGrow = () =>
+    isDone() ||
+    state() === "error" ||
+    state() === "canceled" ||
+    isSaturated();
+
+  // Width + window-resize predicate. Streaming OR a terminal label both
+  // size the pill to content (fit-content + ResizeObserver, floored at
+  // W_MIN, capped at W_MAX). Only the streaming column layout adds the
+  // overflow clip + sticky header/body — those stay on
+  // STREAM_GROW_ENABLED below.
+  const GROW_ENABLED = () => STREAM_GROW_ENABLED() || isTerminalGrow();
+
   // Auto-scroll the streaming body to bottom when new text arrives so
   // the newest tokens are always visible. Also tracks whether the body
   // is genuinely overflowing so the top-fade mask only applies then.
@@ -394,11 +420,14 @@ export default function PillView() {
     });
   });
 
-  // Toggle the observer with the streaming lifecycle so we don't push
-  // height updates for the compact Listening/Done states (Rust handles
-  // those via set_wide).
+  // Toggle the observer with the grow lifecycle so we don't push
+  // height updates for the compact Listening state (Rust handles that
+  // via set_wide). Streaming AND terminal labels both grow, so this
+  // keys on GROW_ENABLED — a terminal state reached without prior
+  // streaming (e.g. "No audio detected" straight off Listening) still
+  // gets the observer + pre-emptive widen so its message fits.
   //
-  // `wasStreaming` doubles as the edge-trigger guard: the createEffect
+  // `wasGrown` doubles as the edge-trigger guard: the createEffect
   // re-fires on every streamingText / streamingMode change while the
   // wide layout is up (because those are tracked dependencies of
   // STREAM_GROW_ENABLED). Without this guard the pre-emptive widen
@@ -406,10 +435,10 @@ export default function PillView() {
   // ResizeObserver's content-driven pillResize and snapping the OS
   // window back to 196 px every tick — visibly clipping the right
   // edge of any transcript wider than 156 px of interior.
-  let wasStreaming = false;
+  let wasGrown = false;
   createEffect(() => {
-    const streamingNow = STREAM_GROW_ENABLED();
-    if (streamingNow) {
+    const growNow = GROW_ENABLED();
+    if (growNow) {
       setupResizeObserver();
       // Pre-emptive widen ONLY on the false→true edge so the OS
       // window catches up to the CSS layout in the same frame the
@@ -422,24 +451,26 @@ export default function PillView() {
       // ResizeObserver follows immediately with the real content
       // size and is the only thing that should resize the window
       // after this initial widen.
-      if (!wasStreaming) {
-        wasStreaming = true;
+      if (!wasGrown) {
+        wasGrown = true;
         void pillResize({
           width: W_MIN + WINDOW_PADDING_W,
         }).catch(() => { });
       }
     } else {
       teardownResizeObserver();
-      if (wasStreaming) {
-        wasStreaming = false;
-        // Pre-empt the Rust-side `set_wide(false)` IPC: terminal
-        // states (Done/Error/Canceled) still render the wide pill for
-        // ~150 ms after streaming ends because the state event and
-        // the resize event arrive at the webview through different
-        // async paths. A compact-dim pillResize request is intercepted
-        // by Rust's `set_size` (below-floor escape hatch) and routed
-        // straight to the compact silhouette so the TerminalLine
-        // renders at 144x36 instead of centred in a 600 px box.
+      if (wasGrown) {
+        wasGrown = false;
+        // A grown state (streaming OR a terminal label) just gave way
+        // to a compact one — i.e. a new session's Listening replacing
+        // the previous Done/Error/Canceled pill. Snap the OS window
+        // back to the compact silhouette: this sub-floor pillResize is
+        // intercepted by Rust's `set_size` (below-floor escape hatch)
+        // and routed straight to 144x36 instead of leaving the window
+        // stuck at the previous grown width while the compact pill
+        // renders centred inside it. (Terminal states themselves stay
+        // in the `if` branch above, so they keep their fitted width for
+        // their whole on-screen lifetime.)
         const COMPACT_W = 116 + WINDOW_PADDING_W;
         const COMPACT_H = 36 + WINDOW_PADDING_H;
         void pillResize({
@@ -448,6 +479,34 @@ export default function PillView() {
         }).catch(() => { });
       }
     }
+  });
+
+  // Guarantee the OS window grows to fit a terminal label even when the
+  // ResizeObserver stays silent. Rust snaps the window to the compact
+  // 144 px frame on the Done/Error/Canceled edge (`set_wide(false)`).
+  // Normally the observer re-reports the wider pill and Rust grows the
+  // window back — but when the outgoing streamed pill and the terminal
+  // label resolve to the SAME width (both pinned to the W_MIN floor,
+  // e.g. after a short utterance) the observer sees no content-box
+  // change and never fires, leaving the ≥180 px pill clipped inside the
+  // 144 px window. Forcing a measure on the terminal edge closes that
+  // gap. The rAF lets the TerminalLine render and the pill settle to
+  // fit-content before we measure.
+  let terminalFlushRaf: number | null = null;
+  createEffect(() => {
+    // Reads isTerminalGrow() (→ state()), so this re-runs on every state
+    // change; cancel any pending flush first so a quick terminal→new
+    // session edge doesn't measure the wrong layout.
+    const terminal = isTerminalGrow();
+    if (terminalFlushRaf !== null) {
+      cancelAnimationFrame(terminalFlushRaf);
+      terminalFlushRaf = null;
+    }
+    if (!terminal) return;
+    terminalFlushRaf = requestAnimationFrame(() => {
+      terminalFlushRaf = null;
+      flushSize();
+    });
   });
 
   // Option (b): drive explicit height IPC from modeChip/modeChipFading signals.
@@ -500,22 +559,24 @@ export default function PillView() {
             // and pushes that back to Rust so the OS window grows in
             // lockstep, and also drives the dynamic min-width lerp so
             // tall content forces the box wider rather than narrower.
-            width: STREAM_GROW_ENABLED() ? "fit-content" : "116px",
-            // Streaming uses the floor signal so the ResizeObserver-driven
+            width: GROW_ENABLED() ? "fit-content" : "116px",
+            // Grown states use the floor signal so the ResizeObserver-driven
             // width-floor lerp survives Solid re-renders triggered by
             // unrelated style changes (e.g. box-shadow flipping on Done).
             // 0 sentinel = floor untouched, fall back to the static W_MIN.
-            "min-width": STREAM_GROW_ENABLED()
+            "min-width": GROW_ENABLED()
               ? `${Math.max(W_MIN, dynamicMinWidth())}px`
               : "116px",
-            "max-width": STREAM_GROW_ENABLED() ? `${W_MAX}px` : "116px",
+            "max-width": GROW_ENABLED() ? `${W_MAX}px` : "116px",
             // Clip streaming-mode children to the rounded boundary.
             // Without this, tall pills painted square corners because
             // StreamingText / ShimmerWord painted past the rim radius.
-            // Restricted to streaming mode so the QueueDot (which
-            // anchors at right:-3px in compact mode) stays visible —
-            // box-shadow / inner-rim glows live OUTSIDE the box and
-            // are unaffected either way.
+            // Restricted to STREAMING mode (not terminal grow) so the
+            // QueueDot — which anchors at right:-3px and can show on a
+            // terminal state with background sessions in flight — stays
+            // visible. The TerminalLine never paints past the rim, so it
+            // needs no clip. box-shadow / inner-rim glows live OUTSIDE
+            // the box and are unaffected either way.
             overflow: STREAM_GROW_ENABLED() ? "hidden" : "visible",
             // Multi-line streaming makes a pure pill (border-radius:
             // 9999px) look squashed at the corners — soften to a 14 px
@@ -531,7 +592,7 @@ export default function PillView() {
               ? STREAM_GROW_ENABLED()
                 ? "14px 14px 0 0"
                 : "9999px 9999px 0 0"
-              : STREAM_GROW_ENABLED()
+              : GROW_ENABLED()
                 ? "14px"
                 : "9999px",
             background: "var(--color-pill-surface)",
