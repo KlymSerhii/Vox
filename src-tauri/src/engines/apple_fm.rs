@@ -64,6 +64,7 @@ fn dynamic_max_tokens(input_chars: usize) -> i32 {
 const APPLE_FM_REINFORCEMENT: &str = "
 
 CRITICAL OUTPUT CONSTRAINTS (highest priority — these override any conflicting instructions above):
+- Output MUST be in the same language as the input transcript. Never translate to another language.
 - Output MUST be the cleaned transcript text and nothing else. No preface, no quotes, no commentary, no \"Here is\" or \"Sure,\".
 - Output length MUST be shorter than or equal to the input length. Do not expand, elaborate, or rephrase for politeness.
 - For multi-topic content, separate distinct ideas with a single blank line (paragraph break).
@@ -72,9 +73,11 @@ CRITICAL OUTPUT CONSTRAINTS (highest priority — these override any conflicting
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
 
+Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate.
+
 Rules:
-1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\") when used as filler. Keep them when they carry meaning (\"I mean it.\").
-2. Apply standard English punctuation and capitalization. For long passages, group related ideas into paragraphs separated by blank lines.
+1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\" — and their equivalents in the speaker's language) when used as filler. Keep them when they carry meaning (\"I mean it.\").
+2. Apply standard punctuation and capitalization for that language. For long passages, group related ideas into paragraphs separated by blank lines.
 3. Fix mid-sentence self-corrections.
 4. Drop content the speaker explicitly retracts — including everything before the retraction marker.
 5. When the speaker enumerates two or more items, render them as a numbered list.
@@ -351,6 +354,10 @@ mod tests {
         assert!(
             s.contains("paragraph break"),
             "paragraph-break rule missing"
+        );
+        assert!(
+            s.to_lowercase().contains("same language"),
+            "language-preservation constraint missing"
         );
     }
 
