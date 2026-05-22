@@ -30,6 +30,8 @@ const KEY_AUTO_SUGGEST_MODES: &str = "auto_suggest_modes";
 
 const KEY_APPEARANCE: &str = "appearance";
 
+const KEY_SHOW_DOCK_ICON: &str = "show_dock_icon";
+
 pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
 
 const KEY_AUTO_PASTE_ENABLED: &str = "auto_paste_enabled";
@@ -100,6 +102,16 @@ fn default_auto_suggest_modes() -> bool {
 }
 fn default_appearance() -> String {
     "dark".into()
+}
+fn default_show_dock_icon() -> bool {
+    // Off by default. Vox is an ambient menu-bar utility — the default
+    // experience stays Dock-free (`ActivationPolicy::Accessory`, backed
+    // by `LSUIElement` in Info.plist). Flipping this on in
+    // Settings → General switches the policy to `Regular` so the app
+    // gains a Dock icon + ⌘-Tab entry; clicking the icon opens Settings
+    // (handled by the `RunEvent::Reopen` arm in `lib.rs`). The menu-bar
+    // icon is always present regardless — this toggle is purely additive.
+    false
 }
 fn default_streaming_pill_enabled() -> bool {
     true
@@ -175,6 +187,14 @@ pub struct Settings {
 
     #[serde(default = "default_appearance")]
     pub appearance: String,
+
+    /// Show a Dock icon (and ⌘-Tab entry) for Vox. Off by default —
+    /// Vox runs as a menu-bar-only accessory app. When true, the
+    /// activation policy is switched to `Regular` at launch and live
+    /// on toggle; clicking the Dock icon opens the Settings window. The
+    /// menu-bar icon is unaffected either way.
+    #[serde(default = "default_show_dock_icon")]
+    pub show_dock_icon: bool,
 
     /// Show transcription / polish text streaming inside the pill after
     /// the hotkey is released. When false, only the existing
@@ -281,6 +301,7 @@ impl Default for Settings {
             mode_cycle_hotkey: default_mode_cycle_hotkey(),
             auto_suggest_modes: default_auto_suggest_modes(),
             appearance: default_appearance(),
+            show_dock_icon: default_show_dock_icon(),
             streaming_pill_enabled: default_streaming_pill_enabled(),
             auto_paste_enabled: default_auto_paste_enabled(),
             live_transcript_enabled: default_live_transcript_enabled(),
@@ -347,6 +368,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         _ => default_appearance(),
     };
 
+    let show_dock_icon = get_bool(KEY_SHOW_DOCK_ICON, default_show_dock_icon());
+
     let streaming_pill_enabled =
         get_bool(KEY_STREAMING_PILL_ENABLED, default_streaming_pill_enabled());
 
@@ -405,6 +428,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         mode_cycle_hotkey,
         auto_suggest_modes,
         appearance,
+        show_dock_icon,
         streaming_pill_enabled,
         auto_paste_enabled,
         live_transcript_enabled,
@@ -457,6 +481,7 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
 
     let appearance = if settings.appearance == "light" { "light" } else { "dark" };
     s(KEY_APPEARANCE, appearance);
+    b(KEY_SHOW_DOCK_ICON, settings.show_dock_icon);
 
     b(KEY_STREAMING_PILL_ENABLED, settings.streaming_pill_enabled);
     b(KEY_AUTO_PASTE_ENABLED, settings.auto_paste_enabled);

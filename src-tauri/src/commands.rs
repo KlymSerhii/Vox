@@ -77,6 +77,7 @@ pub fn set_settings(
         || before.cancel_hotkey != settings.cancel_hotkey
         || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
     let appearance_changed = before.appearance != settings.appearance;
+    let dock_icon_changed = before.show_dock_icon != settings.show_dock_icon;
     let polish_off = before.polishing_enabled && !settings.polishing_enabled;
     let llm_left_gemma =
         before.llm_engine == "gemma-local" && settings.llm_engine != "gemma-local";
@@ -97,6 +98,22 @@ pub fn set_settings(
                     log::warn!("set_theme failed on '{label}': {e}");
                 }
             }
+        }
+    }
+
+    // Live Dock-icon toggle — no restart. `Regular` adds the Dock icon
+    // + ⌘-Tab entry (its click opens Settings via `RunEvent::Reopen`);
+    // `Accessory` returns to menu-bar-only. Safe off the main thread:
+    // `set_activation_policy` posts to the event loop internally.
+    #[cfg(target_os = "macos")]
+    if dock_icon_changed {
+        let policy = if settings.show_dock_icon {
+            tauri::ActivationPolicy::Regular
+        } else {
+            tauri::ActivationPolicy::Accessory
+        };
+        if let Err(e) = app.set_activation_policy(policy) {
+            log::warn!("failed to update Dock icon visibility: {e}");
         }
     }
 
