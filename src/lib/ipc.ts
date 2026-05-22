@@ -22,6 +22,11 @@ export interface Settings {
   mode_cycle_hotkey: string;
   auto_suggest_modes: boolean;
   appearance: "light" | "dark";
+  /// Show a Dock icon (and ⌘-Tab entry) for Vox. Off by default — Vox is
+  /// a menu-bar-only accessory app. When true, the activation policy is
+  /// `Regular`; clicking the Dock icon opens Settings. The menu-bar icon
+  /// is always present regardless.
+  show_dock_icon: boolean;
   /// Show the transcript / polish text streaming inside the pill after
   /// the hotkey is released. Default true; tray popover + Settings →
   /// General both flip it.

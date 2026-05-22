@@ -225,6 +225,20 @@ export function GeneralTab(props: {
         </Show>
       </Card>
 
+      <SectionHeader title="Dock" />
+      <Card>
+        <Row
+          label="Show Vox in the Dock"
+          hint="Adds a Dock icon and a ⌘-Tab entry. Click it to open Settings. Vox always stays in the menu bar."
+          last
+        >
+          <Toggle
+            checked={props.s.show_dock_icon}
+            onChange={(v) => props.update({ show_dock_icon: v })}
+          />
+        </Row>
+      </Card>
+
       <SectionHeader title="Startup" />
       <Card>
         <Row

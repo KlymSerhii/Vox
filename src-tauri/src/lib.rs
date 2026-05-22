@@ -125,7 +125,20 @@ pub fn run() {
         .setup(|app| {
             #[cfg(target_os = "macos")]
             {
-                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                // Activation policy == Dock-icon visibility. Default is
+                // menu-bar-only accessory (matching `LSUIElement` in
+                // Info.plist); `LSUIElement` forces accessory at launch
+                // regardless, so we must explicitly switch to `Regular` for
+                // users who opted into the Dock icon. Its click opens
+                // Settings via the `RunEvent::Reopen` arm below. Decided
+                // here, before `app.handle()` borrows `app`, so the
+                // `&mut App` setter is free to run.
+                let policy = if settings::load(app.handle()).show_dock_icon {
+                    tauri::ActivationPolicy::Regular
+                } else {
+                    tauri::ActivationPolicy::Accessory
+                };
+                app.set_activation_policy(policy);
             }
 
             let app_handle = app.handle();
@@ -266,5 +279,33 @@ pub fn run() {
         if let tauri::RunEvent::Exit = event {
             crate::inference_proc::shutdown_managed(app_handle);
         }
+        // Dock-icon click (NSApplicationDelegate applicationShouldHandleReopen)
+        // → bring Vox's primary window forward. Only fires for users who
+        // enabled the Dock icon, and never on the initial launch, so it can't
+        // pop Settings open on a login-item start.
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = event {
+            focus_primary_window(app_handle);
+        }
     });
+}
+
+/// Surface Vox's primary window in response to a Dock-icon click. Prefers
+/// the onboarding window while first-run is still active (so the click
+/// doesn't reveal the hidden Settings window behind the wizard); otherwise
+/// shows and focuses Settings, mirroring `commands::open_settings`.
+#[cfg(target_os = "macos")]
+fn focus_primary_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if !settings::load(app).onboarded {
+        if let Some(win) = app.get_webview_window(onboarding::LABEL) {
+            let _ = win.show();
+            let _ = win.set_focus();
+            return;
+        }
+    }
+    if let Some(win) = app.get_webview_window("settings") {
+        crate::tray::position_settings_on_active_display(&win);
+        let _ = win.show();
+        let _ = win.set_focus();
+    }
 }
