@@ -42,6 +42,7 @@ export default defineConfig({
         onboarding: r("./onboarding.html"),
         "tray-popover": r("./tray-popover.html"),
         donation: r("./donation.html"),
+        update: r("./update.html"),
       },
     },
   },

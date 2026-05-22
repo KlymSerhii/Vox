@@ -59,6 +59,7 @@ const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
 const KEY_AUTO_UPDATE_CHECK_ENABLED: &str = "auto_update_check_enabled";
 const KEY_LAST_UPDATE_CHECK_AT: &str = "last_update_check_at";
 const KEY_DISMISSED_UPDATE_VERSION: &str = "dismissed_update_version";
+const KEY_UPDATE_WINDOW_SHOWN_VERSION: &str = "update_window_shown_version";
 
 fn default_hotkey() -> String {
     // ⌘⌥. — Cmd + Option + Period. Bound via Carbon
@@ -278,6 +279,14 @@ pub struct Settings {
     /// version moves past this string (a new release auto-rearms).
     #[serde(default)]
     pub dismissed_update_version: Option<String>,
+
+    /// Version for which the prominent auto-show update window has
+    /// already been surfaced. Set once the window builds successfully
+    /// so it fires at most once per available version, ever — even
+    /// across relaunches. The passive tray banner is gated separately
+    /// on `dismissed_update_version`, so this never affects it.
+    #[serde(default)]
+    pub update_window_shown_version: Option<String>,
 }
 
 impl Default for Settings {
@@ -312,6 +321,7 @@ impl Default for Settings {
             auto_update_check_enabled: default_auto_update_check_enabled(),
             last_update_check_at: None,
             dismissed_update_version: None,
+            update_window_shown_version: None,
         }
     }
 }
@@ -407,6 +417,11 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .filter(|s| !s.is_empty());
 
+    let update_window_shown_version = store
+        .get(KEY_UPDATE_WINDOW_SHOWN_VERSION)
+        .and_then(|v| v.as_str().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty());
+
     let _ = store.save();
 
     Settings {
@@ -439,6 +454,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         auto_update_check_enabled,
         last_update_check_at,
         dismissed_update_version,
+        update_window_shown_version,
     }
 }
 
@@ -569,6 +585,34 @@ pub fn set_dismissed_update_version<R: Runtime>(
         }
         _ => {
             store.set(KEY_DISMISSED_UPDATE_VERSION, serde_json::Value::Null);
+        }
+    }
+    store
+        .save()
+        .map_err(|e| anyhow::anyhow!("save store: {e}"))?;
+    Ok(())
+}
+
+/// Persist just the `update_window_shown_version` field. Written once
+/// the prominent auto-show update window builds successfully so the
+/// window fires at most once per available version. `None` / empty
+/// clears the marker.
+pub fn set_update_window_shown_version<R: Runtime>(
+    app: &AppHandle<R>,
+    value: Option<&str>,
+) -> anyhow::Result<()> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
+    match value {
+        Some(v) if !v.is_empty() => {
+            store.set(
+                KEY_UPDATE_WINDOW_SHOWN_VERSION,
+                serde_json::Value::String(v.to_string()),
+            );
+        }
+        _ => {
+            store.set(KEY_UPDATE_WINDOW_SHOWN_VERSION, serde_json::Value::Null);
         }
     }
     store

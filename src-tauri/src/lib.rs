@@ -27,6 +27,7 @@ mod transcripts;
 mod tray;
 mod tray_glyphs;
 mod tray_icon;
+mod update_window;
 mod updater;
 
 use std::sync::Arc;

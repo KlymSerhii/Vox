@@ -1712,6 +1712,11 @@ async fn run_pipeline(
             // fires off-main-thread-safely and marks the tier shown so it
             // never re-appears.
             crate::donation_window::maybe_show(&app);
+            // Same post-delivery moment for the update announcement: if a
+            // background check has already found a new version, surface it
+            // now rather than from the check timer, where a focus grab
+            // could collide with the auto-paste ⌘V into the focused field.
+            crate::update_window::maybe_show(&app);
             // Legacy event keeps the existing tray-popover RECENT
             // logic working for any consumer that hasn't migrated.
             let _ = app.emit("transcripts:changed", transcripts::snapshot());

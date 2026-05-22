@@ -71,6 +71,10 @@ export interface Settings {
   /// tray-icon dot stay hidden. Settings → About still surfaces the
   /// pending state regardless.
   dismissed_update_version?: string | null;
+  /// Version for which the prominent auto-show update window has
+  /// already been surfaced. Set once it builds so the window fires at
+  /// most once per available version. Independent of the tray banner.
+  update_window_shown_version?: string | null;
 }
 
 export interface AudioInputDevice {
