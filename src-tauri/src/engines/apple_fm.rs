@@ -55,35 +55,6 @@ fn dynamic_max_tokens(input_chars: usize) -> i32 {
     cap.clamp(256, 8192) as i32
 }
 
-/// Reinforcement appended after every system prompt (built-in or
-/// user-supplied) before it goes to the Foundation Model. Apple's small
-/// model needs the conciseness/format rules in a *terminal* position
-/// because instruction-following degrades on long preambles. Keep this
-/// short and absolute — bulleted directives perform better than prose
-/// here.
-const APPLE_FM_REINFORCEMENT: &str = "
-
-CRITICAL OUTPUT CONSTRAINTS (highest priority — these override any conflicting instructions above):
-- Output MUST be in the same language as the input transcript. Never translate to another language.
-- Output MUST be the cleaned transcript text and nothing else. No preface, no quotes, no commentary, no \"Here is\" or \"Sure,\".
-- Output length MUST be shorter than or equal to the input length. Do not expand, elaborate, or rephrase for politeness.
-- For multi-topic content, separate distinct ideas with a single blank line (paragraph break).
-- For enumerations of 2+ items, format as a numbered list (\"1. ... 2. ...\").
-- Never add facts, names, dates, or details the speaker did not say.";
-
-const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
-
-Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate.
-
-Rules:
-1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\" — and their equivalents in the speaker's language) when used as filler. Keep them when they carry meaning (\"I mean it.\").
-2. Apply standard punctuation and capitalization for that language. For long passages, group related ideas into paragraphs separated by blank lines.
-3. Fix mid-sentence self-corrections.
-4. Drop content the speaker explicitly retracts — including everything before the retraction marker.
-5. When the speaker enumerates two or more items, render them as a numbered list.
-6. Preserve the speaker's register. Do not formalize casual speech or vice versa.
-7. Never add or substitute content, facts, names, or numbers. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one (e.g. Claude ↛ Claudia), even if the other word feels more familiar.";
-
 pub struct AppleFmEngine;
 
 impl AppleFmEngine {
@@ -293,29 +264,19 @@ pub fn availability_message(code: apple_fm_bridge::AvailabilityCode) -> &'static
     }
 }
 
-fn build_system_prompt(system_override: &str, dictionary: &[String]) -> String {
-    let base = if system_override.trim().is_empty() {
-        DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        system_override.to_string()
-    };
+fn build_system_prompt(system_prompt: &str, dictionary: &[String]) -> String {
     let cleaned: Vec<&str> = dictionary
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
-    let dictionary_block = if cleaned.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nPreserve these proper nouns and acronyms exactly as written: {}.",
-            cleaned.join(", ")
-        )
-    };
-    // Reinforcement comes LAST so it sits adjacent to the user message
-    // — Apple's small model attends most strongly to the tail of the
-    // instruction context.
-    format!("{base}{dictionary_block}{APPLE_FM_REINFORCEMENT}")
+    if cleaned.is_empty() {
+        return system_prompt.to_string();
+    }
+    format!(
+        "{system_prompt}\n\nPreserve these proper nouns and acronyms exactly as written: {}.",
+        cleaned.join(", ")
+    )
 }
 
 #[cfg(test)]
@@ -331,53 +292,20 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_uses_default_for_empty_override() {
-        let s = build_system_prompt("   ", &[]);
-        assert!(s.starts_with(DEFAULT_SYSTEM_PROMPT));
-    }
+    fn build_system_prompt_adds_no_reinforcement() {
+        // The mode prompt (from Settings) is the single source of truth —
+        // the engine must not append its own constraints block or fall
+        // back to a hardcoded default. With no dictionary the output is
+        // exactly the passed prompt; with one, only the dictionary line
+        // is appended.
+        let bare = build_system_prompt("base prompt", &[]);
+        assert_eq!(bare, "base prompt");
+        assert!(!bare.contains("CRITICAL OUTPUT CONSTRAINTS"));
 
-    #[test]
-    fn build_system_prompt_appends_reinforcement_for_apple_small_model() {
-        // The reinforcement block is the load-bearing fix for Apple's
-        // small model ignoring length / paragraph rules buried mid-prompt.
-        // Don't pin the exact text (it'll evolve with prompt tuning) —
-        // just assert the load-bearing tokens are present.
-        let s = build_system_prompt("base prompt", &[]);
-        assert!(
-            s.contains("CRITICAL OUTPUT CONSTRAINTS"),
-            "reinforcement header missing"
-        );
-        assert!(
-            s.contains("shorter than or equal to the input"),
-            "conciseness rule missing"
-        );
-        assert!(
-            s.contains("paragraph break"),
-            "paragraph-break rule missing"
-        );
-        assert!(
-            s.to_lowercase().contains("same language"),
-            "language-preservation constraint missing"
-        );
-    }
-
-    #[test]
-    fn build_system_prompt_places_reinforcement_after_dictionary() {
-        // Dictionary must sit between the base prompt and the
-        // reinforcement so the latter remains adjacent to the user
-        // message — that's where Apple's model focuses attention.
-        let s = build_system_prompt(
-            "base",
-            &["Anthropic".into(), "Vox".into()],
-        );
-        let dict_pos = s.find("Anthropic").expect("dictionary should appear");
-        let reinforce_pos = s
-            .find("CRITICAL OUTPUT CONSTRAINTS")
-            .expect("reinforcement should appear");
-        assert!(
-            dict_pos < reinforce_pos,
-            "reinforcement must come after the dictionary block"
-        );
+        let with_dict = build_system_prompt("base prompt", &["Anthropic".into()]);
+        assert!(with_dict.starts_with("base prompt"));
+        assert!(with_dict.contains("Anthropic"));
+        assert!(!with_dict.contains("CRITICAL OUTPUT CONSTRAINTS"));
     }
 
     #[test]
