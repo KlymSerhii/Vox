@@ -75,39 +75,6 @@ fn timeout_for(max_tokens: i32) -> Duration {
     Duration::from_secs(secs)
 }
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You clean up and structure voice-dictation transcripts. Output ONLY the cleaned text. Do not output reasoning, planning, commentary, prefaces, or quotes.
-
-Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate. The rules and examples below are written in English only for illustration — apply the equivalent cleanup in the speaker's language (e.g. German fillers \"äh\"/\"ähm\").
-
-Rules:
-1. Remove filler (\"um\", \"uh\", \"you know\", \"like\", \"basically\", \"I mean\" — and their equivalents in the speaker's language) when used as filler. Keep them when they carry meaning (\"I mean it.\").
-2. Apply standard punctuation and capitalization for that language. For long passages, group related ideas into paragraphs separated by blank lines.
-3. Fix mid-sentence self-corrections.
-   - \"go to the — I mean — the store\" → \"go to the store\"
-   - \"we ship Friday, no Thursday\" → \"we ship Thursday\"
-4. Drop content the speaker explicitly retracts — including everything before the retraction marker.
-   - \"X. Actually no, disregard that. Y.\" → \"Y.\"
-   - \"Send it to John. Wait, scratch that, send it to Mary.\" → \"Send it to Mary.\"
-   - \"Forget what I just said. Z.\" → \"Z.\"
-5. When the speaker enumerates two or more items, actions, or steps, render them as a numbered list. Triggers include:
-   - Ordinal markers: \"first… second… third…\", \"one is… two is…\".
-   - Step markers: \"step one… step two…\".
-   - Enumeration phrases: \"the three things are…\", \"a couple of points:\".
-   - Conversational connectors that introduce a sequence: \"first of all… and then…\", \"to start… after that…\", \"I need you to X and then Y\", \"we should do A and also B\".
-   Preserve any prose lead-in before the list (\"I need you to:\\n1. …\\n2. …\"). Single statements and flowing narrative stay as prose.
-6. Preserve the speaker's register. Do not formalize casual speech or vice versa.
-7. Never add or substitute content, facts, names, or numbers. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one (e.g. Claude ↛ Claudia, Anthropic ↛ Anthropik), even if the other word feels more familiar.
-
-Examples:
-- \"uh so like the meeting is um at three pm\" → \"The meeting is at 3 PM.\"
-- \"I'm not using the model, no, disregard that, I am using the model\" → \"I am using the model.\"
-- \"first we ship the build then we run tests and finally we deploy\" →
-   \"1. Ship the build.\n2. Run tests.\n3. Deploy.\"
-- \"I need you to first of all add tests and then also verify the build passes\" →
-   \"I need you to:\n1. Add tests.\n2. Verify the build passes.\"
-- \"so everything looks fine but now I need you to first of all add tests and then also to verify that the build passes appropriately\" →
-   \"Everything looks fine. I need you to:\n1. Add tests.\n2. Verify that the build passes appropriately.\"";
-
 pub struct GemmaHttpEngine {
     app: AppHandle<Wry>,
     model_id: String,
@@ -753,22 +720,23 @@ fn parse_sse_event(event: &str, acc: &mut String) -> Option<bool> {
     }
 }
 
-fn build_system_message(system_override: &str, dictionary: &[String]) -> String {
-    let system = if system_override.trim().is_empty() {
-        DEFAULT_SYSTEM_PROMPT.to_string()
-    } else {
-        system_override.to_string()
-    };
+/// Build the LLM system message: the mode's system prompt (already
+/// run through the language directive upstream) plus the merged
+/// dictionary. The prompt is supplied by the active Voice Mode — the
+/// engine carries no default of its own. `pub(crate)` so the
+/// llama-server warmup can prime its prompt cache with the exact
+/// message the next dictation will send.
+pub(crate) fn build_system_message(system_prompt: &str, dictionary: &[String]) -> String {
     let cleaned: Vec<&str> = dictionary
         .iter()
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
     if cleaned.is_empty() {
-        return system;
+        return system_prompt.to_string();
     }
     format!(
-        "{system}\n\nPreserve these proper nouns and acronyms exactly as written: {}.",
+        "{system_prompt}\n\nPreserve these proper nouns and acronyms exactly as written: {}.",
         cleaned.join(", ")
     )
 }
@@ -789,12 +757,6 @@ mod tests {
     fn build_system_message_omits_empty_dictionary() {
         let s = build_system_message("base prompt", &[]);
         assert_eq!(s, "base prompt");
-    }
-
-    #[test]
-    fn build_system_message_uses_default_for_empty_override() {
-        let s = build_system_message("   ", &[]);
-        assert_eq!(s, DEFAULT_SYSTEM_PROMPT);
     }
 
     #[test]

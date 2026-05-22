@@ -2346,6 +2346,28 @@ fn with_language_directive(system_prompt: &str, language: &str) -> String {
     }
 }
 
+/// The exact LLM system message the next dictation would send for the
+/// user's currently-selected Voice Mode: the active mode's prompt run
+/// through the language directive, plus the merged global + mode
+/// dictionary. Used by the llama-server warmup so its `cache_prompt`
+/// prime shares a real prefix with the first real polish, rather than a
+/// throwaway prompt the cache can't reuse. Mirrors `run_pipeline`'s
+/// construction exactly. Falls back to the `general` built-in when no
+/// `ModeStore` is registered yet (launch race), and to an empty string
+/// only if even the built-ins are somehow unavailable.
+pub fn active_polish_system_message<R: Runtime>(app: &AppHandle<R>) -> String {
+    let prefs = settings::prefs(app);
+    let mode = match resolve_active_mode(app, &prefs.active_mode_id)
+        .or_else(|| modes::builtins().into_iter().next())
+    {
+        Some(m) => m,
+        None => return String::new(),
+    };
+    let system_prompt = with_language_directive(&mode.system_prompt, &prefs.language);
+    let dictionary = merge_dictionaries(&prefs.dictionary, &mode.dictionary);
+    crate::engines::gemma_http::build_system_message(&system_prompt, &dictionary)
+}
+
 /// Result of [`polish_with_mode`]. Mirrors the fail-open shape of the
 /// live pipeline: on LLM error the raw input is returned and `warning`
 /// is set so the caller can surface a "Raw copy" hint to the user.

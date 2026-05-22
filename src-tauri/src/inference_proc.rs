@@ -37,7 +37,6 @@ use rand::Rng;
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, Signal, UpdateKind};
 use tauri::{AppHandle, Manager, Runtime};
 
-use crate::engines::gemma_http::DEFAULT_SYSTEM_PROMPT;
 use crate::inference_server;
 use crate::models::{self, ModelKind};
 use crate::settings;
@@ -664,7 +663,12 @@ pub fn prewarm_in_background<R: Runtime>(app: &AppHandle<R>) {
                     server.port,
                     started.elapsed().as_millis()
                 );
-                warmup_completion(&server).await;
+                // Prime the prompt cache with the system message the
+                // first real dictation will actually send (active mode +
+                // language + dictionary), so `cache_prompt` reuse hits.
+                let warm_system =
+                    crate::session::active_polish_system_message(&warm_handle);
+                warmup_completion(&server, &warm_system).await;
             }
             Err(e) => log::info!(
                 "inference: pre-warm skipped after {} ms: {e}",
@@ -680,13 +684,13 @@ pub fn prewarm_in_background<R: Runtime>(app: &AppHandle<R>) {
 // which would otherwise burden the user-facing TTFT by 1.5-3 s. A
 // single warmup request JIT-compiles the kernels and primes caches,
 // shifting that cost into the launch-time pre-warm window.
-async fn warmup_completion(server: &RunningServer) {
+async fn warmup_completion(server: &RunningServer, system_prompt: &str) {
     let started = Instant::now();
     let url = format!("http://{HOST}:{}/v1/chat/completions", server.port);
     let body = serde_json::json!({
         "model": &server.model_id,
         "messages": [
-            {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": "warmup"}
         ],
         "max_tokens": 1,
