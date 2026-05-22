@@ -1,5 +1,6 @@
 mod audio;
 mod commands;
+mod donation;
 mod engines;
 mod frontmost;
 mod hotkey;
@@ -64,6 +65,9 @@ pub fn run() {
             commands::copy_text,
             commands::get_recent_transcripts,
             commands::get_time_saved_stats,
+            commands::get_donation_prompt,
+            commands::donation_opt_out,
+            commands::donation_snooze,
             commands::open_settings,
             commands::close_tray_popover,
             commands::quit_app,

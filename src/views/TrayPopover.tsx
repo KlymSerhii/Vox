@@ -7,7 +7,10 @@ import {
   closeTrayPopover,
   copyText,
   dismissUpdate,
+  donationOptOut,
+  donationSnooze,
   downloadAndInstallUpdate,
+  getDonationPrompt,
   getPublicSettings,
   getTimeSavedStats,
   getUpdateState,
@@ -22,6 +25,7 @@ import {
   onUpdateState,
   onUpdaterProgress,
   openAccessibilitySettings,
+  openExternalUrl,
   openSettingsWindow,
   quitApp,
   rePolishTranscript,
@@ -37,6 +41,7 @@ import {
   setStreamingPillEnabled,
   type AudioInputDevice,
   type CompletedEntry,
+  type DonationPrompt,
   type InProgressEntry,
   type ModelStatus,
   type Period,
@@ -47,13 +52,15 @@ import {
   type VoiceMode,
 } from "../lib/ipc";
 import { AppearanceToggle } from "./tray-popover/components/AppearanceToggle";
+import { DonateBanner } from "./tray-popover/components/DonateBanner";
+import { DonateRow } from "./tray-popover/components/DonateRow";
 import { InProgressRow } from "./tray-popover/components/InProgressRow";
 import { LocalBadge } from "./tray-popover/components/LocalBadge";
 import { SmallSpinner } from "./tray-popover/components/SmallSpinner";
 import { StatusDot } from "./tray-popover/components/StatusDot";
 import { UpdateBanner } from "./tray-popover/components/UpdateBanner";
 import { Toggle } from "../components/Toggle";
-import { PERIOD_OPTIONS } from "./tray-popover/constants";
+import { DONATE_URL, PERIOD_OPTIONS } from "./tray-popover/constants";
 import {
   computeDropdownPosition,
   type DropdownPosition,
@@ -129,6 +136,13 @@ export default function TrayPopoverView() {
     saved_seconds: 0,
     sessions: 0,
   });
+  // Donation nudge. The backend (`get_donation_prompt`) owns the
+  // whether/which-tier decision — opt-out, snooze, and the 1h/10h/50h
+  // gating all live in Rust so this surface can't drift from the policy.
+  // `null` = show only the always-present passive Support row. Refreshed
+  // on mount, on every stats change (a dictation may have just crossed a
+  // tier), and on focus (backstop for a tier crossed while hidden).
+  const [donation, setDonation] = createSignal<DonationPrompt | null>(null);
   const [quickSettingsOpen, setQuickSettingsOpen] = createSignal(false);
   // Accessibility grant status for the auto-paste toggle. `null` =
   // not yet probed; treated as "ungranted" for nudging purposes until
@@ -190,6 +204,15 @@ export default function TrayPopoverView() {
     }
   }
 
+  async function refreshDonation() {
+    try {
+      setDonation(await getDonationPrompt());
+    } catch (e) {
+      console.warn("getDonationPrompt failed:", e);
+      setDonation(null);
+    }
+  }
+
   function applySnapshot(snap: SessionsSnapshot) {
     setInProgress(snap.in_progress);
     // RECENT keeps the richer `CompletedEntry` shape so the per-row
@@ -244,7 +267,10 @@ export default function TrayPopoverView() {
     // fire while the popover is hidden.
     unlistenSettings = await onSettingsChanged(setS);
     unlistenSessions = await onSessionsChanged(applySnapshot);
-    unlistenStats = await onStatsChanged(refreshStats);
+    unlistenStats = await onStatsChanged(() => {
+      void refreshStats();
+      void refreshDonation();
+    });
     // Keep the mode picker fresh when the user creates, edits, or
     // deletes a Voice Mode in the Settings window. The popover
     // webview is built once and reused on every tray click, so the
@@ -273,6 +299,7 @@ export default function TrayPopoverView() {
       }
     });
     void refreshStats();
+    void refreshDonation();
 
     window.addEventListener("focus", () => {
       void sessionsSnapshot().then(applySnapshot);
@@ -282,6 +309,10 @@ export default function TrayPopoverView() {
       // User may have flipped Accessibility in System Settings while
       // the popover was hidden — keep the nudge in sync.
       void refreshAccessibility();
+      // A dictation may have crossed a donation milestone while the
+      // popover was hidden; stats:changed already covers the subscribed
+      // case, but re-check on focus as a cheap backstop.
+      void refreshDonation();
     });
 
     document.addEventListener("keydown", (e) => {
@@ -472,6 +503,50 @@ export default function TrayPopoverView() {
     } catch (e) {
       console.error("copy failed:", e);
     }
+  }
+
+  async function openDonatePage() {
+    try {
+      await openExternalUrl(DONATE_URL);
+    } catch (e) {
+      console.error("openExternalUrl failed:", e);
+    }
+  }
+
+  // Nudge "Support Vox": open the donation page AND stop future nudges —
+  // the user has engaged with donating, so we don't interrupt again
+  // (the passive Support row stays for repeat giving). Opening the page
+  // is the load-bearing half; don't let a failed opt-out swallow it.
+  async function onDonateFromNudge() {
+    await openDonatePage();
+    try {
+      await donationOptOut();
+    } catch (e) {
+      console.warn("donationOptOut failed:", e);
+    }
+    setDonation(null);
+  }
+
+  // Honour-system permanent dismissal — believed on the user's word.
+  async function onAlreadyDonated() {
+    try {
+      await donationOptOut();
+    } catch (e) {
+      console.warn("donationOptOut failed:", e);
+    }
+    setDonation(null);
+  }
+
+  // Tier is passed in from the banner's own `p()` rather than re-read
+  // from the signal after the await, so a stats:changed mid-click can't
+  // make us snooze a different tier than the one shown.
+  async function onDonateLater(milestoneSecs: number) {
+    try {
+      await donationSnooze(milestoneSecs);
+    } catch (e) {
+      console.warn("donationSnooze failed:", e);
+    }
+    setDonation(null);
   }
 
   // Mirror of `UpdateState::banner_visible` on the Rust side. Hides
@@ -789,6 +864,26 @@ export default function TrayPopoverView() {
                 </div>
               </Show>
             </div>
+
+            <Show
+              when={donation()}
+              fallback={
+                <div class="border-b border-[var(--color-border)]">
+                  <DonateRow onClick={() => void openDonatePage()} />
+                </div>
+              }
+            >
+              {(p) => (
+                <div class="border-b border-[var(--color-border)] px-4 py-3">
+                  <DonateBanner
+                    savedLabel={formatDuration(p().saved_secs)}
+                    onDonate={() => void onDonateFromNudge()}
+                    onAlreadyDonated={() => void onAlreadyDonated()}
+                    onLater={() => void onDonateLater(p().milestone_secs)}
+                  />
+                </div>
+              )}
+            </Show>
 
             <div class="border-b border-[var(--color-border)]">
               <button
