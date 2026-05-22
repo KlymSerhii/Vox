@@ -594,7 +594,14 @@ fn reposition_to_frame<R: Runtime>(
     apply_size(win, Some(frame), cur_w, cur_h);
 }
 
-fn active_screen_logical_frame<R: Runtime>(
+/// Logical frame `(x, y, w, h)` of the display the user is currently on
+/// — the one holding the cursor. On macOS (main thread) this reads
+/// `NSScreen` via `NSEvent::mouseLocation`; otherwise it falls back to
+/// the Tauri `available_monitors` + `cursor_position` hit-test. Both
+/// paths return top-left-origin logical coordinates. Shared with
+/// `onboarding` so the wizard opens on the same "active display" the
+/// pill uses, not always the primary.
+pub(crate) fn active_screen_logical_frame<R: Runtime>(
     win: &tauri::WebviewWindow<R>,
 ) -> Option<(f64, f64, f64, f64)> {
     #[cfg(target_os = "macos")]
