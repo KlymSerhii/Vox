@@ -158,6 +158,15 @@ export interface TimeSavedStats {
   sessions: number;
 }
 
+export interface DonationPrompt {
+  /// The milestone tier (seconds) that triggered this nudge: 3600 (1h),
+  /// 36000 (10h), or 180000 (50h). Passed back to `donationSnooze` so the
+  /// shown tier is the one recorded as dismissed.
+  milestone_secs: number;
+  /// Cumulative seconds saved so far — drives the value-quantified copy.
+  saved_secs: number;
+}
+
 export type Stage =
   | "listening"
   | "transcribing"
@@ -299,6 +308,26 @@ export async function getRecentTranscripts(): Promise<RecentTranscript[]> {
 
 export async function getTimeSavedStats(period: Period): Promise<TimeSavedStats> {
   return invoke<TimeSavedStats>("get_time_saved_stats", { period });
+}
+
+/// Whether the tray popover should surface the donation nudge right now,
+/// and for which milestone. `null` = show nothing (opted out, snoozed,
+/// or no new milestone crossed). The gating lives in the Rust `donation`
+/// module so the frontend never re-implements it.
+export async function getDonationPrompt(): Promise<DonationPrompt | null> {
+  return invoke<DonationPrompt | null>("get_donation_prompt");
+}
+
+/// "Donate" / "I already donated" — stop future milestone nudges
+/// permanently. The passive "Support Vox" row remains for repeat giving.
+export async function donationOptOut(): Promise<void> {
+  await invoke("donation_opt_out");
+}
+
+/// "Maybe later" — record the shown tier (so it never re-fires) and hold
+/// further nudges for the snooze floor.
+export async function donationSnooze(milestoneSecs: number): Promise<void> {
+  await invoke("donation_snooze", { milestoneSecs });
 }
 
 export async function openSettingsWindow(): Promise<void> {

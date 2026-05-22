@@ -133,6 +133,15 @@ pub(crate) fn aggregate_in_memory(
     TimeSavedStats { saved_seconds: saved, sessions: count }
 }
 
+/// Cumulative `saved_secs` across every retained record — i.e. the
+/// running "time saved since install", modulo the [`RETENTION_DAYS`]
+/// eviction window. Unlike [`aggregate_in_memory`] this isn't bounded
+/// to a calendar window; it's the figure [`crate::donation`] tests
+/// against its milestone tiers.
+pub(crate) fn total_saved_in_memory(records: &[Record]) -> f64 {
+    records.iter().map(|r| r.saved_secs).sum()
+}
+
 fn load_records<R: Runtime>(app: &AppHandle<R>) -> Vec<Record> {
     let store = match app.store(STORE_FILE) {
         Ok(s) => s,
@@ -206,6 +215,13 @@ pub fn record_session<R: Runtime>(
 pub fn aggregate<R: Runtime>(app: &AppHandle<R>, period: Period) -> TimeSavedStats {
     let records = load_records(app);
     aggregate_in_memory(&records, period, Local::now())
+}
+
+/// Cumulative time saved across all retained records (see
+/// [`total_saved_in_memory`]). Read by [`crate::donation`] to decide
+/// which milestone nudge, if any, to surface.
+pub fn total_saved_secs<R: Runtime>(app: &AppHandle<R>) -> f64 {
+    total_saved_in_memory(&load_records(app))
 }
 
 #[cfg(test)]
@@ -319,6 +335,13 @@ mod tests {
         assert!(saved.contains(&3.0));
         assert!(!saved.contains(&4.0));
         assert!(!saved.contains(&5.0));
+    }
+
+    #[test]
+    fn total_saved_sums_every_record() {
+        assert_eq!(total_saved_in_memory(&[]), 0.0);
+        let records = vec![rec(1, 10.0), rec(2, 20.5), rec(3, 0.0), rec(4, 90.0)];
+        assert!((total_saved_in_memory(&records) - 120.5).abs() < 1e-9);
     }
 
     #[test]

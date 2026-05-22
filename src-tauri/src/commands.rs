@@ -327,6 +327,40 @@ pub fn get_time_saved_stats<R: Runtime>(
     Ok(crate::stats::aggregate(&app, p))
 }
 
+/// Whether the tray popover should surface the donation nudge right now,
+/// and for which milestone. `None` = show nothing (opted out, snoozed,
+/// or no new milestone crossed). The milestone gating is encapsulated in
+/// `donation::prompt` so the frontend never re-implements it.
+///
+/// This and the two `donation_*` writers below are intentionally NOT
+/// behind `assert_secret_window`: the tray popover (not a secret window)
+/// is the consumer, the same as `set_audio_input_device` /
+/// `get_public_settings`. Don't add the guard — it would break the tray.
+#[tauri::command]
+pub fn get_donation_prompt<R: Runtime>(
+    app: AppHandle<R>,
+) -> Option<crate::donation::DonationPrompt> {
+    crate::donation::prompt(&app)
+}
+
+/// "Donate" / "I already donated" — stop future milestone nudges
+/// permanently (honour system; the passive "Support Vox" row stays for
+/// repeat giving).
+#[tauri::command]
+pub fn donation_opt_out<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    crate::donation::opt_out(&app).map_err(|e| e.to_string())
+}
+
+/// "Maybe later" — record the shown tier so it never re-fires and hold
+/// further nudges for the snooze floor.
+#[tauri::command]
+pub fn donation_snooze<R: Runtime>(
+    app: AppHandle<R>,
+    milestone_secs: u64,
+) -> Result<(), String> {
+    crate::donation::snooze(&app, milestone_secs).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub fn open_settings<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("settings") {
