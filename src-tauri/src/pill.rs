@@ -19,6 +19,10 @@ pub const LABEL: &str = "pill";
 pub const WIDTH: f64 = 144.0;
 pub const HEIGHT: f64 = 36.0;
 const BOTTOM_MARGIN: f64 = 96.0;
+/// Poll cadence for the multi-display follower. Moving the cursor to
+/// another monitor is a coarse user action, so a ~300 ms tick keeps the
+/// pill on the right screen without the 50 ms cost of the audio sampler.
+const FOLLOW_POLL_MS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,6 +143,9 @@ pub fn show<R: Runtime>(app: &AppHandle<R>) {
                 let _ = app_clone.emit_to(LABEL, "pill:show", ());
             }
         });
+        // Follow the user across displays for as long as this pill is up.
+        // Keyed on the same generation so the next show/hide tears it down.
+        spawn_display_follower(app.clone(), scheduled_gen);
     }
 }
 
@@ -502,7 +509,99 @@ fn reposition<R: Runtime>(win: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
     Ok(())
 }
 
-fn active_screen_logical_frame<R: Runtime>(
+/// Keep the pill on whatever display the user is currently on. `show`
+/// places it on the cursor's display once; this task then re-centres it
+/// onto a new display if the user moves there mid-session. The pill is
+/// click-through, so following the cursor never steals focus or disrupts
+/// a click. Keyed on `PILL_GENERATION` (captured as `generation`) so the
+/// next `show`/`hide` — which bumps the counter — tears it down. No-op on
+/// single-display setups, where the frame never changes.
+///
+/// Runs off the main thread, so `active_screen_logical_frame` resolves
+/// the active display via the Tauri `available_monitors` +
+/// `cursor_position` fallback, NOT the main-thread NSEvent path `show`
+/// uses. That's deliberate: the streaming resize calls (`set_wide` /
+/// `set_size`) also run off-thread on this same fallback, so the follower
+/// and the resize path always agree on the active display — no 300 ms
+/// flip-flop while live text grows the pill. The only cost is a one-time,
+/// exact-pixel-boundary disagreement with `show`'s NSEvent placement,
+/// which settles on the first real cross-display move.
+fn spawn_display_follower<R: Runtime>(app: AppHandle<R>, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        // Single-display Macs can never change frames — skip the poll
+        // entirely so the common case does zero recurring work.
+        let multi_display = app
+            .get_webview_window(LABEL)
+            .and_then(|w| w.available_monitors().ok())
+            .map(|monitors| monitors.len() > 1)
+            .unwrap_or(false);
+        if !multi_display {
+            return;
+        }
+
+        // Seed through the SAME fallback path the loop uses, so the
+        // immediate first `interval` tick compares like-for-like and is a
+        // no-op (the pill is already where `show` put it) rather than a
+        // spurious reposition.
+        let mut last_frame = app
+            .get_webview_window(LABEL)
+            .and_then(|w| active_screen_logical_frame(&w));
+
+        let mut ticker = tokio::time::interval(Duration::from_millis(FOLLOW_POLL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // A show()/hide() since we were spawned bumped the generation,
+            // so a newer follower (or none) now owns the pill — stand down.
+            if PILL_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let Some(win) = app.get_webview_window(LABEL) else {
+                return;
+            };
+            let frame = active_screen_logical_frame(&win);
+            // Only move on an actual display change. On the same display
+            // the frame is byte-identical, so this stays a cheap no-op and
+            // never fights the frontend's streaming-driven resizes.
+            if frame != last_frame {
+                if let Some(f) = frame {
+                    reposition_to_frame(&win, f);
+                }
+                last_frame = frame;
+            }
+        }
+    });
+}
+
+/// Re-centre the pill onto `frame` (logical x, y, w, h) while preserving
+/// its current size, so a window the streaming ResizeObserver grew keeps
+/// that width when it hops displays. Horizontally centred + bottom-
+/// anchored, identical to [`apply_size`]. The `inner_size` read can lag a
+/// concurrent streaming resize by one frame; the next ResizeObserver tick
+/// re-centres at the corrected width, so the worst case is one 300 ms
+/// frame at the prior width.
+fn reposition_to_frame<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+    frame: (f64, f64, f64, f64),
+) {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let cur = win.inner_size().ok();
+    let cur_w = cur
+        .as_ref()
+        .map(|s| s.width as f64 / scale)
+        .unwrap_or(WIDTH);
+    let cur_h = cur.map(|s| s.height as f64 / scale).unwrap_or(HEIGHT);
+    apply_size(win, Some(frame), cur_w, cur_h);
+}
+
+/// Logical frame `(x, y, w, h)` of the display the user is currently on
+/// — the one holding the cursor. On macOS (main thread) this reads
+/// `NSScreen` via `NSEvent::mouseLocation`; otherwise it falls back to
+/// the Tauri `available_monitors` + `cursor_position` hit-test. Both
+/// paths return top-left-origin logical coordinates. Shared with
+/// `onboarding` so the wizard opens on the same "active display" the
+/// pill uses, not always the primary.
+pub(crate) fn active_screen_logical_frame<R: Runtime>(
     win: &tauri::WebviewWindow<R>,
 ) -> Option<(f64, f64, f64, f64)> {
     #[cfg(target_os = "macos")]
