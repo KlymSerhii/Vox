@@ -41,6 +41,7 @@ export default defineConfig({
         pill: r("./pill.html"),
         onboarding: r("./onboarding.html"),
         "tray-popover": r("./tray-popover.html"),
+        donation: r("./donation.html"),
       },
     },
   },

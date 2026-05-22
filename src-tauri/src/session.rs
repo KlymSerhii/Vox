@@ -1707,6 +1707,11 @@ async fn run_pipeline(
                     );
                 }
             }
+            // Surface the milestone-donation window if this session just
+            // pushed cumulative time-saved past a tier. No-op otherwise;
+            // fires off-main-thread-safely and marks the tier shown so it
+            // never re-appears.
+            crate::donation_window::maybe_show(&app);
             // Legacy event keeps the existing tray-popover RECENT
             // logic working for any consumer that hasn't migrated.
             let _ = app.emit("transcripts:changed", transcripts::snapshot());

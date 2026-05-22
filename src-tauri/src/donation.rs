@@ -139,6 +139,20 @@ pub fn opt_out<R: Runtime>(app: &AppHandle<R>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Mark a milestone tier as already surfaced (the dedicated donation
+/// window auto-appeared for it) so it never re-fires, with no 30-day
+/// hold — the next higher tier can fire as soon as it's crossed.
+pub fn mark_shown<R: Runtime>(app: &AppHandle<R>, milestone_secs: u64) -> anyhow::Result<()> {
+    let store = app
+        .store(STORE_FILE)
+        .map_err(|e| anyhow::anyhow!("open store: {e}"))?;
+    store.set(KEY_LAST_MILESTONE, serde_json::Value::from(milestone_secs));
+    store
+        .save()
+        .map_err(|e| anyhow::anyhow!("save store: {e}"))?;
+    Ok(())
+}
+
 /// "Maybe later" — record the tier we just showed so it never re-fires,
 /// and hold off any further nudge for at least [`SNOOZE_SECS`]. The next
 /// (higher) tier can then fire once both its threshold is crossed and the

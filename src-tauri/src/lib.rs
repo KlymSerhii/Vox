@@ -1,6 +1,7 @@
 mod audio;
 mod commands;
 mod donation;
+mod donation_window;
 mod engines;
 mod frontmost;
 mod hotkey;
