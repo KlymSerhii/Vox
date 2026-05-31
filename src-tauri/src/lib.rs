@@ -16,6 +16,8 @@ mod mac_paste;
 mod mac_perm;
 mod mac_power;
 mod mac_wake;
+#[cfg(target_os = "windows")]
+mod win_paste;
 mod models;
 mod modes;
 mod onboarding;
@@ -227,7 +229,10 @@ pub fn run() {
             // signature check during onboarding rather than on the
             // user's first dictation, where it otherwise stalls the
             // post-polish clipboard write for 30-60 s with a
-            // "Verifying com.vox…" system dialog.
+            // "Verifying com.vox…" system dialog. Windows has no such
+            // first-use check, so the round-trip is a needless clipboard
+            // touch there — macOS-only.
+            #[cfg(target_os = "macos")]
             crate::inject::prewarm_in_background();
 
             // Auto-update scheduler. State is installed BEFORE the

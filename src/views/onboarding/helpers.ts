@@ -1,5 +1,6 @@
 import { type HotkeyDiagnostic } from "@/lib/ipc";
 import { formatHotkey as sharedFormatHotkey } from "@/lib/hotkey";
+import { isMac } from "@/lib/platform";
 import { type ProgressSample } from "./constants";
 
 /** Render a Tauri global-shortcut spec ("Alt+Shift+V", "F13") as a
@@ -61,7 +62,8 @@ export function fellBackNote(d: HotkeyDiagnostic | undefined): string | null {
   if (!d || !d.fell_back || !d.bound) return null;
   const cfg = formatHotkey(d.configured) || d.configured;
   const bnd = formatHotkey(d.bound) || d.bound;
-  return `Configured ${cfg} wasn't available on your Mac — Vox is using ${bnd}.`;
+  const here = isMac ? "your Mac" : "your PC";
+  return `Configured ${cfg} wasn't available on ${here} — Vox is using ${bnd}.`;
 }
 
 export function pttFailed(d: HotkeyDiagnostic | undefined): boolean {

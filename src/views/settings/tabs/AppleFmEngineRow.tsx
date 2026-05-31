@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
 import { type AppleFmAvailability } from "@/lib/ipc";
+import { isMac } from "@/lib/platform";
 import { RaisedCard } from "../components/RaisedCard";
 
 export function AppleFmEngineRow(props: {
@@ -10,7 +11,11 @@ export function AppleFmEngineRow(props: {
 }) {
   const a = () => props.availability;
   const reachable = () => a()?.available ?? false;
+  // Apple Intelligence is macOS-only. The parent already gates this row on
+  // `appleFm()?.supported_host` (false on Windows), but guard here too so
+  // the row can never render off-Mac regardless of caller.
   return (
+    <Show when={isMac}>
     <RaisedCard>
       <div class="flex items-start justify-between gap-3">
         <div class="flex-1">
@@ -64,5 +69,6 @@ export function AppleFmEngineRow(props: {
         </div>
       </div>
     </RaisedCard>
+    </Show>
   );
 }

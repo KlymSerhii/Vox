@@ -3,11 +3,15 @@ import { For, Show } from "solid-js";
 import { formatHotkeyTokens } from "../lib/hotkey";
 
 /**
- * Render a hotkey spec as a row of keycap badges. Modifier badges
- * show both the macOS glyph and a short word — `⌘ Cmd`, `⌥ Opt`,
- * `⇧ Shift`, `⌃ Ctrl` — so the chord is legible to users who don't
- * recognise the symbols. Trailing key glyphs (`.`, `M`, `?`) render
- * on their own.
+ * Render a hotkey spec as a row of keycap badges.
+ *
+ * On macOS, modifier badges show both the glyph and a short word —
+ * `⌘ Cmd`, `⌥ Opt`, `⇧ Shift`, `⌃ Ctrl` — so the chord is legible to
+ * users who don't recognise the symbols; the glyph is `aria-hidden` and
+ * the word carries the accessible name. On Windows the tokeniser emits
+ * the plain word (`Ctrl`, `Alt`, `Shift`, `Win`) in `symbol` with an
+ * empty `label`, so a single keycap reads as that word. Trailing key
+ * glyphs (`.`, `M`, `?`) render on their own.
  *
  * `Mods:Cmd+Alt` renders as the bare modifiers; `Tap2:Alt` renders
  * the modifier followed by a small `×2` suffix attached to the last
@@ -31,7 +35,10 @@ export function HotkeyKeys(props: { spec: string | null | undefined }) {
               <span class="text-[10px] text-[var(--color-ink-faint)]">+</span>
             </Show>
             <span class="keycap">
-              <span aria-hidden="true">{t.symbol}</span>
+              {/* When a separate word label follows (macOS glyph case)
+                  the glyph is decorative; without one (Windows word, or a
+                  plain key like ".") the symbol is the readable content. */}
+              <span aria-hidden={t.label ? "true" : undefined}>{t.symbol}</span>
               <Show when={t.label}>
                 <span class="text-[10px] font-medium text-[var(--color-ink-mute)]">
                   {t.label}

@@ -93,8 +93,14 @@ sha2 = "0.10"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 dirs = "5"
 num_cpus = "1"
-# Heavy native STT engine — see `local-engines` feature above.
-whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
+# Heavy native STT engine — see `local-engines` feature above. The
+# crate is declared per-target (macOS table below pins the Apple
+# CoreML+Metal backends; the Windows table takes the plain CPU backend)
+# so the Apple-only backends never reach a Windows build. Cargo does not
+# merge features across target tables for the same crate, which is
+# exactly what we want here. `local-engines = ["dep:whisper-rs"]`
+# resolves against the union of all dependency tables regardless of which
+# one declares the optional dep.
 # Out-of-process Gemma polishing dependencies.
 # `command-group` puts the child in its own process group on Unix and
 # assigns it to a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
@@ -113,6 +119,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Apple-only STT backends (Core ML + Metal). See the `whisper-rs` note in
+# `[dependencies]` for why the crate is target-split.
+whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
 objc2 = "0.6"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
@@ -140,6 +149,23 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
   "std",
   "CFCGTypes",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Plain CPU backend for v1 — no GPU feature, so the build needs neither
+# the Vulkan SDK at compile time nor a Vulkan ICD at runtime. Vulkan is a
+# clean fast-follow (flip to `features = ["vulkan"]`). The Gemma
+# `llama-server` stays Vulkan because it's a downloaded binary, not linked.
+whisper-rs = { version = "0.16", optional = true }
+# Win32 FFI for the synthetic Ctrl+V (auto-paste), the foreground-window
+# probe (mode suggestion), and ShellExecuteW (external links / settings
+# deep-link). Mirrors the macOS objc2/CoreGraphics FFI convention.
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
 ] }
 
 # Unix-only: `xattr` strips `com.apple.quarantine` from the extracted

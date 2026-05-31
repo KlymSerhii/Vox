@@ -33,12 +33,12 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
-    "targets": [
-      "app",
-      "dmg"
-    ],
+    "targets": "all",
     "icon": [
-      "icons/icon.icns"
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
     ],
     "category": "Utility",
     "shortDescription": "On-device voice dictation",
@@ -50,6 +50,15 @@
       "frameworks": [],
       "signingIdentity": "Developer ID Application: Serhii Klymenko (4NUJDWKWX5)",
       "providerShortName": "4NUJDWKWX5"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"]
+      }
     }
   },
   "plugins": {

@@ -286,7 +286,7 @@ fn root_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("app.vox.vox/models")
+        .join("com.vox.app/models")
 }
 
 fn model_dir(root: &Path, d: &ModelDescriptor) -> PathBuf {

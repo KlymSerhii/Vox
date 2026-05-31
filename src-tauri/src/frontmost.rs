@@ -135,12 +135,93 @@ mod imp {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "windows")]
+mod imp {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, HWND, MAX_PATH};
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_FORMAT,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    };
+
+    /// Windows analogue of the macOS NSWorkspace + AX probe. The "bundle
+    /// id" is the foreground process's executable file name (lowercased,
+    /// e.g. `chrome.exe`) so mode `bundle_glob` matchers can target it;
+    /// the window title comes from `GetWindowTextW`. Fail-open: any null
+    /// handle or failed call returns `None` (or drops the title).
+    pub fn detect() -> Option<(String, Option<String>)> {
+        // SAFETY: every Win32 handle returned here is checked for validity
+        // before use, and the one OpenProcess handle is closed on every
+        // path. None of these calls retain pointers we pass in.
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.is_invalid() {
+                return None;
+            }
+            let exe = foreground_exe_name(hwnd)?;
+            let title = foreground_window_title(hwnd);
+            Some((exe, title))
+        }
+    }
+
+    unsafe fn foreground_exe_name(hwnd: HWND) -> Option<String> {
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid == 0 {
+            return None;
+        }
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+
+        let mut buf = [0u16; MAX_PATH as usize];
+        let mut len = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_FORMAT(0),
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        let _ = CloseHandle(handle);
+        result.ok()?;
+
+        let full_path = String::from_utf16_lossy(&buf[..len as usize]);
+        // Take the file name component (after the last path separator) and
+        // lowercase it so glob matching is case-stable (`Chrome.exe` vs
+        // `chrome.exe`).
+        let name = full_path
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(&full_path)
+            .trim()
+            .to_ascii_lowercase();
+        (!name.is_empty()).then_some(name)
+    }
+
+    unsafe fn foreground_window_title(hwnd: HWND) -> Option<String> {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return None;
+        }
+        // +1 for the trailing NUL that GetWindowTextW writes.
+        let mut buf = vec![0u16; (len as usize) + 1];
+        let copied = GetWindowTextW(hwnd, &mut buf);
+        if copied <= 0 {
+            return None;
+        }
+        let title = String::from_utf16_lossy(&buf[..copied as usize]);
+        let trimmed = title.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 pub fn detect() -> Option<(String, Option<String>)> {
     imp::detect()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn detect() -> Option<(String, Option<String>)> {
     None
 }

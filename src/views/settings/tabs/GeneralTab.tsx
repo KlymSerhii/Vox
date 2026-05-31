@@ -14,6 +14,7 @@ import { Row } from "../components/Row";
 import { SectionHeader } from "../components/SectionHeader";
 import { SegmentedControl } from "../components/SegmentedControl";
 import { Toggle } from "@/components/Toggle";
+import { isMac, isWindows } from "@/lib/platform";
 import { LANGUAGE_OPTIONS } from "../constants";
 import { friendlySttEngineName } from "../helpers";
 
@@ -78,9 +79,12 @@ export function GeneralTab(props: {
   // Show the "needs Accessibility" sub-row when the toggle is on AND
   // we've confirmed the grant is missing. `accessibility() === null`
   // (first render, before the probe lands) is treated as "don't nudge
-  // yet" to avoid a flash during normal use.
+  // yet" to avoid a flash during normal use. Windows has no Accessibility
+  // concept for SendInput — the Rust probe always reports granted there,
+  // so this is already false; gating on `!isWindows` is belt-and-suspenders
+  // so a future probe change can't surface a mac-only nudge on Windows.
   const showAccessibilityNudge = () =>
-    props.s.auto_paste_enabled && accessibility() === false;
+    !isWindows && props.s.auto_paste_enabled && accessibility() === false;
 
   return (
     <>
@@ -132,7 +136,11 @@ export function GeneralTab(props: {
         </Row>
         <Row
           label="Microphone"
-          hint="Pick which input Vox records. Following the system default tracks your macOS Sound input setting."
+          hint={
+            isMac
+              ? "Pick which input Vox records. Following the system default tracks your macOS Sound input setting."
+              : "Pick which input Vox records. Following the system default tracks your Windows sound input setting."
+          }
           last
         >
           <MicrophonePicker
@@ -191,7 +199,11 @@ export function GeneralTab(props: {
       <Card>
         <Row
           label="Paste into focused field"
-          hint="Vox sends ⌘V for you after polishing and restores your clipboard right after. Requires Accessibility."
+          hint={
+            isMac
+              ? "Vox sends ⌘V for you after polishing and restores your clipboard right after. Requires Accessibility."
+              : "Vox sends Ctrl+V for you after polishing and restores your clipboard right after."
+          }
           last={!showAccessibilityNudge()}
         >
           <Toggle

@@ -1,4 +1,5 @@
 import { VoxLogo } from "@/components/VoxLogo";
+import { deviceWord } from "@/lib/platform";
 
 export function Welcome() {
   return (
@@ -7,7 +8,7 @@ export function Welcome() {
       <div>
         <h1 class="text-[24px] font-semibold">On-device dictation.</h1>
         <p class="mt-2 max-w-[360px] text-[13px] text-[var(--color-ink-mute)]">
-          Press, speak, paste. Vox runs entirely on this Mac — nothing
+          Press, speak, paste. Vox runs entirely on this {deviceWord} — nothing
           leaves the device.
         </p>
       </div>

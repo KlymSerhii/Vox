@@ -300,8 +300,8 @@ export function HotkeysTab(props: {
         />
       </Card>
       <p class="text-[11px] text-[var(--color-ink-mute)]">
-        Changes apply immediately. If the configured key fails to bind on
-        macOS, Vox falls back to the next compatible shortcut and shows
+        Changes apply immediately. If the configured key fails to bind,
+        Vox falls back to the next compatible shortcut and shows
         it under the picker.
       </p>
     </>

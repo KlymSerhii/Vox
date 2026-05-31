@@ -1,4 +1,5 @@
 import { openSettingsWindow } from "@/lib/ipc";
+import { deviceWord } from "@/lib/platform";
 
 export function LocalBadge() {
   // Quiet reminder, no popover, no tooltip on the badge itself —
@@ -9,7 +10,7 @@ export function LocalBadge() {
       type="button"
       class="inline-flex items-center gap-1.5 rounded-full px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
       onClick={() => openSettingsWindow()}
-      title="Audio never leaves this Mac"
+      title={`Audio never leaves this ${deviceWord}`}
     >
       <svg
         width="11"

@@ -24,15 +24,19 @@
  * `⌘⇧/`.
  */
 
+import { isMac } from "./platform";
+
 export interface HotkeyToken {
   /** "modifier" for ⌘/⌥/⇧/⌃, "key" for the trailing letter or symbol,
    *  "tap2" for the `×2` suffix that follows a double-tap modifier. */
   kind: "modifier" | "key" | "tap2";
-  /** Mac glyph: `⌘`, `⌥`, `⇧`, `⌃`, or a single character like `.` or `M`.
-   *  Empty string for `tap2` tokens. */
+  /** Mac glyph (`⌘`, `⌥`, `⇧`, `⌃`) or, on Windows, the modifier word
+   *  (`Ctrl`, `Alt`, `Shift`, `Win`). Also a single character like `.` or
+   *  `M` for keys. Empty string for `tap2` tokens. */
   symbol: string;
-  /** Short word for modifiers (`Cmd`, `Opt`, `Shift`, `Ctrl`); empty for
-   *  keys. `×2` for `tap2` tokens. */
+  /** Short word shown next to the glyph on macOS (`Cmd`, `Opt`, `Shift`,
+   *  `Ctrl`); empty for keys and empty on Windows (the word already lives
+   *  in `symbol` there). `×2` for `tap2` tokens. */
   label: string;
 }
 
@@ -55,6 +59,36 @@ const MODIFIER_LABELS: Record<string, string> = {
   "⇧": "Shift",
   "⌃": "Ctrl",
 };
+
+// Windows renders modifiers as plain words — no Apple glyphs. The word is
+// placed in the token's `symbol` slot (with an empty `label`) so a single
+// keycap shows e.g. "Ctrl" rather than a "⌃ Ctrl" pair. `CommandOrControl`
+// (and bare Cmd/Meta/Super) collapse to "Ctrl"; the Win key to "Win".
+const MODIFIER_WORDS_WIN: Record<string, string> = {
+  Alt: "Alt",
+  Option: "Alt",
+  Shift: "Shift",
+  Cmd: "Ctrl",
+  Command: "Ctrl",
+  Meta: "Win",
+  Super: "Win",
+  Ctrl: "Ctrl",
+  Control: "Ctrl",
+  CommandOrControl: "Ctrl",
+};
+
+/** Resolve a raw modifier token to its `{symbol, label}` for the current
+ *  platform. Returns `null` when the token isn't a known modifier. */
+function modifierToken(raw: string): { symbol: string; label: string } | null {
+  if (isMac) {
+    const symbol = MODIFIER_SYMBOLS[raw];
+    if (!symbol) return null;
+    return { symbol, label: MODIFIER_LABELS[symbol] ?? "" };
+  }
+  const word = MODIFIER_WORDS_WIN[raw];
+  if (!word) return null;
+  return { symbol: word, label: "" };
+}
 
 const KEY_UNSHIFTED: Record<string, string> = {
   Slash: "/",
@@ -94,9 +128,9 @@ function specBody(spec: string): string {
 
 function modifierTokensFrom(parts: string[]): HotkeyToken[] {
   return parts.map<HotkeyToken>((t) => {
-    const symbol = MODIFIER_SYMBOLS[t];
-    if (symbol) {
-      return { kind: "modifier", symbol, label: MODIFIER_LABELS[symbol] ?? "" };
+    const m = modifierToken(t);
+    if (m) {
+      return { kind: "modifier", symbol: m.symbol, label: m.label };
     }
     return { kind: "modifier", symbol: t, label: "" };
   });
@@ -130,7 +164,7 @@ export function formatHotkeyTokens(
   // Right/Left Alt is the only single-modifier spec we display — it
   // arrives without a trailing key.
   if (trimmed === "AltRight" || trimmed === "AltLeft") {
-    return [{ kind: "modifier", symbol: "⌥", label: "Opt" }];
+    return modifierTokensFrom(["Alt"]);
   }
 
   const tokens = trimmed.split("+").map((t) => t.trim()).filter(Boolean);
@@ -138,33 +172,37 @@ export function formatHotkeyTokens(
 
   const last = tokens[tokens.length - 1];
   const hasShift = tokens.includes("Shift");
-  const collapseShift = hasShift && Object.prototype.hasOwnProperty.call(KEY_SHIFTED, last);
+  // The shifted-glyph collapse (`Cmd+Shift+/` → `⌘?`) is a macOS menu
+  // convention. On Windows we render `Ctrl+Shift+/` literally.
+  const collapseShift =
+    isMac && hasShift && Object.prototype.hasOwnProperty.call(KEY_SHIFTED, last);
 
   const mods = tokens
     .slice(0, -1)
     .filter((t) => !collapseShift || t !== "Shift")
     .map<HotkeyToken>((t) => {
-      const symbol = MODIFIER_SYMBOLS[t];
-      if (symbol) {
-        return { kind: "modifier", symbol, label: MODIFIER_LABELS[symbol] ?? "" };
+      const m = modifierToken(t);
+      if (m) {
+        return { kind: "modifier", symbol: m.symbol, label: m.label };
       }
       // Unknown token — render verbatim so users see *something*
       // useful for hand-rolled specs.
       return { kind: "modifier", symbol: t, label: "" };
     });
 
+  const lastMod = modifierToken(last);
   const tail: HotkeyToken = collapseShift
     ? { kind: "key", symbol: KEY_SHIFTED[last], label: "" }
     : {
         kind: "key",
-        symbol: KEY_UNSHIFTED[last] ?? MODIFIER_SYMBOLS[last] ?? last,
-        label: MODIFIER_SYMBOLS[last] ? (MODIFIER_LABELS[MODIFIER_SYMBOLS[last]] ?? "") : "",
+        symbol: KEY_UNSHIFTED[last] ?? lastMod?.symbol ?? last,
+        label: lastMod?.label ?? "",
       };
 
   // If the trailing token is itself a modifier (the AltLeft/AltRight
   // case is handled above, but a user-rolled "Shift" spec could land
   // here), promote it to a modifier-style token so the label renders.
-  if (MODIFIER_SYMBOLS[last]) {
+  if (lastMod) {
     tail.kind = "modifier";
   }
 

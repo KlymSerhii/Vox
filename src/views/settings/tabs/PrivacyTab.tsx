@@ -1,17 +1,19 @@
 import { For } from "solid-js";
 import { type Settings } from "@/lib/ipc";
+import { deviceWord, isMac } from "@/lib/platform";
 
 export function PrivacyTab(_props: { s: Settings }) {
   const guarantees: { title: string; detail: string }[] = [
     {
-      title: "Audio never leaves the Mac",
+      title: `Audio never leaves the ${deviceWord}`,
       detail:
         "Captured into memory, transcribed locally, freed before the pipeline ends.",
     },
     {
       title: "Transcripts stay on the device",
-      detail:
-        "Whisper and Gemma both run on Apple Silicon. No network calls in the dictation path.",
+      detail: isMac
+        ? "Whisper and Gemma both run on Apple Silicon. No network calls in the dictation path."
+        : "Whisper and Gemma both run locally on your PC. No network calls in the dictation path.",
     },
     {
       title: "Nothing is written to disk",
@@ -71,7 +73,7 @@ export function PrivacyTab(_props: { s: Settings }) {
               Fully on-device
             </h3>
             <p class="mt-0.5 text-[12px] text-[var(--color-ink-mute)]">
-              Vox runs entirely on this Mac. There is no setting that
+              Vox runs entirely on this {deviceWord}. There is no setting that
               would send your audio or transcripts to any external
               service.
             </p>
