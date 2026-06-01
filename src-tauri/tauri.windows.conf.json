@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": [
+      "../target/release/onnxruntime.dll",
+      "../target/release/DirectML.dll"
+    ]
+  }
+}

@@ -108,29 +108,39 @@ pub const CATALOG: &[ModelDescriptor] = &[
         ram_peak_mb: 1900,
         tier: "quality",
     },
-    // Parakeet TDT 0.6B v3 ships as a Core ML bundle (4 .mlmodelc
-    // directories + vocab JSON) under
-    // https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/.
-    // The single-file `stream_to_file` downloader doesn't apply; the file
-    // manifest lives next to the engine code and the catalog `url` is
-    // intentionally empty so a misuse via `download_model` fails loudly
-    // rather than silently fetching an empty body.
-    /* TODO(model-download-multi-file): replace empty `url` with a manifest
-       once the multi-file downloader lands. size_bytes is a 500 MB
-       placeholder — the FluidAudio Core ML bundle hasn't been measured
-       end-to-end yet; refine when the engine-side downloader pins exact
-       per-file sizes from the HF API. */
+    // Parakeet TDT 0.6B v3:
+    //   macOS aarch64 — Core ML bundle (4 .mlmodelc dirs + vocab JSON)
+    //     https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/
+    //   Windows — ONNX bundle (encoder + external data + decoder_joint + vocab)
+    //     https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/
+    // The single-file `stream_to_file` downloader doesn't apply to either host;
+    // the multi-file manifest lives in `parakeet_v3_files_{macos,windows}()` and
+    // the catalog `url` is intentionally empty so a misuse via `download_model`
+    // fails loudly rather than silently fetching an empty body.
     ModelDescriptor {
         id: "parakeet-tdt-0.6b-v3",
         kind: ModelKind::Stt,
+        #[cfg(target_os = "macos")]
         name: "Parakeet TDT 0.6B v3 (multilingual, 25 languages, ANE-accelerated)",
+        #[cfg(not(target_os = "macos"))]
+        name: "Parakeet TDT 0.6B v3 (multilingual, 25 languages, DirectML-accelerated)",
+        // macOS: approximate Core ML bundle size (~480 MB; FluidAudio doesn't
+        // publish exact figures). Windows: exact sum of the four ONNX manifest
+        // files fetched from HF API on 2026-06-01:
+        //   encoder-model.onnx       41_770_866
+        //   encoder-model.onnx.data  2_435_420_160
+        //   decoder_joint-model.onnx 72_520_893
+        //   vocab.txt                93_939
+        //   Total                    2_549_805_858
+        #[cfg(target_os = "macos")]
         size_bytes: 500 * 1024 * 1024,
+        #[cfg(not(target_os = "macos"))]
+        size_bytes: 2_549_805_858,
         sha256: None,
         url: "",
         engine: "parakeet-local",
-        // Approximate; FluidAudio doesn't publish exact peak figures.
-        // Conservative round-up that covers ANE residency + decoder
-        // buffers; revisit after first profiled run.
+        // Approximate upper bound covering model weights + inference buffers.
+        // Revisit after first profiled run on each platform.
         ram_peak_mb: 800,
         tier: "balanced",
     },
@@ -204,40 +214,94 @@ pub fn list<R: Runtime>(app: &AppHandle<R>) -> Vec<ModelStatus> {
             // last write.
             if d.id == "parakeet-tdt-0.6b-v3" {
                 let bundle_dir = model_dir(&root, d);
-                let vocab_path = bundle_dir
-                    .join("parakeet-tdt-0.6b-v3-coreml")
-                    .join("parakeet_vocab.json");
-                let vocab_bytes = vocab_path
-                    .metadata()
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                let installed = vocab_bytes > 0;
-                // Sum the actual sizes of the manifest files present on
-                // disk so the user sees real disk usage in Settings.
-                let bytes_on_disk = if installed {
-                    parakeet_v3_files()
-                        .iter()
-                        .map(|f| {
-                            bundle_dir
-                                .join(f.relpath)
-                                .metadata()
-                                .map(|m| m.len())
-                                .unwrap_or(0)
-                        })
-                        .sum()
-                } else {
-                    vocab_bytes
-                };
-                return ModelStatus {
-                    descriptor: d.clone(),
-                    installed,
-                    bytes_on_disk,
-                    path: if installed {
-                        bundle_dir.to_str().map(|s| s.to_string())
+
+                #[cfg(target_os = "macos")]
+                {
+                    // macOS: probe the vocab JSON written last by the Core ML
+                    // downloader. Path mirrors `parakeet_local::FLUIDAUDIO_VOCAB_FILE`.
+                    let vocab_path = bundle_dir
+                        .join("parakeet-tdt-0.6b-v3-coreml")
+                        .join("parakeet_vocab.json");
+                    let vocab_bytes = vocab_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    let installed = vocab_bytes > 0;
+                    let bytes_on_disk = if installed {
+                        parakeet_v3_files()
+                            .iter()
+                            .map(|f| {
+                                bundle_dir
+                                    .join(f.relpath)
+                                    .metadata()
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            })
+                            .sum()
                     } else {
-                        None
-                    },
-                };
+                        vocab_bytes
+                    };
+                    return ModelStatus {
+                        descriptor: d.clone(),
+                        installed,
+                        bytes_on_disk,
+                        path: if installed {
+                            bundle_dir.to_str().map(|s| s.to_string())
+                        } else {
+                            None
+                        },
+                    };
+                }
+
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // Windows (and any future non-macOS host): probe vocab.txt
+                    // (written last by the ONNX downloader), then additionally
+                    // confirm the large external weights file is fully present
+                    // so a cancelled mid-download never shows as "installed".
+                    let vocab_path = bundle_dir.join("vocab.txt");
+                    let vocab_bytes = vocab_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    // Require the external weights file (≥2.4 GB) to guard
+                    // against a partially-completed download.
+                    let data_ok = bundle_dir
+                        .join("encoder-model.onnx.data")
+                        .metadata()
+                        .map(|m| m.len() >= 2_400_000_000)
+                        .unwrap_or(false);
+                    let installed = vocab_bytes > 0 && data_ok;
+                    let bytes_on_disk = if installed {
+                        parakeet_v3_files()
+                            .iter()
+                            .map(|f| {
+                                bundle_dir
+                                    .join(f.relpath)
+                                    .metadata()
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            })
+                            .sum()
+                    } else {
+                        // Partial download: sum whatever is on disk already.
+                        parakeet_v3_files()
+                            .iter()
+                            .map(|f| {
+                                bundle_dir
+                                    .join(f.relpath)
+                                    .metadata()
+                                    .map(|m| m.len())
+                                    .unwrap_or(0)
+                            })
+                            .sum::<u64>()
+                            .max(vocab_bytes)
+                    };
+                    return ModelStatus {
+                        descriptor: d.clone(),
+                        installed,
+                        bytes_on_disk,
+                        path: if installed {
+                            bundle_dir.to_str().map(|s| s.to_string())
+                        } else {
+                            None
+                        },
+                    };
+                }
             }
 
             let path = model_dir(&root, d).join(d.kind.filename());
@@ -632,13 +696,25 @@ struct ParakeetFile {
     size_bytes: u64,
 }
 
+/// OS-dispatch: returns the macOS Core ML manifest or the Windows ONNX
+/// manifest depending on the compile-target.
+fn parakeet_v3_files() -> Vec<ParakeetFile> {
+    #[cfg(target_os = "macos")]
+    return parakeet_v3_files_macos();
+    #[cfg(target_os = "windows")]
+    return parakeet_v3_files_windows();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return Vec::new(); // unsupported host — downloader returns no files
+}
+
 /// File manifest for the FluidAudio Parakeet TDT 0.6B v3 Core ML bundle.
 /// Sourced from `huggingface.co/api/models/FluidInference/parakeet-tdt-0.6b-v3-coreml/tree/main`
 /// at the time this constant was hardcoded; sizes are exact from that
 /// snapshot. We pick the int8 `Encoder.mlmodelc` (the FluidAudio default
 /// — `EncoderInt4.mlmodelc` is a separately-published int4 variant we
 /// don't ship). Future repo updates will require bumping this list.
-fn parakeet_v3_files() -> Vec<ParakeetFile> {
+#[cfg(target_os = "macos")]
+fn parakeet_v3_files_macos() -> Vec<ParakeetFile> {
     // The engine code reads `parakeet_vocab.json` (not the v3-suffixed
     // alias) — the HF repo publishes both with identical content; we
     // download the name the engine expects to keep load-time probes
@@ -687,6 +763,50 @@ fn parakeet_v3_files() -> Vec<ParakeetFile> {
                 "https://huggingface.co/FluidInference/parakeet-tdt-0.6b-v3-coreml/resolve/main/parakeet_vocab.json",
             size_bytes: 151_122,
         },
+    ]
+}
+
+/// File manifest for the ONNX Parakeet TDT 0.6B v3 bundle used on Windows.
+///
+/// Files live directly under `<app_data>/models/stt/parakeet-tdt-0.6b-v3/`
+/// (no sub-directory, unlike the macOS Core ML bundle). `parakeet-rs`'s
+/// `ParakeetTDT::from_pretrained` reads `vocab.txt`, `encoder-model.onnx`,
+/// and `decoder_joint-model.onnx` from the directory root; ONNX Runtime
+/// resolves `encoder-model.onnx.data` from the `location` field in the
+/// .onnx protobuf and it must sit next to the .onnx with this exact name.
+///
+/// Sizes and SHA-256 (LFS oid) sourced from HF API on 2026-06-01:
+///   GET https://huggingface.co/api/models/istupakov/parakeet-tdt-0.6b-v3-onnx/tree/main
+///   encoder-model.onnx        41_770_866  98a74b21b4cc0017c1e7030319a4a96f4a9506e50f0708f3a516d02a77c96bb1
+///   encoder-model.onnx.data  2_435_420_160  9a22d372c51455c34f13405da2520baefb7125bd16981397561423ed32d24f36
+///   decoder_joint-model.onnx  72_520_893  e978ddf6688527182c10fde2eb4b83068421648985ef23f7a86be732be8706c1
+///   vocab.txt                     93_939  (no LFS)
+///   Total                    2_549_805_858
+///
+/// We do not ship `nemo128.onnx` (unused by parakeet-rs) or the int8
+/// variants (accuracy regression unmeasured against Vox's test set).
+#[cfg(not(target_os = "macos"))]
+fn parakeet_v3_files_windows() -> Vec<ParakeetFile> {
+    macro_rules! fw {
+        ($rel:expr, $size:expr) => {
+            ParakeetFile {
+                relpath: $rel,
+                url: concat!(
+                    "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/",
+                    $rel
+                ),
+                size_bytes: $size,
+            }
+        };
+    }
+    vec![
+        fw!("encoder-model.onnx", 41_770_866),
+        // External weights — ONNX Runtime resolves this from the protobuf
+        // `location` field; the filename must match exactly.
+        fw!("encoder-model.onnx.data", 2_435_420_160),
+        fw!("decoder_joint-model.onnx", 72_520_893),
+        // vocab.txt is probed by the engine to gate load attempts.
+        fw!("vocab.txt", 93_939),
     ]
 }
 

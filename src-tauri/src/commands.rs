@@ -1193,13 +1193,19 @@ pub struct ParakeetAvailability {
 
 #[tauri::command]
 pub async fn parakeet_availability() -> ParakeetAvailability {
-    let available = crate::engines::parakeet_bridge::is_available();
+    // macOS aarch64: delegate to the Swift bridge (which probes Core ML
+    // availability). Windows x86_64/aarch64: Parakeet is available whenever
+    // the `parakeet` feature is compiled in — DirectML ships with
+    // Windows 10 1903+ on every Vox-supported target, and the CPU EP
+    // fallback covers the rare DX12-less box.
+    let available = crate::engines::parakeet_bridge::is_available()
+        || cfg!(all(target_os = "windows", feature = "parakeet"));
     if available {
         return ParakeetAvailability { available: true, reason: None };
     }
-    let reason = if !cfg!(target_os = "macos") {
-        "macOS only"
-    } else if !cfg!(target_arch = "aarch64") {
+    let reason = if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        "macOS and Windows only"
+    } else if cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64") {
         "requires Apple Silicon"
     } else if !cfg!(feature = "parakeet") {
         "Parakeet not compiled into this build"

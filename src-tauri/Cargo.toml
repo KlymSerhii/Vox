@@ -37,11 +37,17 @@ png = "0.17"
 default = ["local-engines", "apple-fm", "parakeet"]
 local-engines = ["dep:whisper-rs"]
 apple-fm = []
-# Parakeet STT via FluidAudio's Swift package — Apple-Silicon-only.
-# build.rs gates on `target_arch = "aarch64"` so x86_64 / non-macOS
-# builds drop the Swift step and the engine module compiles out via
-# the matching `#[cfg(...)]` in `engines::parakeet_*`.
-parakeet = []
+# Parakeet STT.
+#   - macOS aarch64: FluidAudio (Swift/CoreML/ANE) via swift-parakeet.
+#     build.rs::build_parakeet_bridge gates on `target_arch == aarch64`
+#     and a working `swift` toolchain.
+#   - Windows x86_64: parakeet-rs + ort (ONNX Runtime) with DirectML EP
+#     and CPU EP fallback. ort's default `download-binaries` +
+#     `copy-dylibs` features baked into the Cargo target dir; Tauri's
+#     WiX/NSIS bundler ships them in the installer.
+#   The Rust engine module (`engines::parakeet_local`) is the same name
+#   on both hosts; the concrete impl is selected by `cfg(target_os)`.
+parakeet = ["dep:parakeet-rs"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
@@ -157,6 +163,13 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 # clean fast-follow (flip to `features = ["vulkan"]`). The Gemma
 # `llama-server` stays Vulkan because it's a downloaded binary, not linked.
 whisper-rs = { version = "0.16", optional = true }
+# Parakeet ONNX backend — Windows only. `directml` enables
+# ort::ep::DirectML; default features (`cpu`, `ort-defaults`) keep the
+# CPU EP fallback path always available. ort's `download-binaries` +
+# `copy-dylibs` (pulled via `ort-defaults`) fetch onnxruntime.dll and
+# DirectML.dll at build time and copy them next to the binary for the
+# WiX/NSIS bundler to pick up. Pinned exact: unstable rc series.
+parakeet-rs = { version = "=0.3.5", default-features = true, features = ["directml"], optional = true }
 # Win32 FFI for the synthetic Ctrl+V (auto-paste), the foreground-window
 # probe (mode suggestion), and ShellExecuteW (external links / settings
 # deep-link). Mirrors the macOS objc2/CoreGraphics FFI convention.

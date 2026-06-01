@@ -12,8 +12,8 @@ export function PrivacyTab(_props: { s: Settings }) {
     {
       title: "Transcripts stay on the device",
       detail: isMac
-        ? "Whisper and Gemma both run on Apple Silicon. No network calls in the dictation path."
-        : "Whisper and Gemma both run locally on your PC. No network calls in the dictation path.",
+        ? "Whisper, Parakeet, and Gemma all run on Apple Silicon. No network calls in the dictation path."
+        : "Whisper, Parakeet, and Gemma all run locally on your PC. No network calls in the dictation path.",
     },
     {
       title: "Nothing is written to disk",

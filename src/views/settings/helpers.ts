@@ -1,4 +1,5 @@
 import { type DiagnoseHotkeys, type HotkeyDiagnostic } from "@/lib/ipc";
+import { isMac } from "@/lib/platform";
 
 export function friendlySttEngineName(engine: string): string {
   if (engine === "parakeet-local") return "Parakeet";
@@ -32,7 +33,9 @@ export function formatBytes(b: number) {
 export function modelBlurb(id: string): string | null {
   switch (id) {
     case "parakeet-tdt-0.6b-v3":
-      return "Multilingual (25 languages). Streams transcripts straight onto the Apple Neural Engine.";
+      return isMac
+        ? "Multilingual (25 languages). Streams transcripts straight onto the Apple Neural Engine."
+        : "Multilingual (25 languages). GPU-accelerated via DirectML on your PC.";
     case "whisper-tiny-en-q5_1":
       return "Fastest. English-only. Good for short notes; misses uncommon words.";
     case "whisper-small-en-q5_1":
