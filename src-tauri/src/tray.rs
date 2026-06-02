@@ -163,21 +163,34 @@ pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         let mx = monitor.position().x as f64 / scale;
         let my = monitor.position().y as f64 / scale;
 
+        // Place the popover on the side of the tray icon that points
+        // toward screen centre: below when the icon sits in the top
+        // half of the display (macOS menu bar, or Windows with the
+        // taskbar moved to the top), above when it sits in the bottom
+        // half (Windows default). The icon position straddling the
+        // midline never happens in practice — the icon is always
+        // anchored in a system bar that hugs one edge.
         let (cx_logical, top_y) = match icon_pos {
             Some(p) => {
                 let cx = p.x / scale;
                 let cy = p.y / scale;
-                (cx, cy + 24.0)
+                let open_above = cy > my + mh / 2.0;
+                let top = if open_above {
+                    cy - POPOVER_H - 12.0
+                } else {
+                    cy + 24.0
+                };
+                (cx, top)
             }
             None => (mx + mw - 32.0, my + 8.0 + 22.0),
         };
 
-        // Clamp the popover height so it fits under the menu bar on
-        // small displays (e.g. external 13" panels): take min(POPOVER_H,
-        // available_height) where available = screen_height - menu_bar
-        // (~22 px) - 24 px breathing room. Falls back to POPOVER_H if
-        // the screen probe yielded a non-positive height.
-        let menu_bar_h = 22.0;
+        // Clamp the popover height so it fits within the work area on
+        // small displays. macOS reserves ~22 px at the top for the
+        // menu bar; Windows' system tray sits inside the taskbar at
+        // the bottom and the icon position already accounts for it,
+        // so we only need to leave breathing room.
+        let menu_bar_h: f64 = if cfg!(target_os = "macos") { 22.0 } else { 0.0 };
         let breathing_room = 24.0;
         let available_h = mh - menu_bar_h - breathing_room;
         let popover_h = if available_h > 0.0 {
@@ -189,7 +202,7 @@ pub fn show_popover<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         let x = (cx_logical - POPOVER_W / 2.0)
             .min(mx + mw - POPOVER_W - 8.0)
             .max(mx + 8.0);
-        let y = top_y.max(my + 8.0 + 22.0);
+        let y = top_y.max(my + 8.0 + menu_bar_h);
 
         let _ = win.set_size(LogicalSize::new(POPOVER_W, popover_h));
         let _ = win.set_position(LogicalPosition::new(x, y));
