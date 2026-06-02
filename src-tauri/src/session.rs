@@ -621,6 +621,18 @@ impl SessionManager {
         log::info!("▶ begin recording (sid={new_sid})");
         pill::show(app);
         pill::emit_state(app, PillState::Listening, None);
+        // Live-transcript renders the listening pill in the wide layout
+        // (header label + typing dots + companion chip) before the user
+        // even releases the hotkey. The frontend's ResizeObserver pushes
+        // the new size up via IPC, but the WebView2 → Tauri → DWM chain
+        // on Windows runs slow enough that the OS window stays at the
+        // compact 144 px frame for a visible frame or two and the pill
+        // content clips at both sides. Widen here so the OS window
+        // matches the layout the frontend already wants — idempotent
+        // on macOS where the round-trip was fast enough to win the race.
+        if prefs.live_transcript_enabled {
+            pill::set_wide(app, true);
+        }
         emit_sessions_changed(app, self);
 
         if let Some(m) = active_mode.as_ref() {
