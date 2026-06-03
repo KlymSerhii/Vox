@@ -39,14 +39,14 @@ fn emit_tray_icons() {
     // at the right edge of the ring.
     type Draw = Box<dyn Fn(i32) -> Vec<u8>>;
     let states: &[(&str, Draw)] = &[
-        ("idle", Box::new(|w| tray_glyphs::idle(w))),
+        ("idle", Box::new(tray_glyphs::idle)),
         ("recording", Box::new(|w| tray_glyphs::recording(w, 0.25))),
         // Designer dump uses the dark-mode ink (white) so the reference
         // PNG matches the most common menu-bar appearance; the runtime
         // re-derives ink from `mac_appearance::is_dark_menu_bar`.
         ("processing", Box::new(|w| tray_glyphs::processing(w, 0.0, [255, 255, 255]))),
-        ("error", Box::new(|w| tray_glyphs::error(w))),
-        ("permission", Box::new(|w| tray_glyphs::permission(w))),
+        ("error", Box::new(tray_glyphs::error)),
+        ("permission", Box::new(tray_glyphs::permission)),
     ];
 
     for (name, draw) in states {

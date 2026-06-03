@@ -1,6 +1,6 @@
 # Vox
 
-Fully on-device macOS dictation. Press a hotkey, speak, and the transcript lands on your clipboard ready for `⌘V`.
+Fully on-device dictation for **macOS and Windows**. Press a hotkey, speak, and the transcript lands on your clipboard ready to paste (`⌘V` on macOS, `Ctrl+V` on Windows).
 
 This file is the canonical project reference. The README that used to live at the project root was removed when the app pivoted to a clipboard-only, local-only build; the surviving `docs/liquid-glass-*.md` files are design notes for the existing light/dark UI tokens, not the project overview.
 
@@ -8,15 +8,34 @@ This file is the canonical project reference. The README that used to live at th
 
 ## What it is today
 
-- **macOS menu-bar app**, no Dock icon (`ActivationPolicy::Accessory`).
+- **macOS menu-bar app** (no Dock icon, `ActivationPolicy::Accessory`) and **Windows system-tray app**. Same Rust core + frontend on both; OS-specific behaviour is `cfg`-gated in Rust and branched via `src/lib/platform.ts` (`isMac` / `isWindows` / `deviceWord`) in the UI. Windows is **x86_64 only** in v1 (runs on Windows-on-ARM under x64 emulation; native ARM64 is wired but not shipped — see Platforms).
 - **Tauri 2** Rust core + **SolidJS** + **Tailwind 4** frontend.
-- **Whisper** for STT (in-process via `whisper-rs`).
+- **Two STT engines, user-pickable in onboarding and Settings → Models:**
+  - **Whisper** in-process via `whisper-rs` (cross-platform: CoreML+Metal on macOS, CPU on Windows). Always the safe fallback.
+  - **Parakeet TDT 0.6B v3** (NVIDIA, multilingual / 25 European languages) — recommended over Whisper wherever it's available. It runs in-process two different ways, selected by `cfg(target_os)` behind the **same** engine id `parakeet-local` and model id `parakeet-tdt-0.6b-v3`:
+    - **macOS (Apple Silicon):** the **FluidAudio** Swift package (Core ML + Apple Neural Engine), compiled by `build.rs::build_parakeet_bridge` from `src-tauri/swift-parakeet/` and called through `engines::parakeet_bridge` → `engines::parakeet_local`. On-disk artifact: the FluidAudio Core ML bundle.
+    - **Windows:** **ONNX Runtime via the `parakeet-rs` crate** (`ort` 2.0-rc, pinned) with the **DirectML** execution provider (GPU on any DX12 box) and an automatic **CPU-EP fallback**. On-disk artifact: the ONNX bundle from `istupakov/parakeet-tdt-0.6b-v3-onnx` (~2.5 GB). `commands::parakeet_availability` reports `available` on Windows whenever the `parakeet` feature is compiled in.
 - **Two polishing engines, user-pickable in onboarding and Settings → Models:**
   - **Apple Intelligence** via Apple's `FoundationModels` framework. Implemented as an in-process Swift FFI bridge (`swift/AppleFmBridge.swift` compiled to a static library by `build.rs::build_apple_fm_bridge`, called from `engines::apple_fm` through `engines::apple_fm_bridge`). Recommended default on Macs with macOS 26+ Apple Silicon and Apple Intelligence enabled in System Settings. No download. Apple's safety guardrails can refuse certain dictation; the engine returns a clear error and `session.rs` fail-opens to the raw Whisper transcript.
   - **Gemma 4** out-of-process via a downloaded `llama-server` binary we talk to over loopback HTTP (`engines::gemma_http`). Default fallback when Apple Intelligence is unavailable, and the only option on macOS < 26.
-- All inference is on-device: Metal / Core ML on Apple Silicon, plus the Apple Neural Engine and `modelinferenced` system daemon for Foundation Models. Models live on disk; nothing leaves the Mac.
+- All inference is on-device. macOS: Metal / Core ML on Apple Silicon, plus the Apple Neural Engine and `modelinferenced` system daemon for Foundation Models. Windows: DirectML (any DX12 GPU) or CPU for Parakeet ONNX, CPU for Whisper, and the `llama-server` subprocess for Gemma. Models live on disk; nothing leaves the device.
 - **Cloud is gone.** No Groq, no Anthropic, no API keys, no telemetry, no analytics. The only network calls remaining are model + `llama-server` downloads from Hugging Face / GitHub and the auto-updater pulling release manifests from the `KlymSerhii/vox-releases` GitHub release (minisign-pinned, see `tauri.conf.json::plugins.updater`).
-- **Output is the clipboard by default.** The transcript replaces the clipboard contents and the user pastes manually — no synthetic `Cmd+V`, no Accessibility required for the default pipeline. Users who want hands-off insertion can opt into **auto-paste** in Settings → General → Text insertion; that path synthesises `⌘V` at the HID event tap (`mac_paste::post_cmd_v`) from inside `session::SessionManager::deliver_transcript` after polish completes, and restores the user's prior clipboard text ~250 ms later. A rapid second dictation that lands inside the restore window cancels the previous restore and inherits its captured prior text, so a chain of pipelines still ends with the user's true pre-chain clipboard. Auto-paste requires Accessibility; when the toggle is on but Accessibility isn't granted, `deliver_transcript` fail-opens to the clipboard-only path and the pill toast reads "Copied — grant Accessibility for auto-paste".
+- **Output is the clipboard by default.** The transcript replaces the clipboard contents and the user pastes manually — no synthetic paste, no extra permission required for the default pipeline. Users who want hands-off insertion can opt into **auto-paste** in Settings → General → Text insertion; that path synthesises a paste keystroke from inside `session::SessionManager::deliver_transcript` after polish completes, then restores the user's prior clipboard text ~250 ms later. A rapid second dictation that lands inside the restore window cancels the previous restore and inherits its captured prior text, so a chain of pipelines still ends with the user's true pre-chain clipboard. The synth path is OS-split: **macOS** uses `mac_paste::post_cmd_v` (`⌘V` at the HID event tap via `CGEventPost`), which needs Accessibility — when the toggle is on but the grant is missing, `deliver_transcript` fail-opens to clipboard-only and the toast reads "Copied — grant Accessibility for auto-paste"; **Windows** uses `win_paste::post_ctrl_v` (`Ctrl+V` via `SendInput`), which needs **no** Accessibility-style grant (a normal-integrity process can inject into another normal-integrity foreground window; the one failure mode is a higher-integrity/elevated foreground window silently dropping the keystroke, which still fail-opens to clipboard-only).
+
+## Platforms
+
+The app targets **macOS (Apple Silicon, aarch64)** and **Windows (x86_64)** from one codebase. OS-specific Rust lives behind `#[cfg(target_os = "…")]`; OS-specific UI copy branches on `src/lib/platform.ts` (`isMac` / `isWindows`, and `deviceWord` = `"Mac"` / `"PC"` for sentences like "runs entirely on this PC"). Do not hard-code "Mac" / "Apple Silicon" in user-facing strings — use `deviceWord` / `isMac`.
+
+What differs by OS:
+
+- **Polishing.** macOS gets Apple Intelligence (default on macOS 26+) *or* Gemma; **Windows is Gemma-only** (no Apple Intelligence analogue — see Known limitations). The Gemma `llama-server` pipeline is identical on both.
+- **Parakeet STT backend.** FluidAudio (Core ML / ANE) on macOS vs ONNX Runtime + DirectML on Windows — same engine id, different `cfg`-selected impl and on-disk bundle (see "What it is today").
+- **Auto-paste.** `mac_paste` (`⌘V`, needs Accessibility) vs `win_paste` (`Ctrl+V` via `SendInput`, no grant). The `session.rs` finishing step has a three-arm `cfg` (`macos` / `windows` / other → "unsupported").
+- **Pill window chrome.** The floating pill is a transparent, decoration-less window on both, but the OS drop shadow is **disabled on Windows** (`pill.rs` passes `.shadow(!cfg!(target_os = "windows"))`) because Windows DWM draws the shadow around the rectangular HWND, ignoring the content's rounded alpha — it would paint a visible rectangle around the pill. Depth comes from the inner CSS `box-shadow` there. With live-transcript on, `session.rs` calls `pill::set_wide(true)` at recording start on Windows so the wide listening layout doesn't clip while the slower WebView2 → DWM resize round-trip catches up.
+- **Tray popover placement.** `tray.rs` opens the popover **above** the tray icon when the icon sits in the bottom half of the display (Windows default taskbar) and **below** when it's in the top half (macOS menu bar). The decision is dynamic on the icon's Y, so a relocated Windows taskbar flips it automatically. The macOS menu-bar height (~22 px) is only subtracted from the height clamp on macOS.
+- **Hotkey path.** macOS binds the default `⌘⌥.` via Carbon `RegisterEventHotKey` (no Accessibility); Windows binds through the same `tauri-plugin-global-shortcut` surface.
+
+**Windows build toolchain.** `npm run tauri build`/`dev` on Windows needs: an MSVC dev shell (`cl.exe`/`link.exe` on PATH — the x64 Native Tools / `arm64_x64` Developer prompt on Windows-on-ARM), `LIBCLANG_PATH` pointing at a 64-bit LLVM (`whisper-rs-sys` bindgen), and network egress (the `ort` crate's `download-binaries` + `copy-dylibs` features fetch a prebuilt `onnxruntime.dll` + `DirectML.dll` from `cdn.pyke.io` into the target dir at build time — those DLLs must ship next to `vox.exe`). On Windows-on-ARM the Rust toolchain is x86_64 via `rustup default stable-x86_64-pc-windows-msvc --force-non-host` so build scripts and the final binary are all x64; `CARGO_BUILD_TARGET` must stay unset.
 
 ## Defaults
 
@@ -27,7 +46,7 @@ This file is the canonical project reference. The README that used to live at th
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
 | `dictation_enabled` | `true` | Master kill-switch from the tray popover. |
-| `stt_engine` / `stt_model_id` | `whisper-local` / tier-recommended | Auto-tier via `recommend_tier`. |
+| `stt_engine` / `stt_model_id` | `whisper-local` / tier-recommended on disk; onboarding's LanguageStep flips to `parakeet-local` / `parakeet-tdt-0.6b-v3` when `parakeet_availability` reports `available` (Apple Silicon, or Windows with the `parakeet` feature) and the chosen language is one of Parakeet's 25 | Auto-tier via `recommend_tier`. `recommendedSttEngineFor(language, parakeetAvailable)` in `ipc.ts` routes unsupported languages (and any host where Parakeet is unavailable) to `whisper-local`. Engine id is OS-agnostic — the Settings doc round-trips between a Mac and a PC. |
 | `llm_engine` / `llm_model_id` | `gemma-local` / tier-recommended on disk; onboarding flips to `apple-fm` when `apple_fm_availability` reports `available` | `apple-fm` ignores the `llm_model_id` field but we still keep a tier-matched Gemma id there so a later switch in Settings doesn't have to re-pick one. |
 | `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
 | `enable_thinking` | `false` | Gemma 4 only. When on, Gemma reasons silently before producing the polished output (slower, can improve quality on complex inputs). Sent as `chat_template_kwargs: {"enable_thinking": true}` per request. Apple Intelligence has no equivalent knob and ignores the value. |
@@ -40,7 +59,7 @@ This file is the canonical project reference. The README that used to live at th
 
 ## Pipeline
 
-Hotkey down → **Listening** pill + live waveform → hotkey up → **Transcribing** (Whisper local) → optional **Polishing** (Apple Intelligence or Gemma local, with the active mode's system prompt + dictionary) → **Done** with `Copied — press ⌘V to paste.` (or `Inserted` when `auto_paste_enabled` is on and Accessibility is granted).
+Hotkey down → **Listening** pill + live waveform → hotkey up → **Transcribing** (Whisper or Parakeet, whichever is selected) → optional **Polishing** (Apple Intelligence or Gemma local, with the active mode's system prompt + dictionary) → **Done** with `Copied — press ⌘V to paste.` (`Ctrl+V` on Windows; or `Inserted` when `auto_paste_enabled` is on and — on macOS — Accessibility is granted).
 
 Errors surface in the pill: missing model, mic denied, audio device error, silence, polishing timeout. The pipeline is fail-open: any LLM error — including Apple Intelligence guardrail rejections and `LanguageModelSession.GenerationError` — logs `WARN` and the raw Whisper output is copied instead. The auto-paste step has the same fail-open semantics: if `⌘V` synthesis fails (typically missing Accessibility), the transcript is still on the clipboard, the pill toast nudges the user to grant Accessibility, and the user can paste manually.
 
@@ -97,8 +116,9 @@ Each mode contributes:
 │   │   ├── HotkeyKeys.tsx             ← renders a Tauri shortcut spec as a row of keycap badges (`⌘ Cmd + ⌥ Opt + .`)
 │   │   └── SparkleGlyph.tsx           ← 4-point sparkle SVG; shared by the tray popover's re-polish trigger and the onboarding tips step
 │   ├── lib/
-│   │   ├── ipc.ts                     ← typed bindings to Tauri commands + events
+│   │   ├── ipc.ts                     ← typed bindings to Tauri commands + events (incl. `parakeetAvailability`, `recommendedSttEngineFor`, `parakeetSupportsLanguage`)
 │   │   ├── hotkey.ts                  ← shared `formatHotkeyTokens` / `formatHotkey` for chord display
+│   │   ├── platform.ts                ← UA-sniffed `isMac` / `isWindows` / `deviceWord` for render-time OS branching
 │   │   └── theme.ts                   ← appearance bootstrap
 │   └── styles.css
 ├── src-tauri/
@@ -112,9 +132,10 @@ Each mode contributes:
 │       ├── session.rs                 ← pipeline orchestrator + cancel/timeout
 │       ├── inject.rs                  ← clipboard write + snapshot/restore primitives
 │       ├── hotkey.rs                  ← global shortcuts + chord fallback chain
-│       ├── mac_chord.rs               ← CGEventTap modifier-only chord listener
-│       ├── mac_paste.rs               ← synthetic ⌘V via CGEventPost (opt-in auto-paste)
-│       ├── mac_perm.rs                ← AVFoundation auth FFI (non-prompting)
+│       ├── mac_chord.rs               ← CGEventTap modifier-only chord listener (macOS)
+│       ├── mac_paste.rs               ← synthetic ⌘V via CGEventPost (opt-in auto-paste, macOS)
+│       ├── mac_perm.rs                ← AVFoundation auth FFI (non-prompting, macOS)
+│       ├── win_paste.rs               ← synthetic Ctrl+V via SendInput (opt-in auto-paste, Windows)
 │       ├── pill.rs                    ← pill window + state events
 │       ├── onboarding.rs              ← wizard window lifecycle
 │       ├── tray.rs, tray_icon.rs      ← menu-bar icon + popover anchor
@@ -129,20 +150,25 @@ Each mode contributes:
 │       ├── commands.rs                ← #[tauri::command] handlers
 │       └── engines/
 │           ├── mod.rs                 ← Registry + SttEngine / LlmEngine traits + STT pre-warm helper
-│           ├── whisper_local.rs       ← whisper-rs 0.16 (CoreML+Metal), in-process
+│           ├── whisper_local.rs       ← whisper-rs 0.16 (CoreML+Metal on macOS, CPU on Windows), in-process
+│           ├── parakeet_local.rs      ← Parakeet SttEngine; cfg-split router → FluidAudio (macOS) or parakeet-rs/ONNX/DirectML (Windows)
+│           ├── parakeet_bridge.rs     ← unsafe FFI to the Swift ParakeetBridge static lib (macOS aarch64 only; stubbed elsewhere)
 │           ├── gemma_http.rs          ← OpenAI chat-completions client against the loopback llama-server
 │           ├── apple_fm.rs            ← Apple Intelligence (Foundation Models) LlmEngine, macOS 26+
 │           ├── apple_fm_bridge.rs     ← unsafe FFI wrappers for the Swift static library
 │           └── none.rs                ← no-op LLM (raw transcript)
 ├── src-tauri/swift/
 │   └── AppleFmBridge.swift            ← Swift `@_cdecl` exports calling LanguageModelSession
+├── src-tauri/swift-parakeet/         ← SwiftPM package wrapping FluidAudio; built by build.rs::build_parakeet_bridge (macOS aarch64)
 └── scripts/
     ├── dev-bundle.sh                  ← build + open a debug .app for TCC sanity
     ├── dev-clean-state.sh             ← wipe ALL Vox state for a clean first run
-    └── dev-reset-permissions.sh       ← only resets TCC, keeps settings/models
+    ├── dev-reset-permissions.sh       ← only resets TCC, keeps settings/models
+    ├── release.sh                     ← macOS release: build/sign/notarize, publish darwin-aarch64 to vox-releases
+    └── release-windows.ps1            ← Windows release (PowerShell): build/sign, additively merge windows-x86_64 into the existing latest.json
 ```
 
-Files that no longer exist are documented inline: `inject.rs` (Cmd+V removal) and `engines/gemma_http.rs` (replaced the old in-process `gemma_local.rs` + `llama-cpp-2` to keep C++ asserts from killing the menu-bar app).
+Files that no longer exist are documented inline: `inject.rs` (Cmd+V removal) and `engines/gemma_http.rs` (replaced the old in-process `gemma_local.rs` + `llama-cpp-2` to keep C++ asserts from killing the menu-bar app). `build.rs` builds two Swift bridges on macOS — `build_apple_fm_bridge` (Apple Intelligence) and `build_parakeet_bridge` (FluidAudio); both early-out cleanly on non-macOS / wrong-arch / missing `swift`, leaving the engine to report unavailable at runtime.
 
 ## Development
 
@@ -153,7 +179,7 @@ npm install
 npm run tauri dev
 ```
 
-The first compile is slow because `local-engines` pulls in `whisper-rs` with its Metal backend, and the `apple-fm` feature drives `build.rs::build_apple_fm_bridge` to invoke `swiftc` on `src-tauri/swift/AppleFmBridge.swift`. Gemma polishing lives in a separate `llama-server` subprocess we download at runtime, so it doesn't participate in the Cargo build. Subsequent compiles are incremental.
+The first compile is slow because `local-engines` pulls in `whisper-rs` with its Metal backend, and the `apple-fm` + `parakeet` features drive `build.rs` to invoke `swiftc` on both `swift/AppleFmBridge.swift` and the `swift-parakeet/` package. On Windows the first compile instead builds `whisper-rs-sys` (CMake + MSVC) and resolves `parakeet-rs` + `ort` (whose build script downloads the prebuilt ONNX Runtime), and needs `LIBCLANG_PATH` set (see Platforms). Gemma polishing lives in a separate `llama-server` subprocess we download at runtime, so it doesn't participate in the Cargo build. Subsequent compiles are incremental.
 
 CI / dev machines without Xcode-bundled `swiftc` can opt out of the Swift bridge:
 
@@ -182,15 +208,15 @@ npm run tauri dev
 | `llama-server` binary tree | `~/Library/Application Support/com.vox.app/inference-server/<llama.cpp tag>/` (sentinel: `.complete`) |
 | TCC entries | macOS-managed; reset with `tccutil reset {Microphone,Accessibility} com.vox.app` |
 
-### Building a release `.app`
+On Windows the same tree lives under `%APPDATA%\com.vox.app\` (settings, `modes\`, `models\{stt,llm}\<id>\`, `inference-server\<tag>\`). The Windows Parakeet ONNX bundle lands flat in `models\stt\parakeet-tdt-0.6b-v3\` (no `…-coreml\` sub-dir — that one is FluidAudio/macOS-only). The `dev-clean-state.sh` / `dev-reset-permissions.sh` helpers are macOS bash; on Windows, clear the app-data tree by hand. No TCC on Windows — auto-paste needs no grant there.
 
-```bash
-# Local-first (the only supported build):
-npm run tauri build -- --bundles app
+### Building a release
 
-# Output:
-src-tauri/target/release/bundle/macos/Vox.app
-```
+The releases repo is `KlymSerhii/vox-releases`; the auto-updater fetches `latest.json` from its latest release (minisign-pinned in `tauri.conf.json::plugins.updater`). The `latest.json` `platforms` object carries one entry per OS — `darwin-aarch64` and/or `windows-x86_64`.
+
+**macOS** (`scripts/release.sh`, the only supported macOS path) builds/signs/notarizes the `.app` + `.dmg`, then on `--publish` **delete-and-recreates** the GitHub release with a `darwin-aarch64`-only `latest.json`. Output: `src-tauri/target/release/bundle/macos/Vox.app`. Run it from the signing Mac with the updater key at `~/.tauri/vox-updater.key` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+
+**Windows** (`scripts/release-windows.ps1`, PowerShell) builds the NSIS `-setup.exe` and its minisign `.sig`. In this Tauri version the Windows updater payload **is the `-setup.exe` itself** (passive install) — there is no `.nsis.zip`; one `.exe` is both the user download and the updater artifact. On `-Publish` it is **additive**: it `gh release upload --clobber`s the `.exe` + `.exe.sig` + a `latest.json` that it **merges** `windows-x86_64` into (preserving any `darwin-aarch64` entry), and it **never** deletes the release. Run order is **macOS first, Windows second** (the Mac script's delete-recreate would otherwise wipe the Windows assets). Needs `gh` authenticated, the same `~/.tauri/vox-updater.key` (whose pubkey is embedded in `tauri.conf.json`) + password, plus the Windows build toolchain (see Platforms).
 
 For UI-only fast iteration (no whisper / llama in the binary), opt out of the heavy engines:
 
@@ -229,7 +255,7 @@ The default `Cmd+Alt+Period` shortcut sidesteps Accessibility entirely — it go
 
 - **General** — language, hotkey behaviour (toggle vs hold), launch at login, dictation toggle, streaming pill toggle, **Text insertion** ("Paste into focused field" auto-paste toggle, with an inline Accessibility nudge that only renders when the toggle is on and the grant is missing).
 - **Hotkeys** — push-to-talk, cancel, mode-cycle. Each row shows the configured value, the runtime-bound value (which can differ if a fallback kicked in), and an inline "Test" button that reads the live binding.
-- **Models** — STT engine info + Whisper model rows; the inference-server installer card; Polishing on/off toggle + Gemma model rows. Rows show installed-on-disk size, RAM peak estimate, tier, and Use/Download/Cancel/Delete actions.
+- **Models** — STT engine card (Whisper + the Parakeet card, shown when `parakeet_availability` reports available; copy is host-conditional via `isMac` — "ANE-accelerated" on macOS, "DirectML-accelerated" on Windows) + STT model rows; a "Try Parakeet" prompt for Whisper users on a supported language; the inference-server installer card; Polishing on/off toggle + Gemma model rows. Rows show installed-on-disk size, RAM peak estimate, tier, and Use/Download/Cancel/Delete actions.
 - **Modes** — list, edit, duplicate, export/import, reset built-ins.
 - **Dictionary** — global proper-noun + acronym list merged into every mode's dictionary.
 - **Privacy** — informational; everything LOCAL.
@@ -248,7 +274,7 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - **Engine errors are fail-open.** STT errors abort the session; LLM errors log a warning and the raw transcript is copied. Both states surface a friendly pill.
 - **Mode prompts come from the active mode at session start.** Switching modes mid-pipeline does not affect the current utterance.
 - **Voice Mode IDs are validated** against `[a-z0-9-]{1,64}` with no edge dashes (`is_safe_mode_id`) to prevent path traversal in the JSON store.
-- **Engines pre-warm in the background at launch.** `lib.rs::run`'s setup hook spawns `inference_proc::prewarm_in_background` (boots `llama-server` only when `llm_engine == "gemma-local"` and the binary + Gemma model are installed — it's a no-op for `apple-fm`, which has no spawn cost to amortise; the OS's `modelinferenced` daemon handles its own warmup), `engines::prewarm_stt_in_background` (cold-loads the Whisper GGML weights), and `inject::prewarm_in_background` (a read-and-restore NSPasteboard round-trip that forces macOS's first-use source-app signature check to run during onboarding rather than on the user's first dictation, where it otherwise stalls the post-polish clipboard write for 30-60 s with a "Verifying com.vox…" system dialog; verification is cached by Gatekeeper so subsequent launches are sub-millisecond no-ops). All three are idempotent and no-op when their preconditions aren't met.
+- **Engines pre-warm in the background at launch.** `lib.rs::run`'s setup hook spawns `inference_proc::prewarm_in_background` (boots `llama-server` only when `llm_engine == "gemma-local"` and the binary + Gemma model are installed — it's a no-op for `apple-fm`, which has no spawn cost to amortise; the OS's `modelinferenced` daemon handles its own warmup), `engines::prewarm_stt_in_background` (cold-loads the selected STT engine — Whisper GGML weights, or the Parakeet model: FluidAudio on macOS / the ONNX sessions + DirectML EP on Windows), and `inject::prewarm_in_background` (a read-and-restore NSPasteboard round-trip that forces macOS's first-use source-app signature check to run during onboarding rather than on the user's first dictation, where it otherwise stalls the post-polish clipboard write for 30-60 s with a "Verifying com.vox…" system dialog; verification is cached by Gatekeeper so subsequent launches are sub-millisecond no-ops). All three are idempotent and no-op when their preconditions aren't met.
 - **`llama-server` orphans get reaped at startup.** macOS has no `prctl(PR_SET_PDEATHSIG)`, so a force-killed previous Vox parent can leave a `llama-server` child running. `inference_proc::reap_orphans_at_startup` walks the process table and SIGKILLs any whose `--api-key` argument matches the persisted `inference_api_key`. That's why the api key is persisted across launches even though it's not security-relevant.
 - **Hotkey display uses one shared formatter.** `src/lib/hotkey.ts::formatHotkeyTokens` parses a Tauri shortcut spec (`"CommandOrControl+Alt+Period"`, `"Alt+Shift+M"`, `"AltRight"`, `"F13"`, …) into an array of `{kind, symbol, label}` tokens. `<HotkeyKeys spec={…} />` in `src/components/HotkeyKeys.tsx` renders the tokens as keycap badges — each modifier shows **both** the macOS glyph and a short word (`⌘ Cmd`, `⌥ Opt`, `⇧ Shift`, `⌃ Ctrl`) so the chord stays legible to users who don't recognise the symbols. The shifted-glyph collapse for legibility (`Cmd+Shift+/` → `⌘?`, not `⌘⇧/`) lives in the same tokeniser. For plain-text contexts that can't host rich markup (the onboarding "couldn't be bound" warning, `<option>` labels in the Hotkeys picker dropdown), `formatHotkey(spec)` returns the word form joined with ` + ` (`"Cmd + Opt + ."`); the cycle-hotkey `<option>` labels also keep the symbol form in parens (`"Opt+M  (⌥M)"`). Do not roll a new symbol map at a new callsite — extend the shared tables instead.
 
@@ -256,7 +282,9 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 
 - **Apple Intelligence content guardrails.** The Foundation Models framework hard-blocks high-severity content categories (self-harm, violence, adult sexual content) on both input *and* output, and there is no developer opt-out — guardrail rejections surface as `LanguageModelSession.GenerationError`. We translate that into an `anyhow::Error` from `engines::apple_fm`, which the existing `session.rs` fail-open path turns into a "use the raw Whisper transcript" outcome. Users dictating medical / legal / profanity-heavy content who'd rather not hit this should switch to Gemma 4 in Settings → Models.
 - **Apple Intelligence requires user opt-in.** Even on a supported Mac, `SystemLanguageModel.default.availability` returns `.unavailable(.appleIntelligenceNotEnabled)` until the user toggles Apple Intelligence on in System Settings → Apple Intelligence & Siri. The onboarding card detects this and shows the reason; the Settings → Models tab has a "Re-check" button that re-probes via `commands::apple_fm_availability` so the user can flip the System Settings toggle without restarting Vox.
-- **Windows polishing is Gemma-only.** Phi Silica was evaluated as a Windows analogue of Apple Intelligence and rejected for v1: Microsoft archived `windows-app-rs` (no Rust binding path), Phi Silica is still a Limited Access Feature behind a token gate on the experimental Windows App SDK 2.0-preview1, and only ~3% of Windows boxes meet the Copilot+ PC hardware requirement. When Vox eventually ships on Windows we'll reuse the existing `llama-server` + Gemma pipeline (llama.cpp publishes Windows binaries on the same release tag).
+- **Windows polishing is Gemma-only.** There is no Apple Intelligence analogue on Windows. Phi Silica was evaluated and rejected for v1: Microsoft archived `windows-app-rs` (no Rust binding path), Phi Silica is still a Limited Access Feature behind a token gate on the experimental Windows App SDK 2.0-preview1, and only ~3% of Windows boxes meet the Copilot+ PC hardware requirement. Windows reuses the existing `llama-server` + Gemma pipeline (llama.cpp publishes Windows binaries on the same `LLAMA_CPP_TAG`); `commands::apple_fm_availability` returns `framework_missing` there and the onboarding/Settings Apple Intelligence cards stay hidden.
+- **Windows is x86_64-only in v1.** Native ARM64 Windows isn't shipped: the `ort`/`parakeet-rs` prebuilt ONNX Runtime is sourced for x64, and the toolchain story is "x64 Rust under emulation." The x64 build runs fine on Windows-on-ARM via emulation. `release-windows.ps1` and `commands::parakeet_availability` have the `aarch64-pc-windows-msvc` / `windows-aarch64` paths wired for when native ARM64 is enabled, but no ARM64 ONNX bundle or CI matrix exists yet.
+- **Parakeet on Windows: ONNX/DirectML specifics.** The Windows engine uses `parakeet-rs` (pinned `=0.3.x`) over `ort` (pinned `=2.0.0-rc`), DirectML EP with automatic CPU-EP fallback — a DX12-less box silently runs on CPU (slower, no error surfaced). The `parakeet-tdt-0.6b-v3` model descriptor in `models.rs` is `cfg`-branched (`name` / `size_bytes` per OS); the Windows bundle is the four-file ONNX set from `istupakov/parakeet-tdt-0.6b-v3-onnx` (`encoder-model.onnx` + the ~2.27 GB `encoder-model.onnx.data` external weights + `decoder_joint-model.onnx` + `vocab.txt`, ~2.5 GB total), downloaded by the existing multi-file `parakeet_v3_files_windows()` path and probed for install via `vocab.txt` + the size of the big `.data` file. Like the macOS FluidAudio path, it does **not** forward dictionary biasing — dictionary-heavy users stay on Whisper. Long-form (>~4–5 min single dictation) can truncate on TDT models; normal hotkey-bounded dictation is well under that.
 - **Gemma polish runs out-of-process.** `inference_server.rs` pins `LLAMA_CPP_TAG` (currently `b8953`) and downloads the matching official `llama-server` archive from the llama.cpp GitHub release. `inference_proc.rs` spawns it as a process-group / Job-Object child so the parent's death tears the child down too, even on SIGKILL. Bumping llama.cpp = bump `LLAMA_CPP_TAG` and (when set) `expected_sha256`; users on the old tag re-download into a different version directory and `cleanup_stale_versions` reaps the previous tree on the launch after.
 - **MatFormer Gemma 4 GGUFs from Unsloth crash llama.cpp.** Their conversion produces `GGML_OP_GATED_DELTA_NET` tensors whose names don't carry the `LLAMA_TENSOR_NAME_FGDN_AR` prefix that the FGDN auto-detect path in `llama-context.cpp::sched_reserve` expects, so a `GGML_ASSERT` fires. With the engine out-of-process the assert now exits the child cleanly and `session.rs` fail-opens to the raw transcript (instead of crashing the menu-bar app, as it did under the old in-process `llama-cpp-2`). **bartowski's MatFormer Gemma 4 GGUFs avoid this** — their conversion uses tensor names that do not trip FGDN auto-detect, so we source E2B and E4B from bartowski.
 - **LLM catalog**: `models.rs` ships three polishing options — **Gemma 4 E2B** (`gemma-4-e2b-q5_k_m`, ~3.7 GB, small — default for <12 GB RAM; bartowski Q5_K_M), **Gemma 4 E4B** (`gemma-4-e4b-q5_k_m`, ~5.4 GB, balanced — default for ≥12 GB RAM; bartowski), and **Gemma 4 26B-A4B MoE** (`gemma-4-26b-a4b-q4_k_m`, ~17 GB, quality; Unsloth UD-Q4_K_M for its imatrix calibration edge — safe under any converter because the MoE graph has zero GDN ops, dispatching through `llm_build_gemma4_iswa`'s standard `build_attn` path with `shared_kv_layers=0` and no per-layer embedding). All Gemma releases share the same `<start_of_turn>` chat template. `recommended_llm_model_id()` returns `gemma-4-e2b-q5_k_m` for the `small` tier (<12 GB RAM), `gemma-4-e4b-q5_k_m` for `balanced`, and `gemma-4-26b-a4b-q4_k_m` only when the user explicitly opts in via Settings.
@@ -268,6 +296,9 @@ Click the menu-bar icon for: dictation on/off, recent transcripts (last 5, in-me
 - New Settings field: extend the `Settings` struct + `Default` impl + `load`/`save` in `settings.rs`, and mirror the field in `src/lib/ipc.ts::Settings`. New fields rely on per-field `#[serde(default)]` to fall back when absent from an older on-disk doc.
 - New Voice Mode built-in: add a clone in `modes::builtins()` plus a brand new `*_PROMPT` constant, update tests in `modes::tests`.
 - New engine: implement `SttEngine` or `LlmEngine` in `engines/` and wire it into `engines::Registry`. The engine id is used as-is from the stored Settings doc — `Registry::stt`/`Registry::llm` return `None` for an unknown id, which `session.rs` surfaces as a clear error (STT) or fail-opens to the raw transcript (LLM).
+- OS-split behaviour for the **same** engine id (the Parakeet pattern): keep one id + one model id; select the concrete backend with `#[cfg(target_os = "…")]` inside the engine module (`parakeet_local.rs` routes to FluidAudio on macOS, `parakeet-rs`/ONNX on Windows), and `cfg`-branch the `models.rs` descriptor + a `*_files_<os>()` manifest so download URLs / sizes / on-disk layout differ per host while the Settings doc stays OS-agnostic. Mirror this rather than minting a per-OS engine id (which would force every cross-window listener to learn two ids meaning the same thing).
+- New user-facing OS-conditional copy: branch on `isMac` / `deviceWord` from `src/lib/platform.ts` — never hard-code "Mac" / "Apple Silicon" / "Apple Neural Engine". For OS-specific Rust window/HID behaviour, gate with `cfg!(target_os = "…")` (see `pill.rs` shadow, `tray.rs` popover placement, the `session.rs` paste three-arm).
+- Release plumbing: `latest.json` carries one `platforms` entry per OS. `scripts/release.sh` (macOS) is authoritative and delete-recreates the release; `scripts/release-windows.ps1` (Windows) is additive and merges `windows-x86_64` in without deleting. Adding a third platform = a new additive publisher that merges its own `platforms` key, run after the Mac. Run order is always macOS first.
 - New native FFI bridge (Swift / Objective-C / C++): mirror `swift/AppleFmBridge.swift` + `engines/apple_fm_bridge.rs` + `build.rs::build_apple_fm_bridge`. The pattern: hand-rolled `@_cdecl` exports with `strdup`'d return strings, a thread-local error slot, and a Cargo feature flag so non-macOS builds skip both the build.rs step and the engine module via `#[cfg(all(target_os = "macos", feature = "..."))]`.
 - New hotkey display surface: import `HotkeyKeys` from `src/components/HotkeyKeys.tsx` and pass the raw Tauri shortcut spec — do *not* hand-roll a `Keycap` chain or hard-code glyphs at the callsite. New modifier / key tokens (e.g. a future fn-row binding) go into the `MODIFIER_SYMBOLS` / `KEY_UNSHIFTED` / `KEY_SHIFTED` tables in `src/lib/hotkey.ts`, plus the matching `MODIFIER_LABELS` entry for the word form.
 - New cross-window broadcast: emit from `commands.rs` via `app.emit("namespace:changed", &payload)` (see `emit_modes_changed` / `settings:changed` for the pattern: re-read authoritative state, serialise the full snapshot, log on failure). Add a typed `onXxxChanged(cb)` listener in `src/lib/ipc.ts` and subscribe in every webview that displays the affected state — the Tray popover in particular is built once and reused, so it *requires* live events to stay current.

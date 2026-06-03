@@ -437,7 +437,43 @@ pub fn open_external_url<R: Runtime>(_app: AppHandle<R>, url: String) -> Result<
             .spawn()
             .map_err(|e| e.to_string())?;
     }
+    #[cfg(target_os = "windows")]
+    {
+        shell_open(&url)?;
+    }
     Ok(())
+}
+
+/// Hand the URI to the Windows shell's default handler via `ShellExecuteW`
+/// ("open" verb). Preferred over `cmd /C start` so the URI is passed as a
+/// single wide-string argument with no shell quoting/injection surface.
+/// `ShellExecuteW` returns an `HINSTANCE` whose value is `> 32` on success.
+#[cfg(target_os = "windows")]
+fn shell_open(target: &str) -> Result<(), String> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb = HSTRING::from("open");
+    let file = HSTRING::from(target);
+    // SAFETY: both HSTRINGs outlive the call; ShellExecuteW copies what it
+    // needs. A null HWND/parameters are documented and intended here.
+    let result = unsafe {
+        ShellExecuteW(
+            HWND(std::ptr::null_mut()),
+            &verb,
+            &file,
+            windows::core::PCWSTR::null(),
+            windows::core::PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW failed for '{target}' (code {})", result.0 as isize))
+    }
 }
 
 /// Full app-state wipe and quit, mirroring `scripts/dev-clean-state.sh`:
@@ -597,6 +633,12 @@ pub fn open_microphone_settings<R: Runtime>(_app: AppHandle<R>) -> Result<(), St
             .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
             .spawn()
             .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // The Settings app's microphone-privacy page. `ms-settings:` is a
+        // shell-handled URI, so the same ShellExecuteW path as external URLs.
+        shell_open("ms-settings:privacy-microphone")?;
     }
     Ok(())
 }
@@ -1151,13 +1193,19 @@ pub struct ParakeetAvailability {
 
 #[tauri::command]
 pub async fn parakeet_availability() -> ParakeetAvailability {
-    let available = crate::engines::parakeet_bridge::is_available();
+    // macOS aarch64: delegate to the Swift bridge (which probes Core ML
+    // availability). Windows x86_64/aarch64: Parakeet is available whenever
+    // the `parakeet` feature is compiled in — DirectML ships with
+    // Windows 10 1903+ on every Vox-supported target, and the CPU EP
+    // fallback covers the rare DX12-less box.
+    let available = crate::engines::parakeet_bridge::is_available()
+        || cfg!(all(target_os = "windows", feature = "parakeet"));
     if available {
         return ParakeetAvailability { available: true, reason: None };
     }
-    let reason = if !cfg!(target_os = "macos") {
-        "macOS only"
-    } else if !cfg!(target_arch = "aarch64") {
+    let reason = if !cfg!(any(target_os = "macos", target_os = "windows")) {
+        "macOS and Windows only"
+    } else if cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64") {
         "requires Apple Silicon"
     } else if !cfg!(feature = "parakeet") {
         "Parakeet not compiled into this build"

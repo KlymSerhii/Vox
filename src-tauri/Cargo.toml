@@ -37,11 +37,17 @@ png = "0.17"
 default = ["local-engines", "apple-fm", "parakeet"]
 local-engines = ["dep:whisper-rs"]
 apple-fm = []
-# Parakeet STT via FluidAudio's Swift package — Apple-Silicon-only.
-# build.rs gates on `target_arch = "aarch64"` so x86_64 / non-macOS
-# builds drop the Swift step and the engine module compiles out via
-# the matching `#[cfg(...)]` in `engines::parakeet_*`.
-parakeet = []
+# Parakeet STT.
+#   - macOS aarch64: FluidAudio (Swift/CoreML/ANE) via swift-parakeet.
+#     build.rs::build_parakeet_bridge gates on `target_arch == aarch64`
+#     and a working `swift` toolchain.
+#   - Windows x86_64: parakeet-rs + ort (ONNX Runtime) with DirectML EP
+#     and CPU EP fallback. ort's default `download-binaries` +
+#     `copy-dylibs` features baked into the Cargo target dir; Tauri's
+#     WiX/NSIS bundler ships them in the installer.
+#   The Rust engine module (`engines::parakeet_local`) is the same name
+#   on both hosts; the concrete impl is selected by `cfg(target_os)`.
+parakeet = ["dep:parakeet-rs"]
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
@@ -93,8 +99,14 @@ sha2 = "0.10"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 dirs = "5"
 num_cpus = "1"
-# Heavy native STT engine — see `local-engines` feature above.
-whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
+# Heavy native STT engine — see `local-engines` feature above. The
+# crate is declared per-target (macOS table below pins the Apple
+# CoreML+Metal backends; the Windows table takes the plain CPU backend)
+# so the Apple-only backends never reach a Windows build. Cargo does not
+# merge features across target tables for the same crate, which is
+# exactly what we want here. `local-engines = ["dep:whisper-rs"]`
+# resolves against the union of all dependency tables regardless of which
+# one declares the optional dep.
 # Out-of-process Gemma polishing dependencies.
 # `command-group` puts the child in its own process group on Unix and
 # assigns it to a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
@@ -113,6 +125,9 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 rand = "0.8"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Apple-only STT backends (Core ML + Metal). See the `whisper-rs` note in
+# `[dependencies]` for why the crate is target-split.
+whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
 objc2 = "0.6"
 block2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
@@ -140,6 +155,30 @@ objc2-foundation = { version = "0.3", default-features = false, features = [
 objc2-core-foundation = { version = "0.3", default-features = false, features = [
   "std",
   "CFCGTypes",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Plain CPU backend for v1 — no GPU feature, so the build needs neither
+# the Vulkan SDK at compile time nor a Vulkan ICD at runtime. Vulkan is a
+# clean fast-follow (flip to `features = ["vulkan"]`). The Gemma
+# `llama-server` stays Vulkan because it's a downloaded binary, not linked.
+whisper-rs = { version = "0.16", optional = true }
+# Parakeet ONNX backend — Windows only. `directml` enables
+# ort::ep::DirectML; default features (`cpu`, `ort-defaults`) keep the
+# CPU EP fallback path always available. ort's `download-binaries` +
+# `copy-dylibs` (pulled via `ort-defaults`) fetch onnxruntime.dll and
+# DirectML.dll at build time and copy them next to the binary for the
+# WiX/NSIS bundler to pick up. Pinned exact: unstable rc series.
+parakeet-rs = { version = "=0.3.5", default-features = true, features = ["directml"], optional = true }
+# Win32 FFI for the synthetic Ctrl+V (auto-paste), the foreground-window
+# probe (mode suggestion), and ShellExecuteW (external links / settings
+# deep-link). Mirrors the macOS objc2/CoreGraphics FFI convention.
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
 ] }
 
 # Unix-only: `xattr` strips `com.apple.quarantine` from the extracted

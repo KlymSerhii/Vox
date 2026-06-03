@@ -100,11 +100,14 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .minimizable(false)
         .decorations(false)
         .transparent(true)
-        // OS shadow follows the rounded alpha of the pill content — the
-        // CSS `box-shadow` was producing a rectangular halo clipped to
-        // the NSWindow bounds (same trap documented for
-        // `.liquid-glass-window`).
-        .shadow(true)
+        // OS shadow follows the rounded alpha of the pill content on
+        // macOS (the CSS `box-shadow` was producing a rectangular halo
+        // clipped to the NSWindow bounds — same trap documented for
+        // `.liquid-glass-window`). Windows DWM draws shadows around
+        // the HWND rectangle and ignores content alpha, so an OS
+        // shadow paints a visible rectangular border around the pill;
+        // we lean on the inner CSS `box-shadow` there instead.
+        .shadow(!cfg!(target_os = "windows"))
         .always_on_top(true)
         .skip_taskbar(true)
         .focused(false)

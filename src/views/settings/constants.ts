@@ -5,6 +5,7 @@ import {
   type PunctuationStyle,
 } from "@/lib/ipc";
 import { type HotkeyRowKind } from "@/lib/hotkey";
+import { deviceWord } from "@/lib/platform";
 
 export type Tab =
   | "general"
@@ -50,7 +51,7 @@ export const TABS: { id: Tab; label: string; icon: string; subtitle: string }[] 
     id: "privacy",
     label: "Privacy",
     icon: "lock",
-    subtitle: "What stays on this Mac (everything).",
+    subtitle: `What stays on this ${deviceWord} (everything).`,
   },
   {
     id: "about",

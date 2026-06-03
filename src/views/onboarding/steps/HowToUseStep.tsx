@@ -6,6 +6,7 @@ import {
   type Settings,
 } from "@/lib/ipc";
 import { HotkeyKeys } from "@/components/HotkeyKeys";
+import { isMac } from "@/lib/platform";
 import { TipRow } from "../components/TipRow";
 import { fellBackNote, pttFailed } from "../helpers";
 
@@ -60,16 +61,23 @@ export function HowToUseStep(props: { s: Settings | null }) {
           label={<>{pttVerb()} <HotkeyKeys spec={pttSpec()} /></>}
           description={
             pttFailed(ptt())
-              ? "— Vox can't listen yet, grant Accessibility to enable."
+              ? isMac
+                ? "— Vox can't listen yet, grant Accessibility to enable."
+                : "— Vox couldn't bind that shortcut. Pick another in Settings → Hotkeys."
               : pttTail()
           }
           fellBackNote={fellBackNote(ptt())}
+          // The "grant Accessibility" remedy is macOS-only — on Windows the
+          // hotkey binds via RegisterHotKey, which needs no grant; a failure
+          // there means a reserved/conflicting combo, fixed by re-picking.
           errorAction={
-            pttFailed(ptt())
+            isMac && pttFailed(ptt())
               ? () => void openAccessibilitySettings()
               : undefined
           }
-          errorActionLabel={pttFailed(ptt()) ? "Grant Accessibility" : undefined}
+          errorActionLabel={
+            isMac && pttFailed(ptt()) ? "Grant Accessibility" : undefined
+          }
         />
         <TipRow
           label={<HotkeyKeys spec={cycleSpec()} />}

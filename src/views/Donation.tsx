@@ -2,6 +2,7 @@ import { createSignal } from "solid-js";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { HeartGlyph } from "@/components/HeartGlyph";
 import { donationOptOut, openExternalUrl } from "@/lib/ipc";
+import { deviceWord } from "@/lib/platform";
 import { formatDuration } from "@/views/tray-popover/helpers";
 import { DONATE_URL } from "@/views/tray-popover/constants";
 
@@ -78,7 +79,7 @@ export default function DonationView() {
           You've saved {formatDuration(savedSecs)} of typing
         </h1>
         <p class="max-w-[300px] text-[13px] leading-relaxed text-[var(--color-ink-mute)]">
-          Vox is free and runs entirely on your Mac. If it's been useful,
+          Vox is free and runs entirely on your {deviceWord}. If it's been useful,
           you can chip in to support development.
         </p>
       </div>

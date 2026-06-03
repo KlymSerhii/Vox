@@ -174,7 +174,7 @@ fn root_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("app.vox.vox/inference-server")
+        .join("com.vox.app/inference-server")
 }
 
 fn version_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {

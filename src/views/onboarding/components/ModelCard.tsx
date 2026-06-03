@@ -1,5 +1,6 @@
 import { Show } from "solid-js";
 import { type ModelStatus } from "@/lib/ipc";
+import { deviceWord } from "@/lib/platform";
 import { RadioCard } from "./RadioCard";
 
 /// Generic model card used for both Whisper and Gemma rows. Sizing is
@@ -48,7 +49,7 @@ export function ModelCard(props: {
             </Show>
             <Show when={props.swapWarn}>
               <span class="rounded-full bg-[var(--color-danger)]/15 px-2 py-0.5 text-[10px] font-medium text-[var(--color-danger)]">
-                May swap on this Mac
+                May swap on this {deviceWord}
               </span>
             </Show>
           </>

@@ -175,6 +175,11 @@ cp "$DMG"       "$STAGE/Vox.dmg"
 
 # jq -Rs / --rawfile JSON-escapes the notes so a commit subject containing a
 # quote or backslash can't break the manifest.
+#
+# This script is macOS-only: it publishes the darwin-aarch64 platform entry.
+# Windows is published separately and additively by scripts/release-windows.ps1,
+# which merges a `windows-x86_64` entry into this same latest.json AFTER this
+# runs (it never deletes the release). Run order is macOS first, Windows second.
 SIGNATURE=$(cat "$APP_SIG")
 PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 URL="https://github.com/${RELEASES_REPO}/releases/download/v${VERSION}/Vox.app.tar.gz"

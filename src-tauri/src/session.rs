@@ -43,6 +43,23 @@ pub const MAX_CONCURRENT_SESSIONS: usize = 3;
 /// "RECENT".
 const TERMINAL_LINGER_MS: u64 = 1500;
 
+/// Done-stage hint shown when the transcript is on the clipboard and the
+/// user pastes it themselves. The paste key differs per platform — ⌘V on
+/// macOS, Ctrl+V on Windows.
+#[cfg(target_os = "macos")]
+const PASTE_HINT: &str = "Copied — press \u{2318}V";
+#[cfg(not(target_os = "macos"))]
+const PASTE_HINT: &str = "Copied — press Ctrl+V";
+
+/// Done-stage hint shown when polish succeeded but auto-paste didn't fire.
+/// On macOS that almost always means Accessibility wasn't granted; on
+/// Windows there is no such grant, so `SendInput` failing means the
+/// foreground window rejected the injection (typically an elevated app).
+#[cfg(target_os = "macos")]
+const PASTE_FAILED_HINT: &str = "Copied — grant Accessibility for auto-paste";
+#[cfg(not(target_os = "macos"))]
+const PASTE_FAILED_HINT: &str = "Copied — paste didn't go through, press Ctrl+V";
+
 /// How long an Error pill stays visible before auto-hiding. The Done
 /// path schedules its own hide from `run_pipeline`'s tail with a custom
 /// duration; Canceled is hidden ~600 ms after `cancel_session`. Error
@@ -604,6 +621,18 @@ impl SessionManager {
         log::info!("▶ begin recording (sid={new_sid})");
         pill::show(app);
         pill::emit_state(app, PillState::Listening, None);
+        // Live-transcript renders the listening pill in the wide layout
+        // (header label + typing dots + companion chip) before the user
+        // even releases the hotkey. The frontend's ResizeObserver pushes
+        // the new size up via IPC, but the WebView2 → Tauri → DWM chain
+        // on Windows runs slow enough that the OS window stays at the
+        // compact 144 px frame for a visible frame or two and the pill
+        // content clips at both sides. Widen here so the OS window
+        // matches the layout the frontend already wants — idempotent
+        // on macOS where the round-trip was fast enough to win the race.
+        if prefs.live_transcript_enabled {
+            pill::set_wide(app, true);
+        }
         emit_sessions_changed(app, self);
 
         if let Some(m) = active_mode.as_ref() {
@@ -1144,8 +1173,10 @@ impl SessionManager {
         // doesn't touch the pasteboard.
         #[cfg(target_os = "macos")]
         let paste_result = crate::mac_paste::post_cmd_v().map_err(|e| e.to_string());
-        #[cfg(not(target_os = "macos"))]
-        let paste_result: Result<(), String> = Err("auto-paste is macOS-only".into());
+        #[cfg(target_os = "windows")]
+        let paste_result = crate::win_paste::post_ctrl_v().map_err(|e| e.to_string());
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let paste_result: Result<(), String> = Err("auto-paste unsupported on this OS".into());
 
         match paste_result {
             Ok(()) => {
@@ -1743,21 +1774,14 @@ async fn run_pipeline(
             let (message, warn) = if let Some(msg) = polish_warning {
                 (msg.into(), true)
             } else if paste_failed {
-                (
-                    "Copied — grant Accessibility for auto-paste".into(),
-                    true,
-                )
+                (PASTE_FAILED_HINT.into(), true)
             } else {
                 match outcome {
                     DeliveryOutcome::Pasted => ("Inserted".into(), false),
-                    DeliveryOutcome::CopiedOnly => {
-                        ("Copied — press \u{2318}V".into(), false)
-                    }
+                    DeliveryOutcome::CopiedOnly => (PASTE_HINT.into(), false),
                     // Already handled by the `paste_failed` branch
                     // above; the arm exists for exhaustiveness.
-                    DeliveryOutcome::PasteFailedCopiedOnly => {
-                        ("Copied — press \u{2318}V".into(), true)
-                    }
+                    DeliveryOutcome::PasteFailedCopiedOnly => (PASTE_HINT.into(), true),
                 }
             };
             manager.set_stage(&app, id, Stage::Done, Some(message), warn);

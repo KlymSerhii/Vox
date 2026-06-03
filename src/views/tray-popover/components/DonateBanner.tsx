@@ -1,4 +1,5 @@
 import { HeartGlyph } from "@/components/HeartGlyph";
+import { deviceWord } from "@/lib/platform";
 
 /**
  * Milestone donation nudge, shown in place of the passive `DonateRow`
@@ -38,7 +39,7 @@ export function DonateBanner(props: {
           You've saved {props.savedLabel} of typing
         </span>
         <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-          Vox is free and runs entirely on your Mac. If it's been useful,
+          Vox is free and runs entirely on your {deviceWord}. If it's been useful,
           you can chip in to support development.
         </span>
         <div class="mt-1 flex flex-wrap items-center gap-2">

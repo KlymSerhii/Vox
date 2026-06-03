@@ -17,6 +17,7 @@ import {
   type ParakeetAvailability,
   type Settings,
 } from "@/lib/ipc";
+import { isMac } from "@/lib/platform";
 import { Card } from "../components/Card";
 import { Row } from "../components/Row";
 import { SectionHeader } from "../components/SectionHeader";
@@ -330,8 +331,10 @@ export function ModelsTab(props: {
         <div class="mb-3 flex items-start justify-between gap-3 rounded-[10px] bg-[var(--color-accent-soft)] p-3 ring-1 ring-[var(--color-accent)]/40">
           <div class="flex-1 text-[12px] text-[var(--color-ink)]">
             <span class="font-medium">Try Parakeet</span> — typically
-            5-10× faster on your language. Runs on the Apple Neural
-            Engine.
+            5-10× faster on your language.{" "}
+            {isMac
+              ? "Runs on the Apple Neural Engine."
+              : "GPU-accelerated via DirectML."}
           </div>
           <div class="flex shrink-0 items-center gap-2">
             <button
@@ -358,7 +361,9 @@ export function ModelsTab(props: {
         {(pa) => (
           <SttEngineCard
             title="Parakeet (NVIDIA)"
-            subtitle="NVIDIA Parakeet TDT 0.6B v3 — multilingual, 25 languages, ANE-accelerated."
+            subtitle={isMac
+              ? "NVIDIA Parakeet TDT 0.6B v3 — multilingual, 25 languages, ANE-accelerated."
+              : "NVIDIA Parakeet TDT 0.6B v3 — multilingual, 25 languages, DirectML-accelerated."}
             recommendation="Recommended for English and European languages."
             engineId="parakeet-local"
             isActive={props.s.stt_engine === "parakeet-local"}

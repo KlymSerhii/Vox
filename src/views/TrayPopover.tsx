@@ -60,6 +60,7 @@ import { SmallSpinner } from "./tray-popover/components/SmallSpinner";
 import { StatusDot } from "./tray-popover/components/StatusDot";
 import { UpdateBanner } from "./tray-popover/components/UpdateBanner";
 import { Toggle } from "../components/Toggle";
+import { isMac, isWindows } from "../lib/platform";
 import { DONATE_URL, PERIOD_OPTIONS } from "./tray-popover/constants";
 import {
   computeDropdownPosition,
@@ -1019,7 +1020,9 @@ export default function TrayPopoverView() {
                         Paste into focused field
                       </span>
                       <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
-                        Vox sends ⌘V for you and restores your clipboard.
+                        {isMac
+                          ? "Vox sends ⌘V for you and restores your clipboard."
+                          : "Vox sends Ctrl+V for you and restores your clipboard."}
                       </span>
                     </div>
                     <Toggle
@@ -1029,7 +1032,9 @@ export default function TrayPopoverView() {
                   </div>
                   <Show
                     when={
-                      st().auto_paste_enabled && accessibility() === false
+                      !isWindows &&
+                      st().auto_paste_enabled &&
+                      accessibility() === false
                     }
                   >
                     <div class="mt-2 flex items-center justify-between gap-3 rounded-[6px] bg-[var(--color-overlay)] px-3 py-2">
@@ -1180,7 +1185,9 @@ export default function TrayPopoverView() {
                   <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
                     {micIsCustom()
                       ? "Custom input selected."
-                      : "Follows the macOS Sound input."}
+                      : isMac
+                        ? "Follows the macOS Sound input."
+                        : "Follows the Windows sound input."}
                   </span>
                 </div>
                 <button
@@ -1420,7 +1427,11 @@ export default function TrayPopoverView() {
                             type="button"
                             class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
                             onClick={() => copyRecent(idx(), r.text)}
-                            title="Copy to clipboard (⌘V to paste)"
+                            title={
+                              isMac
+                                ? "Copy to clipboard (⌘V to paste)"
+                                : "Copy to clipboard (Ctrl+V to paste)"
+                            }
                           >
                             <Show
                               when={copyFlash() === idx()}

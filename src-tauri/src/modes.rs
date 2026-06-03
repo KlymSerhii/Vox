@@ -756,7 +756,7 @@ pub fn modes_dir<R: Runtime>(app: &AppHandle<R>) -> PathBuf {
     }
     dirs::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("app.vox.vox/modes")
+        .join("com.vox.app/modes")
 }
 
 fn mode_path(root: &Path, id: &str) -> PathBuf {

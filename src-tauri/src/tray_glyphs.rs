@@ -420,7 +420,7 @@ pub fn recording(w: i32, phase: f32) -> Vec<u8> {
 
     // Main coral dot. Keep the alpha range narrow (0.55..1.0) so it never
     // disappears — the user should always see *something* while recording.
-    let dot_a = (0.55 + 0.45 * breath) as f32;
+    let dot_a = 0.55 + 0.45 * breath;
     let dot_r = 4.0 * s;
     circle_rgba(
         &mut rgba,

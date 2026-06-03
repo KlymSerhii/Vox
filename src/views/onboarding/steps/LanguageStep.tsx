@@ -8,6 +8,7 @@ import {
   type Settings,
 } from "@/lib/ipc";
 import { LanguageCard } from "../components/LanguageCard";
+import { deviceWord } from "@/lib/platform";
 import { AUTO_VALUE, NON_PARAKEET_COMMON } from "../constants";
 
 export function LanguageStep(props: {
@@ -182,7 +183,7 @@ export function LanguageStep(props: {
 
       <Show when={!parakeetOk() && props.parakeet}>
         <p class="text-[11px] text-[var(--color-ink-faint)]">
-          Parakeet isn't available on this Mac
+          Parakeet isn't available on this {deviceWord}
           {props.parakeet!.reason ? ` (${props.parakeet!.reason})` : ""} —
           all languages will use Whisper.
         </p>

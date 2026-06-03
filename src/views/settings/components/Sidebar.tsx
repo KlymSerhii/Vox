@@ -1,5 +1,6 @@
 import { createResource, For } from "solid-js";
 import { getAppVersion } from "@/lib/ipc";
+import { deviceWord } from "@/lib/platform";
 import { VoxLogo } from "@/components/VoxLogo";
 import { TABS, type Tab } from "../constants";
 import { TabIcon } from "./TabIcon";
@@ -61,7 +62,7 @@ export function Sidebar(props: { tab: Tab; onTab: (t: Tab) => void }) {
         <span>Vox {version() ?? "—"}</span>
         <span
           class="rounded-full bg-[var(--color-success)]/15 px-1.5 py-[1px] text-[9px] font-medium uppercase tracking-[0.08em] text-[var(--color-success)]"
-          title="Audio and transcripts never leave this Mac."
+          title={`Audio and transcripts never leave this ${deviceWord}.`}
         >
           Local
         </span>

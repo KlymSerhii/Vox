@@ -28,6 +28,7 @@ import {
   type Settings,
   type TierRecommendation,
 } from "@/lib/ipc";
+import { isMac } from "@/lib/platform";
 import { DownloadBar } from "../components/DownloadBar";
 import { ModelCard } from "../components/ModelCard";
 import { PolishEngineCard } from "../components/PolishEngineCard";
@@ -433,8 +434,9 @@ export function DownloadStep(props: {
       <h2 class="text-[20px] font-semibold">Set up your dictation models.</h2>
       <Show when={!started()}>
         <p class="text-[13px] text-[var(--color-ink-mute)]">
-          Vox runs everything on this Mac. Pick a transcription model and
-          a polishing engine to clean each transcript up.
+          Vox runs everything on {isMac ? "this Mac" : "this PC"}. Pick a
+          transcription model and a polishing engine to clean each transcript
+          up.
         </p>
 
         <Show when={visibleSttModels().length > 0 && props.tier}>
@@ -454,7 +456,8 @@ export function DownloadStep(props: {
                 </span>
                 <Show when={t().physical_ram_gb > 0}>
                   <span class="text-[11px] text-[var(--color-ink-faint)]">
-                    Your Mac has {t().physical_ram_gb} GB RAM
+                    {isMac ? "Your Mac has" : "Your PC has"}{" "}
+                    {t().physical_ram_gb} GB RAM
                   </span>
                 </Show>
               </div>
@@ -497,20 +500,26 @@ export function DownloadStep(props: {
             selected={polishChoice() === "gemma-local"}
             onSelect={() => setPolishChoice("gemma-local")}
           />
-          <PolishEngineCard
-            engine="apple-fm"
-            title="Apple Intelligence"
-            subtitle="On-device. No download. Requires macOS 26 + Apple Silicon."
-            recommended={false}
-            // Surfaces the quality tradeoff so the user picks the
-            // tradeoff knowingly: Apple's Foundation Models polish
-            // faster but produce lower-quality cleanups in our tests.
-            note="Faster, but lower polishing quality."
-            disabled={!(appleFm()?.available ?? false)}
-            disabledReason={appleFm()?.message ?? null}
-            selected={polishChoice() === "apple-fm"}
-            onSelect={() => setPolishChoice("apple-fm")}
-          />
+          {/* Apple Intelligence is macOS-only (the engine compiles out on
+              Windows and `apple_fm_availability` reports framework_missing
+              there). Hide the card outright so Windows doesn't show a dead
+              "macOS 26 + Apple Silicon" option. */}
+          <Show when={isMac}>
+            <PolishEngineCard
+              engine="apple-fm"
+              title="Apple Intelligence"
+              subtitle="On-device. No download. Requires macOS 26 + Apple Silicon."
+              recommended={false}
+              // Surfaces the quality tradeoff so the user picks the
+              // tradeoff knowingly: Apple's Foundation Models polish
+              // faster but produce lower-quality cleanups in our tests.
+              note="Faster, but lower polishing quality."
+              disabled={!(appleFm()?.available ?? false)}
+              disabledReason={appleFm()?.message ?? null}
+              selected={polishChoice() === "apple-fm"}
+              onSelect={() => setPolishChoice("apple-fm")}
+            />
+          </Show>
         </div>
 
         <Show when={polishChoice() === "gemma-local" && llmModels().length > 0 && props.tier}>
