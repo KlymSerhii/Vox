@@ -166,9 +166,14 @@ if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
   throw "missing required env var: TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
 }
 
-# Fail early if we're going to publish but gh isn't authenticated.
-if ($Publish -and -not (Test-NativeSuccess { & gh auth status })) {
-  throw "-Publish requested but 'gh' is not authenticated. Run: gh auth login"
+# gh (GitHub CLI) is required for BOTH the dry-run merge preview (it reads the
+# existing latest.json off the release) and publishing. Check presence + auth
+# up front so we fail before the long build instead of deep in the run.
+if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+  throw "GitHub CLI ('gh') is not installed or not on PATH. Install it (winget install --id GitHub.cli), then open a new shell."
+}
+if (-not (Test-NativeSuccess { & gh auth status })) {
+  throw "'gh' is not authenticated. Run: gh auth login  (or set the GH_TOKEN env var to a PAT with access to $RepoReleases)."
 }
 
 $Stage = Join-Path ([System.IO.Path]::GetTempPath()) ("vox-win-release-" + [System.Guid]::NewGuid().ToString('N'))
