@@ -330,7 +330,7 @@ To deliberately cut a Windows-ONLY release (no macOS entry), re-run with
   }
 
   Write-Host ""
-  Write-Host "Published Windows artifacts for v$Version:"
+  Write-Host "Published Windows artifacts for v${Version}:"
   Write-Host "  Release:            https://github.com/$RepoReleases/releases/tag/v$Version"
   Write-Host "  Windows download:   https://github.com/$RepoReleases/releases/latest/download/Vox_${ArchToken}-setup.exe"
   Write-Host "  macOS download:     https://github.com/$RepoReleases/releases/latest/download/Vox.dmg  (untouched)"
