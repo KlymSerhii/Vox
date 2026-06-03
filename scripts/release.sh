@@ -173,62 +173,30 @@ cp "$APP_TARGZ" "$STAGE/Vox.app.tar.gz"
 cp "$APP_SIG"   "$STAGE/Vox.app.tar.gz.sig"
 cp "$DMG"       "$STAGE/Vox.dmg"
 
-# ---------------------------------------------------------------------------
-# Optional Windows artifacts. This script runs on a Mac and cannot build the
-# NSIS bundle itself (it needs a Windows runner with MSVC + CMake), so the
-# Windows updater artifact is built separately and pointed at here via env:
-#   VOX_WIN_NSIS_ZIP   path to Vox_<arch>-setup.nsis.zip (the updater payload)
-#   VOX_WIN_NSIS_SIG   path to its minisign .sig (or inline signature text)
-# When both are set, the manifest gains a `windows-x86_64` platform entry and
-# the publish step uploads the .nsis.zip. When unset, every line below is a
-# no-op and the macOS-only release path is byte-identical to before.
-# ---------------------------------------------------------------------------
-WIN_PLATFORM_JSON=""
-if [ -n "${VOX_WIN_NSIS_ZIP:-}" ] && [ -n "${VOX_WIN_NSIS_SIG:-}" ]; then
-  if [ ! -f "$VOX_WIN_NSIS_ZIP" ]; then
-    echo "✗ VOX_WIN_NSIS_ZIP set but file not found: $VOX_WIN_NSIS_ZIP" >&2
-    exit 1
-  fi
-  # The signature env var may be a path to the .sig file or the signature
-  # text itself; accept either.
-  if [ -f "$VOX_WIN_NSIS_SIG" ]; then
-    WIN_SIGNATURE=$(cat "$VOX_WIN_NSIS_SIG")
-  else
-    WIN_SIGNATURE="$VOX_WIN_NSIS_SIG"
-  fi
-  # Stage under the same version-agnostic name the URL below references.
-  cp "$VOX_WIN_NSIS_ZIP" "$STAGE/Vox_x64-setup.nsis.zip"
-  WIN_URL="https://github.com/${RELEASES_REPO}/releases/download/v${VERSION}/Vox_x64-setup.nsis.zip"
-  WIN_PLATFORM_JSON=$(jq -n \
-    --arg sig "$WIN_SIGNATURE" \
-    --arg url "$WIN_URL" \
-    '{ "windows-x86_64": { signature: $sig, url: $url } }')
-  echo "==> Including Windows artifact in latest.json: $(basename "$VOX_WIN_NSIS_ZIP")"
-fi
-
 # jq -Rs / --rawfile JSON-escapes the notes so a commit subject containing a
 # quote or backslash can't break the manifest.
+#
+# This script is macOS-only: it publishes the darwin-aarch64 platform entry.
+# Windows is published separately and additively by scripts/release-windows.ps1,
+# which merges a `windows-x86_64` entry into this same latest.json AFTER this
+# runs (it never deletes the release). Run order is macOS first, Windows second.
 SIGNATURE=$(cat "$APP_SIG")
 PUB_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 URL="https://github.com/${RELEASES_REPO}/releases/download/v${VERSION}/Vox.app.tar.gz"
 
-# The macOS platform set is always present; the optional Windows entry is
-# merged in via `* ($win // {})` so an empty `WIN_PLATFORM_JSON` is a no-op.
 jq -n \
   --arg version "$VERSION" \
   --arg pub_date "$PUB_DATE" \
   --arg sig "$SIGNATURE" \
   --arg url "$URL" \
-  --argjson win "${WIN_PLATFORM_JSON:-null}" \
   --rawfile notes "$NOTES_PLAIN" \
   '{
     version: $version,
     notes: $notes,
     pub_date: $pub_date,
-    platforms: (
-      { "darwin-aarch64": { signature: $sig, url: $url } }
-      * ($win // {})
-    )
+    platforms: {
+      "darwin-aarch64": { signature: $sig, url: $url }
+    }
   }' > "$STAGE/latest.json"
 
 # ---------------------------------------------------------------------------
@@ -270,12 +238,6 @@ fi
 # repo and uploads all four artifacts.
 # ---------------------------------------------------------------------------
 echo "==> Publishing v${VERSION} to ${RELEASES_REPO}..."
-# Upload the Windows updater payload too when it was staged above; the array
-# stays empty (and the upload list unchanged) on a Mac-only run.
-WIN_UPLOADS=()
-if [ -n "$WIN_PLATFORM_JSON" ] && [ -f "$STAGE/Vox_x64-setup.nsis.zip" ]; then
-  WIN_UPLOADS+=("$STAGE/Vox_x64-setup.nsis.zip")
-fi
 gh release delete "v${VERSION}" --repo "$RELEASES_REPO" --yes || true
 gh release create "v${VERSION}" \
   --repo "$RELEASES_REPO" \
@@ -284,8 +246,7 @@ gh release create "v${VERSION}" \
   "$STAGE/Vox.app.tar.gz" \
   "$STAGE/Vox.app.tar.gz.sig" \
   "$STAGE/Vox.dmg" \
-  "$STAGE/latest.json" \
-  "${WIN_UPLOADS[@]+"${WIN_UPLOADS[@]}"}"
+  "$STAGE/latest.json"
 
 echo
 echo "Released v${VERSION}: https://github.com/${RELEASES_REPO}/releases/tag/v${VERSION}"
