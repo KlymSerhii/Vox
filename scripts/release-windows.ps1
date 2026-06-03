@@ -154,7 +154,10 @@ if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
   if (-not (Test-Path $UpdaterKey)) {
     throw "$UpdaterKey not found and TAURI_SIGNING_PRIVATE_KEY is unset."
   }
-  $env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw $UpdaterKey
+  # .Trim() mirrors release.sh's `$(cat …)`, which strips the trailing
+  # newline. A stray newline (or a CR from a Notepad save) would otherwise
+  # reach the base64 decoder as an invalid symbol.
+  $env:TAURI_SIGNING_PRIVATE_KEY = (Get-Content -Raw $UpdaterKey).Trim()
 }
 if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
   Write-Host ""
