@@ -13,9 +13,10 @@
 
   This script runs on a Windows box and ADDS the Windows pieces onto that
   same release:
-    * Vox_x64-setup.exe          the user-facing Windows installer (download)
-    * Vox_x64-setup.nsis.zip     the Tauri auto-updater payload
-    * Vox_x64-setup.nsis.zip.sig its minisign signature
+    * Vox_x64-setup.exe          the Windows installer - serves as BOTH the
+                                 user download AND the auto-updater payload
+                                 (Tauri installs it in passive mode)
+    * Vox_x64-setup.exe.sig      its minisign signature
     * latest.json                MERGED: gains `windows-x86_64`, keeps
                                  `darwin-aarch64` byte-for-byte.
 
@@ -25,11 +26,10 @@
   a DISTINCT path (/releases/latest/download/Vox_x64-setup.exe), so the two
   platforms' download links can't collide.
 
-  Interop: the merged manifest is byte-shape-identical to what
-  release.sh produces via its optional VOX_WIN_NSIS_ZIP / VOX_WIN_NSIS_SIG
-  path — both yield { "darwin-aarch64": …, "windows-x86_64": … }. Use
-  whichever is convenient; this script additionally uploads the .exe
-  installer that release.sh's updater-only path does not.
+  This script is the authoritative Windows publisher. (release.sh carries an
+  older optional VOX_WIN_NSIS_* hand-off that assumed a separate .nsis.zip
+  updater payload; this Tauri version ships the -setup.exe as the updater
+  payload instead, so prefer this script on Windows.)
 
 .PARAMETER Publish
   Upload the staged Windows artifacts onto the existing release and
@@ -145,7 +145,7 @@ $Version = $Matches[1]
 Write-Host "==> Vox Windows release v$Version  (target=$Target, publish=$Publish)"
 
 # ---------------------------------------------------------------------------
-# Updater signing key. `tauri build` signs the .nsis.zip with this and writes
+# Updater signing key. `tauri build` signs the -setup.exe with this and writes
 # the .sig the auto-updater verifies against tauri.conf.json's embedded
 # pubkey. Mirrors release.sh: take the env var if set, else read the key file.
 # ---------------------------------------------------------------------------
@@ -177,7 +177,7 @@ New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 try {
   # -------------------------------------------------------------------------
   # Build the NSIS installer + the updater artifact. `createUpdaterArtifacts:
-  # true` in tauri.conf.json makes the .nsis.zip + .sig fall out of the NSIS
+  # true` in tauri.conf.json makes the -setup.exe.sig fall out of the NSIS
   # bundle automatically once the signing key env vars (set above) are present.
   # -------------------------------------------------------------------------
   Write-Host "==> Building Windows NSIS bundle + signed updater artifact (this takes a while)..."
@@ -186,14 +186,17 @@ try {
   }
 
   # -------------------------------------------------------------------------
-  # Locate the artifacts. Tauri names them Vox_<version>_<arch>-setup.*.
+  # Locate the artifacts. With `createUpdaterArtifacts: true` + the NSIS
+  # bundle, this Tauri version's Windows updater payload IS the -setup.exe
+  # itself (installed in passive mode), signed alongside as
+  # <name>-setup.exe.sig. There is no separate .nsis.zip - one .exe is BOTH
+  # the user-facing download AND the auto-updater payload.
   # -------------------------------------------------------------------------
   $BundleDir = "src-tauri/target/$Target/release/bundle/nsis"
   $SetupExe  = Join-Path $BundleDir "Vox_${Version}_${ArchToken}-setup.exe"
-  $NsisZip   = Join-Path $BundleDir "Vox_${Version}_${ArchToken}-setup.nsis.zip"
-  $NsisSig   = "${NsisZip}.sig"
+  $SetupSig  = "${SetupExe}.sig"
 
-  foreach ($f in @($SetupExe, $NsisZip, $NsisSig)) {
+  foreach ($f in @($SetupExe, $SetupSig)) {
     if (-not (Test-Path $f)) {
       Write-Host "Bundle dir contents:"
       Get-ChildItem $BundleDir -ErrorAction SilentlyContinue |
@@ -209,14 +212,12 @@ try {
   # Vox.app.tar.gz, so a Windows upload can never overwrite a macOS asset.
   # -------------------------------------------------------------------------
   $StagedExe = Join-Path $Stage "Vox_${ArchToken}-setup.exe"
-  $StagedZip = Join-Path $Stage "Vox_${ArchToken}-setup.nsis.zip"
-  $StagedSig = Join-Path $Stage "Vox_${ArchToken}-setup.nsis.zip.sig"
+  $StagedSig = Join-Path $Stage "Vox_${ArchToken}-setup.exe.sig"
   Copy-Item $SetupExe $StagedExe -Force
-  Copy-Item $NsisZip  $StagedZip -Force
-  Copy-Item $NsisSig  $StagedSig -Force
+  Copy-Item $SetupSig $StagedSig -Force
 
-  $Signature = (Get-Content -Raw $NsisSig).Trim()
-  $ZipUrl = "https://github.com/$RepoReleases/releases/download/v$Version/Vox_${ArchToken}-setup.nsis.zip"
+  $Signature = (Get-Content -Raw $SetupSig).Trim()
+  $ExeUrl = "https://github.com/$RepoReleases/releases/download/v$Version/Vox_${ArchToken}-setup.exe"
 
   # -------------------------------------------------------------------------
   # Fetch the EXISTING latest.json from the release and merge our platform
@@ -268,7 +269,7 @@ To deliberately cut a Windows-ONLY release (no macOS entry), re-run with
   # Add (or replace) only OUR platform key. -Force overwrites a stale Windows
   # entry from a previous run; every other key (notably darwin-aarch64) is
   # left exactly as it was.
-  $winEntry = [pscustomobject]@{ signature = $Signature; url = $ZipUrl }
+  $winEntry = [pscustomobject]@{ signature = $Signature; url = $ExeUrl }
   $manifest.platforms | Add-Member -NotePropertyName $UpdaterPlatform -NotePropertyValue $winEntry -Force
 
   # Write the merged manifest without a BOM — a UTF-8 BOM trips some strict
@@ -292,7 +293,7 @@ To deliberately cut a Windows-ONLY release (no macOS entry), re-run with
     $Out = "src-tauri/target/$Target/release/vox-win-release-v$Version"
     if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
     New-Item -ItemType Directory -Force -Path $Out | Out-Null
-    Copy-Item $StagedExe, $StagedZip, $StagedSig, $MergedLatest $Out -Force
+    Copy-Item $StagedExe, $StagedSig, $MergedLatest $Out -Force
     Write-Host ""
     Write-Host "============================================================="
     Write-Host "Dry run complete - nothing was published."
@@ -325,7 +326,6 @@ To deliberately cut a Windows-ONLY release (no macOS entry), re-run with
   Invoke-Native -What "gh release upload" -Script {
     & gh release upload "v$Version" `
       $StagedExe `
-      $StagedZip `
       $StagedSig `
       $MergedLatest `
       --repo $RepoReleases `
