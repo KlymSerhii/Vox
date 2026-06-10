@@ -147,6 +147,11 @@ pub fn set_settings(
     if stt_changed {
         crate::engines::prewarm_stt_in_background(&app);
     }
+    // Re-snapshot the wake-listener config unconditionally — it depends
+    // on several fields (toggle, phrase, dictation, STT engine/model,
+    // language, input device) and refresh is a cheap no-op when none of
+    // them moved.
+    crate::wake::refresh(&app);
 
     if let Err(e) = app.emit("settings:changed", &settings) {
         log::warn!("failed to emit settings:changed: {e}");
@@ -166,6 +171,8 @@ pub fn set_dictation_enabled(
     if enabled {
         crate::engines::prewarm_stt_in_background(&app);
     }
+    // The wake listener follows the dictation kill-switch.
+    crate::wake::refresh(&app);
     if let Err(e) = app.emit("settings:changed", &s) {
         log::warn!("failed to emit settings:changed: {e}");
     }
@@ -601,6 +608,8 @@ pub fn set_audio_input_device<R: Runtime>(
     let changed = s.audio_input_device != normalized;
     s.audio_input_device = normalized.clone();
     settings::save(&app, &s).map_err(|e| e.to_string())?;
+    // The wake listener captures from the same configured device.
+    crate::wake::refresh(&app);
     if let Err(e) = app.emit("settings:changed", &s) {
         log::warn!("failed to emit settings:changed: {e}");
     }
@@ -738,6 +747,10 @@ pub fn finish_onboarding<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     // Logged at error level so it's visible regardless of VOX_LOG/RUST_LOG.
     log::error!("onboarding: finish_onboarding IPC entered");
     settings::mark_onboarded(&app);
+    // `onboarded` gates the wake listener; re-snapshot so a user who
+    // enabled the voice trigger and then replayed onboarding gets it
+    // back without a restart.
+    crate::wake::refresh(&app);
     if let Some(win) = app.get_webview_window(onboarding::LABEL) {
         // destroy() bypasses close-event handlers; close() can silently
         // no-op in dev when the window handle is stale.

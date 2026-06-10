@@ -44,6 +44,9 @@ const KEY_TRY_PARAKEET_DISMISSED: &str = "try_parakeet_dismissed";
 
 const KEY_AUDIO_INPUT_DEVICE: &str = "audio_input_device";
 
+const KEY_WAKE_WORD_ENABLED: &str = "wake_word_enabled";
+const KEY_WAKE_PHRASE: &str = "wake_phrase";
+
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
@@ -132,6 +135,15 @@ fn default_live_transcript_enabled() -> bool {
     // changes the listening silhouette — users who explicitly want
     // a live caption flip this on.
     false
+}
+fn default_wake_word_enabled() -> bool {
+    // Opt-in. Keeping the microphone open while Vox is idle is a
+    // meaningful privacy/battery posture change, so the user has to
+    // flip it on in Settings → General themselves.
+    false
+}
+pub fn default_wake_phrase() -> String {
+    "hey vox".to_string()
 }
 fn default_auto_update_check_enabled() -> bool {
     // On by default. The PM-decided behaviour is "check once a day,
@@ -258,6 +270,20 @@ pub struct Settings {
     #[serde(default)]
     pub audio_input_device: Option<String>,
 
+    /// Start a dictation session when the user speaks the wake phrase
+    /// ("Hey Vox" by default). Keeps a low-cost microphone listener
+    /// running whenever Vox is otherwise idle — fully on-device, the
+    /// audio never leaves RAM (see `wake.rs`). Off by default.
+    #[serde(default = "default_wake_word_enabled")]
+    pub wake_word_enabled: bool,
+
+    /// The spoken phrase that triggers a session when
+    /// `wake_word_enabled` is on. Matched fuzzily against the
+    /// transcript of short utterances so near-homophones ("hey fox")
+    /// still trigger. Falls back to the default when blank.
+    #[serde(default = "default_wake_phrase")]
+    pub wake_phrase: String,
+
     /// Periodic auto-update scheduler. ON by default; turning it off
     /// disables the daily background check while keeping the manual
     /// "Check now" button in Settings → About working. Mirrored to
@@ -318,6 +344,8 @@ impl Default for Settings {
             inference_api_key: String::new(),
             try_parakeet_dismissed: false,
             audio_input_device: None,
+            wake_word_enabled: default_wake_word_enabled(),
+            wake_phrase: default_wake_phrase(),
             auto_update_check_enabled: default_auto_update_check_enabled(),
             last_update_check_at: None,
             dismissed_update_version: None,
@@ -402,6 +430,12 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .and_then(|v| v.as_str().map(|s| s.to_string()))
         .filter(|s| !s.is_empty());
 
+    let wake_word_enabled = get_bool(KEY_WAKE_WORD_ENABLED, default_wake_word_enabled());
+    let wake_phrase = get_str(KEY_WAKE_PHRASE)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(default_wake_phrase);
+
     let auto_update_check_enabled = get_bool(
         KEY_AUTO_UPDATE_CHECK_ENABLED,
         default_auto_update_check_enabled(),
@@ -451,6 +485,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         inference_api_key,
         try_parakeet_dismissed,
         audio_input_device,
+        wake_word_enabled,
+        wake_phrase,
         auto_update_check_enabled,
         last_update_check_at,
         dismissed_update_version,
@@ -518,6 +554,14 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
         _ => {
             store.set(KEY_AUDIO_INPUT_DEVICE, serde_json::Value::Null);
         }
+    }
+
+    b(KEY_WAKE_WORD_ENABLED, settings.wake_word_enabled);
+    let wake_phrase = settings.wake_phrase.trim();
+    if wake_phrase.is_empty() {
+        s(KEY_WAKE_PHRASE, &default_wake_phrase());
+    } else {
+        s(KEY_WAKE_PHRASE, wake_phrase);
     }
 
     b(KEY_AUTO_UPDATE_CHECK_ENABLED, settings.auto_update_check_enabled);
@@ -784,6 +828,30 @@ mod tests {
         let bare = "{}";
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(!restored.live_transcript_enabled);
+    }
+
+    #[test]
+    fn wake_word_defaults_off_with_default_phrase() {
+        let s = Settings::default();
+        assert!(!s.wake_word_enabled);
+        assert_eq!(s.wake_phrase, "hey vox");
+    }
+
+    #[test]
+    fn wake_word_roundtrips_through_serde() {
+        let mut s = Settings::default();
+        s.wake_word_enabled = true;
+        s.wake_phrase = "okay vox".to_string();
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.wake_word_enabled);
+        assert_eq!(restored.wake_phrase, "okay vox");
+
+        // Older on-disk docs without the fields fall back to defaults.
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert!(!restored.wake_word_enabled);
+        assert_eq!(restored.wake_phrase, default_wake_phrase());
     }
 
     #[test]
