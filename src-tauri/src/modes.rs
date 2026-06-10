@@ -319,6 +319,22 @@ pub fn builtins() -> Vec<VoiceMode> {
             created_at: now,
             updated_at: now,
         },
+        VoiceMode {
+            id: "braindump".into(),
+            name: "Braindump".into(),
+            icon: "🧠".into(),
+            description: "Reword and structure a stream of thought. Great for explaining a feature request to an AI.".into(),
+            system_prompt: BRAINDUMP_PROMPT.into(),
+            dictionary: vec![],
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: None,
+            enable_thinking: None,
+            auto_triggers: vec![],
+            built_in: true,
+            created_at: now,
+            updated_at: now,
+        },
     ]
 }
 
@@ -451,6 +467,30 @@ Examples:
 - \"um so I was thinking we should ship the new auth flow next week, maybe Tuesday or Wednesday, and uh we also need to make sure the migration script is ready, and oh also we should tell the support team in advance\" → \"Ship the new auth flow Tuesday or Wednesday next week. Prepare the migration script and notify the support team in advance.\"
 - \"today I learned about caching and I think the main thing is that we should always set a max age and also we should think about cache invalidation more carefully\" → \"Two takeaways on caching: always set a max age, and think more carefully about cache invalidation.\"
 - \"the meeting went well, we discussed the roadmap, John said he can take on the API work, and Sarah will own the design refresh, we agreed to sync again on Friday\" → \"Meeting went well. Roadmap discussed; John will take the API work and Sarah will own the design refresh. Next sync on Friday.\"";
+
+const BRAINDUMP_PROMPT: &str = "You are restructuring a stream-of-thought voice-dictation transcript — a braindump. The speaker thought out loud: ideas arrived out of order, with tangents, repetitions, and half-finished sentences. Your job is to fully understand everything they meant, then express it as a clear, well-organized piece of writing that someone (or an AI assistant) reading it cold can act on. Return plain text only — no preface, no quotes, no reasoning, no explanations.
+
+Write the output in the same language as the transcript: detect the language the speaker used and respond in that exact language. Never translate. The rules and examples below are written in English only for illustration.
+
+Rules:
+1. Cover every distinct idea, requirement, constraint, question, and concern the speaker raised. Unlike a summary, you do not condense away substance — you reorganize and reword it. Nothing meaningful gets dropped.
+2. Reword freely. Replace rambling phrasing with clear, direct sentences. Merge scattered fragments about the same topic into one place, even if the speaker returned to it several times.
+3. Reorder for logic, not chronology. Lead with the main goal or request, then supporting details, constraints, and open questions — regardless of the order things were spoken.
+4. Structure the output. Use short paragraphs for connected reasoning and bulleted lists (one item per line, prefixed with \"- \") for enumerable items like requirements or steps. When the dump spans several distinct topics, you may introduce each with a brief one-line label ending in a colon (e.g. \"Open questions:\"). Keep structure proportional — a one-topic dump needs no sections.
+5. Resolve self-corrections and drop retracted content: keep only the speaker's final position, but keep genuine uncertainty (\"maybe X, or possibly Y\") as stated alternatives or open questions.
+6. Remove filler, hesitations, and pure repetition. A point made three times appears once.
+7. Preserve the speaker's intent and point of view. A feature request stays a request; an idea stays an idea. Do not add recommendations, conclusions, or content the speaker did not express.
+8. Never invent facts, names, dates, numbers, or commitments. Every proper noun, name, identifier, and number from the transcript must appear verbatim in the output — do not \"correct\" a name to a different but similar-sounding one.
+
+Example:
+- \"okay so um I want like a dark mode for the app, oh and also it should remember the choice, like persist it, um where was I, yeah dark mode, it needs to follow the system setting by default I think, oh wait one more thing the toggle should be in settings not in the menu bar, and uh maybe we also need a high contrast option but I'm not sure yet\" →
+   \"I want a dark mode for the app.
+
+- It should follow the system setting by default.
+- The user's choice should be persisted.
+- The toggle belongs in settings, not in the menu bar.
+
+Open question: whether we also need a high-contrast option.\"";
 
 /// Process-wide cache rebuilt lazily; invalidated on every mutation.
 #[derive(Default)]
@@ -974,10 +1014,10 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_seeds_seven_builtins() {
+    fn first_launch_seeds_eight_builtins() {
         let (store, _tmp) = fresh_store();
         let modes = store.list();
-        assert_eq!(modes.len(), 7);
+        assert_eq!(modes.len(), 8);
         let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -988,7 +1028,8 @@ mod tests {
                 "chat",
                 "code-comment",
                 "notes",
-                "summary"
+                "summary",
+                "braindump"
             ]
         );
         assert!(modes.iter().all(|m| m.built_in));
@@ -1043,7 +1084,7 @@ mod tests {
         assert!(mode_path(dir.path(), "minimal").exists());
         let ids: Vec<String> = store.list().into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&"minimal".to_string()));
-        assert_eq!(ids.len(), 7);
+        assert_eq!(ids.len(), 8);
     }
 
     #[test]
