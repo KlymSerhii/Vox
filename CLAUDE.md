@@ -53,7 +53,7 @@ What differs by OS:
 | `polishing_enabled` | `true` | UI toggle. Maps to `llm_engine ∈ {gemma-local, apple-fm, none}`. Toggling off only sets `polishing_enabled = false` — `llm_engine` is preserved so a user with Apple Intelligence selected gets it back when they toggle on (lockstep behaviour lives in `session.rs` short-circuiting to the no-op engine when polishing is off). |
 | `enable_thinking` | `false` | Gemma 4 only. When on, Gemma reasons silently before producing the polished output (slower, can improve quality on complex inputs). Sent as `chat_template_kwargs: {"enable_thinking": true}` per request. Apple Intelligence has no equivalent knob and ignores the value. |
 | `language` | `auto` | Whisper language hint; `auto` lets Whisper detect. Also forwarded to the cleanup LLM: when pinned (not `auto`), `session::with_language_directive` appends an explicit "write the output in <language>" instruction to the system prompt so polish stays in the spoken language. Built-in prompts are language-agnostic regardless — they instruct the model to detect the transcript's language and never translate (the prior English-hardcoded prompts caused non-English dictation to come back in English). |
-| `active_mode_id` | `general` | One of `general`, `minimal`, `email`, `chat`, `code-comment`, `notes`, `summary`. |
+| `active_mode_id` | `general` | One of `general`, `minimal`, `email`, `chat`, `code-comment`, `notes`, `summary`, `braindump`. |
 | `auto_suggest_modes` | `true` | Pill suggests a mode based on the focused app/window. Suggestion only — never auto-switches. |
 | `appearance` | `dark` | `light` or `dark`; coerced to `dark` if unrecognised. |
 | `auto_paste_enabled` | `false` | Opt-in. When on, the pipeline synthesises `⌘V` after the clipboard write so the polished transcript lands in the focused text field; the user's prior clipboard text is restored 250 ms later. Requires Accessibility — when the toggle is on but `AXIsProcessTrusted()` is false, the paste step fails and the pipeline fail-opens to clipboard-only with a warning. Backed by `mac_paste.rs` (`CGEventCreateKeyboardEvent` + `CGEventPost(kCGHIDEventTap, …)` for both key-down and key-up of V with the Command flag set). |
@@ -67,7 +67,7 @@ Errors surface in the pill: missing model, mic denied, audio device error, silen
 
 ## Voice Modes
 
-Seven built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch:
+Eight built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch:
 
 - `general` — Balanced cleanup. Default fallback.
 - `minimal` — Preserve every word in order; only strips obvious disfluencies (um/uh, stutter repeats) and adds punctuation/capitalization. For novel drafting, journaling, and interview transcription.
@@ -76,6 +76,7 @@ Seven built-ins seeded from `src-tauri/src/modes.rs::builtins()` on first launch
 - `code-comment` — Lowercase, slash-prefixed.
 - `notes` — Sentence-case bullet style.
 - `summary` — Condenses the dictation into a short summary of key points.
+- `braindump` — Understands a stream-of-thought dump and rewrites it as clear, structured text covering everything said (reworded and reordered, nothing condensed away). For explaining a feature request to an AI, fleshing out ideas, etc.
 
 Modes are JSON files under `~/Library/Application Support/com.vox.app/modes/`. Built-ins re-seed if deleted; `reset_default_modes` also force-overwrites a built-in whose on-disk copy has drifted from the shipped definition (so a prompt change in an app update reaches existing installs), skipping files that already match so its returned count stays meaningful. Launch-time seeding (`init_with_root`) still never overwrites — only the explicit reset does. Users can clone via `duplicate_mode`, edit via `save_mode`, export/import as JSON, or auto-trigger by bundle id glob / window-title substring.
 
