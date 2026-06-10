@@ -31,6 +31,7 @@ mod tray_glyphs;
 mod tray_icon;
 mod update_window;
 mod updater;
+mod wake;
 
 use std::sync::Arc;
 
@@ -225,6 +226,10 @@ pub fn run() {
             // safe to call again later from settings/tray toggles.
             crate::inference_proc::prewarm_in_background(app_handle);
             crate::engines::prewarm_stt_in_background(app_handle);
+            // "Hey Vox" voice trigger. The thread idles (no mic open, no
+            // CPU) until the user opts in via Settings → General; refresh
+            // calls from the settings commands keep it in sync after that.
+            crate::wake::install(app_handle, manager.clone());
             // Trigger the macOS NSPasteboard / Gatekeeper first-use
             // signature check during onboarding rather than on the
             // user's first dictation, where it otherwise stalls the

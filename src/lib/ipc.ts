@@ -58,6 +58,14 @@ export interface Settings {
   /// re-resolved every recording, so swapping inputs in System
   /// Settings takes effect on the next dictation.
   audio_input_device: string | null;
+  /// Start a dictation session by speaking the wake phrase ("Hey Vox"
+  /// by default). Keeps the microphone listening while Vox is idle —
+  /// fully on-device, audio never leaves RAM. Off by default.
+  wake_word_enabled: boolean;
+  /// The spoken phrase that triggers a session when the voice trigger
+  /// is on. Matched fuzzily so near-homophones still trigger; blank
+  /// falls back to the default on the backend.
+  wake_phrase: string;
   /// Periodic auto-update check. On by default. When off, the
   /// background scheduler in `updater.rs` is a no-op but the manual
   /// "Check now" button in Settings → About still works.

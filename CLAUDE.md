@@ -45,6 +45,8 @@ What differs by OS:
 | `cancel_hotkey` | `Escape` | Aborts the in-flight session. The OS grab is acquired only while a session is active (`hotkey::arm_cancel` at `session::begin_recording`, `hotkey::disarm_cancel` from `PipelineGuard::drop`) so Escape works normally in every other app when Vox isn't dictating. |
 | `mode_cycle_hotkey` | `Alt+M` | Advances through Voice Modes. |
 | `hands_free_enabled` | `true` | Press once to start, again to stop. |
+| `wake_word_enabled` | `false` | Opt-in "Hey Vox" voice trigger (Settings → General → "Start dictation by voice"). `wake.rs` keeps a low-cost mic capture + energy VAD running on a dedicated thread while Vox is idle, transcribes each short utterance with the user's selected STT engine (the same cached `Registry` instance the pipeline uses — no extra model RAM), and fuzzy-matches the phrase. On a match it releases its stream, starts a normal session via `SessionManager::begin`, and auto-stops the recording after ~1.5 s of trailing silence so the whole flow is hands-free. The listener suspends (mic fully released) whenever a session is recording or a pipeline is in flight, when dictation/the toggle is off, or when mic permission is missing — it never triggers the TCC prompt itself. Capture buffer is RAM-only, capped at a few seconds, never persisted. |
+| `wake_phrase` | `"hey vox"` | The spoken trigger phrase. Matched fuzzily (per-token Levenshtein + a joined fallback) so STT near-homophones like "hey fox" / "heyvox" still trigger; blank falls back to the default. `wake::refresh` re-snapshots the listener's config after `set_settings`, `set_dictation_enabled`, `set_audio_input_device`, and `finish_onboarding`. |
 | `dictation_enabled` | `true` | Master kill-switch from the tray popover. |
 | `stt_engine` / `stt_model_id` | `whisper-local` / tier-recommended on disk; onboarding's LanguageStep flips to `parakeet-local` / `parakeet-tdt-0.6b-v3` when `parakeet_availability` reports `available` (Apple Silicon, or Windows with the `parakeet` feature) and the chosen language is one of Parakeet's 25 | Auto-tier via `recommend_tier`. `recommendedSttEngineFor(language, parakeetAvailable)` in `ipc.ts` routes unsupported languages (and any host where Parakeet is unavailable) to `whisper-local`. Engine id is OS-agnostic — the Settings doc round-trips between a Mac and a PC. |
 | `llm_engine` / `llm_model_id` | `gemma-local` / tier-recommended on disk; onboarding flips to `apple-fm` when `apple_fm_availability` reports `available` | `apple-fm` ignores the `llm_model_id` field but we still keep a tier-matched Gemma id there so a later switch in Settings doesn't have to re-pick one. |
@@ -132,6 +134,7 @@ Each mode contributes:
 │       ├── session.rs                 ← pipeline orchestrator + cancel/timeout
 │       ├── inject.rs                  ← clipboard write + snapshot/restore primitives
 │       ├── hotkey.rs                  ← global shortcuts + chord fallback chain
+│       ├── wake.rs                    ← opt-in "Hey Vox" wake-phrase listener (VAD + STT fuzzy match)
 │       ├── mac_chord.rs               ← CGEventTap modifier-only chord listener (macOS)
 │       ├── mac_paste.rs               ← synthetic ⌘V via CGEventPost (opt-in auto-paste, macOS)
 │       ├── mac_perm.rs                ← AVFoundation auth FFI (non-prompting, macOS)
@@ -253,7 +256,7 @@ The default `Cmd+Alt+Period` shortcut sidesteps Accessibility entirely — it go
 
 ## Settings tabs
 
-- **General** — language, hotkey behaviour (toggle vs hold), launch at login, dictation toggle, streaming pill toggle, **Text insertion** ("Paste into focused field" auto-paste toggle, with an inline Accessibility nudge that only renders when the toggle is on and the grant is missing).
+- **General** — language, hotkey behaviour (toggle vs hold), the "Start dictation by voice" wake-phrase toggle + trigger-phrase field (renders only while the toggle is on), launch at login, dictation toggle, streaming pill toggle, **Text insertion** ("Paste into focused field" auto-paste toggle, with an inline Accessibility nudge that only renders when the toggle is on and the grant is missing).
 - **Hotkeys** — push-to-talk, cancel, mode-cycle. Each row shows the configured value, the runtime-bound value (which can differ if a fallback kicked in), and an inline "Test" button that reads the live binding.
 - **Models** — STT engine card (Whisper + the Parakeet card, shown when `parakeet_availability` reports available; copy is host-conditional via `isMac` — "ANE-accelerated" on macOS, "DirectML-accelerated" on Windows) + STT model rows; a "Try Parakeet" prompt for Whisper users on a supported language; the inference-server installer card; Polishing on/off toggle + Gemma model rows. Rows show installed-on-disk size, RAM peak estimate, tier, and Use/Download/Cancel/Delete actions.
 - **Modes** — list, edit, duplicate, export/import, reset built-ins.

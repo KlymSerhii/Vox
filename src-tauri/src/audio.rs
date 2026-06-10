@@ -13,7 +13,7 @@ use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
 use parking_lot::Mutex;
 use serde::Serialize;
 
-const TARGET_SR: u32 = 16_000;
+pub(crate) const TARGET_SR: u32 = 16_000;
 
 /// Hard RAM cap, a few seconds above the session-layer recording cap. If
 /// that guard fails to fire, this drops the *oldest* samples so the latest
@@ -53,7 +53,7 @@ const CONTINUITY_WAKE_HOLD_MS: u64 = 300;
 ///
 /// Errors are swallowed: there is no recovery, and the caller is about
 /// to drop the stream anyway.
-fn release_stream(stream: cpal::Stream) {
+pub(crate) fn release_stream(stream: cpal::Stream) {
     if let Err(e) = stream.pause() {
         log::warn!("audio: cpal pause before drop failed: {e}");
     }
@@ -234,7 +234,7 @@ pub fn probe_device(device_name: Option<&str>) -> Result<(), AudioError> {
     Ok(())
 }
 
-fn resolve_input_device(
+pub(crate) fn resolve_input_device(
     host: &cpal::Host,
     device_name: Option<&str>,
 ) -> Result<cpal::Device, AudioError> {
@@ -656,8 +656,14 @@ fn postprocess_to_wav(
 /// Same downmix + linear-resample pipeline as [`postprocess_to_wav`] but
 /// returns the raw 16 kHz mono PCM `Vec<f32>` straight to the caller —
 /// used by the speculative streaming decoder so we don't pay for a WAV
-/// roundtrip on every snapshot.
-fn postprocess_to_pcm_mono_16k(raw: &[f32], input_sr: u32, input_channels: u16) -> Vec<f32> {
+/// roundtrip on every snapshot. `pub(crate)` because the wake-word
+/// listener (`wake.rs`) feeds its own capture buffer through the same
+/// downmix/resample contract before handing audio to the STT engine.
+pub(crate) fn postprocess_to_pcm_mono_16k(
+    raw: &[f32],
+    input_sr: u32,
+    input_channels: u16,
+) -> Vec<f32> {
     let mono = if input_channels <= 1 {
         raw.to_vec()
     } else {
@@ -727,7 +733,7 @@ fn update_rms<I: IntoIterator<Item = f32>>(target: &Arc<AtomicU32>, samples: I) 
     target.store(((prev + scaled) * 0.5).to_bits(), Ordering::Relaxed);
 }
 
-fn encode_wav_pcm16(samples: &[f32], sr: u32) -> Result<Vec<u8>, AudioError> {
+pub(crate) fn encode_wav_pcm16(samples: &[f32], sr: u32) -> Result<Vec<u8>, AudioError> {
     let spec = WavSpec {
         channels: 1,
         sample_rate: sr,

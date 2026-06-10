@@ -14,7 +14,7 @@ import { Row } from "../components/Row";
 import { SectionHeader } from "../components/SectionHeader";
 import { SegmentedControl } from "../components/SegmentedControl";
 import { Toggle } from "@/components/Toggle";
-import { isMac, isWindows } from "@/lib/platform";
+import { deviceWord, isMac, isWindows } from "@/lib/platform";
 import { LANGUAGE_OPTIONS } from "../constants";
 import { friendlySttEngineName } from "../helpers";
 
@@ -93,7 +93,6 @@ export function GeneralTab(props: {
         <Row
           label="When you press the hotkey"
           hint="Hands-free toggles on a press; push-to-talk records while you hold."
-          last
         >
           <SegmentedControl<"toggle" | "ptt">
             ariaLabel="Hotkey behavior"
@@ -107,6 +106,37 @@ export function GeneralTab(props: {
             }
           />
         </Row>
+        <Row
+          label="Start dictation by voice"
+          hint={`Say the trigger phrase to start dictating, no hotkey needed. Vox keeps listening for it while idle; recording stops on its own when you pause. Audio stays in memory on this ${deviceWord} and is never saved.`}
+          last={!props.s.wake_word_enabled}
+        >
+          <Toggle
+            checked={props.s.wake_word_enabled}
+            onChange={(v) => props.update({ wake_word_enabled: v })}
+          />
+        </Row>
+        <Show when={props.s.wake_word_enabled}>
+          <Row
+            label="Trigger phrase"
+            hint='Two short words work best, like "Hey Vox". Close-sounding speech also triggers.'
+            last
+          >
+            <input
+              type="text"
+              class="w-[160px] rounded-[8px] bg-[var(--color-input-bg)] px-2 py-1 text-[12px] ring-1 ring-[var(--color-border-strong)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+              value={props.s.wake_phrase}
+              placeholder="hey vox"
+              spellcheck={false}
+              onChange={(e) => {
+                const phrase = e.currentTarget.value.trim();
+                // Blank reverts to the default rather than saving an
+                // unmatchable empty phrase (the backend does the same).
+                props.update({ wake_phrase: phrase || "hey vox" });
+              }}
+            />
+          </Row>
+        </Show>
       </Card>
 
       <SectionHeader title="Voice" />
