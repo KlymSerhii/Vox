@@ -13,7 +13,9 @@ import {
   isTap2Spec,
 } from "@/lib/hotkey";
 import { Card } from "../components/Card";
+import { Row } from "../components/Row";
 import { SectionHeader } from "../components/SectionHeader";
+import { Toggle } from "@/components/Toggle";
 import {
   DEFAULT_CANCEL_HOTKEY,
   DEFAULT_MODE_CYCLE_HOTKEY,
@@ -273,6 +275,17 @@ export function HotkeysTab(props: {
           onChangeOther={(k) => setAutoCapture(k)}
           onCapturingAxSpecChange={(a) => setRowAx("cancel", a)}
         />
+        <Row
+          label="Require a double-press to cancel"
+          hint="Press the cancel shortcut twice quickly to stop a recording — so a stray Escape (e.g. dismissing a screenshot) doesn't cancel mid-dictation."
+        >
+          <Toggle
+            checked={props.s.cancel_requires_double_press}
+            onChange={(v) =>
+              props.update({ cancel_requires_double_press: v })
+            }
+          />
+        </Row>
         <HotkeyRow
           kind="cycle"
           label="Cycle voice mode"

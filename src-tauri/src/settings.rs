@@ -10,6 +10,7 @@ pub const STORE_FILE: &str = "vox-settings.json";
 
 const KEY_HOTKEY: &str = "hotkey";
 const KEY_CANCEL_HOTKEY: &str = "cancel_hotkey";
+const KEY_CANCEL_REQUIRES_DOUBLE_PRESS: &str = "cancel_requires_double_press";
 const KEY_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const KEY_ONBOARDED: &str = "onboarded";
 const KEY_DICTATION_ENABLED: &str = "dictation_enabled";
@@ -160,6 +161,15 @@ pub struct Settings {
     pub hotkey: String,
     #[serde(default = "default_cancel_hotkey")]
     pub cancel_hotkey: String,
+    /// Require pressing the cancel hotkey (default Escape) twice in
+    /// quick succession to abort a *live recording*, instead of
+    /// cancelling on the first press. Opt-in — off by default keeps the
+    /// single-press behaviour. Guards against a stray Escape (e.g.
+    /// dismissing a screenshot while dictating) tearing down the
+    /// session. Only the recording phase is gated; once the pipeline is
+    /// transcribing / polishing a single press still aborts.
+    #[serde(default)]
+    pub cancel_requires_double_press: bool,
 
     #[serde(default)]
     pub launch_at_login: bool,
@@ -328,6 +338,7 @@ impl Default for Settings {
         Self {
             hotkey: default_hotkey(),
             cancel_hotkey: default_cancel_hotkey(),
+            cancel_requires_double_press: false,
             launch_at_login: false,
             dictation_enabled: true,
             hands_free_enabled: true,
@@ -379,6 +390,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     let hotkey = get_str(KEY_HOTKEY).unwrap_or_else(default_hotkey);
 
     let cancel_hotkey = get_str(KEY_CANCEL_HOTKEY).unwrap_or_else(default_cancel_hotkey);
+    let cancel_requires_double_press =
+        get_bool(KEY_CANCEL_REQUIRES_DOUBLE_PRESS, false);
     let language = get_str(KEY_LANGUAGE).unwrap_or_else(default_language);
 
     let launch_at_login = get_bool(KEY_LAUNCH_AT_LOGIN, false);
@@ -472,6 +485,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
     Settings {
         hotkey,
         cancel_hotkey,
+        cancel_requires_double_press,
         launch_at_login,
         dictation_enabled,
         hands_free_enabled,
@@ -516,6 +530,10 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
 
     s(KEY_HOTKEY, &settings.hotkey);
     s(KEY_CANCEL_HOTKEY, &settings.cancel_hotkey);
+    b(
+        KEY_CANCEL_REQUIRES_DOUBLE_PRESS,
+        settings.cancel_requires_double_press,
+    );
     s(KEY_LANGUAGE, &settings.language);
     b(KEY_HANDS_FREE, settings.hands_free_enabled);
     b(KEY_LAUNCH_AT_LOGIN, settings.launch_at_login);
@@ -734,6 +752,11 @@ pub struct Prefs {
     /// system default; `Some(name)` is matched against
     /// `cpal::Host::input_devices()` at `audio::begin_capture` time.
     pub audio_input_device: Option<String>,
+
+    /// Mirror of `Settings::cancel_requires_double_press`. Read fresh on
+    /// each cancel-hotkey press so toggling it takes effect immediately,
+    /// even mid-session.
+    pub cancel_requires_double_press: bool,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
@@ -756,6 +779,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         live_transcript_enabled: s.live_transcript_enabled,
         enable_thinking: s.enable_thinking,
         audio_input_device: s.audio_input_device,
+        cancel_requires_double_press: s.cancel_requires_double_press,
     }
 }
 
@@ -870,6 +894,23 @@ mod tests {
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(!restored.wake_word_enabled);
         assert_eq!(restored.wake_phrase, default_wake_phrase());
+    }
+
+    #[test]
+    fn cancel_double_press_defaults_off_and_roundtrips() {
+        let s = Settings::default();
+        assert!(!s.cancel_requires_double_press);
+
+        let mut s = Settings::default();
+        s.cancel_requires_double_press = true;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.cancel_requires_double_press);
+
+        // Older on-disk docs without the field fall back to off.
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert!(!restored.cancel_requires_double_press);
     }
 
     #[test]

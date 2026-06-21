@@ -22,9 +22,11 @@ import {
   WINDOW_PADDING_W,
 } from "./pill/constants";
 import { clamp } from "./pill/helpers";
+import { formatHotkey } from "@/lib/hotkey";
 import {
   type ActiveModePayload,
   type AudioLevelPayload,
+  type CancelHintPayload,
   type PillState,
   type PillStatePayload,
   type StreamPayload,
@@ -54,6 +56,23 @@ export default function PillView() {
   const [levels, setLevels] = createSignal<number[]>(new Array(BARS).fill(0));
   const [backgroundCount, setBackgroundCount] = createSignal(0);
   const [toastMessage, setToastMessage] = createSignal<string | null>(null);
+  // Opt-in double-press cancel: true while the first-press hint is
+  // showing inside the listening pill. Cleared on its own timer
+  // (matching the backend confirmation window) and whenever the stage
+  // leaves listening. Does NOT change `state()` — it only overlays the
+  // waveform with the "press again" hint.
+  const [cancelHint, setCancelHint] = createSignal(false);
+  // The bound cancel key, formatted for display ("Escape", "F13", …).
+  // Falls back to a generic phrase if the spec can't be formatted.
+  const [cancelHintKey, setCancelHintKey] = createSignal("the cancel key");
+  let cancelHintTimer: number | null = null;
+  const clearCancelHint = () => {
+    if (cancelHintTimer !== null) {
+      clearTimeout(cancelHintTimer);
+      cancelHintTimer = null;
+    }
+    setCancelHint(false);
+  };
   // Tracks whether a recording session is currently in-flight.
   // Used by the mode-cycle handler to choose chip vs full-takeover HUD.
   // Starts false so a cold-start mode-cycle press correctly shows the HUD.
@@ -196,6 +215,12 @@ export default function PillView() {
         if (e.payload.state === "listening") {
           setSessionActive(true);
         }
+        // The double-press hint only belongs to the live listening
+        // stage; any other stage (transcribing / done / canceled / …)
+        // tears it down so it can't bleed past the recording phase.
+        if (e.payload.state !== "listening") {
+          clearCancelHint();
+        }
         const prevState = state();
         setState(e.payload.state);
         setMessage(e.payload.message ?? null);
@@ -247,6 +272,8 @@ export default function PillView() {
         setLevels(new Array(BARS).fill(0));
         setWarning(false);
         clearStreaming();
+        // New session boundary — drop any stale double-press hint.
+        clearCancelHint();
       }),
     );
     unlisten.push(
@@ -259,6 +286,23 @@ export default function PillView() {
         toastTimer = window.setTimeout(() => {
           setToastMessage(null);
           toastTimer = null;
+        }, e.payload.ms);
+      }),
+    );
+    unlisten.push(
+      await listen<CancelHintPayload>("pill:cancel_hint", (e) => {
+        // Show the "press <key> again to cancel" overlay for the
+        // confirmation window. A second cancel press within the window
+        // fires the backend cancel, which arrives as a `pill:state` →
+        // "canceled" and clears this via the non-listening branch below.
+        setCancelHintKey(formatHotkey(e.payload.key) || "the cancel key");
+        setCancelHint(true);
+        if (cancelHintTimer !== null) {
+          clearTimeout(cancelHintTimer);
+        }
+        cancelHintTimer = window.setTimeout(() => {
+          setCancelHint(false);
+          cancelHintTimer = null;
         }, e.payload.ms);
       }),
     );
@@ -284,6 +328,9 @@ export default function PillView() {
     setSessionActive(false);
     if (toastTimer !== null) {
       clearTimeout(toastTimer);
+    }
+    if (cancelHintTimer !== null) {
+      clearTimeout(cancelHintTimer);
     }
     if (pillTransitionTimer !== null) {
       clearTimeout(pillTransitionTimer);
@@ -395,12 +442,20 @@ export default function PillView() {
     state() === "canceled" ||
     isSaturated();
 
+  // The double-press cancel hint overlays the compact listening pill
+  // with a short message ("Press Esc again to cancel"). It borrows the
+  // terminal-label growth path — fit-content width in ROW layout — so
+  // the message isn't clipped by the 116 px compact silhouette, then
+  // snaps back to the waveform when the hint clears.
+  const isHintGrow = () => cancelHint() && state() === "listening";
+
   // Width + window-resize predicate. Streaming OR a terminal label both
   // size the pill to content (fit-content + ResizeObserver, floored at
   // W_MIN, capped at W_MAX). Only the streaming column layout adds the
   // overflow clip + sticky header/body — those stay on
   // STREAM_GROW_ENABLED below.
-  const GROW_ENABLED = () => STREAM_GROW_ENABLED() || isTerminalGrow();
+  const GROW_ENABLED = () =>
+    STREAM_GROW_ENABLED() || isTerminalGrow() || isHintGrow();
 
   // Auto-scroll the streaming body to bottom when new text arrives so
   // the newest tokens are always visible. Also tracks whether the body
@@ -634,6 +689,9 @@ export default function PillView() {
             {(() => {
               const hud = modeHud();
               if (hud) return `Mode: ${hud.name}`;
+              if (cancelHint() && state() === "listening") {
+                return `Press ${cancelHintKey()} again to cancel`;
+              }
               const st = effectiveState();
               if (st === "listening") {
                 return isLiveListening()
@@ -652,10 +710,28 @@ export default function PillView() {
           <Show when={modeHud()}>
             <ModeHudView mode={modeHud()!} />
           </Show>
+          {/* Opt-in double-press cancel hint — overlays the listening
+            pill on the first (arming) press so the user knows a second
+            press stops dictation. Muted TerminalLine treatment; the
+            isHintGrow path widens the pill to fit the message. */}
+          <Show when={cancelHint() && state() === "listening" && !modeHud()}>
+            <TerminalLine
+              tone="muted"
+              label={`Press ${cancelHintKey()} again to cancel`}
+            />
+          </Show>
           {/* Waveform is the default listening silhouette. Suppressed
             when the live-transcript opt-in is on — that path renders
-            the wide layout below with the caption body instead. */}
-          <Show when={state() === "listening" && !modeHud() && !isLiveListening()}>
+            the wide layout below with the caption body instead — and
+            while the cancel hint is overlaying the pill. */}
+          <Show
+            when={
+              state() === "listening" &&
+              !modeHud() &&
+              !isLiveListening() &&
+              !cancelHint()
+            }
+          >
             <Waveform levels={levels()} color={meterColor()} />
           </Show>
 
@@ -664,7 +740,13 @@ export default function PillView() {
             listening when the user opted into live transcript so the
             speculative caption renders in the same slot the post-stop
             reveal will inherit (no layout reflow on hotkey release). */}
-          <Show when={(isProcessing() || isLiveListening()) && !modeHud()}>
+          <Show
+            when={
+              (isProcessing() || isLiveListening()) &&
+              !modeHud() &&
+              !cancelHint()
+            }
+          >
             {/* Sticky header — always visible for the entire stage. */}
             <div class="processing-header" style={{ "padding-bottom": "2px" }}>
               <Show when={effectiveState() === "polishing"}>

@@ -38,6 +38,16 @@ const SILENCE_PEAK_THRESHOLD: f32 = 0.003;
 /// amber toast when a 4th attempt is made and refuses to start it.
 pub const MAX_CONCURRENT_SESSIONS: usize = 3;
 
+/// Max gap between the two cancel-hotkey presses for the opt-in
+/// double-press cancel (`Settings::cancel_requires_double_press`). A
+/// second press within this window confirms the cancel; a lone press
+/// just arms the window and surfaces a pill hint. Tuned as a deliberate
+/// "double tap" — long enough to read the hint and tap again, short
+/// enough that two unrelated Escape presses rarely both land inside it.
+pub const CANCEL_DOUBLE_PRESS_WINDOW_MS: u32 = 700;
+const CANCEL_DOUBLE_PRESS_WINDOW: Duration =
+    Duration::from_millis(CANCEL_DOUBLE_PRESS_WINDOW_MS as u64);
+
 /// How long a finalised session sticks around in the manager's map so
 /// the popover briefly shows its terminal stage before it folds into
 /// "RECENT".
@@ -77,6 +87,25 @@ const SATURATED_TOAST_MS: u32 = 1500;
 /// shorter than the saturation toast — the user is mid-keystroke and we
 /// just want a brief acknowledgement that the press was seen but ignored.
 const BUSY_TOAST_MS: u32 = 1500;
+
+/// Pure decision for the opt-in double-press cancel. Given the stored
+/// timestamp of a prior unconfirmed cancel press (if any), the current
+/// instant, and the confirmation window, returns `(next_stored, fire)`:
+/// `fire` is true when this press confirms the cancel; `next_stored` is
+/// what to write back (`None` once it fires or hasn't armed, `Some(now)`
+/// while a fresh window is open). A second press *after* the window
+/// lapses simply re-arms rather than firing. Split out as a pure fn so
+/// the timing logic is unit-testable without real clocks.
+fn double_press_decision(
+    prev: Option<Instant>,
+    now: Instant,
+    window: Duration,
+) -> (Option<Instant>, bool) {
+    match prev {
+        Some(first) if now.duration_since(first) <= window => (None, true),
+        _ => (Some(now), false),
+    }
+}
 
 pub type SessionId = u64;
 
@@ -417,6 +446,12 @@ pub struct SessionManager {
     /// (Drop) plus eager `release()` calls in `cancel_session` and the
     /// audio-rollback branch of `begin`.
     pub busy_gate: BusyGate,
+    /// Timestamp of the first cancel-hotkey press while the opt-in
+    /// double-press cancel is armed and a recording is live. `Some`
+    /// means a confirmation window is open: a second press within
+    /// [`CANCEL_DOUBLE_PRESS_WINDOW`] confirms the cancel. Reset at every
+    /// `begin_recording`; only consulted by `request_cancel_foreground`.
+    cancel_first_press_at: Mutex<Option<Instant>>,
 }
 
 impl SessionManager {
@@ -431,6 +466,7 @@ impl SessionManager {
             clipboard_lock: Mutex::new(()),
             pending_restore: Mutex::new(None),
             busy_gate: BusyGate::new(),
+            cancel_first_press_at: Mutex::new(None),
         }
     }
 
@@ -622,6 +658,9 @@ impl SessionManager {
         // is in flight. The disarm fires from end_recording's drop
         // path or from cancel.
         crate::hotkey::arm_cancel(app);
+        // Fresh session → discard any half-armed double-press window
+        // left over from a previous recording.
+        *self.cancel_first_press_at.lock() = None;
 
         log::info!("▶ begin recording (sid={new_sid})");
         pill::show(app);
@@ -772,6 +811,47 @@ impl SessionManager {
 
             run_pipeline(app_clone, manager, session, wav_result).await;
         });
+    }
+
+    /// Entry point for the cancel hotkey (default Escape) while a session
+    /// is in flight. With `require_double` off — the default — this is a
+    /// straight pass-through to [`cancel_foreground`]. With it on, the
+    /// *live recording* is guarded by a double-press: the first press
+    /// arms a short confirmation window and surfaces a pill hint, and only
+    /// a second press inside [`CANCEL_DOUBLE_PRESS_WINDOW`] actually
+    /// cancels. This stops a stray Escape (e.g. dismissing a screenshot
+    /// mid-dictation) from tearing the session down. The guard is scoped
+    /// to recording only: once the user has stopped speaking and the
+    /// pipeline is transcribing / polishing, a single press still aborts
+    /// (the accidental-press risk is specific to the dictation phase, and
+    /// `is_recording()` is false by then).
+    pub fn request_cancel_foreground(
+        self: &Arc<Self>,
+        app: &AppHandle<Wry>,
+        require_double: bool,
+    ) {
+        if !require_double || !self.is_recording() {
+            self.cancel_foreground(app);
+            return;
+        }
+
+        let fire = {
+            let mut slot = self.cancel_first_press_at.lock();
+            let (next, fire) =
+                double_press_decision(*slot, Instant::now(), CANCEL_DOUBLE_PRESS_WINDOW);
+            *slot = next;
+            fire
+        };
+
+        if fire {
+            self.cancel_foreground(app);
+        } else {
+            log::debug!("cancel: first press armed; awaiting confirm within window");
+            // Name the actually-bound cancel key so the hint reads
+            // "Press F13 again…" when the user has remapped it off Escape.
+            let key = crate::settings::load(app).cancel_hotkey;
+            crate::pill::emit_cancel_hint(app, CANCEL_DOUBLE_PRESS_WINDOW_MS, key);
+        }
     }
 
     /// Cancel whichever session is the current foreground recording.
@@ -2537,6 +2617,44 @@ pub fn emit_saturated_toast<R: Runtime>(app: &AppHandle<R>, _in_flight: usize, _
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn double_press_first_press_arms_does_not_fire() {
+        let now = Instant::now();
+        let (next, fire) =
+            double_press_decision(None, now, CANCEL_DOUBLE_PRESS_WINDOW);
+        assert!(!fire, "a lone first press must not cancel");
+        assert_eq!(next, Some(now), "the window must be armed at `now`");
+    }
+
+    #[test]
+    fn double_press_second_press_within_window_fires() {
+        let now = Instant::now();
+        let first = now - Duration::from_millis(200);
+        let (next, fire) =
+            double_press_decision(Some(first), now, CANCEL_DOUBLE_PRESS_WINDOW);
+        assert!(fire, "a second press inside the window must cancel");
+        assert_eq!(next, None, "firing clears the armed window");
+    }
+
+    #[test]
+    fn double_press_second_press_after_window_rearms() {
+        let now = Instant::now();
+        let first = now - (CANCEL_DOUBLE_PRESS_WINDOW + Duration::from_millis(50));
+        let (next, fire) =
+            double_press_decision(Some(first), now, CANCEL_DOUBLE_PRESS_WINDOW);
+        assert!(!fire, "a press after the window lapses re-arms, not cancels");
+        assert_eq!(next, Some(now), "the new press opens a fresh window");
+    }
+
+    #[test]
+    fn double_press_exactly_at_window_edge_fires() {
+        let now = Instant::now();
+        let first = now - CANCEL_DOUBLE_PRESS_WINDOW;
+        let (_, fire) =
+            double_press_decision(Some(first), now, CANCEL_DOUBLE_PRESS_WINDOW);
+        assert!(fire, "the window bound is inclusive (<=)");
+    }
 
     fn fresh_manager() -> Arc<SessionManager> {
         let audio = AudioHandle::spawn().expect("spawn audio thread for tests");

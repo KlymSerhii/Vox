@@ -4,6 +4,11 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export interface Settings {
   hotkey: string;
   cancel_hotkey: string;
+  /// Require pressing the cancel hotkey (default Escape) twice quickly
+  /// to abort a live recording, instead of cancelling on the first
+  /// press. Off by default. Guards against a stray Escape canceling
+  /// dictation; only the recording phase is gated.
+  cancel_requires_double_press: boolean;
   launch_at_login: boolean;
   dictation_enabled: boolean;
   hands_free_enabled: boolean;

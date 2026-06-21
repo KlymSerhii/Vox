@@ -30,6 +30,16 @@ export interface ToastPayload {
   ms: number;
 }
 
+/** Opt-in double-press cancel hint. `ms` is the auto-dismiss duration
+ *  (matching the backend confirmation window); `key` is the configured
+ *  cancel-hotkey spec (e.g. "Escape", "F13") so the copy can name the
+ *  real bound key. The copy template is rendered frontend-side. Does not
+ *  change the pill stage. */
+export interface CancelHintPayload {
+  ms: number;
+  key: string;
+}
+
 export interface StreamPayload {
   session_id: number;
   text: string;
