@@ -14,6 +14,7 @@ const KEY_LAUNCH_AT_LOGIN: &str = "launch_at_login";
 const KEY_ONBOARDED: &str = "onboarded";
 const KEY_DICTATION_ENABLED: &str = "dictation_enabled";
 const KEY_DICTIONARY: &str = "dictionary";
+const KEY_CONTEXT: &str = "context";
 const KEY_HANDS_FREE: &str = "hands_free_enabled";
 const KEY_LANGUAGE: &str = "language";
 
@@ -176,6 +177,13 @@ pub struct Settings {
     #[serde(default)]
     pub dictionary: Vec<String>,
 
+    /// Free-form prose about the user (job, what they're working on, etc.)
+    /// injected into the LLM cleanup/polish system prompt for every mode
+    /// that opts in via `VoiceMode::context_enabled`. Polish step only —
+    /// never the STT bias prompt. Empty by default.
+    #[serde(default)]
+    pub context: String,
+
     #[serde(default = "default_stt_engine")]
     pub stt_engine: String,
     #[serde(default = "default_stt_model_id")]
@@ -326,6 +334,7 @@ impl Default for Settings {
             language: default_language(),
             onboarded: false,
             dictionary: Vec::new(),
+            context: String::new(),
             stt_engine: default_stt_engine(),
             stt_model_id: default_stt_model_id(),
             llm_engine: default_llm_engine(),
@@ -387,6 +396,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    let context = get_str(KEY_CONTEXT).unwrap_or_default();
 
     let stt_engine = get_str(KEY_STT_ENGINE).unwrap_or_else(default_stt_engine);
     let stt_model_id = get_str(KEY_STT_MODEL_ID).unwrap_or_else(default_stt_model_id);
@@ -467,6 +478,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         language,
         onboarded,
         dictionary,
+        context,
         stt_engine,
         stt_model_id,
         llm_engine,
@@ -519,6 +531,7 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
                 .collect(),
         ),
     );
+    s(KEY_CONTEXT, &settings.context);
 
     s(KEY_STT_ENGINE, &settings.stt_engine);
     s(KEY_STT_MODEL_ID, &settings.stt_model_id);
@@ -679,6 +692,10 @@ pub struct Prefs {
     pub hands_free_enabled: bool,
     pub language: String,
     pub dictionary: Vec<String>,
+    /// Mirror of `Settings::context` — the user's free-form background
+    /// prose, folded into the polish system prompt at session start for
+    /// modes that opt in (`VoiceMode::context_enabled`).
+    pub context: String,
 
     pub stt_engine: String,
     pub stt_model_id: String,
@@ -726,6 +743,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         hands_free_enabled: s.hands_free_enabled,
         language: s.language,
         dictionary: s.dictionary,
+        context: s.context,
         stt_engine: s.stt_engine,
         stt_model_id: s.stt_model_id,
         llm_engine: s.llm_engine,

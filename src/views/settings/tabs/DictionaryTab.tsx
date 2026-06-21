@@ -89,6 +89,23 @@ export function DictionaryTab(props: {
         {props.s.dictionary.length} term
         {props.s.dictionary.length === 1 ? "" : "s"}.
       </p>
+
+      <Card>
+        <div class="px-4 py-3">
+          <div class="mb-1 text-[12px] font-medium">Context</div>
+          <textarea
+            class="h-48 w-full rounded-[6px] bg-[var(--color-input-bg)] px-2 py-2 text-[12px] ring-1 ring-[var(--color-border)] outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
+            placeholder="I'm a backend engineer at Acme working on the billing service. I often mention my teammates Priya and Marco, and tools like Stripe and Kafka…"
+            value={props.s.context ?? ""}
+            onChange={(e) => props.update({ context: e.currentTarget.value })}
+          />
+          <p class="mt-1 text-[11px] text-[var(--color-ink-mute)]">
+            Tell Vox about you — your role, what you're working on, projects or
+            people you mention often. Vox uses this to make smarter word
+            choices. Applied to every mode that has “Use my context” enabled.
+          </p>
+        </div>
+      </Card>
     </>
   );
 }

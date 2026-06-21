@@ -41,6 +41,10 @@ pub struct AutoTrigger {
     pub window_title_substring: Option<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VoiceMode {
     pub id: String,
@@ -59,6 +63,12 @@ pub struct VoiceMode {
     /// pins the value for this mode regardless of the global toggle.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_thinking: Option<bool>,
+    /// When true (the default), the user's global `Settings::context`
+    /// prose is folded into this mode's cleanup system prompt. Set false
+    /// to keep a mode context-free (e.g. a verbatim transcription mode).
+    /// Always serialized so the toggle round-trips explicitly.
+    #[serde(default = "default_true")]
+    pub context_enabled: bool,
     #[serde(default)]
     pub auto_triggers: Vec<AutoTrigger>,
     #[serde(default)]
@@ -129,6 +139,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![],
             built_in: true,
             created_at: now,
@@ -145,6 +156,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.literatureandlatte.scrivener3".into()),
@@ -182,6 +194,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.apple.mail".into()),
@@ -215,6 +228,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: Some(280),
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.tinyspeck.slackmacgap".into()),
@@ -248,6 +262,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.microsoft.VSCode".into()),
@@ -281,6 +296,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![
                 AutoTrigger {
                     bundle_id_glob: Some("com.apple.Notes".into()),
@@ -314,6 +330,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![],
             built_in: true,
             created_at: now,
@@ -330,6 +347,7 @@ pub fn builtins() -> Vec<VoiceMode> {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![],
             built_in: true,
             created_at: now,
@@ -1253,6 +1271,7 @@ mod tests {
             case: CaseStyle::Lower,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![],
             built_in: false,
             created_at: 0,
@@ -1275,6 +1294,7 @@ mod tests {
             case: CaseStyle::Title,
             max_length_chars: None,
             enable_thinking: None,
+            context_enabled: true,
             auto_triggers: vec![],
             built_in: false,
             created_at: 0,
@@ -1375,6 +1395,27 @@ mod tests {
         let (store, _tmp) = fresh_store();
         let err = store.delete("../../etc/passwd").unwrap_err();
         assert!(err.to_string().contains("invalid mode id"));
+    }
+
+    #[test]
+    fn context_enabled_defaults_true_when_omitted() {
+        // Older on-disk modes (and imports) without the field must
+        // deserialize with `context_enabled == true` so existing modes
+        // keep folding in the user's context after an upgrade.
+        let json = serde_json::json!({
+            "id": "x",
+            "name": "X",
+            "icon": "",
+            "description": "",
+            "system_prompt": "x",
+            "punctuation": "Standard",
+            "case": "Sentence",
+            "created_at": 0,
+            "updated_at": 0
+        })
+        .to_string();
+        let mode: VoiceMode = serde_json::from_str(&json).unwrap();
+        assert!(mode.context_enabled);
     }
 
 }

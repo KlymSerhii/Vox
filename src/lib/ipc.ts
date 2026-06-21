@@ -10,6 +10,10 @@ export interface Settings {
   language: string;
   onboarded: boolean;
   dictionary: string[];
+  /// Free-form personal context (role, current projects, people the
+  /// user mentions often) merged into the cleanup prompt of every mode
+  /// whose `context_enabled` is true. Empty by default.
+  context: string;
   stt_engine: string;
   stt_model_id: string;
   llm_engine: string;
@@ -111,6 +115,10 @@ export interface VoiceMode {
   /// Tri-state: `null`/missing inherits the global `enable_thinking`,
   /// `true`/`false` overrides it. Only affects `gemma-local`.
   enable_thinking?: boolean | null;
+  /// Whether the global personal context (Settings → Dictionary &
+  /// Context) is folded into this mode's cleanup prompt. Backend always
+  /// serializes it; defaults to `true`.
+  context_enabled: boolean;
   auto_triggers: AutoTrigger[];
   built_in: boolean;
   created_at: number;
