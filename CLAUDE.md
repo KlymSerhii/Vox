@@ -263,7 +263,7 @@ The default `Cmd+Alt+Period` shortcut sidesteps Accessibility entirely — it go
 - **Modes** — list, edit, duplicate, export/import, reset built-ins.
 - **Dictionary** — global proper-noun + acronym list merged into every mode's dictionary.
 - **Privacy** — informational; everything LOCAL.
-- **About** — version, "Replay onboarding", diagnostics (live hotkey snapshot + dev binary path reveal for TCC troubleshooting).
+- **About** — version, legal/publisher attribution (Resonance Logic, LLC — a copyright line in the header card + a "Legal" card carrying the warranty disclaimer & limitation of liability, extended to the LLC's members so it shields the owner personally; mirrored in `tauri.conf.json::bundle.publisher` / `bundle.copyright` so the entity is embedded in the distributed artifact's metadata — Windows installer publisher / `.exe` properties and macOS `Info.plist`), "Replay onboarding", diagnostics (live hotkey snapshot + dev binary path reveal for TCC troubleshooting).
 
 ## Tray popover
 

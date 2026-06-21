@@ -280,6 +280,9 @@ export function AboutTab() {
             Local-first
           </span>
         </div>
+        <div class="mt-3 text-[11px] leading-[1.5] text-[var(--color-ink-faint)]">
+          © 2026 Resonance Logic, LLC · All rights reserved.
+        </div>
       </div>
 
       <SectionHeader title="Updates" />
@@ -600,6 +603,28 @@ export function AboutTab() {
               Gemma
             </a>{" "}
             by Google (Gemma terms).
+          </p>
+        </div>
+      </Card>
+
+      <SectionHeader title="Legal" />
+      <Card>
+        <div class="flex flex-col gap-3 px-4 py-3 text-[12px] leading-[1.55] text-[var(--color-ink-mute)]">
+          <p>
+            Vox is developed and published by{" "}
+            <span class="text-[var(--color-ink)]">Resonance Logic, LLC</span>. ©
+            2026 Resonance Logic, LLC. All rights reserved.
+          </p>
+          <p>
+            Vox is provided “as is”, without warranty of any kind, express or
+            implied, including but not limited to the warranties of
+            merchantability, fitness for a particular purpose, and
+            non-infringement. To the fullest extent permitted by applicable law,
+            in no event shall Resonance Logic, LLC or its members, managers,
+            officers, employees, or affiliates be liable for any claim, damages,
+            or other liability — whether in an action of contract, tort, or
+            otherwise — arising from, out of, or in connection with the software
+            or the use of or other dealings in the software.
           </p>
         </div>
       </Card>
