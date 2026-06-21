@@ -473,7 +473,13 @@ pub fn arm_cancel<R: Runtime>(app: &AppHandle<R>) {
         if let Err(e) = gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
             if let ShortcutState::Pressed = event.state() {
                 if let Some(wry_app) = try_into_wry(&app_handle) {
-                    manager.cancel_foreground(&wry_app);
+                    // Read the pref fresh on each press so toggling
+                    // double-press cancel takes effect immediately, even
+                    // mid-session. Mirrors the PTT closure's per-press
+                    // `settings::prefs` read.
+                    let require_double =
+                        settings::prefs(&app_handle).cancel_requires_double_press;
+                    manager.request_cancel_foreground(&wry_app, require_double);
                 }
             }
         }) {

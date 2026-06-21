@@ -66,6 +66,19 @@ pub struct PillToastPayload {
     pub ms: u32,
 }
 
+/// Payload for the opt-in double-press cancel hint. `ms` is the
+/// auto-dismiss duration (matching the confirmation window); `key` is
+/// the configured cancel-hotkey spec (e.g. `"Escape"`, `"F13"`) so the
+/// frontend can name the actual bound key instead of assuming Escape.
+/// The copy template lives frontend-side. Unlike `pill:toast`, the hint
+/// deliberately does NOT change the pill's stage; it overlays the
+/// listening view for `ms` and reverts to the waveform.
+#[derive(Debug, Clone, Serialize)]
+pub struct CancelHintPayload {
+    pub ms: u32,
+    pub key: String,
+}
+
 /// Cumulative streaming text payload — `text` is the FULL accumulated
 /// transcript / polish so far, not a delta. The frontend's rate limiter
 /// reveals chars/sec smoothly. `final_` flips true on the last chunk so
@@ -241,6 +254,16 @@ pub fn emit_toast<R: Runtime>(app: &AppHandle<R>, message: String, ms: u32) {
         ms,
     };
     let _ = app.emit_to(LABEL, "pill:toast", payload);
+}
+
+/// Show the "press <key> again to cancel" hint inside the pill for `ms`
+/// without disturbing the current stage. `key` is the configured
+/// cancel-hotkey spec so the copy names the real bound key. Fired by the
+/// opt-in double-press cancel on the first (arming) press so the user
+/// learns a second press will stop dictation. See
+/// `session::request_cancel_foreground`.
+pub fn emit_cancel_hint<R: Runtime>(app: &AppHandle<R>, ms: u32, key: String) {
+    let _ = app.emit_to(LABEL, "pill:cancel_hint", CancelHintPayload { ms, key });
 }
 
 pub fn emit_audio_level<R: Runtime>(app: &AppHandle<R>, level: f32) {
