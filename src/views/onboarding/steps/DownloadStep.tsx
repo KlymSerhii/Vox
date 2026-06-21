@@ -68,6 +68,10 @@ export function DownloadStep(props: {
   const [completed, setCompleted] = createSignal<Set<string>>(new Set());
   const [started, setStarted] = createSignal(false);
   const [err, setErr] = createSignal<string | null>(null);
+  // True while a download/pre-warm pass is actually running. Gates the
+  // "Try again" affordance so it only appears once a pass has errored and
+  // stopped — not while one is still in flight.
+  const [inFlight, setInFlight] = createSignal(false);
   // Wall-clock timestamp of when the user kicked off the downloads.
   // Combined with the rolling `samples` history to detect a download
   // that never produced a single progress event (the VPN/firewall
@@ -324,6 +328,8 @@ export function DownloadStep(props: {
     const choice = polishChoice();
     if (!t || !cur || !sttId) return;
     setStarted(true);
+    // Clear any prior failure so a retry starts from a clean slate.
+    setErr(null);
 
     // Derive the engine id from the chosen model descriptor — the
     // user could have switched engines via the Language step but the
@@ -348,6 +354,7 @@ export function DownloadStep(props: {
       });
       try {
         props.onInFlightChange(true);
+        setInFlight(true);
         await downloadModel(sttId);
         // Reconcile against disk before pre-warm — the `model:done`
         // event arrives on a separate IPC channel from the command
@@ -364,6 +371,7 @@ export function DownloadStep(props: {
         setErr(String(e));
       } finally {
         props.onInFlightChange(false);
+        setInFlight(false);
       }
       return;
     }
@@ -386,6 +394,7 @@ export function DownloadStep(props: {
     });
     try {
       props.onInFlightChange(true);
+      setInFlight(true);
       await Promise.all([
         downloadModel(sttId),
         downloadModel(llmId),
@@ -414,6 +423,7 @@ export function DownloadStep(props: {
       setErr(String(e));
     } finally {
       props.onInFlightChange(false);
+      setInFlight(false);
     }
   }
 
@@ -634,7 +644,22 @@ export function DownloadStep(props: {
         </div>
       </Show>
       <Show when={err()}>
-        <p class="text-[12px] text-[var(--color-danger)]">{err()}</p>
+        <div class="flex flex-col items-start gap-2">
+          <p class="text-[12px] text-[var(--color-danger)]">{err()}</p>
+          {/* Once a download fails (e.g. the connection dropped mid-pull),
+              the progress view has hidden the "Accept and download" button,
+              so without this the user is stranded. Re-running start()
+              resumes each artifact from its on-disk `.partial`. */}
+          <Show when={!inFlight()}>
+            <button
+              type="button"
+              class="rounded-[8px] bg-[var(--color-accent)] px-4 py-2 text-[13px] font-medium text-[var(--color-on-accent)] hover:brightness-110"
+              onClick={() => void start()}
+            >
+              Try again
+            </button>
+          </Show>
+        </div>
       </Show>
     </div>
   );

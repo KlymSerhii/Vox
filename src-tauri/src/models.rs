@@ -526,6 +526,39 @@ pub struct StreamArgs<'a> {
     pub lock_file: Option<&'a Path>,
 }
 
+/// Whether the response lets us append to the existing `.partial`
+/// (true) or forces a restart from byte 0 (false). ONLY a `206 Partial
+/// Content` with a non-zero offset means the body is the suffix we asked
+/// for. A `200` despite our `Range:` header means the server (or a
+/// TLS-intercepting proxy) ignored the range and is sending the WHOLE
+/// file — appending that onto the partial yields a `partial + full`
+/// corrupt file, and the catalog ships no sha256 to catch it. Deciding
+/// on the response status (not `resume_from`) is what makes resume safe.
+fn resuming_from_response(resume_from: u64, status: u16) -> bool {
+    resume_from > 0 && status == 206
+}
+
+/// Issue the GET, bounding the connect + header phase and making the wait
+/// cancellable. The client's `read_timeout` only covers body reads, not
+/// the TLS handshake / waiting on response headers, so a connection that
+/// dies before the first byte (laptop asleep) would otherwise hang here.
+/// The explicit timeout plus the cancel race close that gap.
+async fn send_request(
+    req: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    url: &str,
+) -> anyhow::Result<reqwest::Response> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::anyhow!("canceled")),
+        r = tokio::time::timeout(Duration::from_secs(60), req.send()) => match r {
+            Err(_) => Err(anyhow::anyhow!("download timed out connecting to {url}")),
+            Ok(Err(e)) => Err(anyhow::anyhow!("download GET: {e}")),
+            Ok(Ok(resp)) => Ok(resp),
+        },
+    }
+}
+
 /// Streams `partial_path` from `args.url`. Memory residency is bounded
 /// by reqwest's chunk size, so 17 GB downloads work on 8 GB Macs.
 /// Caller owns the rename to the final path.
@@ -546,18 +579,41 @@ pub async fn stream_to_file<R: Runtime>(
     // about.
     let client = reqwest::Client::builder()
         .https_only(true)
+        // Bound the connect + per-read waits. The motivating failure: a
+        // laptop that sleeps mid-download. The TCP connection dies without
+        // an RST, so a body read blocks forever — the download future never
+        // returns, the REGISTRY slot for this id never frees, and every
+        // retry is refused with "already downloading" until the app is
+        // reinstalled. `read_timeout` turns the dead connection into an
+        // error that releases the slot and leaves the `.partial` in place
+        // for a clean resume. `connect_timeout` does the same for the
+        // initial handshake.
+        .connect_timeout(Duration::from_secs(30))
+        .read_timeout(Duration::from_secs(60))
         .build()
         .map_err(|e| anyhow::anyhow!("reqwest build: {e}"))?;
 
-    let mut req = client.get(args.url);
-    if resume_from > 0 {
-        req = req.header("Range", format!("bytes={resume_from}-"));
-    }
-
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| anyhow::anyhow!("download GET: {e}"))?;
+    // Acquire the response, with a single 416-triggered fallback. A range
+    // request against an already-complete (or stale, oversized) `.partial`
+    // returns `416 Range Not Satisfiable`; without this fallback the resume
+    // fails identically on every attempt and the only fix is deleting the
+    // partial by hand — which is what "reinstall the app" did for the user
+    // who reported this. Discard the dead partial and refetch from scratch.
+    let mut effective_resume = resume_from;
+    let resp = {
+        let mut req = client.get(args.url);
+        if effective_resume > 0 {
+            req = req.header("Range", format!("bytes={effective_resume}-"));
+        }
+        let first = send_request(req, &cancel, args.url).await?;
+        if effective_resume > 0 && first.status().as_u16() == 416 {
+            let _ = std::fs::remove_file(args.partial_path);
+            effective_resume = 0;
+            send_request(client.get(args.url), &cancel, args.url).await?
+        } else {
+            first
+        }
+    };
 
     let status = resp.status();
     if !status.is_success() && status.as_u16() != 206 {
@@ -568,27 +624,32 @@ pub async fn stream_to_file<R: Runtime>(
         ));
     }
 
+    // Append onto the partial only if the server honoured the resume; a 200
+    // means it's sending the whole file, so we must restart at byte 0.
+    let resuming = resuming_from_response(effective_resume, status.as_u16());
+    let start_offset = if resuming { effective_resume } else { 0 };
+
     let total_bytes = resp
         .content_length()
-        .map(|c| c + resume_from)
+        .map(|c| c + start_offset)
         .unwrap_or(args.expected_size);
 
     let mut file = OpenOptions::new()
         .create(true)
-        .append(resume_from > 0)
+        .append(resuming)
         .write(true)
-        .truncate(resume_from == 0)
+        .truncate(!resuming)
         .open(args.partial_path)
         .map_err(|e| anyhow::anyhow!("open partial: {e}"))?;
 
     let mut hasher = Sha256::new();
-    if resume_from > 0 {
+    if resuming {
         // Re-hash the existing prefix so the final digest is correct.
         use std::io::Read;
         let mut existing = std::fs::File::open(args.partial_path)
             .map_err(|e| anyhow::anyhow!("rehash open: {e}"))?;
         let mut buf = vec![0u8; 1 << 20];
-        let mut left = resume_from;
+        let mut left = start_offset;
         while left > 0 {
             let want = (buf.len() as u64).min(left) as usize;
             let n = existing
@@ -602,7 +663,7 @@ pub async fn stream_to_file<R: Runtime>(
         }
     }
 
-    let mut downloaded: u64 = resume_from;
+    let mut downloaded: u64 = start_offset;
     let started = Instant::now();
     let mut last_emit = Instant::now()
         .checked_sub(Duration::from_secs(1))
@@ -611,10 +672,17 @@ pub async fn stream_to_file<R: Runtime>(
     let progress_event = format!("{}:progress", args.event_prefix);
 
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if cancel.is_cancelled() {
-            return Err(anyhow::anyhow!("canceled"));
-        }
+    // Race each body read against cancellation so a Cancel click (or
+    // session teardown) interrupts a slow read immediately instead of
+    // waiting up to `read_timeout` for the next chunk. The client's
+    // `read_timeout` still bounds a fully idle / dead connection.
+    loop {
+        let next = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(anyhow::anyhow!("canceled")),
+            n = stream.next() => n,
+        };
+        let Some(chunk) = next else { break };
         let bytes =
             chunk.map_err(|e| anyhow::anyhow!("stream chunk: {e}"))?;
         file.write_all(&bytes)
@@ -624,7 +692,7 @@ pub async fn stream_to_file<R: Runtime>(
 
         if last_emit.elapsed() >= Duration::from_millis(200) {
             let elapsed = started.elapsed().as_secs_f64().max(0.001);
-            let bps = (downloaded - resume_from) as f64 / elapsed;
+            let bps = (downloaded - start_offset) as f64 / elapsed;
             let remaining = total_bytes.saturating_sub(downloaded) as f64;
             let eta = if bps > 1.0 { Some((remaining / bps) as u64) } else { None };
             let _ = app.emit(
@@ -1161,5 +1229,20 @@ mod tests {
         reg.finish("model-x");
         let third = reg.try_insert("model-x");
         assert!(third.is_some(), "post-finish reinsert should succeed");
+    }
+
+    #[test]
+    fn resume_only_appends_on_206_with_offset() {
+        // The only safe append: a real partial-content response.
+        assert!(resuming_from_response(100, 206));
+        // Server ignored our Range and is sending the whole file — must
+        // restart from 0, not append onto the partial (corruption guard).
+        assert!(!resuming_from_response(100, 200));
+        // Fresh download: nothing on disk to resume from.
+        assert!(!resuming_from_response(0, 200));
+        assert!(!resuming_from_response(0, 206));
+        // 416 is handled upstream (discard + refetch) and never reaches
+        // here as a resume, but be explicit that it isn't an append.
+        assert!(!resuming_from_response(100, 416));
     }
 }
