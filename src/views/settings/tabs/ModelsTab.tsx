@@ -369,7 +369,7 @@ export function ModelsTab(props: {
             isActive={props.s.stt_engine === "parakeet-local"}
             available={pa().available}
             unavailableReason={pa().reason}
-            note="Custom dictionary biasing isn't supported on Parakeet in this version. Switch to Whisper if you rely on the Dictionary tab for technical vocabulary."
+            note="Custom dictionary biasing isn't supported on Parakeet in this version. Switch to Whisper if you rely on the Dictionary & Context tab for technical vocabulary."
           >
             <For each={parakeetModels()}>
               {(m) => (

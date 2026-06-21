@@ -6,6 +6,7 @@ import {
 } from "@/lib/ipc";
 import { Card } from "../components/Card";
 import { Row } from "../components/Row";
+import { Toggle } from "@/components/Toggle";
 import { CASE_OPTIONS, PUNCTUATION_OPTIONS } from "../constants";
 
 export function ModeEditor(props: {
@@ -188,6 +189,19 @@ export function ModeEditor(props: {
                 <option value="on">Always on</option>
                 <option value="off">Always off</option>
               </select>
+            </Row>
+          </Card>
+
+          <Card>
+            <Row
+              label="Use my context"
+              hint="Include your personal context (from the Dictionary & Context tab) in this mode's cleanup."
+              last
+            >
+              <Toggle
+                checked={draft().context_enabled ?? true}
+                onChange={(v) => patch({ context_enabled: v })}
+              />
             </Row>
           </Card>
 

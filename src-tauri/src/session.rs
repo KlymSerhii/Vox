@@ -217,6 +217,7 @@ pub struct ModeSnapshot {
     pub case: CaseStyle,
     pub max_length_chars: Option<usize>,
     pub dictionary: Vec<String>,
+    pub context_enabled: bool,
 }
 
 impl ModeSnapshot {
@@ -230,6 +231,7 @@ impl ModeSnapshot {
             case: m.case.clone(),
             max_length_chars: m.max_length_chars,
             dictionary: m.dictionary.clone(),
+            context_enabled: m.context_enabled,
         }
     }
 
@@ -243,6 +245,7 @@ impl ModeSnapshot {
             case: CaseStyle::Sentence,
             max_length_chars: None,
             dictionary: Vec::new(),
+            context_enabled: true,
         }
     }
 
@@ -276,6 +279,7 @@ pub struct SessionState {
     pub llm_model_id: String,
     pub language: String,
     pub dictionary: Vec<String>,
+    pub context: String,
     pub cancel: Arc<AtomicBool>,
     pub started_at: Instant,
     pub started_at_unix: i64,
@@ -584,6 +588,7 @@ impl SessionManager {
             llm_model_id: prefs.llm_model_id.clone(),
             language: prefs.language.clone(),
             dictionary: prefs.dictionary.clone(),
+            context: prefs.context.clone(),
             cancel: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
             started_at_unix: chrono::Utc::now().timestamp(),
@@ -1559,7 +1564,12 @@ async fn run_pipeline(
         return;
     }
 
-    let mode_system_prompt = with_language_directive(&session.mode.system_prompt, &session.language);
+    let ctx_prompt = with_user_context(
+        &session.mode.system_prompt,
+        &session.context,
+        session.mode.context_enabled,
+    );
+    let mode_system_prompt = with_language_directive(&ctx_prompt, &session.language);
     let merged_dictionary = merge_dictionaries(&session.dictionary, &session.mode.dictionary);
 
     let mut polish_warning: Option<&'static str> = None;
@@ -2380,6 +2390,20 @@ fn with_language_directive(system_prompt: &str, language: &str) -> String {
     }
 }
 
+/// Appends the user's free-form context to the cleanup system prompt when
+/// the active mode opts in and the context is non-empty. Language-agnostic
+/// — it adds background only; the language directive (applied after) still
+/// governs output language.
+fn with_user_context(prompt: &str, context: &str, enabled: bool) -> String {
+    let trimmed = context.trim();
+    if !enabled || trimmed.is_empty() {
+        return prompt.to_string();
+    }
+    format!(
+        "{prompt}\n\nBackground about the speaker (use it to inform word choice, names, and intent; do not repeat it verbatim in the output):\n{trimmed}"
+    )
+}
+
 /// The exact LLM system message the next dictation would send for the
 /// user's currently-selected Voice Mode: the active mode's prompt run
 /// through the language directive, plus the merged global + mode
@@ -2397,7 +2421,8 @@ pub fn active_polish_system_message<R: Runtime>(app: &AppHandle<R>) -> String {
         Some(m) => m,
         None => return String::new(),
     };
-    let system_prompt = with_language_directive(&mode.system_prompt, &prefs.language);
+    let ctx_prompt = with_user_context(&mode.system_prompt, &prefs.context, mode.context_enabled);
+    let system_prompt = with_language_directive(&ctx_prompt, &prefs.language);
     let dictionary = merge_dictionaries(&prefs.dictionary, &mode.dictionary);
     crate::engines::gemma_http::build_system_message(&system_prompt, &dictionary)
 }
@@ -2438,12 +2463,14 @@ pub async fn polish_with_mode(
     llm_engine_id: String,
     llm_model_id: String,
     global_dictionary: Vec<String>,
+    context: &str,
     global_enable_thinking: bool,
     language: String,
 ) -> PolishOutcome {
     let mut mode_snapshot = ModeSnapshot::from_voice_mode(mode);
-    mode_snapshot.system_prompt =
-        with_language_directive(&mode_snapshot.system_prompt, &language);
+    let ctx_prompt =
+        with_user_context(&mode_snapshot.system_prompt, context, mode_snapshot.context_enabled);
+    mode_snapshot.system_prompt = with_language_directive(&ctx_prompt, &language);
     let merged_dictionary = merge_dictionaries(&global_dictionary, &mode_snapshot.dictionary);
     // Per-mode override of `enable_thinking` wins; None inherits the
     // global. Matches the resolution in `SessionManager::begin`.
@@ -2528,6 +2555,7 @@ mod tests {
             llm_model_id: "test".into(),
             language: "auto".into(),
             dictionary: Vec::new(),
+            context: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
             started_at_unix: 0,
@@ -2574,6 +2602,30 @@ mod tests {
         // An exotic / legacy code we don't name falls back to detection
         // rather than feeding the model a bare code it might misread.
         assert_eq!(with_language_directive("BASE", "xx"), "BASE");
+    }
+
+    #[test]
+    fn with_user_context_appends_when_enabled_and_nonempty() {
+        let out = with_user_context("BASE PROMPT", "I am a backend engineer.", true);
+        assert!(out.starts_with("BASE PROMPT"));
+        assert!(out.contains("I am a backend engineer."));
+    }
+
+    #[test]
+    fn with_user_context_omits_when_disabled() {
+        // Mode opted out → the prompt is returned untouched even with a
+        // non-empty context.
+        assert_eq!(
+            with_user_context("BASE", "I am a backend engineer.", false),
+            "BASE"
+        );
+    }
+
+    #[test]
+    fn with_user_context_omits_when_empty() {
+        // Enabled but no context (blank or whitespace-only) → no-op.
+        assert_eq!(with_user_context("BASE", "", true), "BASE");
+        assert_eq!(with_user_context("BASE", "   ", true), "BASE");
     }
 
     #[test]
@@ -2692,6 +2744,7 @@ mod tests {
             case: CaseStyle::Lower,
             max_length_chars: None,
             dictionary: Vec::new(),
+            context_enabled: true,
         };
         assert_eq!(snap.apply_post_processing("Hello WORLD"), "hello world");
     }
@@ -2711,6 +2764,7 @@ mod tests {
             case: CaseStyle::Sentence,
             max_length_chars: Some(5),
             dictionary: Vec::new(),
+            context_enabled: true,
         };
         let out = snap.apply_post_processing("abcdefghij");
         assert!(out.chars().count() <= 5, "output {out:?} exceeds cap of 5");
@@ -2730,6 +2784,7 @@ mod tests {
             case: CaseStyle::Sentence,
             max_length_chars: Some(20),
             dictionary: Vec::new(),
+            context_enabled: true,
         };
         let out = snap.apply_post_processing("Hello world. This is a longer second sentence.");
         assert_eq!(out, "Hello world.");

@@ -157,6 +157,7 @@ export function ModesTab(props: {
       punctuation: "Standard",
       case: "Sentence",
       max_length_chars: null,
+      context_enabled: true,
       auto_triggers: [],
       built_in: false,
       created_at: 0,

@@ -43,9 +43,10 @@ export const TABS: { id: Tab; label: string; icon: string; subtitle: string }[] 
   },
   {
     id: "dictionary",
-    label: "Dictionary",
+    label: "Dictionary & Context",
     icon: "book",
-    subtitle: "Names and acronyms Vox should always spell correctly.",
+    subtitle:
+      "Names and acronyms Vox should spell correctly, plus personal context to guide every transcript.",
   },
   {
     id: "privacy",
