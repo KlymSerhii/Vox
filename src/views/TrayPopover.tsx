@@ -52,6 +52,7 @@ import {
   type VoiceMode,
 } from "../lib/ipc";
 import { AppearanceToggle } from "./tray-popover/components/AppearanceToggle";
+import { CommunityRow } from "./tray-popover/components/CommunityRow";
 import { DonateBanner } from "./tray-popover/components/DonateBanner";
 import { DonateRow } from "./tray-popover/components/DonateRow";
 import { InProgressRow } from "./tray-popover/components/InProgressRow";
@@ -61,7 +62,7 @@ import { StatusDot } from "./tray-popover/components/StatusDot";
 import { UpdateBanner } from "./tray-popover/components/UpdateBanner";
 import { Toggle } from "../components/Toggle";
 import { isMac, isWindows } from "../lib/platform";
-import { DONATE_URL, PERIOD_OPTIONS } from "./tray-popover/constants";
+import { DISCORD_URL, DONATE_URL, PERIOD_OPTIONS } from "./tray-popover/constants";
 import {
   computeDropdownPosition,
   type DropdownPosition,
@@ -514,6 +515,14 @@ export default function TrayPopoverView() {
     }
   }
 
+  async function openDiscord() {
+    try {
+      await openExternalUrl(DISCORD_URL);
+    } catch (e) {
+      console.error("openExternalUrl failed:", e);
+    }
+  }
+
   // Nudge "Support Vox": open the donation page AND stop future nudges —
   // the user has engaged with donating, so we don't interrupt again
   // (the passive Support row stays for repeat giving). Opening the page
@@ -885,6 +894,10 @@ export default function TrayPopoverView() {
                 </div>
               )}
             </Show>
+
+            <div class="border-b border-[var(--color-border)]">
+              <CommunityRow onClick={() => void openDiscord()} />
+            </div>
 
             <div class="border-b border-[var(--color-border)]">
               <button

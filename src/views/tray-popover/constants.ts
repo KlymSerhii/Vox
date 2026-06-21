@@ -12,3 +12,8 @@ export const PERIOD_OPTIONS: { value: Period; label: string }[] = [
 /// `openExternalUrl` from the tray popover's permanent "Support Vox" row
 /// and the milestone nudge's "Support Vox" button.
 export const DONATE_URL = "https://vox.rizenhq.com/donation";
+
+/// Community Discord invite. Opened from the tray popover's "Join the
+/// Discord" row, pinned just below the "Support Vox" surface — it's the
+/// hub for feature requests, bug reports, and help from other users.
+export const DISCORD_URL = "https://discord.gg/YQx95C5YbJ";
