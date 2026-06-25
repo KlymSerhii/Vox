@@ -217,10 +217,18 @@ export default function NotchView() {
         if (clickToExpand()) return;
         collapse();
       }}
-      onBlur={() => {
+      onFocusOut={(e) => {
         // Click-to-expand: collapse when focus leaves the panel (a click
-        // elsewhere on the desktop). Hover mode ignores blur.
-        if (clickToExpand()) collapse();
+        // elsewhere on the desktop). Hover mode ignores it. We use
+        // `focusout` (which bubbles, unlike `blur`) so this still fires
+        // when focus was on a descendant — and we ignore moves that stay
+        // INSIDE the panel (e.g. clicking a row's "mark done" checkbox),
+        // which would otherwise collapse the panel the instant the user
+        // ticks the first item.
+        if (!clickToExpand()) return;
+        const next = e.relatedTarget as Node | null;
+        if (next && panelRef?.contains(next)) return;
+        collapse();
       }}
     >
       {/* Collapsed resting line: #1 task, or the empty-state hint. */}
