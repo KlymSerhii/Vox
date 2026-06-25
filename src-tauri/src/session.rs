@@ -357,6 +357,13 @@ pub struct SessionState {
     pub auto_paste_enabled: bool,
     /// Resolved at session start: per-mode override falls back to the global `Settings` value.
     pub enable_thinking: bool,
+    /// When true this session routes its transcript through the notch
+    /// command interpreter (returns structured ops applied to the Notch
+    /// List) instead of the polish + clipboard delivery path. Set in
+    /// `begin` from either the one-shot notch-voice-hotkey flag or when
+    /// the active mode is `notch-list`. macOS-only behaviour, but the
+    /// flag itself is cross-platform so the field compiles everywhere.
+    pub notch_command: bool,
     /// RAII handle for the `SessionManager::busy_gate`. Held by the
     /// session for its entire lifetime; the gate decrements when the
     /// last `Arc<SessionState>` is dropped (after the spawned
@@ -452,6 +459,12 @@ pub struct SessionManager {
     /// [`CANCEL_DOUBLE_PRESS_WINDOW`] confirms the cancel. Reset at every
     /// `begin_recording`; only consulted by `request_cancel_foreground`.
     cancel_first_press_at: Mutex<Option<Instant>>,
+    /// One-shot flag set by the notch-voice hotkey just before it calls
+    /// `begin`. The next `begin` consumes it (swap to false) and flags the
+    /// new session as a notch-command session. A one-shot flag (rather
+    /// than a `begin` argument) keeps the hands-free toggle path — which
+    /// can't pass extra args through the shared PTT closure — simple.
+    notch_command_armed: AtomicBool,
 }
 
 impl SessionManager {
@@ -467,7 +480,14 @@ impl SessionManager {
             pending_restore: Mutex::new(None),
             busy_gate: BusyGate::new(),
             cancel_first_press_at: Mutex::new(None),
+            notch_command_armed: AtomicBool::new(false),
         }
+    }
+
+    /// Arm the next `begin` to start a notch-command session. Called by
+    /// the notch-voice hotkey closure immediately before `begin`.
+    pub fn arm_notch_command(&self) {
+        self.notch_command_armed.store(true, Ordering::SeqCst);
     }
 
     /// True when `id` is the session whose state changes should drive
@@ -609,6 +629,13 @@ impl SessionManager {
             .and_then(|m| m.enable_thinking)
             .unwrap_or(prefs.enable_thinking);
 
+        // Notch-command routing: consume the one-shot hotkey flag, OR
+        // honor the dedicated `notch-list` voice mode being active. Either
+        // path sends this session's transcript to the notch interpreter
+        // instead of polish + clipboard.
+        let notch_command = self.notch_command_armed.swap(false, Ordering::SeqCst)
+            || prefs.active_mode_id == "notch-list";
+
         let session = Arc::new(SessionState {
             id: new_sid,
             stage: Mutex::new(Stage::Listening),
@@ -639,6 +666,7 @@ impl SessionManager {
             live_transcript_enabled: prefs.live_transcript_enabled,
             auto_paste_enabled: prefs.auto_paste_enabled,
             enable_thinking,
+            notch_command,
             busy_guard: Mutex::new(Some(busy_guard)),
         });
 
@@ -1644,6 +1672,26 @@ async fn run_pipeline(
         return;
     }
 
+    // Notch-command fork: this session was started via the notch voice
+    // hotkey (or with the `notch-list` mode active). Interpret the
+    // transcript as a list command and apply the resulting ops to the
+    // Notch List — NO polish, NO clipboard delivery. Fail-open on any
+    // error (the list stays unchanged and a friendly toast surfaces).
+    if session.notch_command {
+        if stream_to_pill() {
+            pill::set_wide(&app, false);
+        }
+        interpret_and_apply_notch(&app, &manager, &session, &transcript, llm_engine).await;
+        // Auto-hide the pill after the notch outcome, mirroring the
+        // normal pipeline's tail. `owns_pill` was captured at the top of
+        // run_pipeline (foreground_id is already None by now).
+        if owns_pill {
+            manager.schedule_pill_hide_unless_taken(&app, id, 2200);
+        }
+        _guard.finalise();
+        return;
+    }
+
     let ctx_prompt = with_user_context(
         &session.mode.system_prompt,
         &session.context,
@@ -1967,6 +2015,169 @@ fn wav_peak_pcm16(wav: &[u8]) -> f32 {
         }
     }
     peak.min(1.0)
+}
+
+/// System prompt for the notch voice-command interpreter. The model must
+/// output ONLY a JSON object matching [`crate::notch_list::NotchCommandResponse`].
+const NOTCH_COMMAND_PROMPT: &str = "You convert a spoken command into structured edits for a small to-do list (the \"Notch List\"). You are given the CURRENT LIST as JSON (each active item has a 1-based index, an id, and text) and a SPOKEN COMMAND transcript.
+
+Output ONLY a single JSON object — no prose, no markdown fences, no explanation — with this exact shape:
+{
+  \"ops\": [ ... ],
+  \"needs_clarification\": null,
+  \"confidence\": 0.0
+}
+
+Each op in \"ops\" is one of:
+- {\"op\": \"add\", \"text\": \"...\", \"priority\": \"high\"|\"med\"|\"low\" (optional), \"position\": \"top\"|\"bottom\" (optional)}
+- {\"op\": \"complete\", \"target\": <target>}
+- {\"op\": \"remove\", \"target\": <target>}
+- {\"op\": \"edit\", \"target\": <target>, \"text\": \"...\"}
+- {\"op\": \"reprioritize\", \"target\": <target>, \"priority\": \"high\"|\"med\"|\"low\"}
+- {\"op\": \"reorder\", \"target\": <target>, \"position\": \"top\"|\"bottom\"}
+
+A <target> is one of: a 1-based integer index into the current list (preferred when the speaker says \"the second one\", \"number three\", \"the last one\"), or a string that matches the item's text.
+
+Rules:
+- Resolve references like \"the second one\", \"the dentist task\", \"that one\" against the provided 1-based list. Prefer an index target when the speaker refers to a position.
+- Do NOT translate task text. Preserve the speaker's language and wording for added/edited text.
+- If the command does not request any change to the list, return an empty \"ops\" array.
+- If the command is ambiguous or you cannot tell which item is meant, set \"needs_clarification\" to a short question and return an empty \"ops\" array.
+- Set \"confidence\" between 0 and 1 reflecting how sure you are the ops match the intent.
+- Output the JSON object and nothing else.";
+
+/// Interpret `transcript` as a Notch List command using the user's LLM
+/// engine, then apply the ops. Fail-open: any failure (no engine, parse
+/// miss, low confidence, clarification needed, apply error) leaves the
+/// list unchanged and surfaces a brief Done/Error pill. Never touches the
+/// clipboard.
+async fn interpret_and_apply_notch(
+    app: &AppHandle<Wry>,
+    manager: &Arc<SessionManager>,
+    session: &Arc<SessionState>,
+    transcript: &str,
+    llm_engine: Option<Arc<dyn crate::engines::LlmEngine>>,
+) {
+    let id = session.id;
+
+    // The notch interpreter needs a real LLM. When polishing is off /
+    // the engine is the no-op, there's nothing to interpret with — fail
+    // open with a clear message.
+    let engine = match llm_engine {
+        Some(e) if e.id() != "none" => e,
+        _ => {
+            log::warn!("notch command (sid={id}): no LLM engine available");
+            manager.set_stage(
+                app,
+                id,
+                Stage::Error,
+                Some("Enable polishing to use voice list editing".into()),
+                false,
+            );
+            return;
+        }
+    };
+
+    manager.set_stage(app, id, Stage::Polishing, None, false);
+
+    let store = crate::notch_list::store(app);
+    let doc = store.read();
+    let list_json = serde_json::to_string_pretty(&doc.top_n(usize::MAX)).unwrap_or_else(|_| "[]".into());
+    let payload = format!(
+        "CURRENT LIST (JSON):\n{}\n\nSPOKEN COMMAND:\n{}",
+        list_json, transcript
+    );
+
+    let raw = match engine
+        .cleanup(&payload, NOTCH_COMMAND_PROMPT, &[], false)
+        .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            log::warn!("notch command (sid={id}): LLM failed: {e}");
+            manager.set_stage(
+                app,
+                id,
+                Stage::Error,
+                Some("Couldn't understand the command".into()),
+                false,
+            );
+            return;
+        }
+    };
+
+    let parsed = match crate::notch_list::parse_command_response(&raw) {
+        Some(p) => p,
+        None => {
+            log::warn!("notch command (sid={id}): could not parse LLM JSON: {raw}");
+            manager.set_stage(
+                app,
+                id,
+                Stage::Error,
+                Some("Couldn't understand the command".into()),
+                false,
+            );
+            return;
+        }
+    };
+
+    if let Some(question) = parsed.needs_clarification.as_deref() {
+        if !question.trim().is_empty() {
+            log::info!("notch command (sid={id}): needs clarification: {question}");
+            manager.set_stage(app, id, Stage::Done, Some(question.to_string()), true);
+            return;
+        }
+    }
+
+    if parsed.confidence < 0.5 {
+        log::info!(
+            "notch command (sid={id}): low confidence {:.2}; not applying",
+            parsed.confidence
+        );
+        manager.set_stage(
+            app,
+            id,
+            Stage::Done,
+            Some("Not sure what you meant — try again".into()),
+            true,
+        );
+        return;
+    }
+
+    if parsed.ops.is_empty() {
+        manager.set_stage(app, id, Stage::Done, Some("No list change".into()), false);
+        return;
+    }
+
+    let confirm = settings::prefs(app).notch_list_confirm_destructive;
+    match store.apply_voice_ops(parsed.ops, confirm) {
+        Ok(result) if result.staged_destructive => {
+            // Destructive batch staged for confirmation. v1 surfaces a
+            // toast and does NOT mutate; the user can re-issue with the
+            // confirm setting off, or remove via the Settings tab.
+            manager.set_stage(
+                app,
+                id,
+                Stage::Done,
+                Some("Removing items needs confirmation — edit in Settings".into()),
+                true,
+            );
+        }
+        Ok(result) => {
+            crate::commands::emit_notch_list_changed(app);
+            manager.set_stage(app, id, Stage::Done, Some(result.summary()), false);
+        }
+        Err(e) => {
+            log::warn!("notch command (sid={id}): apply failed: {e}");
+            manager.set_stage(
+                app,
+                id,
+                Stage::Error,
+                Some("Couldn't find that item".into()),
+                false,
+            );
+        }
+    }
 }
 
 fn friendly_stt_error(e: &anyhow::Error, _engine_id: &str) -> String {
@@ -2688,6 +2899,7 @@ mod tests {
             live_transcript_enabled: false,
             auto_paste_enabled: false,
             enable_thinking: false,
+            notch_command: false,
             busy_guard: Mutex::new(None),
         })
     }

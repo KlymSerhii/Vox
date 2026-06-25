@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Vox Notch</title>
+    <script>
+      // Resolve `data-theme` BEFORE any markup paints so the inline theme
+      // tokens used by the notch pick up the right values on first paint.
+      (function () {
+        var v = null;
+        try { v = localStorage.getItem('vox-theme'); } catch (_) {}
+        var t = v === 'light' || v === 'dark' ? v : 'dark';
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+      })();
+    </script>
+    <style>
+      html,
+      body,
+      #root {
+        background: transparent !important;
+      }
+      body {
+        overflow: hidden;
+      }
+    </style>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/entries/notch.tsx"></script>
+  </body>
+</html>

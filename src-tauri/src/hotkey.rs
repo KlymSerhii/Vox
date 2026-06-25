@@ -30,6 +30,8 @@ use crate::settings::{self, HotkeyPurpose};
 const CANCEL_FALLBACKS: &[&str] = &["Escape"];
 const MODE_CYCLE_FALLBACKS: &[&str] =
     &["Alt+M", "Alt+Shift+M", "CommandOrControl+Shift+M"];
+const NOTCH_VOICE_FALLBACKS: &[&str] =
+    &["Cmd+Alt+L", "Cmd+Shift+L", "Alt+Shift+L"];
 
 /// Snapshot of what's actually bound for one hotkey purpose at runtime.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -67,6 +69,7 @@ pub struct ActiveHotkeyState {
     pub push_to_talk: Mutex<ActiveHotkey>,
     pub cancel: Mutex<ActiveHotkey>,
     pub mode_cycle: Mutex<ActiveHotkey>,
+    pub notch_voice: Mutex<ActiveHotkey>,
     /// Cached cancel binding. The cancel hotkey (default `Escape`) is
     /// only registered with the OS while a dictation session is active —
     /// otherwise pressing Escape in any other app would be swallowed by
@@ -96,6 +99,7 @@ impl ActiveHotkeyState {
             HotkeyPurpose::PushToTalk => &self.push_to_talk,
             HotkeyPurpose::Cancel => &self.cancel,
             HotkeyPurpose::ModeCycle => &self.mode_cycle,
+            HotkeyPurpose::NotchVoice => &self.notch_voice,
         }
     }
 
@@ -295,6 +299,7 @@ pub fn register<R: Runtime>(
     preferred: &str,
     cancel_preferred: &str,
     mode_cycle_preferred: &str,
+    notch_voice_preferred: &str,
     manager: Arc<SessionManager>,
 ) -> Result<String, String> {
     let gs = app.global_shortcut();
@@ -384,15 +389,59 @@ pub fn register<R: Runtime>(
         },
     );
 
+    // Notch-list voice hotkey (default ⌥⌘L). On Pressed it starts a
+    // session flagged as a notch-command session: the next `begin` reads
+    // a one-shot flag and routes the transcript through the notch command
+    // interpreter instead of polish + clipboard. Same fallback walk as
+    // mode-cycle; collides-with checks against the three other bindings.
+    let notch_active = bind_discrete(
+        app,
+        notch_voice_preferred,
+        NOTCH_VOICE_FALLBACKS,
+        HotkeyPurpose::NotchVoice,
+        "notch-voice",
+        |key, sc| {
+            if Some(sc) == ptt_bound_sc {
+                return Err(format!("'{key}' collides with push-to-talk; not registering"));
+            }
+            if Some(sc) == cancel_bound_sc {
+                return Err(format!("'{key}' collides with cancel; not registering"));
+            }
+            let app_handle = app.clone();
+            gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
+                if let ShortcutState::Pressed = event.state() {
+                    if let Some(wry_app) = try_into_wry(&app_handle) {
+                        if let Some(mgr) = wry_app.try_state::<Arc<SessionManager>>() {
+                            mgr.arm_notch_command();
+                            let mgr = mgr.inner().clone();
+                            // Mirror the PTT toggle path: in hands-free
+                            // mode a second press ends the recording; the
+                            // first press begins the (notch-flagged)
+                            // session.
+                            if mgr.foreground_id().is_some() {
+                                mgr.end_recording(wry_app);
+                            } else {
+                                handle_begin(&wry_app, &mgr);
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|e| e.to_string())
+        },
+    );
+
     if let Some(state) = app.try_state::<ActiveHotkeyState>() {
         state.store(HotkeyPurpose::PushToTalk, ptt_active.clone());
         state.store(HotkeyPurpose::Cancel, cancel_active.clone());
         state.store(HotkeyPurpose::ModeCycle, mode_active.clone());
+        state.store(HotkeyPurpose::NotchVoice, notch_active.clone());
     } else {
         let new_state = ActiveHotkeyState::default();
         new_state.store(HotkeyPurpose::PushToTalk, ptt_active.clone());
         new_state.store(HotkeyPurpose::Cancel, cancel_active.clone());
         new_state.store(HotkeyPurpose::ModeCycle, mode_active.clone());
+        new_state.store(HotkeyPurpose::NotchVoice, notch_active.clone());
         app.manage(new_state);
     }
 

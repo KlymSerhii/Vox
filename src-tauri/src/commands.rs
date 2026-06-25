@@ -6,6 +6,7 @@ use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::hotkey::{ActiveHotkey, ActiveHotkeyState};
 use crate::modes::{self, VoiceMode};
+use crate::notch_list::{self, NotchListDoc, NotchItem, Priority};
 use crate::session::SessionManager;
 use crate::settings::HotkeyPurpose;
 use crate::transcripts::SessionsSnapshot;
@@ -75,7 +76,10 @@ pub fn set_settings(
     let before = settings::load(&app);
     let hotkeys_changed = before.hotkey != settings.hotkey
         || before.cancel_hotkey != settings.cancel_hotkey
-        || before.mode_cycle_hotkey != settings.mode_cycle_hotkey;
+        || before.mode_cycle_hotkey != settings.mode_cycle_hotkey
+        || before.notch_list_voice_hotkey != settings.notch_list_voice_hotkey;
+    #[cfg(target_os = "macos")]
+    let notch_enabled_changed = before.notch_list_enabled != settings.notch_list_enabled;
     let appearance_changed = before.appearance != settings.appearance;
     let dock_icon_changed = before.show_dock_icon != settings.show_dock_icon;
     let polish_off = before.polishing_enabled && !settings.polishing_enabled;
@@ -124,6 +128,7 @@ pub fn set_settings(
                 &settings.hotkey,
                 &settings.cancel_hotkey,
                 &settings.mode_cycle_hotkey,
+                &settings.notch_list_voice_hotkey,
                 mgr.inner().clone(),
             ) {
                 Ok(resolved) => log::info!("hotkeys re-bound after settings save: {resolved}"),
@@ -138,6 +143,13 @@ pub fn set_settings(
                  binding will pick up new values on next launch."
             );
         }
+    }
+
+    // Notch List window lifecycle (macOS-only). Create or destroy the
+    // floating notch when the enable toggle flips.
+    #[cfg(target_os = "macos")]
+    if notch_enabled_changed {
+        crate::notch::create_or_destroy(&app, settings.notch_list_enabled);
     }
 
     if polish_off || llm_left_gemma {
@@ -1338,6 +1350,166 @@ pub fn cycle_active_mode<R: Runtime>(app: AppHandle<R>) -> Result<VoiceMode, Str
 pub fn suggest_active_mode<R: Runtime>(app: AppHandle<R>) -> Option<String> {
     let (bundle_id, title) = frontmost::detect()?;
     modes::suggest_mode_for(&app, Some(&bundle_id), title.as_deref())
+}
+
+// ---------------------------------------------------------------------------
+// Notch List commands
+// ---------------------------------------------------------------------------
+
+/// Broadcast the full notch-list doc so every webview (the notch window,
+/// the Settings → Notch List tab) stays in sync after a mutation. Mirrors
+/// `emit_modes_changed`: re-read authoritative state, serialise the full
+/// snapshot, log on failure.
+pub(crate) fn emit_notch_list_changed<R: Runtime>(app: &AppHandle<R>) {
+    let doc = notch_list::store(app).read();
+    if let Err(e) = app.emit("notch-list:changed", &doc) {
+        log::warn!("failed to emit notch-list:changed: {e}");
+    }
+}
+
+/// Read the current notch list. Unrestricted — the notch window and the
+/// Settings tab both call it.
+#[tauri::command]
+pub fn notch_list_get<R: Runtime>(app: AppHandle<R>) -> NotchListDoc {
+    notch_list::store(&app).read()
+}
+
+/// Resize + re-center the notch window (hover expand / collapse). Driven
+/// by the notch webview's ResizeObserver. No-op on non-macOS (the notch
+/// window only exists there). Unrestricted — the notch window is the only
+/// caller and it needs to drive its own size, exactly like `pill_resize`.
+#[tauri::command]
+pub fn notch_resize<R: Runtime>(
+    app: AppHandle<R>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::notch::set_size(&app, width, height);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&app, width, height);
+    }
+    Ok(())
+}
+
+/// Mark an item done. The ONLY notch-list mutation callable from the notch
+/// window itself (so the notch checkbox works) — deliberately NOT gated by
+/// `assert_secret_window`.
+#[tauri::command]
+pub fn notch_list_mark_done<R: Runtime>(app: AppHandle<R>, id: String) -> Result<(), String> {
+    notch_list::store(&app).mark_done(&id).map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_add<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    text: String,
+    priority: Option<Priority>,
+) -> Result<NotchItem, String> {
+    assert_secret_window(&webview)?;
+    let item = notch_list::store(&app)
+        .add(&text, priority.unwrap_or(Priority::Med), None)
+        .map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(item)
+}
+
+#[tauri::command]
+pub fn notch_list_edit<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    id: String,
+    text: String,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    notch_list::store(&app).edit(&id, &text).map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_remove<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    id: String,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    notch_list::store(&app).remove(&id).map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_reorder<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    ordered_ids: Vec<String>,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    notch_list::store(&app)
+        .reorder(&ordered_ids)
+        .map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_set_priority<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    id: String,
+    priority: Priority,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    notch_list::store(&app)
+        .reprioritize(&id, priority)
+        .map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_restore<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+    id: String,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    notch_list::store(&app).restore(&id).map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_clear_completed<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+) -> Result<(), String> {
+    assert_secret_window(&webview)?;
+    notch_list::store(&app)
+        .clear_completed()
+        .map_err(|e| e.to_string())?;
+    emit_notch_list_changed(&app);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn notch_list_undo<R: Runtime>(
+    app: AppHandle<R>,
+    webview: Webview<R>,
+) -> Result<bool, String> {
+    assert_secret_window(&webview)?;
+    let undone = notch_list::store(&app).undo().map_err(|e| e.to_string())?;
+    if undone {
+        emit_notch_list_changed(&app);
+    }
+    Ok(undone)
 }
 
 #[derive(Debug, Serialize)]

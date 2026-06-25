@@ -75,6 +75,20 @@ export interface Settings {
   /// is on. Matched fuzzily so near-homophones still trigger; blank
   /// falls back to the default on the backend.
   wake_phrase: string;
+  /// Notch List (macOS-only). Enabled by default (opt-out). When true
+  /// on macOS, a top-center floating notch window shows the top to-do
+  /// item and expands on hover. No window effect on Windows.
+  notch_list_enabled: boolean;
+  /// How many top items the notch panel reveals on hover (clamped 3–7).
+  notch_list_top_n: number;
+  /// Which display the notch attaches to.
+  notch_list_display: "active" | "builtin" | "primary";
+  /// Dedicated hotkey that routes the next dictation through the notch
+  /// command interpreter instead of polish + clipboard. Default ⌥⌘L.
+  notch_list_voice_hotkey: string;
+  /// Stage destructive voice batches (remove/clear) for confirmation
+  /// rather than applying immediately. On by default.
+  notch_list_confirm_destructive: boolean;
   /// Periodic auto-update check. On by default. When off, the
   /// background scheduler in `updater.rs` is a no-op but the manual
   /// "Check now" button in Settings → About still works.
@@ -128,6 +142,91 @@ export interface VoiceMode {
   built_in: boolean;
   created_at: number;
   updated_at: number;
+}
+
+// --- Notch List -----------------------------------------------------------
+
+export type NotchPriority = "high" | "med" | "low";
+
+export interface NotchItem {
+  id: string;
+  text: string;
+  priority: NotchPriority;
+  order: number;
+  done: boolean;
+  created_at: number;
+  completed_at?: number | null;
+}
+
+export interface NotchListDoc {
+  version: number;
+  items: NotchItem[];
+  archive: NotchItem[];
+}
+
+export async function getNotchList(): Promise<NotchListDoc> {
+  return invoke<NotchListDoc>("notch_list_get");
+}
+
+/// The only notch-list mutation callable from the notch window itself.
+export async function notchListMarkDone(id: string): Promise<void> {
+  await invoke("notch_list_mark_done", { id });
+}
+
+export async function notchListAdd(
+  text: string,
+  priority?: NotchPriority,
+): Promise<NotchItem> {
+  return invoke<NotchItem>("notch_list_add", { text, priority: priority ?? null });
+}
+
+export async function notchListEdit(id: string, text: string): Promise<void> {
+  await invoke("notch_list_edit", { id, text });
+}
+
+export async function notchListRemove(id: string): Promise<void> {
+  await invoke("notch_list_remove", { id });
+}
+
+export async function notchListReorder(orderedIds: string[]): Promise<void> {
+  await invoke("notch_list_reorder", { orderedIds });
+}
+
+export async function notchListSetPriority(
+  id: string,
+  priority: NotchPriority,
+): Promise<void> {
+  await invoke("notch_list_set_priority", { id, priority });
+}
+
+export async function notchListRestore(id: string): Promise<void> {
+  await invoke("notch_list_restore", { id });
+}
+
+export async function notchListClearCompleted(): Promise<void> {
+  await invoke("notch_list_clear_completed");
+}
+
+export async function notchListUndo(): Promise<boolean> {
+  return invoke<boolean>("notch_list_undo");
+}
+
+/// Resize + re-center the notch window (hover expand / collapse).
+export async function notchResize(
+  width: number | null,
+  height: number | null,
+): Promise<void> {
+  await invoke("notch_resize", { width, height });
+}
+
+/// Fired by the backend whenever the notch list changes (any mutation,
+/// including voice commands). Payload is the full current doc. Subscribed
+/// by the notch window and the Settings → Notch List tab so both stay in
+/// sync without polling.
+export async function onNotchListChanged(
+  cb: (doc: NotchListDoc) => void,
+): Promise<UnlistenFn> {
+  return listen<NotchListDoc>("notch-list:changed", (e) => cb(e.payload));
 }
 
 export interface UpdateCheckResult {
