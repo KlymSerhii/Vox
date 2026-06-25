@@ -234,6 +234,31 @@ export async function onNotchListChanged(
   return listen<NotchListDoc>("notch-list:changed", (e) => cb(e.payload));
 }
 
+/// Physical-notch geometry (logical px) for the display the notch is
+/// attached to. The notch webview sizes its idle "nub" to `width` so it
+/// never spills past the camera bump, and uses `has_notch` to decide
+/// whether it's hanging below a real notch. Zeroed on a notchless display.
+export interface NotchGeometry {
+  has_notch: boolean;
+  width: number;
+  height: number;
+}
+
+/// Snapshot the current notch geometry. Called by the notch webview on
+/// mount; pair with `onNotchGeometry` for live updates.
+export async function getNotchGeometry(): Promise<NotchGeometry> {
+  return invoke<NotchGeometry>("notch_geometry");
+}
+
+/// Fired when the notch hops to a display with different notch geometry
+/// (e.g. cursor-follow across monitors, or the notch first becoming known
+/// after launch). Payload is the new geometry.
+export async function onNotchGeometry(
+  cb: (geo: NotchGeometry) => void,
+): Promise<UnlistenFn> {
+  return listen<NotchGeometry>("notch:geometry", (e) => cb(e.payload));
+}
+
 export interface UpdateCheckResult {
   status: "available" | "up-to-date" | "error" | "unconfigured";
   current_version?: string;
