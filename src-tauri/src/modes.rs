@@ -509,7 +509,7 @@ Examples:
 // command path instead of this prompt (so this text is only ever shown,
 // not sent to the polish engine). Kept same-language / no-translate to
 // satisfy the built-in prompt invariant test.
-const NOTCH_LIST_PROMPT: &str = "This mode sends what you say to the Notch List command interpreter instead of polishing and copying text. Speak commands like \"add buy milk\", \"complete the second one\", or \"make the dentist task high priority\" and Vox edits your Notch List directly. Vox detects the language you speak and keeps your task text in that same language; it never translates it.";
+const NOTCH_LIST_PROMPT: &str = "This mode sends what you say to your Notch List instead of polishing and copying text. Just talk the way you would to a friend — say what you want to do, need to do, or want to remember, and Vox turns it into tasks. Reel off several at once (\"first I need to finish the report, then call the dentist, and book the flights\"), check things off (\"I finished the report\"), or change them (\"make the dentist one high priority\") — there are no command words to learn. Vox keeps your tasks in the same language you speak and never translates them.";
 
 const BRAINDUMP_PROMPT: &str = "You are restructuring a stream-of-thought voice-dictation transcript — a braindump. The speaker thought out loud: ideas arrived out of order, with tangents, repetitions, and half-finished sentences. Your job is to fully understand everything they meant, then express it as a clear, well-organized piece of writing that someone (or an AI assistant) reading it cold can act on. Return plain text only — no preface, no quotes, no reasoning, no explanations.
 

@@ -482,6 +482,46 @@ pub struct NotchCommandResponse {
     pub confidence: f32,
 }
 
+/// What [`crate::session`]'s notch interpreter should do with a parsed
+/// response. Pulled out as a pure decision so the natural-language gating
+/// is unit-testable without a live model.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NotchAction {
+    /// The model couldn't act and asked a short disambiguating question;
+    /// surface it to the user.
+    Clarify(String),
+    /// At least one op should be applied.
+    Apply,
+    /// Nothing actionable was heard.
+    Nothing,
+}
+
+impl NotchCommandResponse {
+    /// Decide how to act on this response.
+    ///
+    /// Natural-language editing means *adding is the default*, and a
+    /// rambling, multi-sentence brain-dump should still produce tasks — so
+    /// any non-empty `ops` list is applied regardless of `confidence`
+    /// (every op is reversible: adds/edits/completes via undo, removes via
+    /// the confirm gesture). Gating ops behind a confidence floor used to
+    /// silently drop perfectly good brain-dumps; `confidence` is now
+    /// advisory (logging) only. A clarifying question is surfaced only when
+    /// the model produced no ops AND gave a real question — never as a
+    /// catch-all for conversational speech.
+    pub fn action(&self) -> NotchAction {
+        if !self.ops.is_empty() {
+            return NotchAction::Apply;
+        }
+        if let Some(q) = self.needs_clarification.as_deref() {
+            let q = q.trim();
+            if !q.is_empty() {
+                return NotchAction::Clarify(q.to_string());
+            }
+        }
+        NotchAction::Nothing
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum NotchOp {
@@ -1177,5 +1217,74 @@ mod tests {
             staged_destructive: false,
         };
         assert_eq!(r.summary(), "Added 1, completed 2");
+    }
+
+    #[test]
+    fn action_applies_any_nonempty_ops_ignoring_confidence() {
+        // The regression that made natural speech vanish: a multi-item
+        // brain-dump the model returned with low confidence must STILL be
+        // applied. Adding is the default and every add is undoable.
+        let resp = NotchCommandResponse {
+            ops: vec![
+                NotchOp::Add {
+                    text: "Finish the alarm features".into(),
+                    priority: Some(Priority::High),
+                    position: None,
+                },
+                NotchOp::Add {
+                    text: "Apply for Apple review".into(),
+                    priority: None,
+                    position: None,
+                },
+            ],
+            needs_clarification: None,
+            confidence: 0.1,
+        };
+        assert_eq!(resp.action(), NotchAction::Apply);
+    }
+
+    #[test]
+    fn action_prefers_acting_over_a_tacked_on_question() {
+        // If the model both proposed ops AND tacked on a question, act —
+        // never strand the user's tasks behind a clarification prompt.
+        let resp = NotchCommandResponse {
+            ops: vec![NotchOp::Add {
+                text: "Buy milk".into(),
+                priority: None,
+                position: None,
+            }],
+            needs_clarification: Some("anything else?".into()),
+            confidence: 0.2,
+        };
+        assert_eq!(resp.action(), NotchAction::Apply);
+    }
+
+    #[test]
+    fn action_clarifies_only_with_no_ops_and_a_real_question() {
+        let resp = NotchCommandResponse {
+            ops: vec![],
+            needs_clarification: Some("Which task did you mean?".into()),
+            confidence: 0.4,
+        };
+        assert_eq!(
+            resp.action(),
+            NotchAction::Clarify("Which task did you mean?".into())
+        );
+    }
+
+    #[test]
+    fn action_nothing_when_empty_with_blank_or_absent_question() {
+        let blank = NotchCommandResponse {
+            ops: vec![],
+            needs_clarification: Some("   ".into()),
+            confidence: 0.9,
+        };
+        assert_eq!(blank.action(), NotchAction::Nothing);
+        let absent = NotchCommandResponse {
+            ops: vec![],
+            needs_clarification: None,
+            confidence: 0.9,
+        };
+        assert_eq!(absent.action(), NotchAction::Nothing);
     }
 }
