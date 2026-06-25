@@ -695,6 +695,20 @@ fn apply_macos_panel_style<R: Runtime>(win: &tauri::WebviewWindow<R>) -> anyhow:
     let ns_window: &NSWindow = unsafe { &*(raw as *const NSWindow) };
 
     unsafe {
+        // Apply the style mask FIRST. Changing the mask re-realizes the
+        // window, which resets its `level` and `collectionBehavior` back to
+        // defaults, so anything configured before this call gets silently
+        // wiped. This was the cause of the pill being invisible on a
+        // secondary Space (desktop): `CanJoinAllSpaces` was set and then
+        // cleared by `setStyleMask`, leaving the default behaviour of only
+        // appearing on the Space where the window was created. Setting the
+        // mask up front means the level/collection-behaviour calls below are
+        // the final word.
+        //
+        // NonactivatingPanel keeps focus with the user's current app on click —
+        // we can't swap the NSWindow class to NSPanel without rebuilding,
+        // but the style bit is enough.
+        ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
         // Status-bar level + FullScreenAuxiliary + stationary keep the pill
         // floating above every app (including fullscreen video) on every space.
         ns_window.setLevel(NSStatusWindowLevel);
@@ -706,10 +720,6 @@ fn apply_macos_panel_style<R: Runtime>(win: &tauri::WebviewWindow<R>) -> anyhow:
         ns_window.setMovableByWindowBackground(false);
         ns_window.setHidesOnDeactivate(false);
         ns_window.setExcludedFromWindowsMenu(true);
-        // NonactivatingPanel keeps focus with the user's current app on click —
-        // we can't swap the NSWindow class to NSPanel without rebuilding,
-        // but the style bit is enough.
-        ns_window.setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
         // setCanHide isn't on objc2's typed NSWindow surface; route via msg_send.
         let raw_obj: &AnyObject = &*(ns_window as *const NSWindow as *const AnyObject);
         let _: () = msg_send![raw_obj, setCanHide: false];
