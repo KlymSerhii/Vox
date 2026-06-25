@@ -9,6 +9,7 @@ import {
   notchListReorder,
   notchListRestore,
   notchListSetPriority,
+  notchListUndo,
   onNotchListChanged,
   type NotchItem,
   type NotchListDoc,
@@ -145,6 +146,16 @@ export function NotchListTab(props: {
   async function clearCompleted() {
     try {
       await notchListClearCompleted();
+    } catch (e) {
+      setErr(String(e));
+    }
+  }
+
+  async function undoLast() {
+    setErr(null);
+    try {
+      const undone = await notchListUndo();
+      if (!undone) setErr("Nothing to undo.");
     } catch (e) {
       setErr(String(e));
     }
@@ -389,7 +400,6 @@ export function NotchListTab(props: {
           <Row
             label="Voice command shortcut"
             hint="Press, speak a command (e.g. “add buy milk”), and Vox edits the list instead of copying text."
-            last
           >
             <div class="flex items-center gap-2">
               <HotkeyKeys spec={props.s.notch_list_voice_hotkey} />
@@ -415,6 +425,19 @@ export function NotchListTab(props: {
                 </For>
               </div>
             </div>
+          </Row>
+          <Row
+            label="Undo last voice edit"
+            hint="Revert the most recent voice command (single level)."
+            last
+          >
+            <button
+              type="button"
+              onClick={() => void undoLast()}
+              class="rounded-[7px] bg-[var(--color-control)] px-3 py-1.5 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-inset ring-[var(--color-border)] hover:bg-[var(--color-control-hover)]"
+            >
+              Undo
+            </button>
           </Row>
         </Card>
       </Show>

@@ -388,6 +388,7 @@ pub fn register<R: Runtime>(
             .map_err(|e| e.to_string())
         },
     );
+    let mode_bound_sc = shortcut_from_key(&mode_active.bound);
 
     // Notch-list voice hotkey (default ⌥⌘L). On Pressed it starts a
     // session flagged as a notch-command session: the next `begin` reads
@@ -407,20 +408,32 @@ pub fn register<R: Runtime>(
             if Some(sc) == cancel_bound_sc {
                 return Err(format!("'{key}' collides with cancel; not registering"));
             }
+            if Some(sc) == mode_bound_sc {
+                return Err(format!("'{key}' collides with mode-cycle; not registering"));
+            }
             let app_handle = app.clone();
             gs.on_shortcut(sc, move |_app, _sc, event: ShortcutEvent| {
                 if let ShortcutState::Pressed = event.state() {
                     if let Some(wry_app) = try_into_wry(&app_handle) {
                         if let Some(mgr) = wry_app.try_state::<Arc<SessionManager>>() {
-                            mgr.arm_notch_command();
                             let mgr = mgr.inner().clone();
                             // Mirror the PTT toggle path: in hands-free
                             // mode a second press ends the recording; the
                             // first press begins the (notch-flagged)
-                            // session.
+                            // session. Only arm on the begin branch — the
+                            // stop branch must not leave the one-shot flag
+                            // set, or the user's NEXT normal dictation
+                            // would be wrongly routed to the notch path.
+                            // `begin` consumes the flag on every outcome.
                             if mgr.foreground_id().is_some() {
                                 mgr.end_recording(wry_app);
+                            } else if mgr.try_commit_pending_notch(&wry_app) {
+                                // A destructive batch was staged for
+                                // confirmation and this press is the
+                                // confirm gesture — commit it, don't
+                                // start a recording.
                             } else {
+                                mgr.arm_notch_command();
                                 handle_begin(&wry_app, &mgr);
                             }
                         }

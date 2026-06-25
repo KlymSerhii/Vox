@@ -210,7 +210,7 @@ export default function NotchView() {
       >
         <Show
           when={headItem()}
-          fallback={<EmptyState voiceHotkey={voiceHotkey()} collapsed />}
+          fallback={<EmptyState voiceHotkey={voiceHotkey()} />}
         >
           {(item) => (
             <div
@@ -236,11 +236,11 @@ export default function NotchView() {
 /// Empty-state row. Founder-mandated copy: the literal text
 /// "Vox Notch — " followed by the bound voice hotkey rendered through the
 /// shared `<HotkeyKeys>` component, followed by " to add a task by voice".
-function EmptyState(props: { voiceHotkey: string; collapsed?: boolean }) {
+function EmptyState(props: { voiceHotkey: string }) {
   return (
     <div
       class="flex items-center gap-1.5 px-3 text-[11px] text-[var(--color-ink-mute)]"
-      style={{ height: props.collapsed ? `${COLLAPSED_H}px` : "30px" }}
+      style={{ height: `${COLLAPSED_H}px` }}
     >
       <span>Vox Notch&nbsp;—&nbsp;</span>
       <HotkeyKeys spec={props.voiceHotkey} />

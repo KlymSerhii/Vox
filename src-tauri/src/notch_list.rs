@@ -100,8 +100,11 @@ impl NotchListDoc {
         active
     }
 
-    /// Re-pack `order` densely (0,1,2,…) following the current sorted
-    /// display order so reorders and removals keep a clean sequence.
+    /// Re-pack `order` densely following the current sorted display order
+    /// so reorders and removals keep a clean sequence. Packs starting at
+    /// `1` (not `0`) so a later "move to top" can pick `min - 1` without
+    /// the band-min-is-0 case saturating into a tie with the current top
+    /// item (which a stable sort would otherwise resolve the wrong way).
     fn normalize_order(&mut self) {
         let mut sorted: Vec<&mut NotchItem> = self.items.iter_mut().collect();
         sorted.sort_by(|a, b| {
@@ -111,7 +114,7 @@ impl NotchListDoc {
                 .then(a.order.cmp(&b.order))
         });
         for (idx, item) in sorted.into_iter().enumerate() {
-            item.order = idx as u32;
+            item.order = idx as u32 + 1;
         }
     }
 }
@@ -364,6 +367,23 @@ impl NotchStore {
         Ok(result)
     }
 
+    /// Commit a previously-staged doc (e.g. a confirmed destructive voice
+    /// batch) as the new list, snapshotting the current state for undo.
+    /// Used by the confirm-destructive gesture in `session.rs`.
+    pub fn commit_staged(&self, next: NotchListDoc) -> Result<()> {
+        let prev = self.read();
+        self.commit_with_undo(prev, next)
+    }
+
+    /// Whether an undo snapshot is currently available. Reserved for a
+    /// future "disable the Undo button when nothing to undo" gate (the v1
+    /// Settings button is always-enabled and reports "Nothing to undo");
+    /// kept test-covered so the snapshot bookkeeping stays honest.
+    #[allow(dead_code)]
+    pub fn can_undo(&self) -> bool {
+        self.last_undo.read().is_some()
+    }
+
     /// Restore the pre-last-batch snapshot, if any. Returns false when
     /// there's nothing to undo.
     pub fn undo(&self) -> Result<bool> {
@@ -515,7 +535,9 @@ pub enum Position {
 /// Outcome of [`apply_ops`].
 #[derive(Clone, Debug)]
 pub struct NotchApplyResult {
-    /// The new doc after applying every op (already validated).
+    /// The new doc after applying every op (already validated). This is
+    /// the fully-applied result even when `staged_destructive` is true —
+    /// the caller stages it and commits on confirmation.
     pub doc: NotchListDoc,
     pub added: u32,
     pub completed: u32,
@@ -524,8 +546,9 @@ pub struct NotchApplyResult {
     pub reprioritized: u32,
     pub reordered: u32,
     /// True when `confirm_destructive` was on and the batch contained a
-    /// Remove. The caller should NOT commit `doc` — instead surface a
-    /// confirmation prompt. (No state is mutated in this case.)
+    /// Remove. The caller should NOT auto-commit `doc` — instead stage it
+    /// and surface a confirmation gesture (the store leaves the on-disk
+    /// list untouched until the caller commits).
     pub staged_destructive: bool,
 }
 
@@ -568,12 +591,24 @@ impl NotchApplyResult {
 /// index into the sorted active list → fuzzy (case-insensitive substring,
 /// else nearest by token overlap) text match. Returns `None` when nothing
 /// matches.
+///
+/// Note on the `Id`/`Text` arms: `Target` is `#[serde(untagged)]`, so any
+/// JSON string deserializes into `Id` (the first string variant) — the
+/// model can't actually produce a `Text` target over the wire. We bridge
+/// that by falling back to a fuzzy text match when an `Id` string doesn't
+/// match a real item id, which is what lets the LLM reference items by
+/// their text (e.g. "the dentist task"). The standalone `Text` variant
+/// stays for programmatic callers / tests.
 fn resolve_target(doc: &NotchListDoc, target: &Target) -> Option<String> {
     // Use the FULL sorted active list (not truncated to top_n) so voice
     // references like "the 6th one" still resolve.
     let sorted = doc.top_n(usize::MAX);
     match target {
-        Target::Id(id) => sorted.iter().find(|i| &i.id == id).map(|i| i.id.clone()),
+        Target::Id(id) => sorted
+            .iter()
+            .find(|i| &i.id == id)
+            .map(|i| i.id.clone())
+            .or_else(|| fuzzy_find(&sorted, id)),
         Target::Index(idx) => {
             if *idx == 0 {
                 return None;
@@ -617,27 +652,16 @@ fn fuzzy_find(items: &[NotchItem], needle: &str) -> Option<String> {
 /// against the *original* doc snapshot so indices in the batch refer to
 /// the list the speaker saw, not a mid-batch reshuffled one. An
 /// unresolvable target is a hard error (the caller fails open with a
-/// toast). Returns the new doc + a summary. When `confirm_destructive`
-/// is on and the batch contains a Remove, returns `staged_destructive =
-/// true` with the ORIGINAL doc untouched.
+/// toast). Returns the fully-applied new doc + a summary. When
+/// `confirm_destructive` is on and the batch contains a Remove,
+/// `staged_destructive` is set so the caller stages `doc` rather than
+/// committing it (nothing is persisted by this function either way).
 pub fn apply_ops(
     doc: &NotchListDoc,
     ops: &[NotchOp],
     confirm_destructive: bool,
 ) -> Result<NotchApplyResult> {
     let has_destructive = ops.iter().any(|o| matches!(o, NotchOp::Remove { .. }));
-    if confirm_destructive && has_destructive {
-        return Ok(NotchApplyResult {
-            doc: doc.clone(),
-            added: 0,
-            completed: 0,
-            removed: 0,
-            edited: 0,
-            reprioritized: 0,
-            reordered: 0,
-            staged_destructive: true,
-        });
-    }
 
     // Pre-resolve every target against the original snapshot.
     let mut resolved: Vec<Option<String>> = Vec::with_capacity(ops.len());
@@ -736,6 +760,10 @@ pub fn apply_ops(
         return Err(anyhow!("list would exceed the maximum size"));
     }
     r.doc = next;
+    // `r.doc` is always the FULLY-APPLIED new doc. When the batch was
+    // destructive and confirmation is on, we flag it so the caller stages
+    // `r.doc` for a confirm gesture instead of committing it now.
+    r.staged_destructive = confirm_destructive && has_destructive;
     Ok(r)
 }
 
@@ -874,10 +902,10 @@ mod tests {
         assert_eq!(top[0].text, "high task");
         assert_eq!(top[1].text, "med task");
         assert_eq!(top[2].text, "low task");
-        // Orders are densely packed 0..n following display order.
+        // Orders are densely packed (1-based) following display order.
         let mut orders: Vec<u32> = top.iter().map(|i| i.order).collect();
         orders.sort();
-        assert_eq!(orders, vec![0, 1, 2]);
+        assert_eq!(orders, vec![1, 2, 3]);
     }
 
     #[test]
@@ -898,8 +926,8 @@ mod tests {
         assert_eq!(doc.archive.len(), 1);
         assert!(doc.archive[0].done);
         assert!(doc.archive[0].completed_at.is_some());
-        // Reflowed: the surviving item is order 0.
-        assert_eq!(doc.items[0].order, 0);
+        // Reflowed: the surviving item is order 1 (1-based dense packing).
+        assert_eq!(doc.items[0].order, 1);
     }
 
     #[test]
@@ -1041,8 +1069,12 @@ mod tests {
         }];
         let r = apply_ops(&doc, &ops, true).unwrap();
         assert!(r.staged_destructive);
-        // Original doc untouched in the result.
-        assert_eq!(r.doc.items.len(), 1);
+        // `r.doc` now carries the FULLY-APPLIED result (item removed),
+        // ready for the caller to stage and commit on confirmation. The
+        // on-disk list is only mutated when the caller commits.
+        assert_eq!(r.doc.items.len(), 0);
+        assert_eq!(r.doc.archive.len(), 1);
+        assert_eq!(r.removed, 1);
     }
 
     #[test]
@@ -1075,6 +1107,51 @@ mod tests {
         assert_eq!(store.read().items.len(), 1);
         // Nothing left to undo.
         assert!(!store.undo().unwrap());
+    }
+
+    #[test]
+    fn apply_ops_resolves_text_via_id_string_fallback() {
+        // Over the wire a string target deserializes into Target::Id
+        // (untagged enum), so the LLM's "the dentist task" arrives as
+        // Id("...the dentist..."). resolve_target must still fuzzy-match.
+        let mut doc = NotchListDoc::default();
+        build_add(&mut doc, "Call the dentist tomorrow", Priority::Med, None).unwrap();
+        build_add(&mut doc, "Email Bob", Priority::Med, None).unwrap();
+        doc.normalize_order();
+        let ops = vec![NotchOp::Complete {
+            target: Target::Id("dentist".into()),
+        }];
+        let r = apply_ops(&doc, &ops, false).unwrap();
+        assert_eq!(r.completed, 1);
+        assert!(r.doc.items.iter().all(|i| !i.text.contains("dentist")));
+    }
+
+    #[test]
+    fn commit_staged_persists_and_snapshots_for_undo() {
+        let (store, _f) = fresh_store();
+        store.add("keep", Priority::Med, None).unwrap();
+        // A staged destructive batch is just the fully-applied doc the
+        // confirm gesture will commit.
+        let ops = vec![NotchOp::Remove {
+            target: Target::Index(1),
+        }];
+        let staged = apply_ops(&store.read(), &ops, true).unwrap();
+        assert!(staged.staged_destructive);
+        store.commit_staged(staged.doc).unwrap();
+        assert_eq!(store.read().items.len(), 0);
+        assert!(store.can_undo());
+        assert!(store.undo().unwrap());
+        assert_eq!(store.read().items.len(), 1);
+    }
+
+    #[test]
+    fn can_undo_reports_snapshot_presence() {
+        let (store, _f) = fresh_store();
+        assert!(!store.can_undo());
+        store.add("a", Priority::Med, None).unwrap();
+        assert!(store.can_undo());
+        store.undo().unwrap();
+        assert!(!store.can_undo());
     }
 
     #[test]
