@@ -10,9 +10,26 @@
 //! Whole module is `#[cfg(target_os = "macos")]` (gated at the `mod notch;`
 //! declaration in `lib.rs`), so this file is only ever compiled on macOS.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Runtime, WebviewUrl};
 
 pub const LABEL: &str = "notch";
+
+/// Poll cadence for the display follower + fullscreen probe. Moving the
+/// cursor to another monitor (or entering fullscreen) is a coarse user
+/// action, so a ~300 ms tick keeps the notch on the right screen without
+/// the cost of a tight loop. Mirrors `pill::FOLLOW_POLL_MS`.
+const FOLLOW_POLL_MS: u64 = 300;
+
+/// Bumped every time the notch window is created or destroyed. The
+/// display follower captures the value at spawn time and stands down the
+/// moment a create/destroy advances it — exactly mirroring
+/// `pill::PILL_GENERATION`. Because the notch window is persistent (one
+/// `create` per enable), the follower is spawned once at creation and
+/// torn down on destroy.
+static NOTCH_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 /// Collapsed resting width/height. The window is created at the collapsed
 /// size; the frontend grows it on hover via `setSize` (mirroring how the
@@ -61,11 +78,20 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         log::warn!("notch: failed to apply macOS panel style: {e}");
     }
 
+    // The window is persistent (one create per enable), so we spawn the
+    // follower exactly once here, keyed on a fresh generation. A later
+    // destroy bumps the generation and the follower stands down.
+    let generation = NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    spawn_display_follower(app.clone(), generation);
+
     Ok(())
 }
 
 /// Destroy the notch window (used when the user turns the feature off).
 pub fn destroy<R: Runtime>(app: &AppHandle<R>) {
+    // Bump the generation FIRST so the running follower stands down on its
+    // next tick instead of touching a window we're about to close.
+    NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(LABEL) {
         if let Err(e) = win.close() {
             log::warn!("notch: failed to close window: {e}");
@@ -109,11 +135,103 @@ pub fn set_size<R: Runtime>(app: &AppHandle<R>, width: Option<f64>, height: Opti
     apply_size(&win, frame, target_w, target_h);
 }
 
+/// Re-run the top-center placement for the current window. Public so
+/// `commands::set_settings` can call it (macOS-gated) when
+/// `notch_list_display` changes, so the notch hops to the newly-chosen
+/// display without waiting for the next follower tick. No-op when the
+/// window doesn't exist.
+pub fn refresh_placement<R: Runtime>(app: &AppHandle<R>) {
+    let Some(win) = app.get_webview_window(LABEL) else {
+        return;
+    };
+    if let Err(e) = reposition(&win) {
+        log::warn!("notch refresh_placement failed: {e}");
+    }
+}
+
+/// Keep the notch on whatever display `notch_list_display` resolves to.
+/// `"active"` follows the cursor's display (re-centering when the user
+/// moves to another monitor mid-session); `"builtin"`/`"primary"` resolve
+/// to a constant target frame, so the `frame != last` guard makes the
+/// poll a cheap no-op there. TOP-anchored via `reposition`, never the
+/// pill's bottom-anchored math.
+///
+/// Unlike the pill follower, this runs even on single-display Macs —
+/// the Stage 6 fullscreen probe (added in `follower_tick`) needs the
+/// poll regardless of monitor count.
+///
+/// Keyed on `NOTCH_GENERATION` (captured as `generation`): a create or
+/// destroy bumps the counter and this task stands down on its next tick.
+fn spawn_display_follower<R: Runtime>(app: AppHandle<R>, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        // Seed through the SAME placement path so the first tick compares
+        // like-for-like and is a no-op (the window is already where
+        // `create`/`reposition` put it).
+        let mut last_frame = app
+            .get_webview_window(LABEL)
+            .and_then(|w| target_frame(&w));
+
+        let mut ticker = tokio::time::interval(Duration::from_millis(FOLLOW_POLL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // A create()/destroy() since spawn bumped the generation, so a
+            // newer follower (or none) owns the notch — stand down.
+            if NOTCH_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            let Some(win) = app.get_webview_window(LABEL) else {
+                return;
+            };
+            follower_tick(&win, &mut last_frame);
+        }
+    });
+}
+
+/// One follower iteration: re-center on a display change (preserving the
+/// current window size so an expanded panel keeps its width when it hops
+/// monitors), then run the fullscreen auto-hide probe. Split out so the
+/// hot loop stays readable and the two concerns are independently
+/// fail-open.
+fn follower_tick<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+    last_frame: &mut Option<(f64, f64, f64, f64)>,
+) {
+    let frame = target_frame(win);
+    // Only move on an actual display change. On the same display the
+    // frame is byte-identical, so this stays a cheap no-op and never
+    // fights the frontend's hover-driven resizes.
+    if frame != *last_frame {
+        if let Some(f) = frame {
+            reposition_to_frame(win, f);
+        }
+        *last_frame = frame;
+    }
+
+    // Stage 6: hide the notch when the target display is in fullscreen
+    // (menu bar hidden). Fail-open — a None/failed read never hides.
+    apply_fullscreen_visibility(win);
+}
+
+/// Re-center the notch onto `frame` (logical x, y, w, h) while preserving
+/// its current size — TOP-anchored, mirroring `apply_size`. Used by the
+/// display follower so a hover-expanded panel keeps its dimensions when
+/// it moves to another monitor.
+fn reposition_to_frame<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+    frame: (f64, f64, f64, f64),
+) {
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let cur = win.inner_size().ok();
+    let cur_w = cur.as_ref().map(|s| s.width as f64 / scale).unwrap_or(WIDTH);
+    let cur_h = cur.map(|s| s.height as f64 / scale).unwrap_or(HEIGHT);
+    apply_size(win, Some(frame), cur_w, cur_h);
+}
+
 fn reposition<R: Runtime>(win: &tauri::WebviewWindow<R>) -> tauri::Result<()> {
     if let Some((mx, my, mw, _mh)) = target_frame(win) {
-        let x = mx + (mw - WIDTH) / 2.0;
-        let y = my + TOP_MARGIN;
-        win.set_size(LogicalSize::new(WIDTH, HEIGHT))?;
+        let (x, y, w, h) = fuse_geometry(win, mx, my, mw, WIDTH, HEIGHT);
+        win.set_size(LogicalSize::new(w, h))?;
         win.set_position(LogicalPosition::new(x, y))?;
     }
     Ok(())
@@ -126,14 +244,71 @@ fn apply_size<R: Runtime>(
     target_h: f64,
 ) {
     if let Some((mx, my, mw, _mh)) = frame {
-        let x = mx + (mw - target_w) / 2.0;
-        // Top-anchored: the top edge stays at TOP_MARGIN so hover growth
-        // expands the panel downward from the notch.
-        let y = my + TOP_MARGIN;
-        let _ = win.set_size(LogicalSize::new(target_w, target_h));
+        let (x, y, w, h) = fuse_geometry(win, mx, my, mw, target_w, target_h);
+        let _ = win.set_size(LogicalSize::new(w, h));
         let _ = win.set_position(LogicalPosition::new(x, y));
     } else {
         let _ = win.set_size(LogicalSize::new(target_w, target_h));
+    }
+}
+
+/// Compute the final `(x, y, w, h)` for the notch given the resolved
+/// screen frame origin/width (`mx`, `my`, `mw`) and the desired content
+/// size (`req_w`, `req_h`).
+///
+/// FALLBACK LADDER (the v1.1 safety contract — every rung must be ≥ as
+/// good as v1):
+/// - `notch_geometry()` → `None`         : v1 placement (centered, top
+///   edge at `TOP_MARGIN`). Identical to pre-v1.1.
+/// - `top_inset == 0` (no physical notch) : v1 placement.
+/// - `top_inset > 0`, ears `None`         : fuse vertically — kiss the
+///   very top (`y = my`, no `TOP_MARGIN`), grow the collapsed strip to at
+///   least the inset height so it visually sits in the menu-bar band, and
+///   keep it horizontally centered. Expanded panels (taller than the
+///   inset) start at `my + top_inset` so they drop BELOW the physical
+///   notch instead of behind it.
+/// - `top_inset > 0`, ears `Some`         : same as ears-`None` for v1.1.
+///   We READ + log the ear rects but deliberately do NOT depend on them
+///   for layout this release (conservative).
+fn fuse_geometry<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+    mx: f64,
+    my: f64,
+    mw: f64,
+    req_w: f64,
+    req_h: f64,
+) -> (f64, f64, f64, f64) {
+    let metrics = notch_geometry(win);
+    match metrics {
+        Some(m) if m.top_inset > 0.0 => {
+            if let Some(ears) = m.left_ear {
+                log::debug!("notch: left ear (logical, top-left) = {:?}", ears);
+            }
+            if let Some(ears) = m.right_ear {
+                log::debug!("notch: right ear (logical, top-left) = {:?}", ears);
+            }
+            // Collapsed strip kisses the top and is at least as tall as
+            // the inset so it reads as occupying the menu-bar band; an
+            // already-expanded (taller) panel keeps its requested height.
+            let is_expanded = req_h > m.top_inset + 1.0;
+            let h = req_h.max(m.top_inset).max(HEIGHT);
+            let x = mx + (mw - req_w) / 2.0;
+            let y = if is_expanded {
+                // Drop the expanded panel below the physical notch.
+                my + m.top_inset
+            } else {
+                // Kiss the very top — no TOP_MARGIN gap on a notched
+                // display (the inset already accounts for the chin).
+                my
+            };
+            (x, y, req_w, h)
+        }
+        // None, or a zero inset (no physical notch) → v1 placement.
+        _ => {
+            let x = mx + (mw - req_w) / 2.0;
+            let y = my + TOP_MARGIN;
+            (x, y, req_w, req_h)
+        }
     }
 }
 
@@ -172,6 +347,188 @@ fn primary_frame<R: Runtime>(
             s.height as f64 / scale,
         )
     })
+}
+
+/// Physical-notch geometry for the target display, in **logical**,
+/// **top-left-origin** coordinates (the same space `target_frame`
+/// returns). All fields are `Option`/zero-defaulted so a failed FFI read
+/// degrades to v1 placement via the `fuse_geometry` fallback ladder.
+pub(crate) struct NotchMetrics {
+    /// `safeAreaInsets.top` — the height of the menu-bar band reserved by
+    /// the physical notch (0 on a notchless display / pre-macOS-12).
+    top_inset: f64,
+    /// `auxiliaryTopLeftArea` — the usable "ear" to the LEFT of the notch
+    /// (logical, top-left). Read + logged for v1.1; NOT used for layout.
+    left_ear: Option<(f64, f64, f64, f64)>,
+    /// `auxiliaryTopRightArea` — the usable "ear" to the RIGHT of the
+    /// notch. Read + logged for v1.1; NOT used for layout.
+    right_ear: Option<(f64, f64, f64, f64)>,
+}
+
+/// Resolve the target `NSScreen` for the current `notch_list_display`
+/// setting, mirroring the screen hit-test in
+/// `pill::macos_active_screen_frame` (cursor hit-test for `"active"`,
+/// firstObject otherwise), and invoke `f` with the borrowed screen plus
+/// the primary screen's height (needed for the AppKit→top-left Y flip).
+///
+/// Passing a closure rather than returning an owned `Retained<NSScreen>`
+/// keeps us on the exact borrowed-`&NSScreen` idiom proven in `pill.rs`
+/// (`screens.iter().map(|s| s.frame())`) — no `retain()` guesswork. The
+/// whole module is macOS-gated, so this only ever compiles there.
+/// Returns `None` off the main thread (no screen resolved).
+fn with_target_nsscreen<T>(
+    display: &str,
+    f: impl FnOnce(&objc2_app_kit::NSScreen, f64) -> T,
+) -> Option<T> {
+    use objc2_app_kit::{NSEvent, NSScreen};
+    use objc2_foundation::MainThreadMarker;
+
+    let mtm = MainThreadMarker::new()?;
+    let screens = NSScreen::screens(mtm);
+    let primary = screens.firstObject()?;
+    let primary_height = primary.frame().size.height;
+
+    match display {
+        "active" => {
+            let cursor = NSEvent::mouseLocation();
+            // `iter()` yields borrowed `&NSScreen` — same idiom pill.rs
+            // uses. Operate on the borrow in place so nothing needs to
+            // outlive the array.
+            let hit = screens.iter().find(|s| {
+                let fr = s.frame();
+                cursor.x >= fr.origin.x
+                    && cursor.x < fr.origin.x + fr.size.width
+                    && cursor.y >= fr.origin.y
+                    && cursor.y < fr.origin.y + fr.size.height
+            });
+            match hit {
+                Some(s) => Some(f(&s, primary_height)),
+                None => Some(f(&primary, primary_height)),
+            }
+        }
+        // builtin/primary both resolve to the primary screen — macOS
+        // reports the built-in (notched) panel as primary in the common
+        // case, matching `target_frame`'s resolution.
+        _ => Some(f(&primary, primary_height)),
+    }
+}
+
+/// Read the physical-notch geometry for the target display. Every read is
+/// `respondsToSelector:`-guarded (pre-macOS-12 NSScreen lacks these
+/// selectors → `None`), and any miss returns `None` so the caller falls
+/// back to v1 placement. SAFETY: the off-typed selectors return
+/// `NSEdgeInsets` / `NSRect` from objc2_foundation; we mirror the NSRect
+/// consumption + AppKit→top-left transform used in `pill.rs`.
+#[cfg(target_os = "macos")]
+fn notch_geometry<R: Runtime>(win: &tauri::WebviewWindow<R>) -> Option<NotchMetrics> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2::sel;
+    use objc2_foundation::{NSEdgeInsets, NSRect};
+
+    let display = crate::settings::load(win.app_handle()).notch_list_display;
+
+    with_target_nsscreen(&display, |screen, primary_height| {
+        let screen_obj: &AnyObject =
+            unsafe { &*(screen as *const objc2_app_kit::NSScreen as *const AnyObject) };
+
+        // safeAreaInsets (macOS 12+). Guard the selector; pre-12 → no notch.
+        let responds_safe: bool =
+            unsafe { msg_send![screen_obj, respondsToSelector: sel!(safeAreaInsets)] };
+        if !responds_safe {
+            return None;
+        }
+        let insets: NSEdgeInsets = unsafe { msg_send![screen_obj, safeAreaInsets] };
+        let top_inset = insets.top;
+
+        // auxiliaryTopLeftArea / auxiliaryTopRightArea (macOS 12+). Each
+        // returns a bottom-left-origin AppKit NSRect; convert to logical
+        // top-left like pill.rs. Guard each independently — absence is fine
+        // (ears stay None). The selectors are spelled out as literals for
+        // `msg_send!` rather than passed as data.
+        let to_top_left = |rect: NSRect| -> Option<(f64, f64, f64, f64)> {
+            if rect.size.width <= 0.0 || rect.size.height <= 0.0 {
+                return None;
+            }
+            let logical_y = primary_height - (rect.origin.y + rect.size.height);
+            Some((rect.origin.x, logical_y, rect.size.width, rect.size.height))
+        };
+
+        let left_ear = {
+            let responds: bool =
+                unsafe { msg_send![screen_obj, respondsToSelector: sel!(auxiliaryTopLeftArea)] };
+            if responds {
+                let rect: NSRect = unsafe { msg_send![screen_obj, auxiliaryTopLeftArea] };
+                to_top_left(rect)
+            } else {
+                None
+            }
+        };
+        let right_ear = {
+            let responds: bool =
+                unsafe { msg_send![screen_obj, respondsToSelector: sel!(auxiliaryTopRightArea)] };
+            if responds {
+                let rect: NSRect = unsafe { msg_send![screen_obj, auxiliaryTopRightArea] };
+                to_top_left(rect)
+            } else {
+                None
+            }
+        };
+
+        if top_inset <= 0.0 {
+            // No physical notch on this display → let the caller use v1.
+            return None;
+        }
+
+        Some(NotchMetrics {
+            top_inset,
+            left_ear,
+            right_ear,
+        })
+    })
+    .flatten()
+}
+
+/// Fullscreen auto-hide probe (Stage 6). Compares the target display's
+/// typed `frame()` vs `visibleFrame()`: when the visible frame fills the
+/// full frame height AND shares its bottom origin, the menu bar is hidden
+/// (likely an app in fullscreen), so we `hide()` the notch; otherwise we
+/// `show()` it. Both reads are on objc2's typed surface (no raw
+/// `msg_send!`). FAIL-OPEN: a `None`/failed read never hides — the v1
+/// behaviour is always-visible. Logs a debug line on every visibility
+/// EDGE so an on-device tester can validate the heuristic.
+#[cfg(target_os = "macos")]
+fn apply_fullscreen_visibility<R: Runtime>(win: &tauri::WebviewWindow<R>) {
+    use std::sync::atomic::AtomicBool;
+
+    // Remember the last applied visibility so we only log + act on edges.
+    static LAST_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+    let display = crate::settings::load(win.app_handle()).notch_list_display;
+    // Compare typed frame() vs visibleFrame() on the borrowed screen.
+    // None (couldn't resolve a screen) → never hide (fail-open to v1).
+    let Some(fullscreen) = with_target_nsscreen(&display, |screen, _ph| {
+        let frame = screen.frame();
+        let visible = screen.visibleFrame();
+        // Menu bar hidden ⇒ the visible frame reclaims its height and
+        // bottom origin. ~1px tolerance for fractional scaling.
+        let full_height = (visible.size.height - frame.size.height).abs() <= 1.0;
+        let same_bottom = (visible.origin.y - frame.origin.y).abs() <= 1.0;
+        full_height && same_bottom
+    }) else {
+        return;
+    };
+
+    let was_hidden = LAST_HIDDEN.load(Ordering::SeqCst);
+    if fullscreen && !was_hidden {
+        log::debug!("notch: target display entered fullscreen (menu bar hidden) — hiding notch");
+        let _ = win.hide();
+        LAST_HIDDEN.store(true, Ordering::SeqCst);
+    } else if !fullscreen && was_hidden {
+        log::debug!("notch: target display left fullscreen (menu bar visible) — showing notch");
+        let _ = win.show();
+        LAST_HIDDEN.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Identical panel-style treatment as `pill::apply_macos_panel_style`:

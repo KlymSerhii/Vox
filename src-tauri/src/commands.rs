@@ -80,6 +80,8 @@ pub fn set_settings(
         || before.notch_list_voice_hotkey != settings.notch_list_voice_hotkey;
     #[cfg(target_os = "macos")]
     let notch_enabled_changed = before.notch_list_enabled != settings.notch_list_enabled;
+    #[cfg(target_os = "macos")]
+    let notch_display_changed = before.notch_list_display != settings.notch_list_display;
     let appearance_changed = before.appearance != settings.appearance;
     let dock_icon_changed = before.show_dock_icon != settings.show_dock_icon;
     let polish_off = before.polishing_enabled && !settings.polishing_enabled;
@@ -150,6 +152,13 @@ pub fn set_settings(
     #[cfg(target_os = "macos")]
     if notch_enabled_changed {
         crate::notch::create_or_destroy(&app, settings.notch_list_enabled);
+    }
+
+    // Re-place the notch immediately when the target display changes so it
+    // hops to the new screen without waiting for the follower's next tick.
+    #[cfg(target_os = "macos")]
+    if notch_display_changed && settings.notch_list_enabled {
+        crate::notch::refresh_placement(&app);
     }
 
     if polish_off || llm_left_gemma {

@@ -89,6 +89,11 @@ export interface Settings {
   /// Stage destructive voice batches (remove/clear) for confirmation
   /// rather than applying immediately. On by default.
   notch_list_confirm_destructive: boolean;
+  /// Intent-delay in milliseconds before the notch panel expands on
+  /// hover (clamped 0–1000). UI-only.
+  notch_list_hover_delay_ms: number;
+  /// When true, the notch expands on click instead of hover. UI-only.
+  notch_list_click_to_expand: boolean;
   /// Periodic auto-update check. On by default. When off, the
   /// background scheduler in `updater.rs` is a no-op but the manual
   /// "Check now" button in Settings → About still works.

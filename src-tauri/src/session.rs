@@ -2179,7 +2179,7 @@ async fn interpret_and_apply_notch(
     );
 
     let raw = match engine
-        .cleanup(&payload, NOTCH_COMMAND_PROMPT, &[], false)
+        .cleanup_structured(&payload, NOTCH_COMMAND_PROMPT, &[], false)
         .await
     {
         Ok(t) => t,

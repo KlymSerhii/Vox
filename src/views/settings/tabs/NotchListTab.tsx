@@ -41,6 +41,29 @@ const DISPLAY_OPTIONS: {
 // Preset voice-hotkey choices (mirror the backend `NOTCH_VOICE_FALLBACKS`).
 const VOICE_HOTKEY_PRESETS = ["Cmd+Alt+L", "Cmd+Shift+L", "Alt+Shift+L"];
 
+// Hover-intent delay buckets. The stored value is a free `u32` (clamped
+// 0–1000 ms on the backend); the segmented control maps to four buckets
+// and snaps an arbitrary stored value to the nearest one for display.
+const HOVER_DELAY_BUCKETS: { value: string; label: string; ms: number }[] = [
+  { value: "off", label: "Off", ms: 0 },
+  { value: "short", label: "Short", ms: 120 },
+  { value: "medium", label: "Medium", ms: 350 },
+  { value: "long", label: "Long", ms: 700 },
+];
+
+function bucketForDelay(ms: number): string {
+  let best = HOVER_DELAY_BUCKETS[0];
+  let bestDist = Math.abs(ms - best.ms);
+  for (const b of HOVER_DELAY_BUCKETS) {
+    const d = Math.abs(ms - b.ms);
+    if (d < bestDist) {
+      best = b;
+      bestDist = d;
+    }
+  }
+  return best.value;
+}
+
 function priorityDot(p: NotchPriority): string {
   switch (p) {
     case "high":
@@ -378,6 +401,32 @@ export function NotchListTab(props: {
               options={DISPLAY_OPTIONS}
               onChange={(v) => props.update({ notch_list_display: v })}
               ariaLabel="Notch display"
+            />
+          </Row>
+          <Row
+            label="Hover delay before expanding"
+            hint="How long the cursor must rest on the notch before the panel expands. Off expands instantly."
+          >
+            <SegmentedControl
+              value={bucketForDelay(props.s.notch_list_hover_delay_ms)}
+              options={HOVER_DELAY_BUCKETS.map((b) => ({
+                value: b.value,
+                label: b.label,
+              }))}
+              onChange={(v) => {
+                const bucket = HOVER_DELAY_BUCKETS.find((b) => b.value === v);
+                props.update({ notch_list_hover_delay_ms: bucket?.ms ?? 120 });
+              }}
+              ariaLabel="Notch hover delay"
+            />
+          </Row>
+          <Row
+            label="Expand on click instead of hover"
+            hint="When on, the notch stays collapsed until you click it, then collapses when you click away."
+          >
+            <Toggle
+              checked={props.s.notch_list_click_to_expand}
+              onChange={(v) => props.update({ notch_list_click_to_expand: v })}
             />
           </Row>
           <Row

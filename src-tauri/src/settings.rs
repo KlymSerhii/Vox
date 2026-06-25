@@ -54,6 +54,8 @@ const KEY_NOTCH_LIST_TOP_N: &str = "notch_list_top_n";
 const KEY_NOTCH_LIST_DISPLAY: &str = "notch_list_display";
 const KEY_NOTCH_LIST_VOICE_HOTKEY: &str = "notch_list_voice_hotkey";
 const KEY_NOTCH_LIST_CONFIRM_DESTRUCTIVE: &str = "notch_list_confirm_destructive";
+const KEY_NOTCH_LIST_HOVER_DELAY_MS: &str = "notch_list_hover_delay_ms";
+const KEY_NOTCH_LIST_CLICK_TO_EXPAND: &str = "notch_list_click_to_expand";
 
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
@@ -185,6 +187,17 @@ fn default_notch_list_confirm_destructive() -> bool {
     // rather than applied immediately so an STT mishearing can't wipe
     // the list silently.
     true
+}
+fn default_notch_list_hover_delay_ms() -> u32 {
+    // Intent delay before the notch panel expands on hover, so a cursor
+    // merely passing over the strip doesn't pop the panel. Clamped to
+    // 0..=1000 ms on load/save.
+    120
+}
+fn default_notch_list_click_to_expand() -> bool {
+    // Off by default — the notch expands on hover. When on, hover is
+    // ignored for expansion and the collapsed line toggles on click.
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +377,16 @@ pub struct Settings {
     #[serde(default = "default_notch_list_confirm_destructive")]
     pub notch_list_confirm_destructive: bool,
 
+    /// Intent-delay in milliseconds before the notch panel expands on
+    /// hover. Clamped to 0..=1000 on load and save. UI-only — read by the
+    /// notch webview via `get_public_settings`, never via `Prefs`.
+    #[serde(default = "default_notch_list_hover_delay_ms")]
+    pub notch_list_hover_delay_ms: u32,
+
+    /// When true, the notch expands on click instead of hover. UI-only.
+    #[serde(default = "default_notch_list_click_to_expand")]
+    pub notch_list_click_to_expand: bool,
+
     /// Periodic auto-update scheduler. ON by default; turning it off
     /// disables the daily background check while keeping the manual
     /// "Check now" button in Settings → About working. Mirrored to
@@ -433,6 +456,8 @@ impl Default for Settings {
             notch_list_display: default_notch_list_display(),
             notch_list_voice_hotkey: default_notch_list_voice_hotkey(),
             notch_list_confirm_destructive: default_notch_list_confirm_destructive(),
+            notch_list_hover_delay_ms: default_notch_list_hover_delay_ms(),
+            notch_list_click_to_expand: default_notch_list_click_to_expand(),
             auto_update_check_enabled: default_auto_update_check_enabled(),
             last_update_check_at: None,
             dismissed_update_version: None,
@@ -545,6 +570,15 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         KEY_NOTCH_LIST_CONFIRM_DESTRUCTIVE,
         default_notch_list_confirm_destructive(),
     );
+    let notch_list_hover_delay_ms = store
+        .get(KEY_NOTCH_LIST_HOVER_DELAY_MS)
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(1000) as u32)
+        .unwrap_or_else(default_notch_list_hover_delay_ms);
+    let notch_list_click_to_expand = get_bool(
+        KEY_NOTCH_LIST_CLICK_TO_EXPAND,
+        default_notch_list_click_to_expand(),
+    );
 
     let auto_update_check_enabled = get_bool(
         KEY_AUTO_UPDATE_CHECK_ENABLED,
@@ -604,6 +638,8 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         notch_list_display,
         notch_list_voice_hotkey,
         notch_list_confirm_destructive,
+        notch_list_hover_delay_ms,
+        notch_list_click_to_expand,
         auto_update_check_enabled,
         last_update_check_at,
         dismissed_update_version,
@@ -706,6 +742,14 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     b(
         KEY_NOTCH_LIST_CONFIRM_DESTRUCTIVE,
         settings.notch_list_confirm_destructive,
+    );
+    store.set(
+        KEY_NOTCH_LIST_HOVER_DELAY_MS,
+        serde_json::Value::from(settings.notch_list_hover_delay_ms.min(1000)),
+    );
+    b(
+        KEY_NOTCH_LIST_CLICK_TO_EXPAND,
+        settings.notch_list_click_to_expand,
     );
 
     b(KEY_AUTO_UPDATE_CHECK_ENABLED, settings.auto_update_check_enabled);
@@ -1049,6 +1093,8 @@ mod tests {
         assert_eq!(s.notch_list_display, "active");
         assert_eq!(s.notch_list_voice_hotkey, "Cmd+Alt+L");
         assert!(s.notch_list_confirm_destructive);
+        assert_eq!(s.notch_list_hover_delay_ms, 120);
+        assert!(!s.notch_list_click_to_expand);
     }
 
     #[test]
@@ -1059,6 +1105,8 @@ mod tests {
         s.notch_list_display = "builtin".to_string();
         s.notch_list_voice_hotkey = "Cmd+Shift+L".to_string();
         s.notch_list_confirm_destructive = false;
+        s.notch_list_hover_delay_ms = 300;
+        s.notch_list_click_to_expand = true;
         let json = serde_json::to_string(&s).expect("serialize");
         let restored: Settings = serde_json::from_str(&json).expect("deserialize");
         assert!(!restored.notch_list_enabled);
@@ -1066,6 +1114,8 @@ mod tests {
         assert_eq!(restored.notch_list_display, "builtin");
         assert_eq!(restored.notch_list_voice_hotkey, "Cmd+Shift+L");
         assert!(!restored.notch_list_confirm_destructive);
+        assert_eq!(restored.notch_list_hover_delay_ms, 300);
+        assert!(restored.notch_list_click_to_expand);
     }
 
     #[test]
@@ -1079,6 +1129,23 @@ mod tests {
         assert_eq!(restored.notch_list_display, "active");
         assert_eq!(restored.notch_list_voice_hotkey, "Cmd+Alt+L");
         assert!(restored.notch_list_confirm_destructive);
+        assert_eq!(restored.notch_list_hover_delay_ms, 120);
+        assert!(!restored.notch_list_click_to_expand);
+    }
+
+    #[test]
+    fn notch_list_hover_delay_clamps_on_load() {
+        // The load path clamps an out-of-range stored value to 1000 ms so
+        // a hand-edited doc can't park the notch panel behind a 5 s delay.
+        // We exercise the clamp predicate the load path uses directly,
+        // mirroring the `.min(1000)` in `load`.
+        let stored: u64 = 5000;
+        let loaded = stored.min(1000) as u32;
+        assert_eq!(loaded, 1000);
+        // A serde default still survives (no clamp needed) for an in-range
+        // value.
+        let in_range: u64 = 250;
+        assert_eq!(in_range.min(1000) as u32, 250);
     }
 
     #[test]

@@ -23,6 +23,8 @@ import { HotkeyKeys } from "../components/HotkeyKeys";
 const DEFAULT_TOP_N = 5;
 /// Default voice hotkey spec (matches `default_notch_list_voice_hotkey`).
 const DEFAULT_VOICE_HOTKEY = "Cmd+Alt+L";
+/// Default hover intent delay (matches `default_notch_list_hover_delay_ms`).
+const DEFAULT_HOVER_DELAY_MS = 120;
 
 /// Collapsed/expanded window heights. Width is content-driven via the
 /// ResizeObserver; height is row-driven. Must stay >= the Rust
@@ -59,11 +61,41 @@ export default function NotchView() {
   const [hovered, setHovered] = createSignal(false);
   const [topN, setTopN] = createSignal(DEFAULT_TOP_N);
   const [voiceHotkey, setVoiceHotkey] = createSignal(DEFAULT_VOICE_HOTKEY);
+  const [hoverDelayMs, setHoverDelayMs] = createSignal(DEFAULT_HOVER_DELAY_MS);
+  const [clickToExpand, setClickToExpand] = createSignal(false);
 
   let unlistenList: (() => void) | null = null;
   let unlistenSettings: (() => void) | null = null;
   let panelRef: HTMLDivElement | undefined;
   let ro: ResizeObserver | undefined;
+  /// Pending hover-intent timer; cleared on leave / before re-arming.
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function clearHoverTimer() {
+    if (hoverTimer !== undefined) {
+      clearTimeout(hoverTimer);
+      hoverTimer = undefined;
+    }
+  }
+
+  /// Expand after the configured intent delay so the cursor merely
+  /// passing over the strip doesn't pop the panel. A 0 ms delay expands
+  /// on the next tick. No-op when click-to-expand is on.
+  function armHoverExpand() {
+    if (clickToExpand()) return;
+    clearHoverTimer();
+    hoverTimer = setTimeout(() => {
+      hoverTimer = undefined;
+      setHovered(true);
+      queueMicrotask(syncWindowSize);
+    }, Math.max(0, hoverDelayMs()));
+  }
+
+  function collapse() {
+    clearHoverTimer();
+    setHovered(false);
+    queueMicrotask(syncWindowSize);
+  }
 
   /// Active items sorted by (priority desc, order asc) — the backend
   /// already returns them sorted in `items`, but we re-sort defensively
@@ -94,6 +126,17 @@ export default function NotchView() {
       const s = await getPublicSettings();
       setTopN(Math.min(7, Math.max(3, s.notch_list_top_n || DEFAULT_TOP_N)));
       setVoiceHotkey(s.notch_list_voice_hotkey || DEFAULT_VOICE_HOTKEY);
+      setHoverDelayMs(
+        Math.min(
+          1000,
+          Math.max(0, s.notch_list_hover_delay_ms ?? DEFAULT_HOVER_DELAY_MS),
+        ),
+      );
+      const click = s.notch_list_click_to_expand ?? false;
+      setClickToExpand(click);
+      // Switching into click-to-expand mid-hover should drop any pending
+      // hover-intent timer so it can't fire after the mode changed.
+      if (click) clearHoverTimer();
     } catch (e) {
       console.warn("getPublicSettings (notch):", e);
     }
@@ -131,6 +174,7 @@ export default function NotchView() {
     unlistenList?.();
     unlistenSettings?.();
     ro?.disconnect();
+    clearHoverTimer();
   });
 
   async function markDone(id: string) {
@@ -143,6 +187,14 @@ export default function NotchView() {
 
   const transition = () =>
     reducedMotion() ? "none" : "background 120ms ease, opacity 120ms ease";
+  /// Reveal transition for the expanded panel content (rows fading in as
+  /// the window grows). Disabled under reduced-motion.
+  const panelTransition = () =>
+    reducedMotion() ? "none" : "opacity 140ms ease, transform 140ms ease";
+  /// Checkbox check-off / border colour transition. Disabled under
+  /// reduced-motion.
+  const checkboxTransition = () =>
+    reducedMotion() ? "none" : "border-color 120ms ease, background 120ms ease";
 
   return (
     <div
@@ -156,13 +208,19 @@ export default function NotchView() {
           "inset 0 1px 0 var(--glass-highlight), 0 6px 20px rgba(0,0,0,0.35)",
         color: "var(--color-ink)",
       }}
+      tabindex={clickToExpand() ? 0 : undefined}
       onMouseEnter={() => {
-        setHovered(true);
-        queueMicrotask(syncWindowSize);
+        if (clickToExpand()) return;
+        armHoverExpand();
       }}
       onMouseLeave={() => {
-        setHovered(false);
-        queueMicrotask(syncWindowSize);
+        if (clickToExpand()) return;
+        collapse();
+      }}
+      onBlur={() => {
+        // Click-to-expand: collapse when focus leaves the panel (a click
+        // elsewhere on the desktop). Hover mode ignores blur.
+        if (clickToExpand()) collapse();
       }}
     >
       {/* Collapsed resting line: #1 task, or the empty-state hint. */}
@@ -176,7 +234,10 @@ export default function NotchView() {
           >
             <div
               class="flex flex-col gap-0.5 px-2 py-1.5"
-              style={{ "min-height": `${PANEL_PAD + ROW_H}px` }}
+              style={{
+                "min-height": `${PANEL_PAD + ROW_H}px`,
+                transition: panelTransition(),
+              }}
             >
               <For each={top()}>
                 {(item) => (
@@ -187,10 +248,16 @@ export default function NotchView() {
                     <button
                       type="button"
                       aria-label="Mark done"
-                      onClick={() => void markDone(item.id)}
-                      class="flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded-full border transition-colors"
+                      onClick={(e) => {
+                        // Keep a checkbox click from bubbling to a
+                        // click-to-expand panel toggle.
+                        e.stopPropagation();
+                        void markDone(item.id);
+                      }}
+                      class="flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded-full border"
                       style={{
                         "border-color": "var(--color-border, #4a4a4a)",
+                        transition: checkboxTransition(),
                       }}
                     />
                     <span
@@ -215,7 +282,13 @@ export default function NotchView() {
           {(item) => (
             <div
               class="flex items-center gap-2 px-3"
+              classList={{ "cursor-pointer": clickToExpand() }}
               style={{ height: `${COLLAPSED_H}px` }}
+              onClick={() => {
+                if (!clickToExpand()) return;
+                setHovered((v) => !v);
+                queueMicrotask(syncWindowSize);
+              }}
             >
               <span
                 class="h-[7px] w-[7px] shrink-0 rounded-full"
