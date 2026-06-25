@@ -46,6 +46,10 @@ export interface Settings {
   /// the pipeline falls open to the clipboard-only path and the pill
   /// surfaces a warning. Off by default.
   auto_paste_enabled: boolean;
+  /// What to do with other audio that's playing when dictation starts:
+  /// `"off"` leaves it alone, `"duck"` lowers its volume, `"pause"`
+  /// stops playback. Restored when dictation ends. Defaults to `"duck"`.
+  audio_attenuation: "off" | "duck" | "pause";
   /// Show a live transcript inside the pill while the user is still
   /// speaking, in place of the default waveform. Driven by the same
   /// speculative transcription decoder that already feeds the post-stop
@@ -434,6 +438,16 @@ export async function setStreamingPillEnabled(enabled: boolean): Promise<void> {
 
 export async function setAutoPasteEnabled(enabled: boolean): Promise<void> {
   await invoke("set_auto_paste_enabled", { enabled });
+}
+
+/// Persist the "quiet other audio while dictating" mode. Dedicated
+/// single-field setter (mirrors `setAutoPasteEnabled` etc.) so the tray
+/// popover can change it — `set_settings` is gated to the settings /
+/// onboarding webviews. Broadcasts `settings:changed`.
+export async function setAudioAttenuation(
+  value: "off" | "duck" | "pause",
+): Promise<void> {
+  await invoke("set_audio_attenuation", { value });
 }
 
 export async function setLiveTranscriptEnabled(enabled: boolean): Promise<void> {

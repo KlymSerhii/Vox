@@ -267,6 +267,39 @@ export function GeneralTab(props: {
         </Show>
       </Card>
 
+      <SectionHeader title="Other audio" />
+      <Card>
+        <Row
+          label="Quiet other audio while dictating"
+          hint="When you start dictating, Vox lowers or pauses whatever else is playing, then restores it when you're done."
+          last={props.s.audio_attenuation === "off"}
+        >
+          <Toggle
+            checked={props.s.audio_attenuation !== "off"}
+            onChange={(v) =>
+              props.update({ audio_attenuation: v ? "duck" : "off" })
+            }
+          />
+        </Row>
+        <Show when={props.s.audio_attenuation !== "off"}>
+          <Row
+            label="How to quiet it"
+            hint="Lower volume dims other audio so you can still hear it. Pause stops playback entirely. On Bluetooth headsets, switching to the mic can affect call-audio quality regardless — choose Pause to avoid that."
+            last
+          >
+            <SegmentedControl<"duck" | "pause">
+              ariaLabel="How to quiet other audio"
+              value={props.s.audio_attenuation === "pause" ? "pause" : "duck"}
+              options={[
+                { value: "duck", label: "Lower volume" },
+                { value: "pause", label: "Pause" },
+              ]}
+              onChange={(seg) => props.update({ audio_attenuation: seg })}
+            />
+          </Row>
+        </Show>
+      </Card>
+
       <SectionHeader title="Dock" />
       <Card>
         <Row
