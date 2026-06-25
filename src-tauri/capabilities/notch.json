@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "notch",
+  "description": "Permissions for Vox's Notch List window. The notch reads the list, listens for `notch-list:changed` / `settings:changed`, drives its own hover resize, and invokes the single unrestricted `notch_list_mark_done` command (the only mutation reachable from the notch). It is NOT a privileged settings window — full CRUD lives in Settings → Notch List.",
+  "windows": ["notch"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-is-visible",
+    "core:app:allow-version",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

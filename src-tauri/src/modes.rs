@@ -337,6 +337,23 @@ pub fn builtins() -> Vec<VoiceMode> {
             updated_at: now,
         },
         VoiceMode {
+            id: "notch-list".into(),
+            name: "Notch List".into(),
+            icon: "✅".into(),
+            description: "Edit your Notch List by voice — add, complete, reprioritize, and reorder tasks.".into(),
+            system_prompt: NOTCH_LIST_PROMPT.into(),
+            dictionary: vec![],
+            punctuation: PunctuationStyle::Standard,
+            case: CaseStyle::Sentence,
+            max_length_chars: None,
+            enable_thinking: None,
+            context_enabled: true,
+            auto_triggers: vec![],
+            built_in: true,
+            created_at: now,
+            updated_at: now,
+        },
+        VoiceMode {
             id: "braindump".into(),
             name: "Braindump".into(),
             icon: "🧠".into(),
@@ -485,6 +502,14 @@ Examples:
 - \"um so I was thinking we should ship the new auth flow next week, maybe Tuesday or Wednesday, and uh we also need to make sure the migration script is ready, and oh also we should tell the support team in advance\" → \"Ship the new auth flow Tuesday or Wednesday next week. Prepare the migration script and notify the support team in advance.\"
 - \"today I learned about caching and I think the main thing is that we should always set a max age and also we should think about cache invalidation more carefully\" → \"Two takeaways on caching: always set a max age, and think more carefully about cache invalidation.\"
 - \"the meeting went well, we discussed the roadmap, John said he can take on the API work, and Sarah will own the design refresh, we agreed to sync again on Friday\" → \"Meeting went well. Roadmap discussed; John will take the API work and Sarah will own the design refresh. Next sync on Friday.\"";
+
+// User-facing description shown in the Modes list. The REAL command
+// interpretation prompt is `NOTCH_COMMAND_PROMPT` in `session.rs`; when
+// this mode is active, `session.rs` routes the transcript to the notch
+// command path instead of this prompt (so this text is only ever shown,
+// not sent to the polish engine). Kept same-language / no-translate to
+// satisfy the built-in prompt invariant test.
+const NOTCH_LIST_PROMPT: &str = "This mode sends what you say to the Notch List command interpreter instead of polishing and copying text. Speak commands like \"add buy milk\", \"complete the second one\", or \"make the dentist task high priority\" and Vox edits your Notch List directly. Vox detects the language you speak and keeps your task text in that same language; it never translates it.";
 
 const BRAINDUMP_PROMPT: &str = "You are restructuring a stream-of-thought voice-dictation transcript — a braindump. The speaker thought out loud: ideas arrived out of order, with tangents, repetitions, and half-finished sentences. Your job is to fully understand everything they meant, then express it as a clear, well-organized piece of writing that someone (or an AI assistant) reading it cold can act on. Return plain text only — no preface, no quotes, no reasoning, no explanations.
 
@@ -1032,10 +1057,10 @@ mod tests {
     }
 
     #[test]
-    fn first_launch_seeds_eight_builtins() {
+    fn first_launch_seeds_nine_builtins() {
         let (store, _tmp) = fresh_store();
         let modes = store.list();
-        assert_eq!(modes.len(), 8);
+        assert_eq!(modes.len(), 9);
         let ids: Vec<&str> = modes.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
@@ -1047,6 +1072,7 @@ mod tests {
                 "code-comment",
                 "notes",
                 "summary",
+                "notch-list",
                 "braindump"
             ]
         );
@@ -1102,7 +1128,7 @@ mod tests {
         assert!(mode_path(dir.path(), "minimal").exists());
         let ids: Vec<String> = store.list().into_iter().map(|m| m.id).collect();
         assert!(ids.contains(&"minimal".to_string()));
-        assert_eq!(ids.len(), 8);
+        assert_eq!(ids.len(), 9);
     }
 
     #[test]

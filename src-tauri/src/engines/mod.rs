@@ -76,6 +76,23 @@ pub trait LlmEngine: Send + Sync {
         enable_thinking: bool,
     ) -> anyhow::Result<String>;
 
+    /// Structured-output variant of `cleanup` for callers that need the
+    /// model to emit a JSON object (the notch command interpreter). The
+    /// default impl delegates to `cleanup` so engines without a structured
+    /// mode (Apple Intelligence, the no-op engine) inherit zero behaviour
+    /// change. Only `GemmaHttpEngine` overrides it to set the
+    /// OpenAI-compatible `response_format` hint on the wire.
+    async fn cleanup_structured(
+        &self,
+        transcript: &str,
+        system_prompt: &str,
+        dictionary: &[String],
+        enable_thinking: bool,
+    ) -> anyhow::Result<String> {
+        self.cleanup(transcript, system_prompt, dictionary, enable_thinking)
+            .await
+    }
+
     /// Streaming variant of `cleanup` — fires `on_chunk` repeatedly with
     /// the cumulative output so far while the polish runs, then
     /// resolves with the final cleaned text. Default impl falls back

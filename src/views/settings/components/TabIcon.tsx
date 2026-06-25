@@ -76,6 +76,15 @@ export function TabIcon(props: { name: string; active: boolean }) {
           <path d="M3 12h18" />
         </>
       )}
+      {props.name === "checklist" && (
+        <>
+          <polyline points="3 6 4.5 7.5 7 5" />
+          <polyline points="3 12 4.5 13.5 7 11" />
+          <line x1="11" y1="6" x2="21" y2="6" />
+          <line x1="11" y1="12" x2="21" y2="12" />
+          <line x1="11" y1="18" x2="21" y2="18" />
+        </>
+      )}
     </svg>
   );
 }

@@ -21,7 +21,9 @@ import { GeneralTab } from "./settings/tabs/GeneralTab";
 import { HotkeysTab } from "./settings/tabs/HotkeysTab";
 import { ModelsTab } from "./settings/tabs/ModelsTab";
 import { ModesTab } from "./settings/tabs/ModesTab";
+import { NotchListTab } from "./settings/tabs/NotchListTab";
 import { PrivacyTab } from "./settings/tabs/PrivacyTab";
+import { isMac } from "@/lib/platform";
 
 export default function SettingsView() {
   const [tab, setTab] = createSignal<Tab>("general");
@@ -95,6 +97,9 @@ export default function SettingsView() {
               </Show>
               <Show when={tab() === "modes"}>
                 <ModesTab s={s()} update={update} />
+              </Show>
+              <Show when={isMac && tab() === "notch-list"}>
+                <NotchListTab s={s()} update={update} />
               </Show>
               <Show when={tab() === "dictionary"}>
                 <DictionaryTab s={s()} update={update} />

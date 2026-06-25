@@ -120,6 +120,16 @@ struct ChatRequest<'a> {
     /// behaviour is preserved.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_template_kwargs: Option<serde_json::Value>,
+    /// OpenAI-compatible structured-output hint. Set to
+    /// `{"type":"json_object"}` only for the notch command interpreter
+    /// (`cleanup_structured`) so llama.cpp constrains the completion to a
+    /// JSON object. ABSENT for the normal polish path — that keeps the
+    /// cleanup request bytes byte-identical to the pre-v1.1 build (the
+    /// field is skipped when `None`). Older llama-server tags that don't
+    /// understand it simply ignore it, degrading to the prose-tolerant
+    /// `parse_command_response` safety net.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -217,7 +227,8 @@ impl LlmEngine for GemmaHttpEngine {
             let server = inference_proc::ensure_running(&self.app, &self.model_id)
                 .await
                 .map_err(|e| AttemptError { err: e, server_dead: false })?;
-            self.post_cleanup(&server, system_prompt, dictionary, trimmed, enable_thinking).await
+            self.post_cleanup(&server, system_prompt, dictionary, trimmed, enable_thinking, false)
+                .await
         };
 
         // Retry only when the child is actually gone: a TCP connect
@@ -260,6 +271,65 @@ impl LlmEngine for GemmaHttpEngine {
                 "gemma-http: polish FAILED in {} ms — session will fail-open to raw transcript: {e}",
                 started.elapsed().as_millis()
             ),
+        }
+        result
+    }
+
+    /// Structured-output variant used by the notch command interpreter.
+    /// Identical to [`cleanup`] but sets `response_format: json_object` on
+    /// the wire so llama.cpp constrains the completion to a JSON object.
+    /// `enable_thinking` is forced off here (the interpreter wants a terse
+    /// JSON object, not chain-of-thought), and the prose-tolerant
+    /// `parse_command_response` in `notch_list.rs` remains the safety net
+    /// for servers that ignore the field.
+    async fn cleanup_structured(
+        &self,
+        transcript: &str,
+        system_prompt: &str,
+        dictionary: &[String],
+        enable_thinking: bool,
+    ) -> anyhow::Result<String> {
+        let trimmed = transcript.trim();
+        if trimmed.split_whitespace().count() < 2 {
+            return Ok(trimmed.to_string());
+        }
+
+        let started = Instant::now();
+        log::info!(
+            "gemma-http: structured-polishing {} chars with model={} (thinking={})",
+            trimmed.len(),
+            self.model_id,
+            enable_thinking,
+        );
+
+        let request_once = || async {
+            let server = inference_proc::ensure_running(&self.app, &self.model_id)
+                .await
+                .map_err(|e| AttemptError { err: e, server_dead: false })?;
+            self.post_cleanup(&server, system_prompt, dictionary, trimmed, enable_thinking, true)
+                .await
+        };
+
+        let result = match request_once().await {
+            Ok(s) => Ok(s),
+            Err(first) if first.server_dead => {
+                log::warn!(
+                    "gemma-http: first structured request failed ({}) and server appears dead; respawning and retrying once",
+                    first.err
+                );
+                inference_proc::drop_managed(&self.app);
+                request_once().await.map_err(|second| {
+                    anyhow::anyhow!("gemma-http structured retry failed: {} | {}", first.err, second.err)
+                })
+            }
+            Err(first) => Err(first.err),
+        };
+
+        if let Err(e) = &result {
+            log::warn!(
+                "gemma-http: structured polish FAILED in {} ms: {e}",
+                started.elapsed().as_millis()
+            );
         }
         result
     }
@@ -355,6 +425,7 @@ impl GemmaHttpEngine {
         dictionary: &[String],
         transcript: &str,
         enable_thinking: bool,
+        json_mode: bool,
     ) -> Result<String, AttemptError> {
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
         let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking);
@@ -393,6 +464,11 @@ impl GemmaHttpEngine {
             chat_template_kwargs: Some(serde_json::json!({
                 "enable_thinking": enable_thinking,
             })),
+            // Present only in structured (notch) mode; the normal cleanup
+            // path passes `json_mode = false`, leaving this `None` so the
+            // field is skipped and the wire bytes stay byte-identical to
+            // the pre-v1.1 build.
+            response_format: json_mode.then(|| serde_json::json!({ "type": "json_object" })),
         };
 
         let send_fut = self
@@ -539,6 +615,8 @@ impl GemmaHttpEngine {
             chat_template_kwargs: Some(serde_json::json!({
                 "enable_thinking": enable_thinking,
             })),
+            // Streaming is the normal-polish path only — never structured.
+            response_format: None,
         };
 
         let send_fut = self
@@ -744,6 +822,46 @@ pub(crate) fn build_system_message(system_prompt: &str, dictionary: &[String]) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_request(json_mode: bool) -> ChatRequest<'static> {
+        ChatRequest {
+            model: "gemma-local",
+            messages: vec![ChatMessage {
+                role: "user",
+                content: "hi".into(),
+            }],
+            max_tokens: 256,
+            temperature: 0.2,
+            stream: false,
+            cache_prompt: true,
+            chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
+            response_format: json_mode.then(|| serde_json::json!({ "type": "json_object" })),
+        }
+    }
+
+    #[test]
+    fn response_format_absent_for_normal_cleanup() {
+        // The normal-polish path must serialize byte-for-byte as before:
+        // `response_format` is `None`, so `skip_serializing_if` drops it
+        // entirely from the wire.
+        let v = serde_json::to_value(sample_request(false)).unwrap();
+        assert!(
+            v.get("response_format").is_none(),
+            "normal cleanup must not serialize response_format"
+        );
+    }
+
+    #[test]
+    fn response_format_present_only_in_structured_mode() {
+        // Structured (notch) mode emits the OpenAI-compatible
+        // json_object hint so llama.cpp constrains the completion.
+        let v = serde_json::to_value(sample_request(true)).unwrap();
+        assert_eq!(
+            v.get("response_format"),
+            Some(&serde_json::json!({ "type": "json_object" })),
+            "structured mode must serialize response_format as json_object"
+        );
+    }
 
     #[test]
     fn build_system_message_appends_dictionary() {

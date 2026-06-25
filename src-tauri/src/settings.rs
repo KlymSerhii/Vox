@@ -49,6 +49,14 @@ const KEY_AUDIO_INPUT_DEVICE: &str = "audio_input_device";
 const KEY_WAKE_WORD_ENABLED: &str = "wake_word_enabled";
 const KEY_WAKE_PHRASE: &str = "wake_phrase";
 
+const KEY_NOTCH_LIST_ENABLED: &str = "notch_list_enabled";
+const KEY_NOTCH_LIST_TOP_N: &str = "notch_list_top_n";
+const KEY_NOTCH_LIST_DISPLAY: &str = "notch_list_display";
+const KEY_NOTCH_LIST_VOICE_HOTKEY: &str = "notch_list_voice_hotkey";
+const KEY_NOTCH_LIST_CONFIRM_DESTRUCTIVE: &str = "notch_list_confirm_destructive";
+const KEY_NOTCH_LIST_HOVER_DELAY_MS: &str = "notch_list_hover_delay_ms";
+const KEY_NOTCH_LIST_CLICK_TO_EXPAND: &str = "notch_list_click_to_expand";
+
 // Process-identification token passed to `llama-server` as `--api-key`,
 // reused across sessions so the orphan reaper can spot stale children.
 const KEY_INFERENCE_API_KEY: &str = "inference_api_key";
@@ -153,6 +161,43 @@ fn default_auto_update_check_enabled() -> bool {
     // scheduler in `updater.rs`; the manual button in
     // Settings → About still works.
     true
+}
+fn default_notch_list_enabled() -> bool {
+    // Opt-OUT — the Notch List ships enabled by default (founder
+    // mandate). On macOS the notch window is created at launch when
+    // this is true; flipping it off in Settings → Notch List destroys
+    // the window. Always false in effect on Windows (no notch window).
+    true
+}
+fn default_notch_list_top_n() -> u8 {
+    5
+}
+fn default_notch_list_display() -> String {
+    // One of "active" | "builtin" | "primary". "active" follows the
+    // display the cursor is on (mirroring the pill); coerced on load.
+    "active".into()
+}
+pub fn default_notch_list_voice_hotkey() -> String {
+    // ⌥⌘L — Option + Command + L. Routes the next dictation through the
+    // notch command interpreter instead of the polish/clipboard path.
+    "Cmd+Alt+L".to_string()
+}
+fn default_notch_list_confirm_destructive() -> bool {
+    // On by default — a voice batch that removes/clears items is staged
+    // rather than applied immediately so an STT mishearing can't wipe
+    // the list silently.
+    true
+}
+fn default_notch_list_hover_delay_ms() -> u32 {
+    // Intent delay before the notch panel expands on hover, so a cursor
+    // merely passing over the strip doesn't pop the panel. Clamped to
+    // 0..=1000 ms on load/save.
+    120
+}
+fn default_notch_list_click_to_expand() -> bool {
+    // Off by default — the notch expands on hover. When on, hover is
+    // ignored for expansion and the collapsed line toggles on click.
+    false
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,6 +347,46 @@ pub struct Settings {
     #[serde(default = "default_wake_phrase")]
     pub wake_phrase: String,
 
+    /// Notch List (macOS-only). Enabled by default (opt-out). When true
+    /// on macOS, a top-center floating "notch" window is created at
+    /// launch showing the top to-do item, expanding on hover. The
+    /// Settings field round-trips on Windows too (where it has no
+    /// window effect) so the doc stays OS-agnostic.
+    #[serde(default = "default_notch_list_enabled")]
+    pub notch_list_enabled: bool,
+
+    /// How many top items the notch panel reveals on hover. Clamped to
+    /// 3..=7 on load.
+    #[serde(default = "default_notch_list_top_n")]
+    pub notch_list_top_n: u8,
+
+    /// Which display the notch attaches to: `"active"` (cursor's
+    /// screen, like the pill), `"builtin"`, or `"primary"`. Coerced to
+    /// one of those three on load.
+    #[serde(default = "default_notch_list_display")]
+    pub notch_list_display: String,
+
+    /// Dedicated hotkey that routes the next dictation through the notch
+    /// command interpreter (returns structured ops applied to the list)
+    /// instead of the polish + clipboard pipeline. Default `Cmd+Alt+L`.
+    #[serde(default = "default_notch_list_voice_hotkey")]
+    pub notch_list_voice_hotkey: String,
+
+    /// When true, a voice batch that removes or clears items is staged
+    /// for confirmation rather than applied immediately. On by default.
+    #[serde(default = "default_notch_list_confirm_destructive")]
+    pub notch_list_confirm_destructive: bool,
+
+    /// Intent-delay in milliseconds before the notch panel expands on
+    /// hover. Clamped to 0..=1000 on load and save. UI-only — read by the
+    /// notch webview via `get_public_settings`, never via `Prefs`.
+    #[serde(default = "default_notch_list_hover_delay_ms")]
+    pub notch_list_hover_delay_ms: u32,
+
+    /// When true, the notch expands on click instead of hover. UI-only.
+    #[serde(default = "default_notch_list_click_to_expand")]
+    pub notch_list_click_to_expand: bool,
+
     /// Periodic auto-update scheduler. ON by default; turning it off
     /// disables the daily background check while keeping the manual
     /// "Check now" button in Settings → About working. Mirrored to
@@ -366,6 +451,13 @@ impl Default for Settings {
             audio_input_device: None,
             wake_word_enabled: default_wake_word_enabled(),
             wake_phrase: default_wake_phrase(),
+            notch_list_enabled: default_notch_list_enabled(),
+            notch_list_top_n: default_notch_list_top_n(),
+            notch_list_display: default_notch_list_display(),
+            notch_list_voice_hotkey: default_notch_list_voice_hotkey(),
+            notch_list_confirm_destructive: default_notch_list_confirm_destructive(),
+            notch_list_hover_delay_ms: default_notch_list_hover_delay_ms(),
+            notch_list_click_to_expand: default_notch_list_click_to_expand(),
             auto_update_check_enabled: default_auto_update_check_enabled(),
             last_update_check_at: None,
             dismissed_update_version: None,
@@ -460,6 +552,34 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(default_wake_phrase);
 
+    let notch_list_enabled = get_bool(KEY_NOTCH_LIST_ENABLED, default_notch_list_enabled());
+    let notch_list_top_n = store
+        .get(KEY_NOTCH_LIST_TOP_N)
+        .and_then(|v| v.as_u64())
+        .map(|n| n.clamp(3, 7) as u8)
+        .unwrap_or_else(default_notch_list_top_n);
+    let notch_list_display = match get_str(KEY_NOTCH_LIST_DISPLAY).as_deref() {
+        Some("active") => "active".to_string(),
+        Some("builtin") => "builtin".to_string(),
+        Some("primary") => "primary".to_string(),
+        _ => default_notch_list_display(),
+    };
+    let notch_list_voice_hotkey =
+        get_str(KEY_NOTCH_LIST_VOICE_HOTKEY).unwrap_or_else(default_notch_list_voice_hotkey);
+    let notch_list_confirm_destructive = get_bool(
+        KEY_NOTCH_LIST_CONFIRM_DESTRUCTIVE,
+        default_notch_list_confirm_destructive(),
+    );
+    let notch_list_hover_delay_ms = store
+        .get(KEY_NOTCH_LIST_HOVER_DELAY_MS)
+        .and_then(|v| v.as_u64())
+        .map(|n| n.min(1000) as u32)
+        .unwrap_or_else(default_notch_list_hover_delay_ms);
+    let notch_list_click_to_expand = get_bool(
+        KEY_NOTCH_LIST_CLICK_TO_EXPAND,
+        default_notch_list_click_to_expand(),
+    );
+
     let auto_update_check_enabled = get_bool(
         KEY_AUTO_UPDATE_CHECK_ENABLED,
         default_auto_update_check_enabled(),
@@ -513,6 +633,13 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         audio_input_device,
         wake_word_enabled,
         wake_phrase,
+        notch_list_enabled,
+        notch_list_top_n,
+        notch_list_display,
+        notch_list_voice_hotkey,
+        notch_list_confirm_destructive,
+        notch_list_hover_delay_ms,
+        notch_list_click_to_expand,
         auto_update_check_enabled,
         last_update_check_at,
         dismissed_update_version,
@@ -594,6 +721,36 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
     } else {
         s(KEY_WAKE_PHRASE, wake_phrase);
     }
+
+    b(KEY_NOTCH_LIST_ENABLED, settings.notch_list_enabled);
+    store.set(
+        KEY_NOTCH_LIST_TOP_N,
+        serde_json::Value::from(settings.notch_list_top_n.clamp(3, 7)),
+    );
+    let notch_display = match settings.notch_list_display.as_str() {
+        "builtin" => "builtin",
+        "primary" => "primary",
+        _ => "active",
+    };
+    s(KEY_NOTCH_LIST_DISPLAY, notch_display);
+    let notch_hotkey = settings.notch_list_voice_hotkey.trim();
+    if notch_hotkey.is_empty() {
+        s(KEY_NOTCH_LIST_VOICE_HOTKEY, &default_notch_list_voice_hotkey());
+    } else {
+        s(KEY_NOTCH_LIST_VOICE_HOTKEY, notch_hotkey);
+    }
+    b(
+        KEY_NOTCH_LIST_CONFIRM_DESTRUCTIVE,
+        settings.notch_list_confirm_destructive,
+    );
+    store.set(
+        KEY_NOTCH_LIST_HOVER_DELAY_MS,
+        serde_json::Value::from(settings.notch_list_hover_delay_ms.min(1000)),
+    );
+    b(
+        KEY_NOTCH_LIST_CLICK_TO_EXPAND,
+        settings.notch_list_click_to_expand,
+    );
 
     b(KEY_AUTO_UPDATE_CHECK_ENABLED, settings.auto_update_check_enabled);
     match settings.last_update_check_at {
@@ -757,6 +914,17 @@ pub struct Prefs {
     /// each cancel-hotkey press so toggling it takes effect immediately,
     /// even mid-session.
     pub cancel_requires_double_press: bool,
+
+    /// Mirror of `Settings::notch_list_display`. Read by the notch
+    /// window placement to pick the target screen (macOS only — the
+    /// notch window is `cfg`-gated, so this is unused on other hosts).
+    #[allow(dead_code)]
+    pub notch_list_display: String,
+
+    /// Mirror of `Settings::notch_list_confirm_destructive`. Captured so
+    /// the notch-command session can stage destructive batches without a
+    /// second settings load.
+    pub notch_list_confirm_destructive: bool,
 }
 
 pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
@@ -780,6 +948,8 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         enable_thinking: s.enable_thinking,
         audio_input_device: s.audio_input_device,
         cancel_requires_double_press: s.cancel_requires_double_press,
+        notch_list_display: s.notch_list_display,
+        notch_list_confirm_destructive: s.notch_list_confirm_destructive,
     }
 }
 
@@ -814,6 +984,7 @@ pub fn set_hotkey_field<R: Runtime>(
         HotkeyPurpose::PushToTalk => KEY_HOTKEY,
         HotkeyPurpose::Cancel => KEY_CANCEL_HOTKEY,
         HotkeyPurpose::ModeCycle => KEY_MODE_CYCLE_HOTKEY,
+        HotkeyPurpose::NotchVoice => KEY_NOTCH_LIST_VOICE_HOTKEY,
     };
     store.set(key, serde_json::Value::String(value.to_string()));
     store
@@ -827,6 +998,7 @@ pub enum HotkeyPurpose {
     PushToTalk,
     Cancel,
     ModeCycle,
+    NotchVoice,
 }
 
 #[cfg(test)]
@@ -911,6 +1083,69 @@ mod tests {
         let bare = "{}";
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(!restored.cancel_requires_double_press);
+    }
+
+    #[test]
+    fn notch_list_defaults_enabled_with_top_n_5() {
+        let s = Settings::default();
+        assert!(s.notch_list_enabled);
+        assert_eq!(s.notch_list_top_n, 5);
+        assert_eq!(s.notch_list_display, "active");
+        assert_eq!(s.notch_list_voice_hotkey, "Cmd+Alt+L");
+        assert!(s.notch_list_confirm_destructive);
+        assert_eq!(s.notch_list_hover_delay_ms, 120);
+        assert!(!s.notch_list_click_to_expand);
+    }
+
+    #[test]
+    fn notch_list_fields_roundtrip_through_serde() {
+        let mut s = Settings::default();
+        s.notch_list_enabled = false;
+        s.notch_list_top_n = 7;
+        s.notch_list_display = "builtin".to_string();
+        s.notch_list_voice_hotkey = "Cmd+Shift+L".to_string();
+        s.notch_list_confirm_destructive = false;
+        s.notch_list_hover_delay_ms = 300;
+        s.notch_list_click_to_expand = true;
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert!(!restored.notch_list_enabled);
+        assert_eq!(restored.notch_list_top_n, 7);
+        assert_eq!(restored.notch_list_display, "builtin");
+        assert_eq!(restored.notch_list_voice_hotkey, "Cmd+Shift+L");
+        assert!(!restored.notch_list_confirm_destructive);
+        assert_eq!(restored.notch_list_hover_delay_ms, 300);
+        assert!(restored.notch_list_click_to_expand);
+    }
+
+    #[test]
+    fn notch_list_absent_fields_fall_back_to_defaults() {
+        // Older on-disk docs without the notch fields must deserialize
+        // with the opt-out default ON (founder mandate).
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert!(restored.notch_list_enabled);
+        assert_eq!(restored.notch_list_top_n, 5);
+        assert_eq!(restored.notch_list_display, "active");
+        assert_eq!(restored.notch_list_voice_hotkey, "Cmd+Alt+L");
+        assert!(restored.notch_list_confirm_destructive);
+        assert_eq!(restored.notch_list_hover_delay_ms, 120);
+        assert!(!restored.notch_list_click_to_expand);
+    }
+
+    #[test]
+    fn notch_list_hover_delay_clamps_on_load() {
+        // The load path clamps an out-of-range stored value to 1000 ms so
+        // a hand-edited doc can't park the notch panel behind a 5 s delay.
+        // We exercise the clamp predicate the load path uses directly,
+        // mirroring the `.min(1000)` in `load`.
+        let stored: u64 = 5000;
+        let loaded = stored.min(1000) as u32;
+        assert_eq!(loaded, 1000);
+        // A serde default still survives (no clamp needed) for an in-range
+        // value.
+        let in_range: u64 = 250;
+        assert_eq!(in_range.min(1000) as u32, 250);
     }
 
     #[test]

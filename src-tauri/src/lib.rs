@@ -20,6 +20,9 @@ mod mac_wake;
 mod win_paste;
 mod models;
 mod modes;
+#[cfg(target_os = "macos")]
+mod notch;
+mod notch_list;
 mod onboarding;
 mod pill;
 mod session;
@@ -124,6 +127,17 @@ pub fn run() {
             commands::reset_default_modes,
             commands::cycle_active_mode,
             commands::suggest_active_mode,
+            commands::notch_list_get,
+            commands::notch_resize,
+            commands::notch_list_mark_done,
+            commands::notch_list_add,
+            commands::notch_list_edit,
+            commands::notch_list_remove,
+            commands::notch_list_reorder,
+            commands::notch_list_set_priority,
+            commands::notch_list_restore,
+            commands::notch_list_clear_completed,
+            commands::notch_list_undo,
             commands::get_active_hotkey,
             commands::diagnose_hotkeys,
             commands::reveal_dev_binary_path,
@@ -194,6 +208,15 @@ pub fn run() {
             }
             app.manage(mode_store);
 
+            // Notch List store (single JSON file). Cross-platform; the
+            // notch *window* is macOS-only and created below.
+            let notch_store = std::sync::Arc::new(crate::notch_list::NotchStore::new());
+            let notch_path = crate::notch_list::notch_list_path(app_handle);
+            if let Err(e) = notch_store.init_with_path(notch_path) {
+                log::warn!("notch list init failed: {e}");
+            }
+            app.manage(notch_store);
+
             let s = settings::load(app_handle);
 
             match hotkey::register(
@@ -201,6 +224,7 @@ pub fn run() {
                 &s.hotkey,
                 &s.cancel_hotkey,
                 &s.mode_cycle_hotkey,
+                &s.notch_list_voice_hotkey,
                 manager.clone(),
             ) {
                 Ok(resolved) => log::info!("push-to-talk bound to {resolved}"),
@@ -212,6 +236,15 @@ pub fn run() {
 
             if let Err(e) = pill::create(app_handle) {
                 log::error!("failed to create pill window: {e}");
+            }
+            // Notch List window — macOS-only, and only when enabled
+            // (opt-out, so on by default). Errors are non-fatal: the rest
+            // of the app runs fine without the notch.
+            #[cfg(target_os = "macos")]
+            if s.notch_list_enabled {
+                if let Err(e) = crate::notch::create(app_handle) {
+                    log::error!("failed to create notch window: {e}");
+                }
             }
             if let Err(e) = tray::build(app_handle) {
                 log::error!("failed to build tray icon: {e}");
@@ -268,7 +301,7 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if matches!(window.label(), "settings" | "tray-popover" | "pill") {
+                if matches!(window.label(), "settings" | "tray-popover" | "pill" | "notch") {
                     let _ = window.hide();
                     api.prevent_close();
                 }

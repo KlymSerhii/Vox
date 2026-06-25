@@ -5,13 +5,14 @@ import {
   type PunctuationStyle,
 } from "@/lib/ipc";
 import { type HotkeyRowKind } from "@/lib/hotkey";
-import { deviceWord } from "@/lib/platform";
+import { deviceWord, isMac } from "@/lib/platform";
 
 export type Tab =
   | "general"
   | "hotkeys"
   | "models"
   | "modes"
+  | "notch-list"
   | "dictionary"
   | "privacy"
   | "about";
@@ -41,6 +42,18 @@ export const TABS: { id: Tab; label: string; icon: string; subtitle: string }[] 
     icon: "modes",
     subtitle: "Tone, punctuation, and dictionary per situation.",
   },
+  // Notch List is macOS-only (the floating notch window doesn't exist on
+  // Windows), so the tab only appears there.
+  ...(isMac
+    ? [
+        {
+          id: "notch-list" as Tab,
+          label: "Notch List",
+          icon: "checklist",
+          subtitle: "An always-visible priority to-do list in the notch.",
+        },
+      ]
+    : []),
   {
     id: "dictionary",
     label: "Dictionary & Context",

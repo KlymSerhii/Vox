@@ -39,6 +39,7 @@ export default defineConfig({
       input: {
         settings: r("./index.html"),
         pill: r("./pill.html"),
+        notch: r("./notch.html"),
         onboarding: r("./onboarding.html"),
         "tray-popover": r("./tray-popover.html"),
         donation: r("./donation.html"),
