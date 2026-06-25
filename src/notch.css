@@ -1,0 +1,94 @@
+@import "tailwindcss";
+
+/* ===========================================================================
+ * Notch List — self-contained stylesheet.
+ *
+ * The Notch List window is DELIBERATELY decoupled from the app/pill design
+ * system in `src/styles.css`. It is a black panel that hangs below the
+ * physical camera notch and must always read as an extension of that
+ * true-black cutout:
+ *   - It NEVER follows the app's light/dark appearance (the panel is always
+ *     dark; there are no `[data-theme]` overrides here on purpose).
+ *   - It does NOT inherit pill "liquid glass" tokens, the shimmer/processing
+ *     keyframes, focus rings, or any other app surface styling.
+ *
+ * So it ships its OWN fixed, always-dark token set plus the few primitives
+ * its markup needs (the generic <HotkeyKeys> keycap). Tailwind's utility
+ * layer is shared — it's a neutral toolkit (`flex`, `rounded`, `truncate`),
+ * not a pill style. Keep this file as the single source of truth for how the
+ * notch looks; do not reach back into `styles.css`.
+ * ========================================================================= */
+
+:root {
+  /* Panel surface — near-black so it blends with the physical (true-black)
+   * notch. The border is a faint top rim that lifts the panel off dark
+   * wallpapers without reading as an outline. */
+  --color-notch-surface: rgba(10, 10, 12, 0.92);
+  --color-notch-border: rgba(255, 255, 255, 0.1);
+  /* Subtle backdrop blur — notch-owned, intentionally lighter than the
+   * pill's heavy frosted `--glass-blur`. */
+  --notch-blur: blur(20px) saturate(150%);
+
+  /* Fixed light-on-dark text ramp. Never flips with appearance. */
+  --color-ink: #f4f4f5;
+  --color-ink-mute: rgba(255, 255, 255, 0.62);
+  --color-ink-faint: rgba(255, 255, 255, 0.4);
+
+  /* Priority dots (high / med; low falls back to ink-faint). */
+  --color-danger: #ff6b6b;
+  --color-warning: #fbbf24;
+
+  /* Keycap chrome, consumed by the shared <HotkeyKeys> component. */
+  --color-control: rgba(255, 255, 255, 0.08);
+  --color-border: rgba(255, 255, 255, 0.12);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: transparent !important;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  color: var(--color-ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  cursor: pointer;
+}
+
+/* Keycap badge — notch-local copy kept structurally in sync with the shared
+ * <HotkeyKeys> markup. The app's copy lives in `styles.css`; this one is
+ * driven by the notch's fixed dark tokens above so it reads on black. */
+.keycap {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-family:
+    ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-ink);
+  background: var(--color-control);
+  box-shadow: inset 0 0 0 1px var(--color-border);
+}
+
+/* Reduced-motion safety net. Notch.tsx already gates its transitions in JS;
+ * this covers any future CSS animation that slips in. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}

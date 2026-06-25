@@ -129,6 +129,7 @@ pub fn run() {
             commands::suggest_active_mode,
             commands::notch_list_get,
             commands::notch_resize,
+            commands::notch_geometry,
             commands::notch_list_mark_done,
             commands::notch_list_add,
             commands::notch_list_edit,

@@ -3,27 +3,19 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="color-scheme" content="dark light" />
+    <!-- The notch is ALWAYS dark — a near-black panel that blends with the
+         physical (true-black) camera notch. Unlike every other window it does
+         not follow the app's light/dark appearance, so there is no theme
+         bootstrap script here; all styling lives in `src/notch.css`. -->
+    <meta name="color-scheme" content="dark" />
     <title>Vox Notch</title>
-    <script>
-      // Resolve `data-theme` BEFORE any markup paints so the inline theme
-      // tokens used by the notch pick up the right values on first paint.
-      (function () {
-        var v = null;
-        try { v = localStorage.getItem('vox-theme'); } catch (_) {}
-        var t = v === 'light' || v === 'dark' ? v : 'dark';
-        document.documentElement.dataset.theme = t;
-        document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
-      })();
-    </script>
+    <!-- Pre-CSS transparent background to avoid any first-paint flash before
+         notch.css loads (it sets the same). -->
     <style>
       html,
       body,
       #root {
         background: transparent !important;
-      }
-      body {
-        overflow: hidden;
       }
     </style>
   </head>

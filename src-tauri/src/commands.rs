@@ -1404,6 +1404,38 @@ pub fn notch_resize<R: Runtime>(
     Ok(())
 }
 
+/// Physical-notch geometry for the notch webview, in logical points. Lets
+/// the notch UI size its idle "nub" to the camera-bump width and know
+/// whether it's hanging below a real notch (vs. a notchless display, where
+/// it falls back to a default nub width). Computed on the macOS main thread
+/// and cached in `notch.rs`; this is a cheap snapshot read. `Default` (no
+/// notch, zero size) on non-macOS.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
+pub struct NotchGeometry {
+    /// Whether the target display has a physical notch (camera bump).
+    pub has_notch: bool,
+    /// Width of the physical notch in logical points (0 when unknown).
+    pub width: f64,
+    /// Height of the notch band (`safeAreaInsets.top`) in logical points.
+    pub height: f64,
+}
+
+/// Snapshot the cached notch geometry for the current target display. Read
+/// by the notch webview on mount; the backend also pushes a `notch:geometry`
+/// event when the target display's geometry changes (e.g. a cross-monitor
+/// hop), which the webview listens for.
+#[tauri::command]
+pub fn notch_geometry<R: Runtime>(_app: AppHandle<R>) -> NotchGeometry {
+    #[cfg(target_os = "macos")]
+    {
+        crate::notch::geometry_snapshot()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        NotchGeometry::default()
+    }
+}
+
 /// Mark an item done. The ONLY notch-list mutation callable from the notch
 /// window itself (so the notch checkbox works) — deliberately NOT gated by
 /// `assert_secret_window`.
