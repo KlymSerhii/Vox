@@ -431,7 +431,7 @@ export function NotchListTab(props: {
           </Row>
           <Row
             label="Confirm destructive voice edits"
-            hint="When a spoken command removes or clears items, ask for confirmation instead of applying it immediately."
+            hint="When something you say removes or clears items, ask for confirmation instead of applying it immediately."
             last
           >
             <Toggle
@@ -447,8 +447,8 @@ export function NotchListTab(props: {
         <SectionHeader title="Voice editing" />
         <Card>
           <Row
-            label="Voice command shortcut"
-            hint="Press, speak a command (e.g. “add buy milk”), and Vox edits the list instead of copying text."
+            label="Voice shortcut"
+            hint="Press it, then just talk — say what you want to do, what you finished, or reel off several things at once — and Vox turns it into tasks instead of copying text. No commands to memorize."
           >
             <div class="flex items-center gap-2">
               <HotkeyKeys spec={props.s.notch_list_voice_hotkey} />
@@ -477,7 +477,7 @@ export function NotchListTab(props: {
           </Row>
           <Row
             label="Undo last voice edit"
-            hint="Revert the most recent voice command (single level)."
+            hint="Revert the most recent voice edit (single level)."
             last
           >
             <button

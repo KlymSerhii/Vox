@@ -2072,9 +2072,19 @@ fn wav_peak_pcm16(wav: &[u8]) -> f32 {
     peak.min(1.0)
 }
 
-/// System prompt for the notch voice-command interpreter. The model must
-/// output ONLY a JSON object matching [`crate::notch_list::NotchCommandResponse`].
-const NOTCH_COMMAND_PROMPT: &str = "You convert a spoken command into structured edits for a small to-do list (the \"Notch List\"). You are given the CURRENT LIST as JSON (each active item has a 1-based index, an id, and text) and a SPOKEN COMMAND transcript.
+/// System prompt for the notch voice interpreter. The model must output
+/// ONLY a JSON object matching [`crate::notch_list::NotchCommandResponse`].
+///
+/// Framed around *natural, conversational speech*, not memorised commands:
+/// people talk to the list the way they'd talk to a friend ("my first
+/// priority is to ship the app, then I need to call the dentist…") and the
+/// model's job is to understand the meaning and capture it — adding is the
+/// default. The worked examples carry most of the weight here; keep the
+/// multi-item brain-dump example, since that is the exact case that used to
+/// fail.
+const NOTCH_COMMAND_PROMPT: &str = "You turn what someone says out loud into edits for their personal to-do list (the \"Notch List\"). They are talking the way they would talk to a friend — there are NO special command words and they should never have to learn any. Understand what they mean and capture it as list edits.
+
+You are given the CURRENT LIST as JSON (each item has a 1-based \"index\", its \"text\", and \"priority\") and a transcript of WHAT THE USER SAID.
 
 Output ONLY a single JSON object — no prose, no markdown fences, no explanation — with this exact shape:
 {
@@ -2091,15 +2101,30 @@ Each op in \"ops\" is one of:
 - {\"op\": \"reprioritize\", \"target\": <target>, \"priority\": \"high\"|\"med\"|\"low\"}
 - {\"op\": \"reorder\", \"target\": <target>, \"position\": \"top\"|\"bottom\"}
 
-A <target> is one of: a 1-based integer index into the current list (preferred when the speaker says \"the second one\", \"number three\", \"the last one\"), or a string that matches the item's text.
+A <target> is a 1-based integer index into the current list (use this when they point at a position: \"the second one\", \"number three\", \"the last one\") OR a string matching the item's text (\"the dentist one\").
 
-Rules:
-- Resolve references like \"the second one\", \"the dentist task\", \"that one\" against the provided 1-based list. Prefer an index target when the speaker refers to a position.
-- Do NOT translate task text. Preserve the speaker's language and wording for added/edited text.
-- If the command does not request any change to the list, return an empty \"ops\" array.
-- If the command is ambiguous or you cannot tell which item is meant, set \"needs_clarification\" to a short question and return an empty \"ops\" array.
-- Set \"confidence\" between 0 and 1 reflecting how sure you are the ops match the intent.
-- Output the JSON object and nothing else.";
+How to understand natural speech:
+- ADDING IS THE DEFAULT. Whenever someone mentions something they want to do, need to do, plan to do, or should remember — even as plain narration like \"my first priority is to finish the alarm app\", \"then I need to apply for review\", \"after that I want to release Vox\", or \"don't let me forget to call the dentist\" — create one \"add\" op for each distinct task, in the order they said them.
+- Write each task as a short, clear action and DROP the filler around it (\"my first priority is to\", \"I need to\", \"then\", \"after that\", \"I want to\", \"I should\"). E.g. \"then I really need to call the dentist about my tooth\" → text \"Call the dentist about my tooth\".
+- Keep the speaker's own language and wording. Do NOT translate.
+- Infer priority from their words: clear importance/urgency (\"most important\", \"first priority\", \"top priority\", \"critical\", \"urgent\", \"asap\", \"right away\") → \"high\"; clearly can-wait (\"eventually\", \"someday\", \"at some point\", \"whenever\", \"low priority\", \"no rush\") → \"low\"; otherwise leave priority out.
+- They can also change EXISTING items: finishing/checking off → \"complete\"; deleting/scratching/never-mind → \"remove\"; rewording → \"edit\"; making something more/less important → \"reprioritize\"; moving up/down → \"reorder\". Resolve \"the second one\", \"that dentist task\", \"the last one\" against the current list (prefer an index when they name a position).
+- One utterance can mix several edits (add two things AND finish one) — emit an op for each.
+
+When NOT to act:
+- Set \"needs_clarification\" to a short question (and return empty \"ops\") ONLY when they clearly meant to change an EXISTING item but you genuinely cannot tell which one. NEVER ask just because the speech is long, casual, or rambling — prefer adding.
+- If they truly said nothing actionable, return an empty \"ops\" array.
+
+Set \"confidence\" between 0 and 1. Output the JSON object and nothing else.
+
+Examples:
+CURRENT LIST: []
+SAID: \"Okay so my first priority is to finish all the new features for the alarm app, then I need to apply for Apple review, after that I want to release the Vox update, and finally fix the alarm bugs.\"
+OUTPUT: {\"ops\":[{\"op\":\"add\",\"text\":\"Finish all new features for the alarm app\",\"priority\":\"high\"},{\"op\":\"add\",\"text\":\"Apply for Apple review\"},{\"op\":\"add\",\"text\":\"Release the Vox update\"},{\"op\":\"add\",\"text\":\"Fix the alarm bugs\"}],\"needs_clarification\":null,\"confidence\":0.95}
+
+CURRENT LIST: [{\"index\":1,\"text\":\"Email Bob\",\"priority\":\"med\"},{\"index\":2,\"text\":\"Call the dentist\",\"priority\":\"med\"}]
+SAID: \"I finished emailing Bob, and bump the dentist one up to high priority.\"
+OUTPUT: {\"ops\":[{\"op\":\"complete\",\"target\":1},{\"op\":\"reprioritize\",\"target\":\"dentist\",\"priority\":\"high\"}],\"needs_clarification\":null,\"confidence\":0.9}";
 
 /// True for a bare spoken "undo" command — "undo", "undo that", "undo
 /// last", "undo last edit/change" — after lowercasing, trimming, and
@@ -2171,10 +2196,28 @@ async fn interpret_and_apply_notch(
 
     manager.set_stage(app, id, Stage::Polishing, None, false);
 
+    // Give the model a slim, explicitly-indexed view of the active list
+    // (1-based index + text + priority) instead of the raw on-disk items.
+    // The interpreter references items by index or text — it never needs
+    // ids, timestamps, or internal order — and the explicit "index" field
+    // makes "the second one" resolve reliably. The index here matches
+    // `resolve_target`'s 1-based index into the same sorted active list.
     let doc = store.read();
-    let list_json = serde_json::to_string_pretty(&doc.top_n(usize::MAX)).unwrap_or_else(|_| "[]".into());
+    let active = doc.top_n(usize::MAX);
+    let slim: Vec<serde_json::Value> = active
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            serde_json::json!({
+                "index": i + 1,
+                "text": item.text,
+                "priority": item.priority,
+            })
+        })
+        .collect();
+    let list_json = serde_json::to_string(&slim).unwrap_or_else(|_| "[]".into());
     let payload = format!(
-        "CURRENT LIST (JSON):\n{}\n\nSPOKEN COMMAND:\n{}",
+        "CURRENT LIST (JSON):\n{}\n\nWHAT THE USER SAID:\n{}",
         list_json, transcript
     );
 
@@ -2189,7 +2232,7 @@ async fn interpret_and_apply_notch(
                 app,
                 id,
                 Stage::Error,
-                Some("Couldn't understand the command".into()),
+                Some("Didn't catch that — try again".into()),
                 false,
             );
             return;
@@ -2204,39 +2247,47 @@ async fn interpret_and_apply_notch(
                 app,
                 id,
                 Stage::Error,
-                Some("Couldn't understand the command".into()),
+                Some("Didn't catch that — try again".into()),
                 false,
             );
             return;
         }
     };
 
-    if let Some(question) = parsed.needs_clarification.as_deref() {
-        if !question.trim().is_empty() {
+    // Decide what to do with the interpreter's response. Non-empty ops are
+    // always applied — pulling tasks out of natural, conversational speech
+    // is the whole point, and every op is reversible (adds/edits/completes
+    // via undo, removes via the confirm gesture). We deliberately do NOT
+    // gate ops behind `confidence`; that floor used to silently drop
+    // perfectly good multi-item brain-dumps. A clarifying question only
+    // surfaces when the model produced no ops and asked a real one.
+    match parsed.action() {
+        crate::notch_list::NotchAction::Clarify(question) => {
             log::info!("notch command (sid={id}): needs clarification: {question}");
-            manager.set_stage(app, id, Stage::Done, Some(question.to_string()), true);
+            manager.set_stage(app, id, Stage::Done, Some(question), true);
             return;
         }
-    }
-
-    if parsed.confidence < 0.5 {
-        log::info!(
-            "notch command (sid={id}): low confidence {:.2}; not applying",
-            parsed.confidence
-        );
-        manager.set_stage(
-            app,
-            id,
-            Stage::Done,
-            Some("Not sure what you meant — try again".into()),
-            true,
-        );
-        return;
-    }
-
-    if parsed.ops.is_empty() {
-        manager.set_stage(app, id, Stage::Done, Some("No list change".into()), false);
-        return;
+        crate::notch_list::NotchAction::Nothing => {
+            log::info!(
+                "notch command (sid={id}): nothing actionable (confidence {:.2})",
+                parsed.confidence
+            );
+            manager.set_stage(
+                app,
+                id,
+                Stage::Done,
+                Some("Didn't catch any tasks — try again".into()),
+                true,
+            );
+            return;
+        }
+        crate::notch_list::NotchAction::Apply => {
+            log::debug!(
+                "notch command (sid={id}): applying {} op(s) (confidence {:.2})",
+                parsed.ops.len(),
+                parsed.confidence
+            );
+        }
     }
 
     let confirm = settings::prefs(app).notch_list_confirm_destructive;
