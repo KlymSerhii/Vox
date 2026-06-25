@@ -38,6 +38,8 @@ pub const KEY_STREAMING_PILL_ENABLED: &str = "streaming_pill_enabled";
 
 const KEY_AUTO_PASTE_ENABLED: &str = "auto_paste_enabled";
 
+const KEY_AUDIO_ATTENUATION: &str = "audio_attenuation";
+
 const KEY_LIVE_TRANSCRIPT_ENABLED: &str = "live_transcript_enabled";
 
 const KEY_ENABLE_THINKING: &str = "enable_thinking";
@@ -136,6 +138,12 @@ fn default_auto_paste_enabled() -> bool {
     // hands-off "speak straight into the focused field" flow flip
     // this on in Settings → General.
     false
+}
+fn default_audio_attenuation() -> String {
+    // "duck" by default — lower other audio to 25% while dictating, then
+    // restore. "pause" (media key) is opt-in, "off" disables it. Coerced
+    // against this allow-list on load.
+    "duck".into()
 }
 fn default_live_transcript_enabled() -> bool {
     // Opt-in. Reveals the speculative transcript inside the
@@ -287,6 +295,15 @@ pub struct Settings {
     /// Accessibility.
     #[serde(default = "default_auto_paste_enabled")]
     pub auto_paste_enabled: bool,
+
+    /// How to attenuate other audio (music, video) while a dictation
+    /// session is recording. One of `"off"`, `"duck"` (lower system
+    /// output volume to 25%, the default), or `"pause"` (post a media
+    /// Play/Pause key — opt-in, falls back to duck when the key can't be
+    /// posted). Coerced against the allow-list on load. OS-agnostic: the
+    /// concrete device poke is `cfg`-selected in `audio_attenuation`.
+    #[serde(default = "default_audio_attenuation")]
+    pub audio_attenuation: String,
 
     /// Show a live transcript inside the pill while the user is still
     /// speaking, in place of the default waveform. Driven by the same
@@ -444,6 +461,7 @@ impl Default for Settings {
             show_dock_icon: default_show_dock_icon(),
             streaming_pill_enabled: default_streaming_pill_enabled(),
             auto_paste_enabled: default_auto_paste_enabled(),
+            audio_attenuation: default_audio_attenuation(),
             live_transcript_enabled: default_live_transcript_enabled(),
             enable_thinking: false,
             inference_api_key: String::new(),
@@ -529,6 +547,13 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
 
     let auto_paste_enabled =
         get_bool(KEY_AUTO_PASTE_ENABLED, default_auto_paste_enabled());
+
+    let audio_attenuation = match get_str(KEY_AUDIO_ATTENUATION).as_deref() {
+        Some("off") => "off".to_string(),
+        Some("pause") => "pause".to_string(),
+        Some("duck") => "duck".to_string(),
+        _ => default_audio_attenuation(),
+    };
 
     let live_transcript_enabled = get_bool(
         KEY_LIVE_TRANSCRIPT_ENABLED,
@@ -626,6 +651,7 @@ pub fn load<R: Runtime>(app: &AppHandle<R>) -> Settings {
         show_dock_icon,
         streaming_pill_enabled,
         auto_paste_enabled,
+        audio_attenuation,
         live_transcript_enabled,
         enable_thinking,
         inference_api_key,
@@ -695,6 +721,12 @@ pub fn save<R: Runtime>(app: &AppHandle<R>, settings: &Settings) -> anyhow::Resu
 
     b(KEY_STREAMING_PILL_ENABLED, settings.streaming_pill_enabled);
     b(KEY_AUTO_PASTE_ENABLED, settings.auto_paste_enabled);
+    let audio_attenuation = match settings.audio_attenuation.as_str() {
+        "off" => "off",
+        "pause" => "pause",
+        _ => "duck",
+    };
+    s(KEY_AUDIO_ATTENUATION, audio_attenuation);
     b(
         KEY_LIVE_TRANSCRIPT_ENABLED,
         settings.live_transcript_enabled,
@@ -893,6 +925,12 @@ pub struct Prefs {
     /// behaviour for an in-flight transcript.
     pub auto_paste_enabled: bool,
 
+    /// Mirror of `Settings::audio_attenuation` (`"off"`/`"duck"`/
+    /// `"pause"`). Read at recording start so `audio_attenuation::begin`
+    /// knows how to quiet other audio; the restore side takes no setting
+    /// (it just undoes whatever the snapshot recorded).
+    pub audio_attenuation: String,
+
     /// Mirror of `Settings::live_transcript_enabled`. Captured at
     /// session start so a mid-utterance toggle can't swap the pill
     /// silhouette under the user. Drives the speculative decoder's
@@ -944,6 +982,7 @@ pub fn prefs<R: Runtime>(app: &AppHandle<R>) -> Prefs {
         auto_suggest_modes: s.auto_suggest_modes,
         streaming_pill_enabled: s.streaming_pill_enabled,
         auto_paste_enabled: s.auto_paste_enabled,
+        audio_attenuation: s.audio_attenuation,
         live_transcript_enabled: s.live_transcript_enabled,
         enable_thinking: s.enable_thinking,
         audio_input_device: s.audio_input_device,
@@ -1042,6 +1081,26 @@ mod tests {
         let bare = "{}";
         let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
         assert!(!restored.live_transcript_enabled);
+    }
+
+    #[test]
+    fn audio_attenuation_defaults_to_duck() {
+        let s = Settings::default();
+        assert_eq!(s.audio_attenuation, "duck");
+    }
+
+    #[test]
+    fn audio_attenuation_roundtrips_through_serde() {
+        let mut s = Settings::default();
+        s.audio_attenuation = "pause".to_string();
+        let json = serde_json::to_string(&s).expect("serialize");
+        let restored: Settings = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.audio_attenuation, "pause");
+
+        // Older on-disk docs without the field fall back to the default.
+        let bare = "{}";
+        let restored: Settings = serde_json::from_str(bare).expect("deserialize bare");
+        assert_eq!(restored.audio_attenuation, default_audio_attenuation());
     }
 
     #[test]

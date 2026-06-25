@@ -1,4 +1,5 @@
 mod audio;
+mod audio_attenuation;
 mod commands;
 mod donation;
 mod donation_window;
@@ -9,6 +10,8 @@ mod inference_proc;
 mod inference_server;
 mod inject;
 #[cfg(target_os = "macos")]
+mod mac_audio;
+#[cfg(target_os = "macos")]
 mod mac_chord;
 #[cfg(target_os = "macos")]
 mod mac_paste;
@@ -16,6 +19,8 @@ mod mac_paste;
 mod mac_perm;
 mod mac_power;
 mod mac_wake;
+#[cfg(target_os = "windows")]
+mod win_audio;
 #[cfg(target_os = "windows")]
 mod win_paste;
 mod models;
@@ -70,6 +75,7 @@ pub fn run() {
             commands::set_live_transcript_enabled,
             commands::set_enable_thinking,
             commands::set_appearance,
+            commands::set_audio_attenuation,
             commands::copy_text,
             commands::get_recent_transcripts,
             commands::get_time_saved_stats,

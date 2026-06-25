@@ -171,14 +171,25 @@ whisper-rs = { version = "0.16", optional = true }
 # WiX/NSIS bundler to pick up. Pinned exact: unstable rc series.
 parakeet-rs = { version = "=0.3.5", default-features = true, features = ["directml"], optional = true }
 # Win32 FFI for the synthetic Ctrl+V (auto-paste), the foreground-window
-# probe (mode suggestion), and ShellExecuteW (external links / settings
-# deep-link). Mirrors the macOS objc2/CoreGraphics FFI convention.
+# probe (mode suggestion), ShellExecuteW (external links / settings
+# deep-link), and the WASAPI audio-control module (`win_audio.rs`:
+# IAudioEndpointVolume master volume + IAudioMeterInformation peak probe +
+# the media Play/Pause SendInput). Mirrors the macOS objc2/CoreGraphics FFI
+# convention. `Win32_Media_Audio{,_Endpoints}` carry the WASAPI device /
+# endpoint-volume / meter interfaces; `Win32_System_Com` gates COM init
+# (`CoInitializeEx`/`CoCreateInstance`) and the generic `IMMDevice::Activate`.
+# `PROPVARIANT` rides in via `windows-core`, so no
+# `Win32_System_Com_StructuredStorage`/`Win32_Devices_FunctionDiscovery` are
+# needed.
 windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_Threading",
   "Win32_UI_Shell",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
 ] }
 
 # Unix-only: `xattr` strips `com.apple.quarantine` from the extracted

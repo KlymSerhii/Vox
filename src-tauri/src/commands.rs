@@ -357,6 +357,32 @@ pub fn set_appearance<R: Runtime>(
     Ok(())
 }
 
+/// Single-field setter for `Settings::audio_attenuation` (`"off"` /
+/// `"duck"` / `"pause"`). Not behind `assert_secret_window` so the tray
+/// popover can flip it directly. In-flight sessions are unaffected —
+/// `audio_attenuation::begin` reads the value fresh at recording start.
+#[tauri::command]
+pub fn set_audio_attenuation<R: Runtime>(
+    app: AppHandle<R>,
+    value: String,
+) -> Result<(), String> {
+    match value.as_str() {
+        "off" | "duck" | "pause" => {}
+        other => return Err(format!("invalid audio_attenuation: {other}")),
+    }
+
+    let mut s = settings::load(&app);
+    if s.audio_attenuation == value {
+        return Ok(());
+    }
+    s.audio_attenuation = value;
+    settings::save(&app, &s).map_err(|e| e.to_string())?;
+    if let Err(e) = app.emit("settings:changed", &s) {
+        log::warn!("failed to emit settings:changed: {e}");
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_recent_transcripts() -> Vec<transcripts::RecentTranscript> {
     transcripts::snapshot()

@@ -32,6 +32,7 @@ import {
   sessionsSnapshot,
   setActiveMode,
   setAppearance,
+  setAudioAttenuation,
   setAudioInputDevice,
   setAutoPasteEnabled,
   setEnableThinking,
@@ -489,6 +490,32 @@ export default function TrayPopoverView() {
     // Re-probe on flip-on so the nudge surfaces immediately if
     // Accessibility isn't granted yet.
     if (v) await refreshAccessibility();
+  }
+
+  // Single-row tri-state cycle (duck → pause → off → duck) so all three
+  // choices fit one compact tray row. Uses the dedicated
+  // `set_audio_attenuation` IPC — `set_settings` is gated to the
+  // settings/onboarding windows. Optimistic flip with rollback, mirroring
+  // `toggleLiveTranscript`.
+  function audioAttenuationLabel(v: Settings["audio_attenuation"]): string {
+    return v === "duck" ? "Lower" : v === "pause" ? "Pause" : "Off";
+  }
+  async function cycleAudioAttenuation() {
+    const cur = s();
+    if (!cur) return;
+    const next: Settings["audio_attenuation"] =
+      cur.audio_attenuation === "duck"
+        ? "pause"
+        : cur.audio_attenuation === "pause"
+          ? "off"
+          : "duck";
+    setS({ ...cur, audio_attenuation: next });
+    try {
+      await setAudioAttenuation(next);
+    } catch (err) {
+      console.error("setAudioAttenuation failed:", err);
+      setS(cur);
+    }
   }
 
   async function toggleEnableThinking(v: boolean) {
@@ -1064,6 +1091,32 @@ export default function TrayPopoverView() {
                       </button>
                     </div>
                   </Show>
+                </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Audio
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {st().audio_attenuation === "off"
+                          ? "Other audio keeps playing while you dictate."
+                          : st().audio_attenuation === "pause"
+                            ? "Other audio pauses while you dictate."
+                            : "Other audio gets quieter while you dictate."}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      class="liquid-card inline-flex shrink-0 items-center justify-center rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                      onClick={() => void cycleAudioAttenuation()}
+                      aria-label="Quiet other audio while dictating"
+                      title="Tap to switch: Lower → Pause → Off"
+                    >
+                      {audioAttenuationLabel(st().audio_attenuation)}
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>

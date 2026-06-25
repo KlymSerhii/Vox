@@ -771,6 +771,15 @@ impl SessionManager {
             spawn_suggestion_probe(app.clone(), prefs.active_mode_id.clone());
         }
 
+        // Probe playback BEFORE opening the mic so the reading isn't
+        // polluted by our own capture: on a combined Bluetooth headset
+        // (one device carrying input + output) our mic stream can make
+        // the output read "active" even in silence, which would let
+        // pause mode post a media key that starts music from silence.
+        // Skip the probe entirely when attenuation is off.
+        let was_playing =
+            prefs.audio_attenuation != "off" && crate::audio_attenuation::probe_playback();
+
         if let Err(e) = self.audio.start(prefs.audio_input_device.clone()) {
             log::error!("failed to start audio: {e}");
             // Roll back: release the busy gate, remove session, clear
@@ -816,6 +825,18 @@ impl SessionManager {
             return BeginOutcome::AudioError(e.to_string());
         }
 
+        // Audio is recording — attenuate other audio (music/video) per
+        // the user's setting. The primary restore is anchored to
+        // mic-release in `end_recording`; `cancel_session` and
+        // `PipelineGuard::drop` are idempotent backstops. Best-effort and
+        // fully fail-open: a failure here never blocks the session. Placed
+        // after the audio-start success so the error early-return above
+        // can't leave audio ducked with no recording to restore it. The
+        // playback state was probed above (before mic-open) to avoid a
+        // combined-Bluetooth-device false-positive that could let pause
+        // start music from silence.
+        crate::audio_attenuation::begin(&prefs.audio_attenuation, was_playing);
+
         spawn_max_record_guard(app.clone(), self.clone(), session.clone(), MAX_RECORD_SECS);
         spawn_audio_level_sampler(app.clone(), self.clone(), session.clone());
         spawn_speculative_decoder(app.clone(), self.clone(), session.clone());
@@ -849,6 +870,17 @@ impl SessionManager {
         if let Err(e) = self.audio.stop() {
             log::warn!("end_recording: audio.stop failed: {e}");
         }
+
+        // Primary restore: un-attenuate other audio the moment the mic is
+        // released — i.e. when the user stops dictating ("revert when
+        // untriggered") — rather than waiting for the detached pipeline to
+        // unwind in `PipelineGuard::drop`. This keeps `begin`↔`restore`
+        // symmetric with the serialized recording lifecycle, so a new
+        // dictation that `begin`s while the previous pipeline is still
+        // transcribing/polishing can't race two snapshots over the one
+        // global slot. Idempotent (take-based): the guard-drop and
+        // cancel backstops below safely no-op if this already ran.
+        crate::audio_attenuation::restore();
 
         // Escape stays grabbed past the end of recording — the user can
         // still cancel during the transcribe / polish stages. Disarm is
@@ -989,6 +1021,12 @@ impl SessionManager {
                 log::warn!("cancel_session({id}): audio.stop failed: {e}");
             }
             crate::hotkey::disarm_cancel(app);
+            // Backstop restore for a cancel that aborts the recording
+            // before `end_recording` runs its primary restore (and before
+            // `run_pipeline` / `PipelineGuard` is ever constructed).
+            // Idempotent: whichever restore runs first take()s the
+            // snapshot, the rest no-op.
+            crate::audio_attenuation::restore();
         }
 
         let session = match self.sessions.lock().get(&id).cloned() {
@@ -1481,6 +1519,14 @@ async fn run_pipeline(
             // the grab survives from begin() through to pipeline
             // finalisation.
             crate::hotkey::disarm_cancel(&self.app);
+            // Backstop restore for any audio we attenuated at recording
+            // start. The primary restore now fires at mic-release in
+            // `end_recording`; this guard-drop covers the only paths that
+            // skip it — a pipeline-phase panic that unwinds through Drop.
+            // Idempotent: if the mic-release (or a foreground cancel)
+            // already restored, this take()s an empty snapshot and no-ops.
+            // Panic-safe — runs from Drop.
+            crate::audio_attenuation::restore();
         }
     }
     let mut _guard = PipelineGuard::new(session.clone(), app.clone());
