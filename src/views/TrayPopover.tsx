@@ -77,8 +77,9 @@ import {
 // All four dropdowns (mode, period, mic, re-polish) share the same
 // `DropdownPosition` shape so the rendering picks the anchor side
 // (top vs bottom) via `placement` without per-call-site branching.
-// Mode and period never flip up, but using the same shape keeps the
-// dropdown JSX uniform.
+// The mode, mic, and re-polish pickers flip up when there's more
+// headroom above (their lists can outgrow the space below); the
+// period picker has few options and stays "below".
 function initialDropdownPos(): DropdownPosition {
   return {
     placement: "below",
@@ -1117,7 +1118,16 @@ export default function TrayPopoverView() {
                             height: window.innerHeight,
                           },
                           minMenuWidth: 224,
-                          preferred: "below",
+                          // The Voice mode row sits mid-popover and the
+                          // list now carries 8 built-ins, so a forced
+                          // "below" placement clips the lower modes at
+                          // the window's bottom edge. Mirror the mic /
+                          // re-polish pickers: flip above when there's
+                          // more headroom up there, and cap max-height
+                          // to the chosen side so the list scrolls
+                          // instead of clipping.
+                          desiredHeight: 280,
+                          preferred: "auto",
                           align: "end",
                         }),
                       );
@@ -1151,7 +1161,7 @@ export default function TrayPopoverView() {
               <Show when={modeMenuOpen()}>
                 <div
                   ref={(el) => (modeMenuRef = el)}
-                  class="liquid-glass z-50 max-h-60 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  class="liquid-glass z-50 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
                   role="listbox"
                   style={{
                     position: "fixed",
@@ -1160,6 +1170,7 @@ export default function TrayPopoverView() {
                       : { top: `${modeMenuPos().top}px` }),
                     left: `${modeMenuPos().left}px`,
                     "min-width": `${modeMenuPos().minWidth}px`,
+                    "max-height": `${modeMenuPos().maxHeight}px`,
                   }}
                 >
                   <For each={modes()}>
