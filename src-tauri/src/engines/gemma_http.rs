@@ -39,6 +39,28 @@ const MAX_NEW_TOKENS_CAP: u32 = 8192;
 // "data:" line with no `\n\n` event boundary.
 const SSE_BUFFER_MAX_BYTES: usize = 1_048_576;
 
+// Floor for the structured/JSON (notch) path, applied even when
+// `enable_thinking == false`. The structured payload is small (a slim
+// list + a short transcript) so the length-based budget alone clamps
+// near the 256 floor — but llama.cpp's Gemma 4 chat handler still emits
+// `reasoning_content` regardless of the `enable_thinking` kwarg (the
+// server isn't started with `--reasoning-budget 0`, intentionally, so
+// normal opt-in thinking keeps working). JSON-object mode constrains
+// only `content`, not reasoning, so ~1k chars of chain-of-thought can
+// burn a 256-token budget before a single `{` lands → empty `content`,
+// `finish_reason=length`, and the notch parser fails. 2048 leaves room
+// for that reasoning plus the terse JSON object. The model stops at
+// `finish_reason=stop` once the JSON is complete, so this higher ceiling
+// only prevents truncation — it does not slow the common case.
+const STRUCTURED_MIN_NEW_TOKENS: u32 = 2048;
+
+// Deadline basis for the structured path. The 2048-token *budget* prevents
+// truncation, but the wedge-failure *deadline* should reflect the expected
+// completion (reasoning + a terse JSON object), not the full ceiling — so a
+// hung structured call fails open in ~1 min, not ~1.6 min. The common case
+// stops at finish_reason=stop long before either bound.
+const STRUCTURED_DEADLINE_TOKENS: u32 = 1024;
+
 // English BPE ≈ 4 chars/token. Budget = reasoning + output + margin:
 // - Reasoning: ~3× input. Gemma 4's chain-of-thought consistently
 //   runs 2-4× the input length on cleanup-with-structuring tasks;
@@ -51,7 +73,13 @@ const SSE_BUFFER_MAX_BYTES: usize = 1_048_576;
 // — Gemma 4 emits answer tokens directly into `content`. A tighter
 // budget shortens the per-call timeout (computed downstream from
 // `max_tokens`) so a wedged call fails-open in seconds, not minutes.
-fn dynamic_max_tokens(input_chars: usize, enable_thinking: bool) -> i32 {
+//
+// `json_mode` is the structured/notch path: even with thinking off,
+// llama.cpp still streams `reasoning_content` ahead of the JSON, so the
+// budget is floored at `STRUCTURED_MIN_NEW_TOKENS` (2048) to keep the
+// JSON from being truncated. This raise is scoped to `json_mode` only —
+// normal (non-JSON) polishing keeps its exact prior behavior.
+fn dynamic_max_tokens(input_chars: usize, enable_thinking: bool, json_mode: bool) -> i32 {
     let estimated_input = input_chars / 4;
     if enable_thinking {
         let reasoning_budget = estimated_input * 3;
@@ -60,7 +88,11 @@ fn dynamic_max_tokens(input_chars: usize, enable_thinking: bool) -> i32 {
         dynamic.clamp(MIN_NEW_TOKENS, MAX_NEW_TOKENS_CAP) as i32
     } else {
         let budget = ((estimated_input as f64) * 1.5).round() as u32;
-        budget.clamp(256, MAX_NEW_TOKENS_CAP) as i32
+        // Structured/JSON path needs headroom for reasoning + JSON even
+        // with thinking off (see STRUCTURED_MIN_NEW_TOKENS); normal
+        // polishing keeps the 256 floor unchanged.
+        let floor = if json_mode { STRUCTURED_MIN_NEW_TOKENS } else { 256 };
+        budget.clamp(floor, MAX_NEW_TOKENS_CAP) as i32
     }
 }
 
@@ -278,17 +310,25 @@ impl LlmEngine for GemmaHttpEngine {
     /// Structured-output variant used by the notch command interpreter.
     /// Identical to [`cleanup`] but sets `response_format: json_object` on
     /// the wire so llama.cpp constrains the completion to a JSON object.
-    /// `enable_thinking` is forced off here (the interpreter wants a terse
-    /// JSON object, not chain-of-thought), and the prose-tolerant
+    /// Thinking is forced off here regardless of the `enable_thinking`
+    /// argument (the interpreter wants a terse JSON object, not
+    /// chain-of-thought) — belt-and-suspenders so a future caller can't
+    /// reintroduce reasoning on the structured path. The prose-tolerant
     /// `parse_command_response` in `notch_list.rs` remains the safety net
-    /// for servers that ignore the field.
+    /// for servers that ignore the field, and the structured token budget
+    /// (see `dynamic_max_tokens`'s `json_mode` floor) leaves room for any
+    /// reasoning the server emits anyway plus the JSON object.
     async fn cleanup_structured(
         &self,
         transcript: &str,
         system_prompt: &str,
         dictionary: &[String],
-        enable_thinking: bool,
+        _enable_thinking: bool,
     ) -> anyhow::Result<String> {
+        // Hardcoded for the structured call: never reason on this path,
+        // whatever the caller passed. See the doc comment above.
+        let enable_thinking = false;
+
         let trimmed = transcript.trim();
         if trimmed.split_whitespace().count() < 2 {
             return Ok(trimmed.to_string());
@@ -428,8 +468,15 @@ impl GemmaHttpEngine {
         json_mode: bool,
     ) -> Result<String, AttemptError> {
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
-        let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking);
-        let deadline = timeout_for(max_tokens);
+        let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking, json_mode);
+        // Structured path: bound the wedge deadline to the expected completion,
+        // not the inflated 2048 budget (see STRUCTURED_DEADLINE_TOKENS).
+        let deadline_tokens = if json_mode {
+            max_tokens.min(STRUCTURED_DEADLINE_TOKENS as i32)
+        } else {
+            max_tokens
+        };
+        let deadline = timeout_for(deadline_tokens);
 
         let system_msg = build_system_message(system_prompt, dictionary);
         // Fenced block keeps content like "Hey Claude, …" from being
@@ -594,7 +641,8 @@ impl GemmaHttpEngine {
     ) -> Result<String, AttemptError> {
         let started = Instant::now();
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", server.port);
-        let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking);
+        // Streaming polish is always the normal (non-JSON) path.
+        let max_tokens = dynamic_max_tokens(transcript.len(), enable_thinking, false);
         let deadline = timeout_for(max_tokens);
 
         let system_msg = build_system_message(system_prompt, dictionary);
@@ -879,8 +927,8 @@ mod tests {
 
     #[test]
     fn dynamic_max_tokens_floors_short_inputs() {
-        assert_eq!(dynamic_max_tokens(5, true), MIN_NEW_TOKENS as i32);
-        assert_eq!(dynamic_max_tokens(0, true), MIN_NEW_TOKENS as i32);
+        assert_eq!(dynamic_max_tokens(5, true, false), MIN_NEW_TOKENS as i32);
+        assert_eq!(dynamic_max_tokens(0, true, false), MIN_NEW_TOKENS as i32);
     }
 
     #[test]
@@ -893,7 +941,7 @@ mod tests {
         // empty, and the session fell through to copying the raw
         // Whisper transcript untouched. The budget must now leave
         // room for thinking + a polished reply.
-        let cap = dynamic_max_tokens(1_600, true);
+        let cap = dynamic_max_tokens(1_600, true, false);
         assert!(
             cap >= 1_800,
             "1600-char input must budget for thinking + answer, got {cap}"
@@ -903,14 +951,70 @@ mod tests {
     #[test]
     fn dynamic_max_tokens_scales_for_30min_audio() {
         // 30 min × 150 wpm × ~5 chars/word ≈ 22.5k chars input.
-        let cap = dynamic_max_tokens(22_500, true);
+        let cap = dynamic_max_tokens(22_500, true, false);
         assert!(cap >= 6_000, "30-min polish needs at least 6k output tokens, got {cap}");
         assert!(cap <= MAX_NEW_TOKENS_CAP as i32);
     }
 
     #[test]
     fn dynamic_max_tokens_caps_pathological_inputs() {
-        assert_eq!(dynamic_max_tokens(200_000, true), MAX_NEW_TOKENS_CAP as i32);
+        assert_eq!(dynamic_max_tokens(200_000, true, false), MAX_NEW_TOKENS_CAP as i32);
+    }
+
+    #[test]
+    fn dynamic_max_tokens_structured_path_floors_at_2048_without_thinking() {
+        // Regression guard for the notch fail-closed we hit in
+        // production: a short structured payload (385 chars) with
+        // thinking off computed a length-based budget of ~144 tokens,
+        // which the non-JSON path clamped to the 256 floor. But
+        // llama.cpp's Gemma 4 handler still streams ~1k chars of
+        // reasoning_content ahead of the JSON regardless of the
+        // enable_thinking kwarg, so all 256 tokens were burned before a
+        // single `{` landed → empty content, finish_reason=length, and
+        // "could not parse LLM JSON". The structured/json path must now
+        // floor at STRUCTURED_MIN_NEW_TOKENS so reasoning + JSON both
+        // fit.
+        let cap = dynamic_max_tokens(385, false, true);
+        assert!(
+            cap >= STRUCTURED_MIN_NEW_TOKENS as i32,
+            "structured path must budget for reasoning + JSON even with thinking off, got {cap}"
+        );
+        assert_ne!(cap, 256, "structured path must NOT clamp to the 256 normal-path floor");
+    }
+
+    #[test]
+    fn structured_deadline_basis_is_capped_below_the_budget() {
+        // The structured path sends the full STRUCTURED_MIN_NEW_TOKENS budget
+        // (2048) so the JSON can't truncate, but the wedge-failure deadline
+        // must be computed from the smaller STRUCTURED_DEADLINE_TOKENS basis
+        // (the expected reasoning + JSON completion), not the inflated budget.
+        // This guards the notch voice→JSON path — a FOREGROUND, user-waiting
+        // interaction — from hanging ~1.6 min before failing open.
+        let max_tokens = dynamic_max_tokens(385, false, true);
+        assert_eq!(
+            max_tokens, STRUCTURED_MIN_NEW_TOKENS as i32,
+            "structured path still sends the full 2048-token budget on the wire"
+        );
+
+        // Mirror the post_cleanup deadline computation for json_mode = true.
+        let deadline_tokens = max_tokens.min(STRUCTURED_DEADLINE_TOKENS as i32);
+        assert_eq!(
+            deadline_tokens, STRUCTURED_DEADLINE_TOKENS as i32,
+            "structured deadline basis must clamp to STRUCTURED_DEADLINE_TOKENS"
+        );
+        assert!(
+            timeout_for(deadline_tokens) < timeout_for(max_tokens),
+            "capped structured deadline must be shorter than the full-budget deadline"
+        );
+    }
+
+    #[test]
+    fn dynamic_max_tokens_normal_path_keeps_256_floor_without_thinking() {
+        // The structured floor must be scoped to json_mode only: normal
+        // (non-JSON) polishing of a short input keeps its prior 256
+        // floor — the bug fix must not inflate the common case.
+        assert_eq!(dynamic_max_tokens(385, false, false), 256);
+        assert_eq!(dynamic_max_tokens(5, false, false), 256);
     }
 
     #[test]

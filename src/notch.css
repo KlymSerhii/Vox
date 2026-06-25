@@ -54,10 +54,14 @@ body {
   margin: 0;
   overflow: hidden;
   color: var(--color-ink);
+  /* Rounded system stack — zero network, gives the idle strip an
+   * Apple-hardware "extension of the camera cutout" feel. Falls back
+   * cleanly to the standard system face where ui-rounded is absent. */
   font-family:
-    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
-    "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont,
+    system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 button {

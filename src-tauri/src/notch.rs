@@ -608,6 +608,12 @@ fn apply_macos_panel_style<R: Runtime>(win: &tauri::WebviewWindow<R>) -> anyhow:
             .setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
         let raw_obj: &AnyObject = &*(ns_window as *const NSWindow as *const AnyObject);
         let _: () = msg_send![raw_obj, setCanHide: false];
+        // Non-activating panels don't receive mouseMoved / mouseEntered /
+        // mouseExited until they opt into moved events — without this the
+        // CSS :hover / onMouseEnter reveal only fires after the user first
+        // clicks the notch (which momentarily routes events to it). Enabling
+        // moved-event delivery makes hover work while another app is focused.
+        let _: () = msg_send![raw_obj, setAcceptsMouseMovedEvents: true];
     }
     Ok(())
 }
