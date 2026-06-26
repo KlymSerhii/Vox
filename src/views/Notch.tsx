@@ -3,6 +3,7 @@ import {
   createMemo,
   createSignal,
   For,
+  Index,
   onCleanup,
   onMount,
   Show,
@@ -25,6 +26,7 @@ import {
   type NotchItem,
   type NotchListDoc,
 } from "../lib/ipc";
+import { formatHotkey, formatHotkeyTokens } from "../lib/hotkey";
 
 /// Default top-N if settings haven't loaded yet (matches the backend
 /// `default_notch_list_top_n`).
@@ -36,20 +38,27 @@ const DEFAULT_HOVER_DELAY_MS = 120;
 const ROW_H = 28;
 /// Vertical padding inside the expanded list (top + bottom).
 const LIST_PAD_Y = 6;
-/// Collapsed single-line drawer height (the #1-task bar).
-const COLLAPSED_H = 30;
+/// Collapsed single-line drawer height (the #1-task bar). Kept tight (a 12px
+/// line at leading-16 exactly fills it, no extra padding) so the idle nub
+/// hangs as little as possible below the camera bump — at the old 30px it
+/// overlapped app chrome right under the menu bar (e.g. browser tabs).
+const COLLAPSED_H = 16;
+/// Add-task hint row height — the keycap affordance revealed on hover. It's
+/// the only drawer content when the list is empty, and a faint footer beneath
+/// the rows when it isn't.
+const HINT_H = 30;
 
 /* ---------------------------------------------------------------------------
  * Ear-row + cutout geometry — logical px. The window is TOP-ANCHORED at the
  * screen's top edge (Rust owns the y-anchor + re-centering). The view is one
  * vertical stack:
  *
- *   [ear-row]   <- always visible: [Vox ear][transparent cutout spacer][Notch ear]
+ *   [ear-row]   <- always visible: [Vox ear][black spacer][Notch ear]
  *   [drawer]    <- below the cutout: 0-height when idle/empty, grows on hover
  *
  * The ear row is width-pinned (earW*2 + cutoutWidth) and centered so the
- * transparent spacer always sits under the physical camera bump. Only the
- * drawer changes width.
+ * black spacer always sits under the physical camera bump. Only the drawer
+ * changes width.
  * ------------------------------------------------------------------------ */
 
 /// Fallback central-cutout width when the real camera-bump width is unknown
@@ -65,10 +74,11 @@ const CUTOUT_H_FALLBACK = 34;
 const CUTOUT_H_MIN = 24;
 const CUTOUT_H_MAX = 48;
 
-/// Ear width clamp + bounds. ~40pt each (~half of the old 78px chip), tied to
-/// the cutout so the assembly stays proportional across notch geometries.
-const EAR_W_MIN = 34;
-const EAR_W_MAX = 44;
+/// Ear width clamp + bounds. Sized to seat the longer "Notch" label with
+/// comfortable horizontal padding at the word size below, tied to the cutout
+/// so the assembly stays proportional across notch geometries.
+const EAR_W_MIN = 46;
+const EAR_W_MAX = 56;
 
 /// Expanded-drawer width clamp (relative to the cutout width).
 const EXPANDED_W_MIN = 280;
@@ -77,6 +87,14 @@ const EXPANDED_W_MAX = 380;
 /// Checkbox border. Hardcoded (not a theme token) because the notch sits on
 /// pure black regardless of app appearance.
 const CHECKBOX_BORDER = "rgba(255,255,255,0.32)";
+
+/// Listening-waveform bar fill — a cool silver shimmer (a hair of blue) that
+/// reads as a deliberate "tech/listening" accent on the pure-black panel,
+/// calmer and unmistakably distinct from the pill's coral. Hardcoded for the
+/// same reason as the checkbox border: the notch is always on true black. The
+/// 0.70 base alpha keeps the thin (1.5px) edge-dissolved bars from vanishing
+/// once the sine envelope × live amplitude knock them down.
+const WAVE_COLOR = "rgba(207, 216, 224, 0.7)";
 
 /// Shared premium easing for reveals.
 const EASE_IN = "cubic-bezier(0.32, 0.72, 0, 1)";
@@ -146,6 +164,9 @@ export default function NotchView() {
   const [hovered, setHovered] = createSignal(false);
   const [topN, setTopN] = createSignal(DEFAULT_TOP_N);
   const [hoverDelayMs, setHoverDelayMs] = createSignal(DEFAULT_HOVER_DELAY_MS);
+  /// The notch voice hotkey (default ⌥⌘L), shown in the on-hover add-task
+  /// hint. Kept in sync via `applySettings` / `settings:changed`.
+  const [voiceHotkey, setVoiceHotkey] = createSignal<string>("Cmd+Alt+L");
   /// Physical-notch geometry, pushed from Rust.
   const [geo, setGeo] = createSignal<NotchGeometry>({
     has_notch: false,
@@ -270,10 +291,11 @@ export default function NotchView() {
     return Math.min(CUTOUT_H_MAX, Math.max(CUTOUT_H_MIN, base));
   });
 
-  /// Ear width — tied to the cutout (~0.19×), clamped to [34,44].
+  /// Ear width — tied to the cutout (~0.24×), clamped to
+  /// [EAR_W_MIN, EAR_W_MAX] so the "Notch" label keeps padding on both edges.
   const earWidth = createMemo(() =>
     Math.round(
-      Math.min(EAR_W_MAX, Math.max(EAR_W_MIN, cutoutWidth() * 0.19)),
+      Math.min(EAR_W_MAX, Math.max(EAR_W_MIN, cutoutWidth() * 0.24)),
     ),
   );
 
@@ -291,10 +313,10 @@ export default function NotchView() {
 
   /// Drawer shows the voice strip whenever a phase is active.
   const voiceActive = createMemo(() => phase() !== null);
-  /// Expanded list (hover) — but only when not mid-voice and items exist.
-  const listExpanded = createMemo(
-    () => hovered() && !isEmpty() && !voiceActive(),
-  );
+  /// Hover-expanded drawer: any time the notch is hovered and not mid-voice.
+  /// Drives both the task list (when there are items) and the add-task hint
+  /// (always — the hint is the sole drawer content when the list is empty).
+  const hoverExpanded = createMemo(() => hovered() && !voiceActive());
 
   async function refresh() {
     try {
@@ -314,6 +336,7 @@ export default function NotchView() {
           Math.max(0, s.notch_list_hover_delay_ms ?? DEFAULT_HOVER_DELAY_MS),
         ),
       );
+      setVoiceHotkey(s.notch_list_voice_hotkey || "Cmd+Alt+L");
     } catch (e) {
       console.warn("getPublicSettings (notch):", e);
     }
@@ -475,8 +498,9 @@ export default function NotchView() {
   }
 
   function onHandlePointerDown(e: PointerEvent, index: number) {
-    // Only in the expanded list; never in the collapsed single line.
-    if (!listExpanded()) return;
+    // Only in the expanded list; never in the collapsed single line. (Empty
+    // lists expand to just the hint, which has no rows or drag handles.)
+    if (!hoverExpanded()) return;
     e.preventDefault();
     e.stopPropagation();
     dragStartY = e.clientY;
@@ -636,11 +660,11 @@ export default function NotchView() {
         cutoutWidth={cutoutWidth()}
         cutoutHeight={cutoutHeight()}
         // List
-        listExpanded={listExpanded()}
-        isEmpty={isEmpty()}
+        hoverExpanded={hoverExpanded()}
         head={headItem()}
         rows={top()}
         expandedWidth={expandedWidth()}
+        voiceHotkey={voiceHotkey()}
         flashIds={flashIds()}
         reduced={reducedMotion()}
         // Drag
@@ -662,9 +686,10 @@ export default function NotchView() {
 }
 
 /* ===========================================================================
- * Ear row — [Vox ear][transparent cutout spacer][Notch ear]. Width-pinned and
- * centered at all times so the spacer sits under the physical camera bump.
- * Ears are pure #000; inner corners (touching the cutout) square, outer
+ * Ear row — [Vox ear][black spacer][Notch ear]. Width-pinned and centered at
+ * all times so the spacer sits under the physical camera bump. Ears AND spacer
+ * are pure #000 so the row reads as one continuous black bar flanking the
+ * cutout (no wallpaper gaps); inner corners (touching the spacer) square, outer
  * corners rounded. Notchless: the two ears butt together into one pill with a
  * hairline divider between the words.
  * ======================================================================== */
@@ -711,8 +736,8 @@ function EarRow(props: {
       >
         <span
           style={{
-            "font-size": "12px",
-            "font-weight": 700,
+            "font-size": "11px",
+            "font-weight": 600,
             "letter-spacing": "-0.01em",
             color: "#fff",
             opacity: `${wordOpacity()}`,
@@ -723,14 +748,19 @@ function EarRow(props: {
         </span>
       </div>
 
-      {/* Central cutout spacer — TRANSPARENT (the physical camera is here). */}
+      {/* Central spacer over the camera bump — BLACK (not transparent), so the
+          two ears read as one continuous black bar flanking the cutout instead
+          of separate tabs with wallpaper showing through the gaps. The physical
+          camera occupies the middle (no pixels there); the spacer's #000 only
+          paints the slivers beside it, bridging each ear to the true-black
+          bump. Width still tracks the bump so the ears never overlap the lens. */}
       <Show when={showCutout()}>
         <div
           aria-hidden="true"
           style={{
             width: `${props.cutoutWidth}px`,
             height: "100%",
-            background: "transparent",
+            background: "var(--color-notch-surface, #000)",
           }}
         />
       </Show>
@@ -750,8 +780,8 @@ function EarRow(props: {
       >
         <span
           style={{
-            "font-size": "12px",
-            "font-weight": 500,
+            "font-size": "11px",
+            "font-weight": 600,
             "letter-spacing": "-0.01em",
             color: "#fff",
             opacity: `${wordOpacity()}`,
@@ -786,11 +816,11 @@ function Drawer(props: {
   levels: number[];
   cutoutWidth: number;
   cutoutHeight: number;
-  listExpanded: boolean;
-  isEmpty: boolean;
+  hoverExpanded: boolean;
   head: NotchItem | null;
   rows: NotchItem[];
   expandedWidth: number;
+  voiceHotkey: string;
   flashIds: Set<string>;
   reduced: boolean;
   dragId: string | null;
@@ -805,13 +835,16 @@ function Drawer(props: {
   rowTransition: string;
   checkboxTransition: string;
 }) {
-  // What the drawer should render right now (priority: voice > list).
+  // What the drawer should render right now (priority: voice > hover > list).
+  // On hover we always "expand" — to the task list when there are items, or to
+  // just the add-task hint when the list is empty. Off hover: the #1-task line
+  // when there are items, nothing when empty.
   const mode = createMemo<
     "voice" | "expanded" | "collapsed" | "empty"
   >(() => {
     if (props.phase !== null) return "voice";
-    if (props.isEmpty) return "empty";
-    return props.listExpanded ? "expanded" : "collapsed";
+    if (props.hoverExpanded) return "expanded";
+    return props.rows.length === 0 ? "empty" : "collapsed";
   });
 
   // Target content height (px) for the current mode. 0 collapses the window.
@@ -821,7 +854,13 @@ function Drawer(props: {
         // Waveform / dots / error strip — short calm ribbon.
         return Math.round(props.cutoutHeight * 0.65) + 10;
       case "expanded":
-        return props.rows.length * props.rowH + LIST_PAD_Y * 2;
+        // Task rows (when any) + the always-present add-task hint footer. When
+        // the list is empty the hint stands alone.
+        return (
+          (props.rows.length > 0
+            ? props.rows.length * props.rowH + LIST_PAD_Y * 2
+            : 0) + HINT_H
+        );
       case "collapsed":
         return COLLAPSED_H;
       default:
@@ -834,7 +873,9 @@ function Drawer(props: {
   const targetWidth = createMemo(() => {
     switch (mode()) {
       case "expanded":
-        return props.expandedWidth;
+        // Wide for the task list; narrow (cutout-width) when it's just the
+        // add-task hint, so an empty hover doesn't fan out a near-empty panel.
+        return props.rows.length > 0 ? props.expandedWidth : props.cutoutWidth;
       default:
         return props.cutoutWidth;
     }
@@ -901,8 +942,12 @@ function Drawer(props: {
       <Show when={mode() === "collapsed"}>
         <Show when={props.head}>
           {(item) => (
+            // Centered under the camera when idle (the user reads the single
+            // top task at a glance); the hovered list switches to the
+            // left-aligned ExpandedList. `min-w-0` lets a long task shrink +
+            // truncate instead of centering off both edges.
             <div
-              class="flex items-center gap-2 px-3"
+              class="flex items-center justify-center gap-2 px-3"
               classList={{ "notch-flash": props.flashIds.has(item().id) }}
               style={{ height: `${COLLAPSED_H}px` }}
             >
@@ -911,7 +956,7 @@ function Drawer(props: {
                 style={{ background: priorityColor(item().priority) }}
                 aria-hidden="true"
               />
-              <span class="truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
+              <span class="min-w-0 truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
                 {item().text}
               </span>
             </div>
@@ -919,7 +964,7 @@ function Drawer(props: {
         </Show>
       </Show>
 
-      <Show when={mode() === "expanded"}>
+      <Show when={mode() === "expanded" && props.rows.length > 0}>
         <ExpandedList
           rows={props.rows}
           flashIds={props.flashIds}
@@ -937,6 +982,44 @@ function Drawer(props: {
           checkboxTransition={props.checkboxTransition}
         />
       </Show>
+
+      <Show when={mode() === "expanded"}>
+        <AddHint hotkey={props.voiceHotkey} />
+      </Show>
+    </div>
+  );
+}
+
+/* ===========================================================================
+ * Add-task hint — the keyboard affordance revealed on hover. Renders the notch
+ * voice hotkey (default ⌥⌘L) as keycaps + a short label, so a user hovering an
+ * empty notch learns how to capture a task. It's the sole drawer content when
+ * the list is empty and a faint footer beneath the rows when it isn't.
+ * ======================================================================== */
+function AddHint(props: { hotkey: string }) {
+  const tokens = createMemo(() => formatHotkeyTokens(props.hotkey));
+  const label = createMemo(() => {
+    const k = formatHotkey(props.hotkey);
+    return k ? `Press ${k} to add a task` : "Add a task by voice";
+  });
+  return (
+    <div
+      class="flex items-center justify-center gap-1.5"
+      style={{ height: `${HINT_H}px` }}
+      role="note"
+      aria-label={label()}
+    >
+      <span class="flex items-center gap-1" aria-hidden="true">
+        <For each={tokens()}>
+          {(t) => <kbd class="notch-kbd">{t.symbol}</kbd>}
+        </For>
+      </span>
+      <span
+        class="text-[11px] leading-none text-[var(--color-ink-faint)]"
+        aria-hidden="true"
+      >
+        to add a task
+      </span>
     </div>
   );
 }
@@ -967,28 +1050,37 @@ function VoiceStrip(props: {
           style={{ height: `${stripH()}px` }}
           aria-hidden="true"
         >
-          <For each={props.levels}>
+          {/* `Index` (not `For`): the levels array is a fixed-length window
+              whose VALUES change every audio tick. `For` keys by value and
+              freezes each bar's amplitude at creation (the bars stayed black
+              while speaking); `Index` keys by position and hands each bar a
+              `level()` SIGNAL, so heights update in place and the CSS height
+              transition animates a live equalizer. */}
+          <Index each={props.levels}>
             {(level, i) => {
+              // Sine bell — dissolve into the black at both edges. Static: it
+              // depends only on the bar's fixed index + window length.
+              const env = edgeEnvelope(i, props.levels.length);
               // Gamma 0.65 opens the bottom of the range (RMS lives low).
-              const shaped = Math.pow(Math.max(0, Math.min(1, level)), 0.65);
-              // Sine bell — dissolve into the black at both edges.
-              const env = edgeEnvelope(i(), props.levels.length);
-              const h = Math.max(
-                1.5,
-                Math.round(
-                  (0.22 + shaped * 0.78) * maxBar() * (0.4 + 0.6 * env),
-                ),
-              );
-              const opacity = (0.32 + shaped * 0.68) * env;
+              // Reactive via the `level()` signal so the bar tracks live RMS.
+              const shaped = () => Math.pow(Math.max(0, Math.min(1, level())), 0.65);
+              const h = () =>
+                Math.max(
+                  1.5,
+                  Math.round(
+                    (0.22 + shaped() * 0.78) * maxBar() * (0.4 + 0.6 * env),
+                  ),
+                );
+              const opacity = () => (0.32 + shaped() * 0.68) * env;
               return (
                 <div
                   style={{
                     width: "1.5px",
-                    height: `${h}px`,
+                    height: `${h()}px`,
                     "border-radius": "1.5px",
-                    // Muted white — calm acknowledgment, not the pill coral.
-                    background: "var(--color-ink-mute, rgba(255,255,255,.62))",
-                    opacity,
+                    // Cool silver shimmer — calm acknowledgment, not pill coral.
+                    background: WAVE_COLOR,
+                    opacity: opacity(),
                     transition: props.reduced
                       ? "none"
                       : "height 110ms ease-out, opacity 180ms ease-out",
@@ -996,7 +1088,7 @@ function VoiceStrip(props: {
                 />
               );
             }}
-          </For>
+          </Index>
         </div>
       </Show>
 
