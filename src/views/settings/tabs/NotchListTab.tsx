@@ -450,29 +450,30 @@ export function NotchListTab(props: {
             label="Voice shortcut"
             hint="Press it, then just talk — say what you want to do, what you finished, or reel off several things at once — and Vox turns it into tasks instead of copying text. No commands to memorize."
           >
-            <div class="flex items-center gap-2">
-              <HotkeyKeys spec={props.s.notch_list_voice_hotkey} />
-              <div class="flex gap-1">
-                <For each={VOICE_HOTKEY_PRESETS}>
-                  {(spec) => (
-                    <button
-                      type="button"
-                      onClick={() =>
-                        props.update({ notch_list_voice_hotkey: spec })
-                      }
-                      class="rounded-[6px] px-2 py-1 text-[11px] ring-1 ring-inset transition-colors"
-                      classList={{
-                        "bg-[var(--color-surface-raised)] ring-[var(--color-accent)] text-[var(--color-ink)]":
-                          props.s.notch_list_voice_hotkey === spec,
-                        "bg-[var(--color-control)] ring-[var(--color-border)] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]":
-                          props.s.notch_list_voice_hotkey !== spec,
-                      }}
-                    >
-                      <HotkeyKeys spec={spec} />
-                    </button>
-                  )}
-                </For>
-              </div>
+            {/* Presets stack vertically so the row of word+glyph keycaps
+                doesn't crush the label column (the Row control slot is
+                shrink-0). The highlighted button is the current selection —
+                no separate value chip needed. */}
+            <div class="flex flex-col items-stretch gap-1">
+              <For each={VOICE_HOTKEY_PRESETS}>
+                {(spec) => (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      props.update({ notch_list_voice_hotkey: spec })
+                    }
+                    class="flex justify-center rounded-[6px] px-2 py-1 text-[11px] ring-1 ring-inset transition-colors"
+                    classList={{
+                      "bg-[var(--color-surface-raised)] ring-[var(--color-accent)] text-[var(--color-ink)]":
+                        props.s.notch_list_voice_hotkey === spec,
+                      "bg-[var(--color-control)] ring-[var(--color-border)] text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]":
+                        props.s.notch_list_voice_hotkey !== spec,
+                    }}
+                  >
+                    <HotkeyKeys spec={spec} />
+                  </button>
+                )}
+              </For>
             </div>
           </Row>
           <Row

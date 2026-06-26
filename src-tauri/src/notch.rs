@@ -136,12 +136,22 @@ fn refresh_geometry_cache<R: Runtime>(app: &AppHandle<R>) -> bool {
     changed
 }
 
-/// Create the notch window if it doesn't already exist. Mirrors
-/// `pill::create`: transparent, decoration-less, always-on-top,
-/// skip-taskbar, non-focusing. Unlike the pill it stays interactive
-/// (no `set_ignore_cursor_events`).
+/// Create (or re-show) the notch window. Mirrors `pill::create`:
+/// transparent, decoration-less, always-on-top, skip-taskbar, non-focusing.
+/// Unlike the pill it stays interactive (no `set_ignore_cursor_events`).
+///
+/// The notch window is **persistent**: turning the feature off HIDES it (the
+/// `CloseRequested` handler in `lib.rs` keeps it alive), so a later re-enable
+/// finds the window still in the registry. In that case we re-show + re-arm
+/// it instead of early-returning — the old early-return left the hidden window
+/// hidden forever, so toggling the notch off then on in Settings showed
+/// nothing.
 pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
-    if app.get_webview_window(LABEL).is_some() {
+    if let Some(window) = app.get_webview_window(LABEL) {
+        if let Err(e) = window.show() {
+            log::warn!("notch: failed to re-show window: {e}");
+        }
+        arm(app, &window);
         return Ok(());
     }
 
@@ -168,6 +178,23 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             .accept_first_mouse(true)
             .build()?;
 
+    // The macOS panel style (status-bar level, all-spaces collection
+    // behaviour, non-activating) persists on the live window, so it's applied
+    // once here on first build — `arm` (which also runs on re-show) skips it.
+    if let Err(e) = apply_macos_panel_style(&window) {
+        log::warn!("notch: failed to apply macOS panel style: {e}");
+    }
+
+    arm(app, &window);
+
+    Ok(())
+}
+
+/// (Re)establish the notch's geometry cache, top-anchored placement, hover
+/// edge, and the two background pollers under a fresh generation. Run once on
+/// first build AND on every re-show: a `destroy` bumps the generation to stand
+/// the old followers down, so a re-enabled notch needs them spawned anew.
+fn arm<R: Runtime>(app: &AppHandle<R>, window: &tauri::WebviewWindow<R>) {
     // Populate the geometry cache up front so the very first `reposition`
     // (and the webview's first `notch_geometry` read) already know the
     // camera-bump width and band height. On the common launch path this runs
@@ -176,38 +203,36 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // refreshes + re-places within one tick.
     refresh_geometry_cache(app);
 
-    if let Err(e) = reposition(&window) {
+    if let Err(e) = reposition(window) {
         log::warn!("notch reposition failed: {e}");
     }
 
-    if let Err(e) = apply_macos_panel_style(&window) {
-        log::warn!("notch: failed to apply macOS panel style: {e}");
-    }
-
-    // The window is persistent (one create per enable), so we spawn the
-    // follower exactly once here, keyed on a fresh generation. A later
-    // destroy bumps the generation and the follower stands down.
+    // The window is persistent, so we re-key the pollers on a fresh
+    // generation each time: a later destroy bumps the counter and the old
+    // follower + hover poll stand down. A fresh/re-shown window starts
+    // collapsed (not hovered) — seed the edge state so the first real enter
+    // emits a `true` transition.
     let generation = NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    // A fresh window starts collapsed (not hovered) — seed the edge state so
-    // the first real enter emits a `true` transition.
     NOTCH_HOVER_INSIDE.store(false, Ordering::SeqCst);
     spawn_display_follower(app.clone(), generation);
     spawn_hover_poll(app.clone(), generation);
-
-    Ok(())
 }
 
-/// Destroy the notch window (used when the user turns the feature off).
+/// Hide the notch window when the user turns the feature off. The window is
+/// **persistent** (kept alive in the registry, mirroring the pill/settings
+/// windows) so a later re-enable re-shows it instantly via `create`; we hide
+/// rather than close. Named `destroy` for its lifecycle role — the user-facing
+/// effect is the notch disappearing.
 pub fn destroy<R: Runtime>(app: &AppHandle<R>) {
     // Bump the generation FIRST so the running follower + hover poll stand
     // down on their next tick instead of touching a window we're about to
-    // close.
+    // hide.
     NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst);
-    // Clear the hover edge so a re-created window starts collapsed.
+    // Clear the hover edge so a re-shown window starts collapsed.
     NOTCH_HOVER_INSIDE.store(false, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(LABEL) {
-        if let Err(e) = win.close() {
-            log::warn!("notch: failed to close window: {e}");
+        if let Err(e) = win.hide() {
+            log::warn!("notch: failed to hide window: {e}");
         }
     }
 }
