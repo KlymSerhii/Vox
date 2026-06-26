@@ -270,6 +270,47 @@ pub fn emit_audio_level<R: Runtime>(app: &AppHandle<R>, level: f32) {
     let _ = app.emit_to(LABEL, "pill:audio_level", AudioLevelPayload { level });
 }
 
+/// Webview label the notch UI listens on. The notch is owned by the
+/// other engineer's `notch.rs`; this module only *emits* to it so the
+/// notch can mirror the listening state + waveform that the pill would
+/// otherwise show for a ⌘L (notch-voice) session.
+pub const NOTCH_LABEL: &str = "notch";
+
+/// Number of bars the notch waveform renders. The notch emits a fixed
+/// 32-sample window per tick (a sliding history of the recent mic RMS)
+/// so the frontend can paint a stable equalizer without doing its own
+/// buffering. Matches the frontend contract.
+pub const NOTCH_LEVELS_LEN: usize = 32;
+
+#[derive(Debug, Clone, Serialize)]
+struct NotchListeningPayload {
+    /// `"listening" | "compiling" | "idle" | "error"`.
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+/// Phase of a notch-voice (⌘L) session, mirrored to the notch webview in
+/// place of the floating pill. The notch owns its own listening UI, so a
+/// notch session never shows the pill — these emits drive the notch's
+/// waveform/compiling/idle/error chrome instead. See `session.rs`'s
+/// notch-command path.
+pub fn emit_notch_phase<R: Runtime>(app: &AppHandle<R>, phase: &'static str, message: Option<String>) {
+    let _ = app.emit_to(
+        NOTCH_LABEL,
+        "notch:listening",
+        NotchListeningPayload { phase, message },
+    );
+}
+
+/// Mirror the recording's audio levels to the notch webview as a
+/// fixed-length `[f32; NOTCH_LEVELS_LEN]` window (values 0..1). Replaces
+/// the per-sample `pill:audio_level` emit for notch sessions — the notch
+/// waveform wants a full window per tick, not a single scalar.
+pub fn emit_notch_levels<R: Runtime>(app: &AppHandle<R>, levels: &[f32]) {
+    let _ = app.emit_to(NOTCH_LABEL, "notch:levels", levels);
+}
+
 /// Emit a transcript stream chunk for `session_id`. `text` is the
 /// cumulative transcript so far (Whisper segments concatenated by
 /// the engine). `final_` flips true on the last chunk.

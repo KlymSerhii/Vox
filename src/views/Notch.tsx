@@ -12,68 +12,100 @@ import {
   getNotchList,
   getPublicSettings,
   notchListMarkDone,
+  notchListReorder,
+  notchListSetPriority,
   notchResize,
   onNotchGeometry,
+  onNotchHover,
+  onNotchLevels,
   onNotchListChanged,
+  onNotchListening,
   onSettingsChanged,
   type NotchGeometry,
   type NotchItem,
   type NotchListDoc,
 } from "../lib/ipc";
-import { HotkeyKeys } from "../components/HotkeyKeys";
 
 /// Default top-N if settings haven't loaded yet (matches the backend
 /// `default_notch_list_top_n`).
 const DEFAULT_TOP_N = 5;
-/// Default voice hotkey spec (matches `default_notch_list_voice_hotkey`).
-const DEFAULT_VOICE_HOTKEY = "Cmd+Alt+L";
 /// Default hover intent delay (matches `default_notch_list_hover_delay_ms`).
 const DEFAULT_HOVER_DELAY_MS = 120;
 
-/// Height of the collapsed "show #1 task" bar (populated state). Needs room
-/// for a line of text. The window is content-driven via the ResizeObserver,
-/// so this is just the row height.
-const COLLAPSED_H = 30;
+/// Expanded-row height (drag handle + checkbox + priority dot + text).
 const ROW_H = 28;
-const PANEL_PAD = 12;
+/// Vertical padding inside the expanded list (top + bottom).
+const LIST_PAD_Y = 6;
+/// Collapsed single-line drawer height (the #1-task bar).
+const COLLAPSED_H = 30;
 
 /* ---------------------------------------------------------------------------
- * Idle (empty) strip geometry — logical px. The empty state renders as one
- * continuous black object that reads as the camera cutout extended downward:
- * [Vox chip] [central cutout] [Notch chip], flush to the window's top edge,
- * square top corners, rounded bottom corners. A hint nub descends from the
- * cutout on hover. See `IdleStrip`.
+ * Ear-row + cutout geometry — logical px. The window is TOP-ANCHORED at the
+ * screen's top edge (Rust owns the y-anchor + re-centering). The view is one
+ * vertical stack:
+ *
+ *   [ear-row]   <- always visible: [Vox ear][transparent cutout spacer][Notch ear]
+ *   [drawer]    <- below the cutout: 0-height when idle/empty, grows on hover
+ *
+ * The ear row is width-pinned (earW*2 + cutoutWidth) and centered so the
+ * transparent spacer always sits under the physical camera bump. Only the
+ * drawer changes width.
  * ------------------------------------------------------------------------ */
-/// Resting strip height.
-const STRIP_H = 34;
+
 /// Fallback central-cutout width when the real camera-bump width is unknown
 /// (notchless display, or before geometry resolves).
 const CUTOUT_FALLBACK_W = 200;
 /// Cutout width clamp. Slightly wider than the physical notch is acceptable.
 const CUTOUT_MIN_W = 180;
 const CUTOUT_MAX_W = 230;
-/// Equal-width side chips ("Vox" / "Notch"). EQUAL width is required so the
-/// cutout stays horizontally centered in the (screen-centered) window and
-/// therefore lines up under the physical camera notch.
-const SIDE_CHIP_W = 78;
-/// Outer bottom radius of the two end chips, and the smaller inner radius at
-/// the seam where each chip meets the cutout — so the three pieces read as
-/// fused-but-articulated.
-const CHIP_OUTER_R = 18;
-const CHIP_INNER_R = 10;
-/// Hint nub (hover only) — descends from the underside of the central cutout.
-const HINT_H = 30;
-/// Nub is inset from the cutout width so it reads as extruding from it.
-const HINT_INSET = 8;
-/// Negative top margin: the nub overlaps the cutout's bottom so it reads as
-/// extruding from the notch, not a detached tooltip.
-const HINT_OVERLAP = 2;
-const HINT_BOTTOM_R = 14;
+/// Cutout-height (menu-bar band) clamp + fallback. `geo.height` is the
+/// safeAreaInsets.top band (~32–38pt). The ears match this so their top edge
+/// forms one unbroken line with the physical bump.
+const CUTOUT_H_FALLBACK = 34;
+const CUTOUT_H_MIN = 24;
+const CUTOUT_H_MAX = 48;
 
-/// Checkbox border + row-hover tints. Hardcoded (not theme tokens) because
-/// the notch is pinned to a near-black surface regardless of app appearance,
-/// and the default `--color-border` (0.08 white) is too faint on pure black.
+/// Ear width clamp + bounds. ~40pt each (~half of the old 78px chip), tied to
+/// the cutout so the assembly stays proportional across notch geometries.
+const EAR_W_MIN = 34;
+const EAR_W_MAX = 44;
+
+/// Expanded-drawer width clamp (relative to the cutout width).
+const EXPANDED_W_MIN = 280;
+const EXPANDED_W_MAX = 380;
+
+/// Checkbox border. Hardcoded (not a theme token) because the notch sits on
+/// pure black regardless of app appearance.
 const CHECKBOX_BORDER = "rgba(255,255,255,0.32)";
+
+/// Shared premium easing for reveals.
+const EASE_IN = "cubic-bezier(0.32, 0.72, 0, 1)";
+/// Overshoot ease for the drag-settle.
+const EASE_SETTLE = "cubic-bezier(0.34, 1.4, 0.64, 1)";
+/// How long the reserved drawer height is held after collapse so the exit
+/// animation can play before the single resize-down. Slightly over the
+/// longest exit transition.
+const RETRACT_MS = 210;
+/// Change-flash duration (keep in sync with the `.notch-flash` keyframe).
+const FLASH_MS = 400;
+/// How long an `error` phase (mis-heard / silence / clarify / confirm prompt)
+/// stays on screen before the drawer auto-returns to its idle/list state.
+/// Rust does not follow `error` with `idle`, so this is the only thing that
+/// clears it (and restores hover-expand). Long enough to read a confirm
+/// prompt, short enough not to feel stuck.
+const ERROR_AUTO_CLEAR_MS = 4500;
+/// Drag threshold before a pointerdown becomes a lift.
+const DRAG_THRESHOLD = 4;
+/// After the user stops speaking, STT runs but `phase` is still "listening"
+/// and `notch:levels` stop arriving — the bars would freeze mid-amplitude.
+/// Once levels go stale past this window we ease them down to a calm resting
+/// state so the ribbon reads as "settled", not stuck.
+const LEVELS_STALE_MS = 400;
+/// Decay tick cadence + per-tick multiplier for the stale-levels ease-down.
+const LEVELS_DECAY_MS = 60;
+const LEVELS_DECAY_FACTOR = 0.82;
+
+type DrawerPhase = "listening" | "compiling" | "error";
 
 function reducedMotion(): boolean {
   return (
@@ -94,32 +126,86 @@ function priorityColor(p: NotchItem["priority"]): string {
   }
 }
 
+/// Soft sine bell — 0 at the edges, 1 in the middle. Mirrors
+/// `pill/helpers.ts::edgeEnvelope` so the notch waveform dissolves into the
+/// black at its edges exactly like the pill's does.
+function edgeEnvelope(i: number, n: number): number {
+  const t = (i + 0.5) / n;
+  return Math.sin(Math.PI * t);
+}
+
 export default function NotchView() {
   const [doc, setDoc] = createSignal<NotchListDoc>({
     version: 1,
     items: [],
     archive: [],
   });
+  /// `true` while the cursor is over the physical notch rect. Driven by the
+  /// `notch:hover` event (authoritative — fires even when another app is
+  /// focused) with DOM enter/leave as a secondary trigger.
   const [hovered, setHovered] = createSignal(false);
   const [topN, setTopN] = createSignal(DEFAULT_TOP_N);
-  const [voiceHotkey, setVoiceHotkey] = createSignal(DEFAULT_VOICE_HOTKEY);
   const [hoverDelayMs, setHoverDelayMs] = createSignal(DEFAULT_HOVER_DELAY_MS);
-  const [clickToExpand, setClickToExpand] = createSignal(false);
-  /// Physical-notch geometry, pushed from Rust. Drives the idle nub width so
-  /// it never spills past the camera bump.
+  /// Physical-notch geometry, pushed from Rust.
   const [geo, setGeo] = createSignal<NotchGeometry>({
     has_notch: false,
     width: 0,
     height: 0,
   });
 
+  // --- Voice (⌘L) drawer state -------------------------------------------
+  /// Current voice phase, or null when not capturing. Drives the waveform /
+  /// compiling / error drawer.
+  const [phase, setPhase] = createSignal<DrawerPhase | null>(null);
+  const [phaseMessage, setPhaseMessage] = createSignal<string>("");
+  const [levels, setLevels] = createSignal<number[]>(new Array(32).fill(0));
+  /// Set of item ids to flash once after a voice edit lands.
+  const [flashIds, setFlashIds] = createSignal<Set<string>>(new Set());
+
+  // --- Drag-to-reorder state ---------------------------------------------
+  /// Id of the row being dragged, or null. The dragged row lifts and follows
+  /// the pointer; siblings slide via a computed gap.
+  const [dragId, setDragId] = createSignal<string | null>(null);
+  /// Pointer-following Y offset (px) of the lifted row from its origin slot.
+  const [dragOffsetY, setDragOffsetY] = createSignal(0);
+  /// Target insertion index (into the active-id order) while dragging.
+  const [dropIndex, setDropIndex] = createSignal<number | null>(null);
+  /// True once the pointer has moved past the threshold (an actual lift, not
+  /// a click). Until then the row sits in place so a tap still ticks nothing.
+  const [dragLifted, setDragLifted] = createSignal(false);
+  /// Id of the just-dropped row during its settle window — drives the
+  /// overshoot ease on the transform back to its resting slot.
+  const [settleId, setSettleId] = createSignal<string | null>(null);
+
   let unlistenList: (() => void) | null = null;
   let unlistenSettings: (() => void) | null = null;
   let unlistenGeo: (() => void) | null = null;
+  let unlistenHover: (() => void) | null = null;
+  let unlistenListening: (() => void) | null = null;
+  let unlistenLevels: (() => void) | null = null;
   let panelRef: HTMLDivElement | undefined;
+  let listRef: HTMLDivElement | undefined;
   let ro: ResizeObserver | undefined;
   /// Pending hover-intent timer; cleared on leave / before re-arming.
   let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+  /// Pending change-flash clear.
+  let flashTimer: ReturnType<typeof setTimeout> | undefined;
+  /// Pending error-phase auto-clear. Rust emits `error` for every
+  /// mis-heard / silence / clarify / destructive-confirm outcome and
+  /// (intentionally) does NOT follow with `idle`, so the drawer would pin on
+  /// the error text forever — which also keeps `voiceActive()` true and blocks
+  /// hover-expand. This timer returns the drawer to its idle/list state.
+  let errorTimer: ReturnType<typeof setTimeout> | undefined;
+  /// Pointer-drag bookkeeping (non-reactive — set during a gesture).
+  let dragStartY = 0;
+  let dragStartIndex = 0;
+  let dragRowH = ROW_H;
+  /// Pending settle-state clear.
+  let settleTimer: ReturnType<typeof setTimeout> | undefined;
+  /// Timestamp (ms) of the last `notch:levels` payload, for stale-detection.
+  let lastLevelsAt = 0;
+  /// Recurring decay ticker that eases frozen bars down once levels go stale.
+  let levelsDecayTimer: ReturnType<typeof setInterval> | undefined;
 
   function clearHoverTimer() {
     if (hoverTimer !== undefined) {
@@ -128,25 +214,16 @@ export default function NotchView() {
     }
   }
 
-  /// Expand after the configured intent delay so the cursor merely
-  /// passing over the strip doesn't pop the panel. A 0 ms delay expands
-  /// on the next tick. No-op when click-to-expand is on.
-  function armHoverExpand() {
-    if (clickToExpand()) return;
-    clearHoverTimer();
-    hoverTimer = setTimeout(() => {
-      hoverTimer = undefined;
-      setHovered(true);
-      queueMicrotask(syncWindowSize);
-    }, Math.max(0, hoverDelayMs()));
+  function clearErrorTimer() {
+    if (errorTimer !== undefined) {
+      clearTimeout(errorTimer);
+      errorTimer = undefined;
+    }
   }
 
-  /// Idle-strip hint reveal. Reuses the same intent timer and `hoverDelayMs`
-  /// as `armHoverExpand`, but is NOT gated by click-to-expand: the empty
-  /// state is always hover-driven (the spec's "hover-only + hotkey-only"),
-  /// and click-to-expand is a populated-state affordance that has no meaning
-  /// when there's nothing to expand.
-  function armIdleHint() {
+  /// Expand after the configured intent delay so the cursor merely passing
+  /// over the notch doesn't pop the drawer. A 0 ms delay expands next tick.
+  function armHoverExpand() {
     clearHoverTimer();
     hoverTimer = setTimeout(() => {
       hoverTimer = undefined;
@@ -161,18 +238,9 @@ export default function NotchView() {
     queueMicrotask(syncWindowSize);
   }
 
-  /// Toggle expand/collapse on click (click-to-expand mode only). Shared by
-  /// the idle nub and the collapsed #1-task bar so both affordances behave
-  /// the same.
-  function toggleClickExpand() {
-    if (!clickToExpand()) return;
-    setHovered((v) => !v);
-    queueMicrotask(syncWindowSize);
-  }
-
-  /// Active items sorted by (priority desc, order asc) — the backend
-  /// already returns them sorted in `items`, but we re-sort defensively
-  /// so the notch never depends on write-order.
+  /// Active items sorted by (priority desc, order asc). The backend already
+  /// returns them sorted; we re-sort defensively so the notch never depends
+  /// on write-order.
   const activeItems = createMemo(() => {
     const rank = (p: NotchItem["priority"]) =>
       p === "high" ? 0 : p === "med" ? 1 : 2;
@@ -186,16 +254,47 @@ export default function NotchView() {
   const isEmpty = createMemo(() => activeItems().length === 0);
   const headItem = createMemo(() => activeItems()[0] ?? null);
 
-  /// Central-cutout width for the idle strip: the real camera-bump width when
-  /// known, else a sensible default. Rounded so the window doesn't request
-  /// sub-pixel sizes, and clamped to [CUTOUT_MIN_W, CUTOUT_MAX_W] so it tracks
-  /// the physical notch (matching, or slightly wider) without a bad geometry
-  /// read stretching it to an absurd width.
+  /// Central-cutout width: real camera-bump width when known, else fallback,
+  /// clamped so a bad geometry read can't stretch it absurdly wide.
   const cutoutWidth = createMemo(() => {
     const w = geo().width;
     const base = w >= 80 && w <= 360 ? Math.round(w) : CUTOUT_FALLBACK_W;
     return Math.min(CUTOUT_MAX_W, Math.max(CUTOUT_MIN_W, base));
   });
+
+  /// Cutout / menu-bar-band height. Drives the ear height so the top edge is
+  /// one unbroken line with the physical bump.
+  const cutoutHeight = createMemo(() => {
+    const h = geo().height;
+    const base = h >= 16 && h <= 80 ? Math.round(h) : CUTOUT_H_FALLBACK;
+    return Math.min(CUTOUT_H_MAX, Math.max(CUTOUT_H_MIN, base));
+  });
+
+  /// Ear width — tied to the cutout (~0.19×), clamped to [34,44].
+  const earWidth = createMemo(() =>
+    Math.round(
+      Math.min(EAR_W_MAX, Math.max(EAR_W_MIN, cutoutWidth() * 0.19)),
+    ),
+  );
+
+  /// Width of the expanded list drawer.
+  const expandedWidth = createMemo(() =>
+    Math.round(
+      Math.min(
+        EXPANDED_W_MAX,
+        Math.max(EXPANDED_W_MIN, cutoutWidth() * 1.6),
+      ),
+    ),
+  );
+
+  const hasNotch = createMemo(() => geo().has_notch);
+
+  /// Drawer shows the voice strip whenever a phase is active.
+  const voiceActive = createMemo(() => phase() !== null);
+  /// Expanded list (hover) — but only when not mid-voice and items exist.
+  const listExpanded = createMemo(
+    () => hovered() && !isEmpty() && !voiceActive(),
+  );
 
   async function refresh() {
     try {
@@ -209,27 +308,20 @@ export default function NotchView() {
     try {
       const s = await getPublicSettings();
       setTopN(Math.min(7, Math.max(3, s.notch_list_top_n || DEFAULT_TOP_N)));
-      setVoiceHotkey(s.notch_list_voice_hotkey || DEFAULT_VOICE_HOTKEY);
       setHoverDelayMs(
         Math.min(
           1000,
           Math.max(0, s.notch_list_hover_delay_ms ?? DEFAULT_HOVER_DELAY_MS),
         ),
       );
-      const click = s.notch_list_click_to_expand ?? false;
-      setClickToExpand(click);
-      // Switching into click-to-expand mid-hover should drop any pending
-      // hover-intent timer so it can't fire after the mode changed.
-      if (click) clearHoverTimer();
     } catch (e) {
       console.warn("getPublicSettings (notch):", e);
     }
   }
 
-  /// Push the measured content size up to the OS window so it grows on
-  /// hover and snaps back on leave. Mirrors how the pill drives its size.
-  /// The `notch_resize` command re-centers the window below the notch (the
-  /// frontend can't know the display origin), so it owns sizing.
+  /// Push the measured content size up to the OS window so it grows on hover
+  /// and snaps back on leave. `notch_resize` re-centers the window below the
+  /// notch (the frontend can't know the display origin), so it owns sizing.
   function syncWindowSize() {
     const el = panelRef;
     if (!el) return;
@@ -246,13 +338,80 @@ export default function NotchView() {
       console.warn("getNotchGeometry:", e);
     }
     await refresh();
-    unlistenList = await onNotchListChanged(setDoc);
+    unlistenList = await onNotchListChanged((next) => {
+      flashChangedRows(doc(), next);
+      setDoc(next);
+    });
     unlistenSettings = await onSettingsChanged(() => {
       void applySettings();
     });
     // The notch can hop displays (cursor-follow) or learn its geometry just
-    // after launch — re-size the nub when that happens.
-    unlistenGeo = await onNotchGeometry(setGeo);
+    // after launch — re-measure when that happens.
+    unlistenGeo = await onNotchGeometry((g) => {
+      setGeo(g);
+      queueMicrotask(syncWindowSize);
+    });
+    // Authoritative hover, hit-tested by Rust against the physical notch rect
+    // (works even when another app is focused — the bug we're fixing).
+    unlistenHover = await onNotchHover((over) => {
+      if (over) armHoverExpand();
+      else collapse();
+    });
+    // ⌘L voice flow.
+    unlistenListening = await onNotchListening((s) => {
+      const p = s.phase;
+      // Any new phase supersedes a pending error auto-clear.
+      clearErrorTimer();
+      if (p === "idle") {
+        setPhase(null);
+        setPhaseMessage("");
+      } else {
+        setPhase(p as DrawerPhase);
+        setPhaseMessage(s.message ?? "");
+        // Reset the stale-levels clock when listening (re)starts so the
+        // decay ticker waits a full window before easing the bars down.
+        if (p === "listening") lastLevelsAt = Date.now();
+        // `error` is terminal on the Rust side (no following `idle`), so it
+        // would otherwise pin the drawer and keep `voiceActive()` true —
+        // disabling hover-expand. Auto-clear it back to the idle/list state;
+        // this also dismisses the destructive-confirm prompt after the window.
+        if (p === "error") {
+          errorTimer = setTimeout(() => {
+            errorTimer = undefined;
+            setPhase(null);
+            setPhaseMessage("");
+            queueMicrotask(syncWindowSize);
+          }, ERROR_AUTO_CLEAR_MS);
+        }
+      }
+      queueMicrotask(syncWindowSize);
+    });
+    unlistenLevels = await onNotchLevels((lv) => {
+      // Coerce to length 32 so a stray payload can't break the waveform.
+      if (Array.isArray(lv) && lv.length === 32) {
+        lastLevelsAt = Date.now();
+        setLevels(lv);
+      }
+    });
+
+    // Stale-levels ease-down: when STT runs after speech ends, `notch:levels`
+    // stop arriving while `phase` is still "listening". Decay the bars toward
+    // a calm low floor so the ribbon doesn't look frozen. The CSS `height`
+    // transition on each bar smooths the steps. No-op unless mid-listening
+    // AND levels are stale, so it never fights live input.
+    levelsDecayTimer = setInterval(() => {
+      if (phase() !== "listening") return;
+      if (Date.now() - lastLevelsAt < LEVELS_STALE_MS) return;
+      const cur = levels();
+      let anyAbove = false;
+      const next = cur.map((v) => {
+        const d = v * LEVELS_DECAY_FACTOR;
+        const settled = d < 0.02 ? 0 : d;
+        if (settled > 0) anyAbove = true;
+        return settled;
+      });
+      if (anyAbove) setLevels(next);
+    }, LEVELS_DECAY_MS);
 
     if (panelRef && typeof ResizeObserver !== "undefined") {
       ro = new ResizeObserver(() => syncWindowSize());
@@ -266,9 +425,38 @@ export default function NotchView() {
     unlistenList?.();
     unlistenSettings?.();
     unlistenGeo?.();
+    unlistenHover?.();
+    unlistenListening?.();
+    unlistenLevels?.();
     ro?.disconnect();
     clearHoverTimer();
+    clearErrorTimer();
+    if (flashTimer !== undefined) clearTimeout(flashTimer);
+    if (settleTimer !== undefined) clearTimeout(settleTimer);
+    if (levelsDecayTimer !== undefined) clearInterval(levelsDecayTimer);
+    detachDragListeners();
   });
+
+  /// Flash any item whose text/priority changed (or that's brand new)
+  /// between two list snapshots — used after voice edits land.
+  function flashChangedRows(prev: NotchListDoc, next: NotchListDoc) {
+    const byId = new Map(prev.items.map((i) => [i.id, i]));
+    const changed = new Set<string>();
+    for (const it of next.items) {
+      if (it.done) continue;
+      const before = byId.get(it.id);
+      if (!before || before.text !== it.text || before.priority !== it.priority) {
+        changed.add(it.id);
+      }
+    }
+    if (changed.size === 0) return;
+    setFlashIds(changed);
+    if (flashTimer !== undefined) clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => {
+      flashTimer = undefined;
+      setFlashIds(new Set<string>());
+    }, FLASH_MS);
+  }
 
   async function markDone(id: string) {
     try {
@@ -278,214 +466,384 @@ export default function NotchView() {
     }
   }
 
-  const transition = () =>
+  // --- Drag-to-reorder ----------------------------------------------------
+
+  function detachDragListeners() {
+    window.removeEventListener("pointermove", onDragMove);
+    window.removeEventListener("pointerup", onDragEnd);
+    window.removeEventListener("pointercancel", onDragEnd);
+  }
+
+  function onHandlePointerDown(e: PointerEvent, index: number) {
+    // Only in the expanded list; never in the collapsed single line.
+    if (!listExpanded()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragStartY = e.clientY;
+    dragStartIndex = index;
+    dragRowH = ROW_H;
+    setDragId(top()[index]?.id ?? null);
+    setDragLifted(false);
+    setDragOffsetY(0);
+    setDropIndex(index);
+    window.addEventListener("pointermove", onDragMove);
+    window.addEventListener("pointerup", onDragEnd);
+    window.addEventListener("pointercancel", onDragEnd);
+  }
+
+  function onDragMove(e: PointerEvent) {
+    if (dragId() === null) return;
+    const dy = e.clientY - dragStartY;
+    if (!dragLifted()) {
+      if (Math.abs(dy) < DRAG_THRESHOLD) return;
+      setDragLifted(true);
+    }
+    const rows = top();
+    // Clamp the lifted row to the list bounds (Y only — X is locked).
+    const maxUp = -dragStartIndex * dragRowH;
+    const maxDown = (rows.length - 1 - dragStartIndex) * dragRowH;
+    const clamped = Math.max(maxUp, Math.min(maxDown, dy));
+    setDragOffsetY(clamped);
+    // Insertion index = origin shifted by whole-row steps.
+    const steps = Math.round(clamped / dragRowH);
+    const idx = Math.max(0, Math.min(rows.length - 1, dragStartIndex + steps));
+    setDropIndex(idx);
+  }
+
+  function onDragEnd(e: PointerEvent) {
+    detachDragListeners();
+    const id = dragId();
+    const lifted = dragLifted();
+    const target = dropIndex();
+    // Reset the lift state immediately; the row settles via CSS. Mark the
+    // dropped row as "settling" for one settle window so its transform back
+    // to the resting slot rides the overshoot ease (not the lift's 0ms).
+    setDragId(null);
+    setDragLifted(false);
+    setDragOffsetY(0);
+    setDropIndex(null);
+    if (id !== null && lifted && !reducedMotion()) {
+      setSettleId(id);
+      if (settleTimer !== undefined) clearTimeout(settleTimer);
+      settleTimer = setTimeout(() => {
+        settleTimer = undefined;
+        setSettleId(null);
+      }, 240);
+    }
+    if (id === null || !lifted) return;
+
+    // Released outside the drawer → spring back, no reorder.
+    const within = listRef && pointerWithin(listRef, e.clientX, e.clientY);
+    if (!within || target === null) return;
+
+    const rows = top().map((i) => i.id);
+    const from = rows.indexOf(id);
+    if (from === -1 || from === target) return;
+    const reordered = rows.slice();
+    reordered.splice(from, 1);
+    reordered.splice(target, 0, id);
+    // Full active-id order: reordered top-N, then the remaining tail in its
+    // existing relative order, so items below the fold keep their positions.
+    const tail = activeItems()
+      .map((i) => i.id)
+      .filter((x) => !rows.includes(x));
+    const fullOrder = [...reordered, ...tail];
+
+    // Cross-band stick: the list sorts by (priority desc, order asc) and the
+    // backend re-sorts on the echo, so a flat `order` rewrite alone makes a
+    // row dropped across a priority boundary snap back. Adopt the band of the
+    // neighbor at the drop slot (the row above the insertion point, or the row
+    // below when dropped at the very top) so the dragged row STICKS where it
+    // landed. Compute against the NEW visual order (`reordered`).
+    const byId = new Map(doc().items.map((it) => [it.id, it]));
+    const draggedItem = byId.get(id);
+    const neighborId =
+      target > 0 ? reordered[target - 1] : reordered[target + 1];
+    const neighbor = neighborId ? byId.get(neighborId) : undefined;
+    const targetPriority = neighbor?.priority ?? draggedItem?.priority;
+    const bandChanged =
+      draggedItem !== undefined &&
+      targetPriority !== undefined &&
+      targetPriority !== draggedItem.priority;
+
+    const reorder = () =>
+      notchListReorder(fullOrder).catch((err) => {
+        console.error("notchListReorder:", err);
+        // Reconciliation flows from the `notch-list:changed` echo; on failure
+        // the existing `doc()` stands.
+        void refresh();
+      });
+
+    if (bandChanged) {
+      // Re-priority FIRST (it re-normalizes order on the backend), THEN
+      // reorder so the final flat order is written last. Two
+      // `notch-list:changed` echoes may arrive; the reconcile re-reads the
+      // doc each time, so both are safe.
+      void notchListSetPriority(id, targetPriority!)
+        .then(reorder)
+        .catch((err) => {
+          console.error("notchListSetPriority:", err);
+          void refresh();
+        });
+    } else {
+      void reorder();
+    }
+  }
+
+  function pointerWithin(el: HTMLElement, x: number, y: number): boolean {
+    const r = el.getBoundingClientRect();
+    // Generous horizontal slop (the lifted row may overhang) but require
+    // the pointer to stay within the vertical band.
+    return y >= r.top - 8 && y <= r.bottom + 8 && x >= r.left - 40 && x <= r.right + 40;
+  }
+
+  // --- Transitions --------------------------------------------------------
+
+  const rowTransition = () =>
     reducedMotion() ? "none" : "background 120ms ease, opacity 120ms ease";
-  /// Reveal transition for the expanded panel content (rows fading in as
-  /// the window grows). Disabled under reduced-motion.
-  const panelTransition = () =>
-    reducedMotion() ? "none" : "opacity 140ms ease, transform 140ms ease";
-  /// Checkbox check-off / border colour transition. Disabled under
-  /// reduced-motion.
   const checkboxTransition = () =>
     reducedMotion() ? "none" : "border-color 120ms ease, background 120ms ease";
 
   return (
-    // Stable outer wrapper — ALWAYS the same element across empty↔populated
-    // swaps so `panelRef` (and the ResizeObserver bound to it in onMount)
-    // never goes stale. It is styling-neutral (transparent, shrink-wraps to
-    // content); the visible surface is painted by the inner branch (the glass
-    // panel for the populated state, the solid-black strip for idle). Mouse
-    // handlers live here, branching on empty vs populated so the idle strip is
-    // always hover-driven while the populated panel honours click-to-expand.
+    // Stable outer wrapper — ALWAYS the same element so `panelRef` (and the
+    // ResizeObserver bound to it in onMount) never goes stale. Transparent,
+    // shrink-wraps to content. A flex column, centered: the ear row on top,
+    // the drawer directly below the cutout. DOM mouse handlers are a SECONDARY
+    // hover trigger; `notch:hover` is the source of truth.
     <div
       ref={panelRef}
-      class="inline-flex w-max max-w-[440px] flex-col items-stretch"
+      class="inline-flex flex-col items-center"
       aria-label={isEmpty() ? "Vox Notch — empty" : "Vox Notch"}
-      tabindex={!isEmpty() && clickToExpand() ? 0 : undefined}
-      onMouseEnter={() => {
-        if (isEmpty()) {
-          armIdleHint();
-          return;
-        }
-        if (clickToExpand()) return;
-        armHoverExpand();
-      }}
-      onMouseLeave={() => {
-        if (isEmpty()) {
-          collapse();
-          return;
-        }
-        if (clickToExpand()) return;
-        collapse();
-      }}
-      onFocusOut={(e) => {
-        // Click-to-expand (populated only): collapse when focus leaves the
-        // panel (a click elsewhere on the desktop). Hover mode ignores it. We
-        // use `focusout` (which bubbles, unlike `blur`) so this still fires
-        // when focus was on a descendant — and we ignore moves that stay
-        // INSIDE the panel (e.g. clicking a row's "mark done" checkbox), which
-        // would otherwise collapse the panel the instant the user ticks the
-        // first item.
-        if (isEmpty() || !clickToExpand()) return;
-        const next = e.relatedTarget as Node | null;
-        if (next && panelRef?.contains(next)) return;
-        collapse();
-      }}
+      onMouseEnter={() => armHoverExpand()}
+      onMouseLeave={() => collapse()}
     >
-      <Show
-        when={!isEmpty()}
-        fallback={
-          // Empty / idle state — a continuous black object that reads as the
-          // camera cutout extended downward, with an on-hover hint nub.
-          // Self-contained styling (no glass, no blur, square top corners).
-          <IdleStrip
-            cutoutWidth={cutoutWidth()}
-            hovered={hovered()}
-            reduced={reducedMotion()}
-            voiceHotkey={voiceHotkey()}
-          />
-        }
-      >
-        <div
-          class="flex w-full flex-col overflow-hidden rounded-[14px]"
-          style={{
-            // Always near-black so the panel reads as an extension of the
-            // physical (true-black) notch, regardless of app appearance. All
-            // tokens here come from the notch's own stylesheet
-            // (`src/notch.css`), never the pill/app design system.
-            background: "var(--color-notch-surface, rgba(10,10,12,0.92))",
-            "backdrop-filter": "var(--notch-blur, blur(20px) saturate(150%))",
-            "-webkit-backdrop-filter":
-              "var(--notch-blur, blur(20px) saturate(150%))",
-            // Faint top rim for definition over dark wallpapers; the OS window
-            // shadow (hasShadow=YES) supplies the drop shadow under the panel.
-            "box-shadow":
-              "inset 0 1px 0 rgba(255,255,255,0.06), 0 8px 24px rgba(0,0,0,0.55)",
-            color: "var(--color-ink)",
-          }}
-        >
-          {/* Collapsed resting state: the #1 task line. Expanded: top-N rows. */}
-          <Show
-            when={!hovered()}
-            fallback={
-              <div
-                class="flex flex-col gap-0.5 px-2 py-1.5"
-                style={{
-                  "min-height": `${PANEL_PAD + ROW_H}px`,
-                  transition: panelTransition(),
-                }}
-              >
-                <For each={top()}>
-                  {(item) => (
-                    <div
-                      class="flex items-center gap-2 rounded-[7px] px-1.5 py-1 hover:bg-white/[0.06]"
-                      style={{ height: `${ROW_H}px`, transition: transition() }}
-                    >
-                      <button
-                        type="button"
-                        aria-label="Mark done"
-                        onClick={(e) => {
-                          // Keep a checkbox click from bubbling to a
-                          // click-to-expand panel toggle.
-                          e.stopPropagation();
-                          void markDone(item.id);
-                        }}
-                        class="flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded-full border"
-                        style={{
-                          "border-color": CHECKBOX_BORDER,
-                          transition: checkboxTransition(),
-                        }}
-                      />
-                      <span
-                        class="h-[7px] w-[7px] shrink-0 rounded-full"
-                        style={{ background: priorityColor(item.priority) }}
-                        aria-hidden="true"
-                      />
-                      <span class="truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
-                        {item.text}
-                      </span>
-                    </div>
-                  )}
-                </For>
-              </div>
-            }
-          >
-            {/* Click-to-expand wrapper: the #1-task bar expands on click. */}
-            <div
-              classList={{ "cursor-pointer": clickToExpand() }}
-              onClick={toggleClickExpand}
-            >
-              <Show when={headItem()}>
-                {(item) => (
-                  <div
-                    class="flex items-center gap-2 px-3"
-                    style={{ height: `${COLLAPSED_H}px` }}
-                  >
-                    <span
-                      class="h-[7px] w-[7px] shrink-0 rounded-full"
-                      style={{ background: priorityColor(item().priority) }}
-                      aria-hidden="true"
-                    />
-                    <span class="truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
-                      {item().text}
-                    </span>
-                  </div>
-                )}
-              </Show>
-            </div>
-          </Show>
-        </div>
-      </Show>
+      {/* ===== Ear row — ALWAYS visible, height = cutoutHeight() ===== */}
+      <EarRow
+        earWidth={earWidth()}
+        cutoutWidth={cutoutWidth()}
+        height={cutoutHeight()}
+        hovered={hovered()}
+        hasNotch={hasNotch()}
+        reduced={reducedMotion()}
+      />
+
+      {/* ===== Drawer — below the cutout ===== */}
+      <Drawer
+        // Voice
+        phase={phase()}
+        phaseMessage={phaseMessage()}
+        levels={levels()}
+        cutoutWidth={cutoutWidth()}
+        cutoutHeight={cutoutHeight()}
+        // List
+        listExpanded={listExpanded()}
+        isEmpty={isEmpty()}
+        head={headItem()}
+        rows={top()}
+        expandedWidth={expandedWidth()}
+        flashIds={flashIds()}
+        reduced={reducedMotion()}
+        // Drag
+        dragId={dragId()}
+        dragLifted={dragLifted()}
+        dragOffsetY={dragOffsetY()}
+        dropIndex={dropIndex()}
+        settleId={settleId()}
+        rowH={ROW_H}
+        // Refs / callbacks
+        setListRef={(el) => (listRef = el)}
+        onHandleDown={onHandlePointerDown}
+        onMarkDone={markDone}
+        rowTransition={rowTransition()}
+        checkboxTransition={checkboxTransition()}
+      />
     </div>
   );
 }
 
-/// Shared premium easing for the idle hint reveal.
-const EASE_IN = "cubic-bezier(0.32, 0.72, 0, 1)";
-/// Sharper ease for retraction.
-const EASE_OUT = "cubic-bezier(0.4, 0, 1, 1)";
-/// How long to hold the reserved height after hover-out so the retract
-/// animation can play before the window collapses in a single step. Slightly
-/// over the longest exit transition (the 200ms nub transform).
-const RETRACT_MS = 210;
-
-/// Idle / empty state — one continuous black object that reads as the camera
-/// cutout extended downward: [Vox chip] [central cutout] [Notch chip], flush
-/// to the window's top edge, square top corners, rounded bottom corners. On
-/// hover a hint nub descends from the underside of the central cutout carrying
-/// the voice-hotkey copy.
-///
-/// Single-resize discipline: when hover begins, the hint's height is reserved
-/// INSTANTLY (no height transition) so `scrollHeight` jumps once and the OS
-/// window resizes a single time; only the nub's transform/opacity then animate
-/// via CSS inside that reserved space. The transform reveal is armed one
-/// animation frame after the reserve so the first frame can't clip during the
-/// OS resize round-trip. On hover-out the reserved height is held for one
-/// retract duration so the exit animation is visible, then released in a
-/// single step (one resize down) — never a chasing/height animation.
-function IdleStrip(props: {
+/* ===========================================================================
+ * Ear row — [Vox ear][transparent cutout spacer][Notch ear]. Width-pinned and
+ * centered at all times so the spacer sits under the physical camera bump.
+ * Ears are pure #000; inner corners (touching the cutout) square, outer
+ * corners rounded. Notchless: the two ears butt together into one pill with a
+ * hairline divider between the words.
+ * ======================================================================== */
+function EarRow(props: {
+  earWidth: number;
   cutoutWidth: number;
+  height: number;
   hovered: boolean;
+  hasNotch: boolean;
   reduced: boolean;
-  voiceHotkey: string;
 }) {
-  // Two coordinated signals drive a single-resize reveal with a visible
-  // retract:
-  //   `reserved` — gates the in-flow spacer height AND whether the (absolutely
-  //                positioned) nub is mounted. Flips true the instant hover
-  //                begins so `scrollHeight` jumps once → one OS resize up. On
-  //                hover-out it stays true through the exit animation, then
-  //                flips false → one OS resize down. Keeping the nub unmounted
-  //                while collapsed is what keeps the invisible nub from
-  //                inflating the resting 34px `scrollHeight`.
-  //   `armed`    — drives the nub's transform/opacity to their final state. On
-  //                the way IN it trails `reserved` by one frame so the reveal
-  //                can't clip during the OS resize round-trip; on the way OUT
-  //                it drops immediately so the retract animation plays first,
-  //                inside the still-reserved height.
-  const [reserved, setReserved] = createSignal(false);
-  const [armed, setArmed] = createSignal(false);
-  let raf = 0;
+  const wordOpacity = () => (props.hovered ? 0.95 : 0.62);
+  const wordTransition = () =>
+    props.reduced ? "opacity 100ms linear" : `opacity 180ms ${EASE_IN}`;
+
+  // Notchless: collapse the cutout spacer to 0 and fuse the ears into one
+  // pill, rounding the inner corners and dropping a 1px divider between them.
+  const showCutout = () => props.hasNotch;
+
+  return (
+    <div
+      class="flex"
+      style={{
+        height: `${props.height}px`,
+        width: `${props.earWidth * 2 + (showCutout() ? props.cutoutWidth : 0)}px`,
+      }}
+    >
+      {/* Left ear — "Vox" */}
+      <div
+        class="flex items-center justify-center"
+        style={{
+          width: `${props.earWidth}px`,
+          height: "100%",
+          background: "var(--color-notch-surface, #000)",
+          // With-notch: inner (right, toward cutout) corners SQUARE so the ear
+          // hugs the cutout wall; outer (left) corners rounded.
+          // Notchless: round all four so the fused [Vox|Notch] reads as one
+          // pill, with a hairline divider on the seam.
+          "border-radius": showCutout() ? "6px 0 0 12px" : "8px 0 0 12px",
+          "border-right": showCutout()
+            ? undefined
+            : "1px solid rgba(255,255,255,0.1)",
+        }}
+      >
+        <span
+          style={{
+            "font-size": "12px",
+            "font-weight": 700,
+            "letter-spacing": "-0.01em",
+            color: "#fff",
+            opacity: `${wordOpacity()}`,
+            transition: wordTransition(),
+          }}
+        >
+          Vox
+        </span>
+      </div>
+
+      {/* Central cutout spacer — TRANSPARENT (the physical camera is here). */}
+      <Show when={showCutout()}>
+        <div
+          aria-hidden="true"
+          style={{
+            width: `${props.cutoutWidth}px`,
+            height: "100%",
+            background: "transparent",
+          }}
+        />
+      </Show>
+
+      {/* Right ear — "Notch" */}
+      <div
+        class="flex items-center justify-center"
+        style={{
+          width: `${props.earWidth}px`,
+          height: "100%",
+          background: "var(--color-notch-surface, #000)",
+          // With-notch: inner (left, toward cutout) corners SQUARE; outer
+          // (right) corners rounded. Notchless: round all four (the seam is
+          // drawn by the left ear's right divider).
+          "border-radius": showCutout() ? "0 6px 12px 0" : "0 8px 12px 0",
+        }}
+      >
+        <span
+          style={{
+            "font-size": "12px",
+            "font-weight": 500,
+            "letter-spacing": "-0.01em",
+            color: "#fff",
+            opacity: `${wordOpacity()}`,
+            transition: wordTransition(),
+          }}
+        >
+          Notch
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/* ===========================================================================
+ * Drawer — the variable region below the cutout. State machine:
+ *   idle + empty           → height 0 (nothing)
+ *   items + collapsed      → one line (cutout width): #1 task
+ *   items + expanded       → wide; top-N rows (drag handle + checkbox + dot + text)
+ *   voice: listening       → waveform ribbon (cutout width)
+ *   voice: compiling       → pulsing dots (cutout width)
+ *   voice: error           → message text (briefly), then idle
+ *
+ * Single-resize discipline: the drawer's height is reserved INSTANTLY when it
+ * changes (no height transition), so `scrollHeight` jumps once → one OS resize.
+ * Content fades/slides INSIDE the reserved space via transform/opacity. On
+ * collapse the reserved height is held for one retract duration so the exit
+ * animation plays, then released in a single step.
+ * ======================================================================== */
+function Drawer(props: {
+  phase: DrawerPhase | null;
+  phaseMessage: string;
+  levels: number[];
+  cutoutWidth: number;
+  cutoutHeight: number;
+  listExpanded: boolean;
+  isEmpty: boolean;
+  head: NotchItem | null;
+  rows: NotchItem[];
+  expandedWidth: number;
+  flashIds: Set<string>;
+  reduced: boolean;
+  dragId: string | null;
+  dragLifted: boolean;
+  dragOffsetY: number;
+  dropIndex: number | null;
+  settleId: string | null;
+  rowH: number;
+  setListRef: (el: HTMLDivElement) => void;
+  onHandleDown: (e: PointerEvent, index: number) => void;
+  onMarkDone: (id: string) => void;
+  rowTransition: string;
+  checkboxTransition: string;
+}) {
+  // What the drawer should render right now (priority: voice > list).
+  const mode = createMemo<
+    "voice" | "expanded" | "collapsed" | "empty"
+  >(() => {
+    if (props.phase !== null) return "voice";
+    if (props.isEmpty) return "empty";
+    return props.listExpanded ? "expanded" : "collapsed";
+  });
+
+  // Target content height (px) for the current mode. 0 collapses the window.
+  const targetHeight = createMemo(() => {
+    switch (mode()) {
+      case "voice":
+        // Waveform / dots / error strip — short calm ribbon.
+        return Math.round(props.cutoutHeight * 0.65) + 10;
+      case "expanded":
+        return props.rows.length * props.rowH + LIST_PAD_Y * 2;
+      case "collapsed":
+        return COLLAPSED_H;
+      default:
+        return 0;
+    }
+  });
+
+  // Target content width. The ear row owns its own pinned width; the drawer
+  // is independent. Collapsed/voice = cutout width; expanded = wide.
+  const targetWidth = createMemo(() => {
+    switch (mode()) {
+      case "expanded":
+        return props.expandedWidth;
+      default:
+        return props.cutoutWidth;
+    }
+  });
+
+  // --- Single-resize height reservation ----------------------------------
+  // `reservedH` toggles instantly to the target so the window resizes once;
+  // on the way DOWN it's held for one retract before releasing to 0.
+  const [reservedH, setReservedH] = createSignal(0);
   let collapseTimer: ReturnType<typeof setTimeout> | undefined;
   const clearCollapse = () => {
     if (collapseTimer !== undefined) {
@@ -494,203 +852,336 @@ function IdleStrip(props: {
     }
   };
   createEffect(() => {
-    if (props.hovered) {
-      clearCollapse();
-      setReserved(true);
-      if (props.reduced) {
-        setArmed(true);
-      } else {
-        if (raf) cancelAnimationFrame(raf);
-        raf = requestAnimationFrame(() => {
-          raf = 0;
-          setArmed(true);
-        });
-      }
+    const target = targetHeight();
+    clearCollapse();
+    if (target > 0) {
+      setReservedH(target);
+    } else if (props.reduced) {
+      setReservedH(0);
     } else {
-      if (raf) cancelAnimationFrame(raf);
-      raf = 0;
-      setArmed(false);
-      // Hold the reserved height through the retract, then collapse in one
-      // step. Reduced motion skips the wait and snaps down immediately.
-      clearCollapse();
-      if (props.reduced) {
-        setReserved(false);
-      } else {
-        collapseTimer = setTimeout(() => {
-          collapseTimer = undefined;
-          setReserved(false);
-        }, RETRACT_MS);
-      }
+      // Hold the height through the exit animation, then drop in one step.
+      collapseTimer = setTimeout(() => {
+        collapseTimer = undefined;
+        setReservedH(0);
+      }, RETRACT_MS);
     }
   });
-  onCleanup(() => {
-    if (raf) cancelAnimationFrame(raf);
-    clearCollapse();
-  });
-
-  const totalWidth = () => SIDE_CHIP_W * 2 + props.cutoutWidth;
-  const nubWidth = () => props.cutoutWidth - HINT_INSET;
-  // Reserved hint height, added BELOW the strip via an in-flow spacer. It
-  // toggles instantly (no height transition) so `scrollHeight` jumps exactly
-  // once and the OS window resizes a single time. The nub itself is absolutely
-  // positioned (overlapping the strip's bottom by HINT_OVERLAP) and so doesn't
-  // participate in this height — total growth stays HINT_H - HINT_OVERLAP
-  // (~28px → strip 34 + 28 = ~62px tall expanded).
-  const reservedH = () => (reserved() ? HINT_H - HINT_OVERLAP : 0);
-
-  // Side-word opacity: subtle at idle, brighter on hover.
-  const wordOpacity = () => (props.hovered ? 0.9 : 0.55);
-  const wordTransition = () =>
-    props.reduced ? "opacity 100ms linear" : `opacity 180ms ${EASE_IN}`;
-
-  // Nub transform/opacity. Reduced motion: opacity-only cross-fade, no scale
-  // or translate (and the height jump is already instant).
-  const nubTransform = () => {
-    if (props.reduced) return "none";
-    return armed() ? "scaleY(1) translateY(0)" : "scaleY(0.4) translateY(-6px)";
-  };
-  const nubOpacity = () => (armed() ? 1 : 0);
-  const nubTransition = () => {
-    if (props.reduced) return "opacity 100ms linear";
-    return props.hovered
-      ? // in: transform 320ms; opacity 0→1 delayed ~40ms
-        `transform 320ms ${EASE_IN}, opacity 280ms ${EASE_IN} 40ms`
-      : // out: retract + fade ~120ms, sharper ease
-        `transform 200ms ${EASE_OUT}, opacity 120ms ${EASE_OUT}`;
-  };
-
-  // Hint text trails the nub: fades + rises (translateY 2px→0) starting ~90ms.
-  const textOpacity = () => (armed() ? 1 : 0);
-  const textTransform = () =>
-    props.reduced || armed() ? "translateY(0)" : "translateY(2px)";
-  const textTransition = () => {
-    if (props.reduced) return "opacity 100ms linear";
-    return props.hovered
-      ? `opacity 230ms ${EASE_IN} 90ms, transform 230ms ${EASE_IN} 90ms`
-      : `opacity 120ms ${EASE_OUT}, transform 120ms ${EASE_OUT}`;
-  };
+  onCleanup(clearCollapse);
 
   return (
     <div
-      class="relative flex flex-col items-center"
-      style={{ width: `${totalWidth()}px` }}
+      class="overflow-hidden"
+      style={{
+        // Single-resize discipline (mirrors the old IdleStrip): BOTH width
+        // and height jump instantly to their target — NO CSS size transition
+        // on the measured element — so `scrollWidth`/`scrollHeight` each step
+        // exactly once and the OS window resizes a single time per state
+        // change instead of chasing a multi-frame animation. The visible
+        // "expand" feel comes from the content fading/rising in (the
+        // staggered row reveal), not from animating the window box.
+        height: `${reservedH()}px`,
+        width: `${targetWidth()}px`,
+        background:
+          reservedH() > 0 ? "var(--color-notch-surface, #000)" : "transparent",
+        // Top corners SQUARE (fused under the cutout); bottom rounded.
+        "border-radius": "0 0 16px 16px",
+        color: "var(--color-ink)",
+      }}
     >
-      {/* The black strip: three fused segments, flush to the window top. */}
-      <div class="flex w-full" style={{ height: `${STRIP_H}px` }}>
-        {/* Left chip — "Vox" */}
-        <div
-          class="flex items-center justify-center"
-          style={{
-            width: `${SIDE_CHIP_W}px`,
-            background: "#000",
-            "border-radius": `0 0 ${CHIP_INNER_R}px ${CHIP_OUTER_R}px`,
-            // Subtle bezel realism on the underside; no outer border (it would
-            // break the cutout illusion — the OS drop shadow supplies depth).
-            "box-shadow": "inset 0 -0.5px 0 rgba(255,255,255,0.04)",
-          }}
-        >
-          <span
-            style={{
-              "font-size": "14px",
-              "font-weight": 700,
-              "letter-spacing": "-0.01em",
-              color: "#fff",
-              opacity: `${wordOpacity()}`,
-              transition: wordTransition(),
-            }}
-          >
-            Vox
-          </span>
-        </div>
-
-        {/* Central cutout — pure-black continuation of the physical notch. */}
-        <div
-          aria-hidden="true"
-          style={{
-            width: `${props.cutoutWidth}px`,
-            background: "#000",
-            // Square all corners: this segment IS the notch, continued down.
-            "border-radius": "0",
-          }}
+      <Show when={mode() === "voice"}>
+        <VoiceStrip
+          phase={props.phase}
+          message={props.phaseMessage}
+          levels={props.levels}
+          cutoutHeight={props.cutoutHeight}
+          reduced={props.reduced}
         />
+      </Show>
 
-        {/* Right chip — "Notch" */}
-        <div
-          class="flex items-center justify-center"
-          style={{
-            width: `${SIDE_CHIP_W}px`,
-            background: "#000",
-            "border-radius": `0 0 ${CHIP_OUTER_R}px ${CHIP_INNER_R}px`,
-            "box-shadow": "inset 0 -0.5px 0 rgba(255,255,255,0.04)",
-          }}
-        >
-          <span
-            style={{
-              "font-size": "14px",
-              "font-weight": 500,
-              "letter-spacing": "-0.01em",
-              color: "#fff",
-              opacity: `${wordOpacity()}`,
-              transition: wordTransition(),
-            }}
-          >
-            Notch
-          </span>
-        </div>
-      </div>
-
-      {/* In-flow spacer: reserves the hint's height so `scrollHeight` jumps
-          once (single OS resize). Instant — no height transition. */}
-      <div style={{ height: `${reservedH()}px` }} aria-hidden="true" />
-
-      {/* Hint nub — absolutely positioned so it can overlap the strip's
-          underside (HINT_OVERLAP) without being clipped and without feeding
-          the height animation. Anchored just inside the strip's bottom edge,
-          horizontally centered → sits directly under the central cutout. Only
-          mounted while the height is reserved, so the invisible nub can't
-          inflate the resting `scrollHeight`. */}
-      <Show when={reserved()}>
-        <div
-          class="pointer-events-none absolute inset-x-0 flex justify-center"
-          style={{ top: `${STRIP_H - HINT_OVERLAP}px` }}
-          aria-hidden={props.hovered ? undefined : "true"}
-        >
-          <div
-            class="flex items-center justify-center"
-            style={{
-              width: "max-content",
-              "min-width": `${nubWidth()}px`,
-              "max-width": `${totalWidth()}px`,
-              height: `${HINT_H}px`,
-              background: "#000",
-              // Square top (continues the cutout), rounded bottom.
-              "border-radius": `0 0 ${HINT_BOTTOM_R}px ${HINT_BOTTOM_R}px`,
-              padding: "0 16px",
-              "transform-origin": "top center",
-              transform: nubTransform(),
-              opacity: `${nubOpacity()}`,
-              transition: nubTransition(),
-              "will-change": "transform, opacity",
-            }}
-          >
+      <Show when={mode() === "collapsed"}>
+        <Show when={props.head}>
+          {(item) => (
             <div
-              class="flex items-center gap-1.5 whitespace-nowrap"
-              style={{
-                "font-size": "11px",
-                "font-weight": 500,
-                "letter-spacing": "0.01em",
-                color: "rgba(255,255,255,0.62)",
-                opacity: `${textOpacity()}`,
-                transform: textTransform(),
-                transition: textTransition(),
-              }}
+              class="flex items-center gap-2 px-3"
+              classList={{ "notch-flash": props.flashIds.has(item().id) }}
+              style={{ height: `${COLLAPSED_H}px` }}
             >
-              <HotkeyKeys spec={props.voiceHotkey} />
-              <span>to add a task by voice</span>
+              <span
+                class="h-[7px] w-[7px] shrink-0 rounded-full"
+                style={{ background: priorityColor(item().priority) }}
+                aria-hidden="true"
+              />
+              <span class="truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
+                {item().text}
+              </span>
             </div>
-          </div>
+          )}
+        </Show>
+      </Show>
+
+      <Show when={mode() === "expanded"}>
+        <ExpandedList
+          rows={props.rows}
+          flashIds={props.flashIds}
+          reduced={props.reduced}
+          dragId={props.dragId}
+          dragLifted={props.dragLifted}
+          dragOffsetY={props.dragOffsetY}
+          dropIndex={props.dropIndex}
+          settleId={props.settleId}
+          rowH={props.rowH}
+          setListRef={props.setListRef}
+          onHandleDown={props.onHandleDown}
+          onMarkDone={props.onMarkDone}
+          rowTransition={props.rowTransition}
+          checkboxTransition={props.checkboxTransition}
+        />
+      </Show>
+    </div>
+  );
+}
+
+/* ===========================================================================
+ * Voice strip — waveform (listening) / dots (compiling) / message (error).
+ * Calm muted-white acknowledgment ribbon, NOT the pill's coral.
+ * ======================================================================== */
+function VoiceStrip(props: {
+  phase: DrawerPhase | null;
+  message: string;
+  levels: number[];
+  cutoutHeight: number;
+  reduced: boolean;
+}) {
+  // Waveform bars cap LOW (~0.5× the band) so it reads as a quiet ribbon.
+  const maxBar = () => Math.max(10, Math.round(props.cutoutHeight * 0.5));
+  const stripH = () => Math.round(props.cutoutHeight * 0.65);
+
+  return (
+    <div
+      class="flex w-full items-center justify-center px-3"
+      style={{ height: "100%" }}
+    >
+      <Show when={props.phase === "listening"}>
+        <div
+          class="flex w-full items-center justify-between"
+          style={{ height: `${stripH()}px` }}
+          aria-hidden="true"
+        >
+          <For each={props.levels}>
+            {(level, i) => {
+              // Gamma 0.65 opens the bottom of the range (RMS lives low).
+              const shaped = Math.pow(Math.max(0, Math.min(1, level)), 0.65);
+              // Sine bell — dissolve into the black at both edges.
+              const env = edgeEnvelope(i(), props.levels.length);
+              const h = Math.max(
+                1.5,
+                Math.round(
+                  (0.22 + shaped * 0.78) * maxBar() * (0.4 + 0.6 * env),
+                ),
+              );
+              const opacity = (0.32 + shaped * 0.68) * env;
+              return (
+                <div
+                  style={{
+                    width: "1.5px",
+                    height: `${h}px`,
+                    "border-radius": "1.5px",
+                    // Muted white — calm acknowledgment, not the pill coral.
+                    background: "var(--color-ink-mute, rgba(255,255,255,.62))",
+                    opacity,
+                    transition: props.reduced
+                      ? "none"
+                      : "height 110ms ease-out, opacity 180ms ease-out",
+                  }}
+                />
+              );
+            }}
+          </For>
         </div>
       </Show>
+
+      <Show when={props.phase === "compiling"}>
+        <div class="flex items-center gap-1.5" aria-label="Working">
+          <span class="notch-dot" />
+          <span class="notch-dot" style={{ "animation-delay": "0.15s" }} />
+          <span class="notch-dot" style={{ "animation-delay": "0.3s" }} />
+        </div>
+      </Show>
+
+      <Show when={props.phase === "error"}>
+        <span class="truncate text-[11px] leading-[14px] text-[var(--color-ink-mute,rgba(255,255,255,.62))]">
+          {props.message || "Couldn't understand that"}
+        </span>
+      </Show>
+    </div>
+  );
+}
+
+/* ===========================================================================
+ * Expanded list — top-N rows. Each: drag handle + checkbox + priority dot +
+ * text. Rows fade+rise in on mount with a ~20ms stagger. Drag lifts a row to
+ * follow the pointer; siblings slide; a 2px accent drop-line marks the
+ * insertion point.
+ * ======================================================================== */
+function ExpandedList(props: {
+  rows: NotchItem[];
+  flashIds: Set<string>;
+  reduced: boolean;
+  dragId: string | null;
+  dragLifted: boolean;
+  dragOffsetY: number;
+  dropIndex: number | null;
+  settleId: string | null;
+  rowH: number;
+  setListRef: (el: HTMLDivElement) => void;
+  onHandleDown: (e: PointerEvent, index: number) => void;
+  onMarkDone: (id: string) => void;
+  rowTransition: string;
+  checkboxTransition: string;
+}) {
+  const draggingActive = () =>
+    props.dragId !== null && props.dragLifted;
+
+  // The slot index the dragged row currently occupies (its origin).
+  const dragOriginIndex = () =>
+    props.dragId === null
+      ? -1
+      : props.rows.findIndex((r) => r.id === props.dragId);
+
+  // Per-row sibling shift while dragging: rows between the origin and the
+  // drop target slide by one row height to open the gap.
+  function siblingShift(index: number): number {
+    if (!draggingActive()) return 0;
+    const from = dragOriginIndex();
+    const to = props.dropIndex;
+    if (from === -1 || to === null || index === from) return 0;
+    if (from < to) {
+      // Dragging down: rows in (from, to] slide UP.
+      if (index > from && index <= to) return -props.rowH;
+    } else if (from > to) {
+      // Dragging up: rows in [to, from) slide DOWN.
+      if (index >= to && index < from) return props.rowH;
+    }
+    return 0;
+  }
+
+  return (
+    <div
+      ref={props.setListRef}
+      class="relative flex flex-col px-2"
+      style={{ "padding-top": `${LIST_PAD_Y}px`, "padding-bottom": `${LIST_PAD_Y}px` }}
+    >
+      {/* Accent drop-line at the insertion point (drag only). */}
+      <Show when={draggingActive() && props.dropIndex !== null}>
+        <div
+          class="pointer-events-none absolute inset-x-2"
+          style={{
+            top: `${LIST_PAD_Y + (props.dropIndex ?? 0) * props.rowH - 1}px`,
+            height: "2px",
+            background: "var(--color-accent, #3fb8b0)",
+            "border-radius": "1px",
+          }}
+          aria-hidden="true"
+        />
+      </Show>
+
+      <For each={props.rows}>
+        {(item, i) => {
+          const isDragged = () => props.dragId === item.id && props.dragLifted;
+          const enterDelay = () =>
+            props.reduced ? "0ms" : `${i() * 20}ms`;
+          const liftTransform = () => {
+            if (isDragged()) {
+              return `translateY(${props.dragOffsetY}px) scale(1.02)`;
+            }
+            const shift = siblingShift(i());
+            return shift ? `translateY(${shift}px)` : "translateY(0)";
+          };
+          const dragTransition = () => {
+            if (props.reduced) return "none";
+            if (isDragged()) {
+              // While following the pointer: no transform transition — we set
+              // the transform on every move, so any easing would lag the
+              // cursor.
+              return "transform 0ms";
+            }
+            // The just-dropped row settles back to its slot with a slight
+            // overshoot; ordinary siblings just slide. The background/shadow
+            // (lift wash) rides the shared row transition either way.
+            const t =
+              props.settleId === item.id
+                ? `transform 220ms ${EASE_SETTLE}`
+                : `transform 160ms ${EASE_IN}`;
+            return `${t}, ${props.rowTransition}, box-shadow 120ms ease`;
+          };
+          return (
+            <div
+              class="flex items-center gap-2 rounded-[8px] px-1.5 hover:bg-white/[0.06]"
+              classList={{
+                "notch-flash": props.flashIds.has(item.id),
+                // Mount-reveal: fade + rise with a per-row stagger. Disabled
+                // for any row once a drag is in flight (the lift/shift
+                // transform would fight the keyframe's transform) and while a
+                // row is flashing (both use the `animation` shorthand).
+                "notch-row-enter":
+                  !draggingActive() &&
+                  !props.reduced &&
+                  !props.flashIds.has(item.id),
+              }}
+              style={{
+                height: `${props.rowH}px`,
+                "z-index": isDragged() ? 5 : 1,
+                position: "relative",
+                transform: liftTransform(),
+                transition: dragTransition(),
+                background: isDragged() ? "rgba(255,255,255,0.10)" : undefined,
+                "box-shadow": isDragged()
+                  ? "0 6px 16px rgba(0,0,0,0.55)"
+                  : "none",
+                opacity: 1,
+                "animation-delay": draggingActive() ? "0ms" : enterDelay(),
+              }}
+            >
+              {/* Drag handle — always faintly visible when expanded. */}
+              <div
+                class="notch-drag-handle shrink-0"
+                style={{ "touch-action": "none" }}
+                onPointerDown={(e) => props.onHandleDown(e, i())}
+                aria-hidden="true"
+              >
+                <span class="notch-drag-dot" />
+                <span class="notch-drag-dot" />
+                <span class="notch-drag-dot" />
+                <span class="notch-drag-dot" />
+                <span class="notch-drag-dot" />
+                <span class="notch-drag-dot" />
+              </div>
+
+              <button
+                type="button"
+                aria-label="Mark done"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  props.onMarkDone(item.id);
+                }}
+                class="flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded-full border"
+                style={{
+                  "border-color": CHECKBOX_BORDER,
+                  transition: props.checkboxTransition,
+                }}
+              />
+              <span
+                class="h-[7px] w-[7px] shrink-0 rounded-full"
+                style={{ background: priorityColor(item.priority) }}
+                aria-hidden="true"
+              />
+              <span class="truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
+                {item.text}
+              </span>
+            </div>
+          );
+        }}
+      </For>
     </div>
   );
 }

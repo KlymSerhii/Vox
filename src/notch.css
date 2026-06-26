@@ -12,22 +12,18 @@
  *   - It does NOT inherit pill "liquid glass" tokens, the shimmer/processing
  *     keyframes, focus rings, or any other app surface styling.
  *
- * So it ships its OWN fixed, always-dark token set plus the few primitives
- * its markup needs (the generic <HotkeyKeys> keycap). Tailwind's utility
- * layer is shared — it's a neutral toolkit (`flex`, `rounded`, `truncate`),
- * not a pill style. Keep this file as the single source of truth for how the
- * notch looks; do not reach back into `styles.css`.
+ * So it ships its OWN fixed, always-dark token set. Tailwind's utility layer
+ * is shared — it's a neutral toolkit (`flex`, `rounded`, `truncate`), not a
+ * pill style. Keep this file as the single source of truth for how the notch
+ * looks; do not reach back into `styles.css`.
  * ========================================================================= */
 
 :root {
-  /* Panel surface — near-black so it blends with the physical (true-black)
-   * notch. The border is a faint top rim that lifts the panel off dark
-   * wallpapers without reading as an outline. */
-  --color-notch-surface: rgba(10, 10, 12, 0.92);
-  --color-notch-border: rgba(255, 255, 255, 0.1);
-  /* Subtle backdrop blur — notch-owned, intentionally lighter than the
-   * pill's heavy frosted `--glass-blur`. */
-  --notch-blur: blur(20px) saturate(150%);
+  /* Panel surface — PURE black so it fuses seamlessly with the physical
+   * (true-black) notch under the camera cutout. No backdrop blur, no top
+   * rim: any grey edge breaks the "extension of the cutout" illusion.
+   * Depth comes from the OS window drop shadow (hasShadow=YES), not CSS. */
+  --color-notch-surface: #000;
 
   /* Fixed light-on-dark text ramp. Never flips with appearance. */
   --color-ink: #f4f4f5;
@@ -38,9 +34,8 @@
   --color-danger: #ff6b6b;
   --color-warning: #fbbf24;
 
-  /* Keycap chrome, consumed by the shared <HotkeyKeys> component. */
-  --color-control: rgba(255, 255, 255, 0.08);
-  --color-border: rgba(255, 255, 255, 0.12);
+  /* Accent teal — drag drop-line + change-flash highlight. */
+  --color-accent: #3fb8b0;
 }
 
 html,
@@ -68,22 +63,77 @@ button {
   cursor: pointer;
 }
 
-/* Keycap badge — notch-local copy kept structurally in sync with the shared
- * <HotkeyKeys> markup. The app's copy lives in `styles.css`; this one is
- * driven by the notch's fixed dark tokens above so it reads on black. */
-.keycap {
-  display: inline-flex;
-  align-items: center;
+/* Change-flash: a freshly-added / changed task row pulses an accent-teal
+ * wash once, then settles. Applied via the `.notch-flash` class which
+ * Notch.tsx toggles for ~400ms after a voice edit. */
+@keyframes notch-row-flash {
+  0% {
+    background: rgba(63, 184, 176, 0.18);
+  }
+  100% {
+    background: transparent;
+  }
+}
+.notch-flash {
+  animation: notch-row-flash 400ms ease-out;
+}
+
+/* Expanded-list row entry — fade + rise as the drawer grows. A per-row
+ * `animation-delay` (set inline in Notch.tsx) staggers them ~20ms apart. */
+@keyframes notch-row-enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.notch-row-enter {
+  animation: notch-row-enter 140ms ease-out both;
+}
+
+/* "Compiling" indicator — three dots breathing in sequence under the
+ * cutout while the voice utterance is interpreted. Calm, low-contrast. */
+@keyframes notch-dot-pulse {
+  0%,
+  80%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.8);
+  }
+  40% {
+    opacity: 0.9;
+    transform: scale(1);
+  }
+}
+.notch-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 9999px;
+  background: var(--color-ink-mute);
+  animation: notch-dot-pulse 1.1s ease-in-out infinite;
+}
+
+/* Drag handle — a faint 2×3 dot grid shown when the drawer is expanded.
+ * Always visible (not gated on row :hover, which can't fire reliably when
+ * another app holds focus). */
+.notch-drag-handle {
+  display: grid;
+  grid-template-columns: repeat(2, 2px);
+  grid-template-rows: repeat(3, 2px);
   gap: 2px;
-  padding: 1px 6px;
-  border-radius: 6px;
-  font-family:
-    ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--color-ink);
-  background: var(--color-control);
-  box-shadow: inset 0 0 0 1px var(--color-border);
+  cursor: grab;
+}
+.notch-drag-handle:active {
+  cursor: grabbing;
+}
+.notch-drag-dot {
+  width: 2px;
+  height: 2px;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.4);
 }
 
 /* Reduced-motion safety net. Notch.tsx already gates its transitions in JS;

@@ -410,7 +410,7 @@ impl SessionState {
 #[derive(Debug, Serialize)]
 pub enum BeginOutcome {
     Started(SessionId),
-    Saturated { in_flight: usize },
+    Saturated { in_flight: usize, notch: bool },
     DictationDisabled,
     AlreadyRecording,
     AudioError(String),
@@ -530,7 +530,7 @@ impl SessionManager {
         match store.commit_staged(doc) {
             Ok(()) => {
                 crate::commands::emit_notch_list_changed(app);
-                pill::emit_toast(app, "Removed".into(), 1600);
+                pill::emit_notch_phase(app, "idle", None);
                 true
             }
             Err(e) => {
@@ -611,27 +611,39 @@ impl SessionManager {
             Some(g) => g,
             None => {
                 log::warn!("ignoring hotkey: pipeline still in flight");
-                // No pill::show here on purpose: the pill is guaranteed
-                // visible because a pipeline is in flight (the busy_gate
-                // cap-1 IS the proof of life). Calling show would fire
-                // the frontend's `pill:show` listener which calls
-                // clearStreaming(), wiping the in-flight polish stream
-                // out from under the user.
-                pill::emit_toast(
-                    app,
-                    "Still finishing previous".into(),
-                    BUSY_TOAST_MS,
-                );
-                // Restore the live pipeline stage on the pill as soon as
-                // the toast plays out. The frontend's toast handler
-                // (Pill.tsx) flips state to "saturated" on toast arrival
-                // and only schedules a clear of the toast MESSAGE — it
-                // never clears the state itself. Without this re-emit
-                // the pill stays stuck on the saturated warning until
-                // the pipeline's next stage transition fires a fresh
-                // pill:state event, which during a long polish run is
-                // typically not until Done.
-                self.schedule_pill_state_restore(app, u64::from(BUSY_TOAST_MS));
+                if notch_armed {
+                    // Notch press: its feedback lives in-notch, not in the
+                    // pill. Route the busy rejection to the notch surface
+                    // (auto-clears after ~4.5s) and skip the pill-only
+                    // toast + state-restore entirely.
+                    pill::emit_notch_phase(
+                        app,
+                        "error",
+                        Some("Still finishing the previous list".into()),
+                    );
+                } else {
+                    // No pill::show here on purpose: the pill is guaranteed
+                    // visible because a pipeline is in flight (the busy_gate
+                    // cap-1 IS the proof of life). Calling show would fire
+                    // the frontend's `pill:show` listener which calls
+                    // clearStreaming(), wiping the in-flight polish stream
+                    // out from under the user.
+                    pill::emit_toast(
+                        app,
+                        "Still finishing previous".into(),
+                        BUSY_TOAST_MS,
+                    );
+                    // Restore the live pipeline stage on the pill as soon as
+                    // the toast plays out. The frontend's toast handler
+                    // (Pill.tsx) flips state to "saturated" on toast arrival
+                    // and only schedules a clear of the toast MESSAGE — it
+                    // never clears the state itself. Without this re-emit
+                    // the pill stays stuck on the saturated warning until
+                    // the pipeline's next stage transition fires a fresh
+                    // pill:state event, which during a long polish run is
+                    // typically not until Done.
+                    self.schedule_pill_state_restore(app, u64::from(BUSY_TOAST_MS));
+                }
                 return BeginOutcome::PipelineBusy;
             }
         };
@@ -652,7 +664,10 @@ impl SessionManager {
                     self.max_concurrent
                 );
                 drop(busy_guard);
-                return BeginOutcome::Saturated { in_flight };
+                return BeginOutcome::Saturated {
+                    in_flight,
+                    notch: notch_armed,
+                };
             }
         }
 
@@ -732,8 +747,14 @@ impl SessionManager {
         *active = Some(new_sid);
         // Take ownership of the pill — replaces any previous session
         // whose pipeline is still running in the background, so the
-        // pill always tracks the newest recording.
-        *self.pill_owner.lock() = Some(new_sid);
+        // pill always tracks the newest recording. A notch-voice (⌘L)
+        // session deliberately does NOT claim the pill: its UI lives in
+        // the notch, so leaving `pill_owner` untouched keeps every
+        // `set_stage` pill emit a no-op for this session (and avoids
+        // clobbering a real pill another in-flight session may own).
+        if !notch_command {
+            *self.pill_owner.lock() = Some(new_sid);
+        }
         drop(active);
 
         // Arm the OS Escape grab now (and not at app launch) so
@@ -746,19 +767,30 @@ impl SessionManager {
         *self.cancel_first_press_at.lock() = None;
 
         log::info!("▶ begin recording (sid={new_sid})");
-        pill::show(app);
-        pill::emit_state(app, PillState::Listening, None);
-        // Live-transcript renders the listening pill in the wide layout
-        // (header label + typing dots + companion chip) before the user
-        // even releases the hotkey. The frontend's ResizeObserver pushes
-        // the new size up via IPC, but the WebView2 → Tauri → DWM chain
-        // on Windows runs slow enough that the OS window stays at the
-        // compact 144 px frame for a visible frame or two and the pill
-        // content clips at both sides. Widen here so the OS window
-        // matches the layout the frontend already wants — idempotent
-        // on macOS where the round-trip was fast enough to win the race.
-        if prefs.live_transcript_enabled {
-            pill::set_wide(app, true);
+        // A notch-voice (⌘L) session NEVER shows the floating pill — its
+        // listening UI lives in the notch instead. Drive the notch's
+        // listening phase here and skip every pill::show / emit_state /
+        // set_wide call below so the user never sees the pill for ⌘L.
+        // The transcribing/compiling/done states for this session are
+        // routed to the notch from `interpret_and_apply_notch`, and the
+        // mic levels are mirrored to the notch by `spawn_audio_level_sampler`.
+        if notch_command {
+            pill::emit_notch_phase(app, "listening", None);
+        } else {
+            pill::show(app);
+            pill::emit_state(app, PillState::Listening, None);
+            // Live-transcript renders the listening pill in the wide layout
+            // (header label + typing dots + companion chip) before the user
+            // even releases the hotkey. The frontend's ResizeObserver pushes
+            // the new size up via IPC, but the WebView2 → Tauri → DWM chain
+            // on Windows runs slow enough that the OS window stays at the
+            // compact 144 px frame for a visible frame or two and the pill
+            // content clips at both sides. Widen here so the OS window
+            // matches the layout the frontend already wants — idempotent
+            // on macOS where the round-trip was fast enough to win the race.
+            if prefs.live_transcript_enabled {
+                pill::set_wide(app, true);
+            }
         }
         emit_sessions_changed(app, self);
 
@@ -819,7 +851,15 @@ impl SessionManager {
                 }
                 _ => "Microphone unavailable — check System Settings and try again.".into(),
             };
-            pill::emit_state(app, PillState::Error, Some(pill_msg));
+            // Route the mic-failure surface to the notch (not the pill)
+            // for a notch-voice session so a ⌘L mic failure never flashes
+            // the pill. The pill was never shown for this session, so its
+            // hide schedule below is a harmless no-op either way.
+            if notch_command {
+                pill::emit_notch_phase(app, "error", Some(pill_msg));
+            } else {
+                pill::emit_state(app, PillState::Error, Some(pill_msg));
+            }
             self.schedule_pill_hide_unless_taken(app, new_sid, 3000);
             emit_sessions_changed(app, self);
             return BeginOutcome::AudioError(e.to_string());
@@ -1042,6 +1082,17 @@ impl SessionManager {
         // Drop is a no-op once released.
         if let Some(g) = session.busy_guard.lock().take() {
             g.release();
+        }
+
+        // A notch-voice session owns no pill — cancelling it drops the
+        // notch back to idle rather than flashing the pill's Canceled
+        // label. Escape IS armed for notch sessions (begin arms the grab
+        // regardless), so this path is reachable when the user cancels a
+        // ⌘L recording.
+        if session.notch_command {
+            pill::emit_notch_phase(app, "idle", None);
+            self.set_stage(app, id, Stage::Canceled, None, false);
+            return;
         }
 
         // Pill cleanup runs for both foreground (cancel during recording)
@@ -1475,6 +1526,12 @@ async fn run_pipeline(
     wav_result: Result<Option<Vec<u8>>, String>,
 ) {
     let id = session.id;
+    // A notch-voice (⌘L) session never touches the pill — its UI lives in
+    // the notch. Captured once here so every bail-out path below can route
+    // its surface to the notch (`notch:listening`) and skip the pill
+    // hide/show calls that would otherwise dismiss or flash a pill the
+    // user never saw (and that another in-flight session may own).
+    let notch_command = session.notch_command;
 
     // Guard so the cancel grab disarm + map cleanup happens on every
     // exit path. We use an explicit RAII guard rather than scattering
@@ -1533,6 +1590,11 @@ async fn run_pipeline(
 
     if session.is_canceled() {
         log::info!("session {id} canceled before pipeline ran");
+        if notch_command {
+            // A cancelled notch session leaves the list untouched — drop
+            // the notch back to idle rather than flashing a pill.
+            pill::emit_notch_phase(&app, "idle", None);
+        }
         manager.set_stage(&app, id, Stage::Canceled, None, false);
         _guard.finalise();
         return;
@@ -1542,8 +1604,14 @@ async fn run_pipeline(
         Ok(Some(buf)) => buf,
         Ok(None) => {
             log::info!("session {id} too short, skipping STT");
-            // Silent skip: pill goes back to hidden.
-            pill::hide(&app);
+            if notch_command {
+                // Silent skip → notch idle; never hide the pill (which a
+                // concurrent normal session may own).
+                pill::emit_notch_phase(&app, "idle", None);
+            } else {
+                // Silent skip: pill goes back to hidden.
+                pill::hide(&app);
+            }
             manager.sessions.lock().remove(&id);
             emit_sessions_changed(&app, &manager);
             _guard.finalise();
@@ -1552,6 +1620,9 @@ async fn run_pipeline(
         Err(e) => {
             log::error!("audio stop/encode failed: {e}");
             *session.error.lock() = Some(e);
+            if notch_command {
+                pill::emit_notch_phase(&app, "error", Some("Audio error — try again".into()));
+            }
             manager.set_stage(
                 &app,
                 id,
@@ -1566,7 +1637,11 @@ async fn run_pipeline(
 
     if wav.len() < 44 + 16_000 * 2 / 4 {
         log::info!("recording too short ({} bytes), skipping STT", wav.len());
-        pill::hide(&app);
+        if notch_command {
+            pill::emit_notch_phase(&app, "idle", None);
+        } else {
+            pill::hide(&app);
+        }
         manager.sessions.lock().remove(&id);
         emit_sessions_changed(&app, &manager);
         _guard.finalise();
@@ -1575,6 +1650,9 @@ async fn run_pipeline(
 
     if wav_peak_pcm16(&wav) < SILENCE_PEAK_THRESHOLD {
         log::info!("session {id} silent buffer; skipping STT");
+        if notch_command {
+            pill::emit_notch_phase(&app, "error", Some("No audio detected — check your mic.".into()));
+        }
         manager.set_stage(
             &app,
             id,
@@ -1590,6 +1668,9 @@ async fn run_pipeline(
         Some(r) => r.inner().clone(),
         None => {
             log::error!("engine registry missing — onboarding never finished?");
+            if notch_command {
+                pill::emit_notch_phase(&app, "error", Some("Engines not initialised — restart Vox.".into()));
+            }
             manager.set_stage(
                 &app,
                 id,
@@ -1605,6 +1686,13 @@ async fn run_pipeline(
     let stt_engine = match registry.stt(&app, &session.stt_engine_id, &session.stt_model_id) {
         Some(e) => e,
         None => {
+            if notch_command {
+                pill::emit_notch_phase(
+                    &app,
+                    "error",
+                    Some("STT engine not configured — open Settings → Models".into()),
+                );
+            }
             manager.set_stage(
                 &app,
                 id,
@@ -1719,6 +1807,9 @@ async fn run_pipeline(
                 if stream_to_pill() {
                     pill::set_wide(&app, false);
                 }
+                if notch_command {
+                    pill::emit_notch_phase(&app, "idle", None);
+                }
                 manager.set_stage(&app, id, Stage::Canceled, None, false);
                 _guard.finalise();
                 return;
@@ -1730,7 +1821,13 @@ async fn run_pipeline(
                     if stream_to_pill() {
                         pill::set_wide(&app, false);
                     }
-                    pill::hide(&app);
+                    if notch_command {
+                        // Nothing was said — drop the notch back to idle
+                        // rather than hiding a pill that was never shown.
+                        pill::emit_notch_phase(&app, "idle", None);
+                    } else {
+                        pill::hide(&app);
+                    }
                     manager.sessions.lock().remove(&id);
                     emit_sessions_changed(&app, &manager);
                     _guard.finalise();
@@ -1740,6 +1837,13 @@ async fn run_pipeline(
                     log::error!("STT failed (sid={id}): {e}");
                     if stream_to_pill() {
                         pill::set_wide(&app, false);
+                    }
+                    if notch_command {
+                        pill::emit_notch_phase(
+                            &app,
+                            "error",
+                            Some(friendly_stt_error(&e, &session.stt_engine_id)),
+                        );
                     }
                     *session.error.lock() = Some(format!("{e}"));
                     manager.set_stage(
@@ -1768,6 +1872,9 @@ async fn run_pipeline(
         if stream_to_pill() {
             pill::set_wide(&app, false);
         }
+        if notch_command {
+            pill::emit_notch_phase(&app, "idle", None);
+        }
         manager.set_stage(&app, id, Stage::Canceled, None, false);
         _guard.finalise();
         return;
@@ -1777,18 +1884,14 @@ async fn run_pipeline(
     // hotkey (or with the `notch-list` mode active). Interpret the
     // transcript as a list command and apply the resulting ops to the
     // Notch List — NO polish, NO clipboard delivery. Fail-open on any
-    // error (the list stays unchanged and a friendly toast surfaces).
-    if session.notch_command {
-        if stream_to_pill() {
-            pill::set_wide(&app, false);
-        }
+    // error (the list stays unchanged; the outcome surfaces in the notch
+    // via `notch:listening`, and any list change rides `notch-list:changed`).
+    // The pill is never involved: a notch session owns no pill, so
+    // `stream_to_pill()` and `owns_pill` are both false here — there is
+    // nothing to widen or hide. `interpret_and_apply_notch` emits every
+    // notch phase (compiling → idle/error) itself.
+    if notch_command {
         interpret_and_apply_notch(&app, &manager, &session, &transcript, llm_engine).await;
-        // Auto-hide the pill after the notch outcome, mirroring the
-        // normal pipeline's tail. `owns_pill` was captured at the top of
-        // run_pipeline (foreground_id is already None by now).
-        if owns_pill {
-            manager.schedule_pill_hide_unless_taken(&app, id, 2200);
-        }
         _guard.finalise();
         return;
     }
@@ -2154,6 +2257,7 @@ How to understand natural speech:
 - Write each task as a short, clear action and DROP the filler around it (\"my first priority is to\", \"I need to\", \"then\", \"after that\", \"I want to\", \"I should\"). E.g. \"then I really need to call the dentist about my tooth\" → text \"Call the dentist about my tooth\".
 - Keep the speaker's own language and wording. Do NOT translate.
 - Infer priority from their words: clear importance/urgency (\"most important\", \"first priority\", \"top priority\", \"critical\", \"urgent\", \"asap\", \"right away\") → \"high\"; clearly can-wait (\"eventually\", \"someday\", \"at some point\", \"whenever\", \"low priority\", \"no rush\") → \"low\"; otherwise leave priority out.
+- RESOLVE BACK-REFERENCES: when a task points back at something said earlier in the SAME utterance with a vague phrase (\"that application\", \"it\", \"the same one\", \"that bug\", \"there\"), rewrite it to name the concrete thing from the earlier sentence. E.g. \"fix all issues on the alarm application, then apply for Apple review for that application\" → the second task becomes \"Apply for Apple review for the alarm application\". Only substitute when exactly ONE earlier noun is an unambiguous antecedent; if it is unclear or there are several candidates, keep the user's words as spoken. NEVER invent a noun that was not said.
 - They can also change EXISTING items: finishing/checking off → \"complete\"; deleting/scratching/never-mind → \"remove\"; rewording → \"edit\"; making something more/less important → \"reprioritize\"; moving up/down → \"reorder\". Resolve \"the second one\", \"that dentist task\", \"the last one\" against the current list (prefer an index when they name a position).
 - One utterance can mix several edits (add two things AND finish one) — emit an op for each.
 
@@ -2170,7 +2274,11 @@ OUTPUT: {\"ops\":[{\"op\":\"add\",\"text\":\"Finish all new features for the ala
 
 CURRENT LIST: [{\"index\":1,\"text\":\"Email Bob\",\"priority\":\"med\"},{\"index\":2,\"text\":\"Call the dentist\",\"priority\":\"med\"}]
 SAID: \"I finished emailing Bob, and bump the dentist one up to high priority.\"
-OUTPUT: {\"ops\":[{\"op\":\"complete\",\"target\":1},{\"op\":\"reprioritize\",\"target\":\"dentist\",\"priority\":\"high\"}],\"needs_clarification\":null,\"confidence\":0.9}";
+OUTPUT: {\"ops\":[{\"op\":\"complete\",\"target\":1},{\"op\":\"reprioritize\",\"target\":\"dentist\",\"priority\":\"high\"}],\"needs_clarification\":null,\"confidence\":0.9}
+
+CURRENT LIST: []
+SAID: \"Fix all the issues on the alarm application, then apply for Apple review for that application.\"
+OUTPUT: {\"ops\":[{\"op\":\"add\",\"text\":\"Fix all the issues on the alarm application\"},{\"op\":\"add\",\"text\":\"Apply for Apple review for the alarm application\"}],\"needs_clarification\":null,\"confidence\":0.95}";
 
 /// True for a bare spoken "undo" command — "undo", "undo that", "undo
 /// last", "undo last edit/change" — after lowercasing, trimming, and
@@ -2204,18 +2312,25 @@ async fn interpret_and_apply_notch(
 
     // Deterministic "undo" shortcut: a bare "undo" / "undo that" / "undo
     // last [edit]" skips the LLM round-trip entirely and restores the
-    // pre-last-batch snapshot. Cheap, offline, and instant.
+    // pre-last-batch snapshot. Cheap, offline, and instant. The visible
+    // result flows to the notch (idle on success, error otherwise); the
+    // list change itself rides `notch-list:changed`. `set_stage` still
+    // runs so the tray popover's IN PROGRESS snapshot stays consistent,
+    // but it no longer drives the pill (a notch session owns no pill).
     if is_undo_phrase(transcript) {
         match store.undo() {
             Ok(true) => {
                 crate::commands::emit_notch_list_changed(app);
+                pill::emit_notch_phase(app, "idle", None);
                 manager.set_stage(app, id, Stage::Done, Some("Undone".into()), false);
             }
             Ok(false) => {
+                pill::emit_notch_phase(app, "idle", None);
                 manager.set_stage(app, id, Stage::Done, Some("Nothing to undo".into()), true);
             }
             Err(e) => {
                 log::warn!("notch command (sid={id}): undo failed: {e}");
+                pill::emit_notch_phase(app, "error", Some("Undo failed".into()));
                 manager.set_stage(app, id, Stage::Error, Some("Undo failed".into()), false);
             }
         }
@@ -2224,11 +2339,16 @@ async fn interpret_and_apply_notch(
 
     // The notch interpreter needs a real LLM. When polishing is off /
     // the engine is the no-op, there's nothing to interpret with — fail
-    // open with a clear message.
+    // open with a clear message routed to the notch (never the pill).
     let engine = match llm_engine {
         Some(e) if e.id() != "none" => e,
         _ => {
             log::warn!("notch command (sid={id}): no LLM engine available");
+            pill::emit_notch_phase(
+                app,
+                "error",
+                Some("Enable polishing to use voice list editing".into()),
+            );
             manager.set_stage(
                 app,
                 id,
@@ -2240,6 +2360,9 @@ async fn interpret_and_apply_notch(
         }
     };
 
+    // Compiling = the LLM interpret call is about to run. Drives the
+    // notch's "thinking" chrome in place of the pill's Polishing stage.
+    pill::emit_notch_phase(app, "compiling", None);
     manager.set_stage(app, id, Stage::Polishing, None, false);
 
     // Give the model a slim, explicitly-indexed view of the active list
@@ -2274,6 +2397,7 @@ async fn interpret_and_apply_notch(
         Ok(t) => t,
         Err(e) => {
             log::warn!("notch command (sid={id}): LLM failed: {e}");
+            pill::emit_notch_phase(app, "error", Some("Didn't catch that — try again".into()));
             manager.set_stage(
                 app,
                 id,
@@ -2289,6 +2413,7 @@ async fn interpret_and_apply_notch(
         Some(p) => p,
         None => {
             log::warn!("notch command (sid={id}): could not parse LLM JSON: {raw}");
+            pill::emit_notch_phase(app, "error", Some("Didn't catch that — try again".into()));
             manager.set_stage(
                 app,
                 id,
@@ -2310,6 +2435,10 @@ async fn interpret_and_apply_notch(
     match parsed.action() {
         crate::notch_list::NotchAction::Clarify(question) => {
             log::info!("notch command (sid={id}): needs clarification: {question}");
+            // A clarifying question is a soft "couldn't act" outcome — the
+            // notch surfaces it as an error-phase message so the user sees
+            // what to disambiguate. The list is unchanged.
+            pill::emit_notch_phase(app, "error", Some(question.clone()));
             manager.set_stage(app, id, Stage::Done, Some(question), true);
             return;
         }
@@ -2317,6 +2446,11 @@ async fn interpret_and_apply_notch(
             log::info!(
                 "notch command (sid={id}): nothing actionable (confidence {:.2})",
                 parsed.confidence
+            );
+            pill::emit_notch_phase(
+                app,
+                "error",
+                Some("Didn't catch any tasks — try again".into()),
             );
             manager.set_stage(
                 app,
@@ -2344,6 +2478,14 @@ async fn interpret_and_apply_notch(
             // within NOTCH_CONFIRM_WINDOW (handled in the hotkey closure
             // via `try_commit_pending_notch`). Nothing is persisted yet.
             manager.stage_notch_destructive(result.doc);
+            // The notch list itself hasn't changed (nothing persisted), so
+            // we use an error-phase message to carry the confirm prompt to
+            // the notch UI rather than `notch-list:changed`.
+            pill::emit_notch_phase(
+                app,
+                "error",
+                Some("Press your Notch List hotkey again to confirm removal".into()),
+            );
             manager.set_stage(
                 app,
                 id,
@@ -2355,13 +2497,16 @@ async fn interpret_and_apply_notch(
         Ok(result) => {
             // A non-destructive edit invalidates any pending destructive
             // confirmation so a later confirm press can't apply a stale,
-            // now-superseded batch.
+            // now-superseded batch. The actual list change flows through
+            // `notch-list:changed`; the notch returns to idle.
             manager.clear_notch_destructive();
             crate::commands::emit_notch_list_changed(app);
+            pill::emit_notch_phase(app, "idle", None);
             manager.set_stage(app, id, Stage::Done, Some(result.summary()), false);
         }
         Err(e) => {
             log::warn!("notch command (sid={id}): apply failed: {e}");
+            pill::emit_notch_phase(app, "error", Some("Couldn't find that item".into()));
             manager.set_stage(
                 app,
                 id,
@@ -2424,11 +2569,21 @@ fn spawn_max_record_guard(
                     // and the user has no idea the safety guard
                     // fired. The transcript still gets copied (via
                     // the regular end_recording → run_pipeline path).
-                    pill::emit_toast(
-                        &app,
-                        "Stopped after 30 min — paste or discard".into(),
-                        4000,
-                    );
+                    if session.notch_command {
+                        // Notch session: its UI lives in the notch, not
+                        // the pill, so route the cap notice there.
+                        pill::emit_notch_phase(
+                            &app,
+                            "error",
+                            Some("Stopped after 30 min".into()),
+                        );
+                    } else {
+                        pill::emit_toast(
+                            &app,
+                            "Stopped after 30 min — paste or discard".into(),
+                            4000,
+                        );
+                    }
                     manager.end_recording(app);
                 }
             }
@@ -2756,17 +2911,38 @@ fn spawn_audio_level_sampler(
     session: Arc<SessionState>,
 ) {
     let id = session.id;
+    let notch_command = session.notch_command;
     let audio = manager.audio.clone();
     tauri::async_runtime::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(50));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Sliding history of recent RMS samples for the notch waveform.
+        // The notch wants a full fixed-length window per tick (so it can
+        // paint a stable equalizer without buffering), whereas the pill
+        // consumes one scalar per tick. Only allocated/maintained for a
+        // notch session.
+        let mut window: Vec<f32> = if notch_command {
+            vec![0.0; pill::NOTCH_LEVELS_LEN]
+        } else {
+            Vec::new()
+        };
         loop {
             ticker.tick().await;
             if manager.foreground_id() != Some(id) {
                 break;
             }
             let level = audio.current_rms();
-            pill::emit_audio_level(&app, level);
+            if notch_command {
+                // Slide the newest sample into the right edge so the
+                // waveform scrolls left-to-right like a live equalizer.
+                window.rotate_left(1);
+                if let Some(last) = window.last_mut() {
+                    *last = level.clamp(0.0, 1.0);
+                }
+                pill::emit_notch_levels(&app, &window);
+            } else {
+                pill::emit_audio_level(&app, level);
+            }
         }
     });
 }

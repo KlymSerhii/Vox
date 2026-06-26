@@ -751,11 +751,21 @@ fn handle_begin(app: &tauri::AppHandle<tauri::Wry>, manager: &Arc<SessionManager
             // begin already showed the pill, emitted Listening, and
             // armed the cancel grab.
         }
-        BeginOutcome::Saturated { in_flight } => {
+        BeginOutcome::Saturated { in_flight, notch } => {
             log::info!(
                 "ptt: refusing new session — {in_flight}/{MAX_CONCURRENT_SESSIONS} already in flight"
             );
-            session::emit_saturated_toast(app, in_flight, MAX_CONCURRENT_SESSIONS);
+            if notch {
+                // Notch press: its feedback lives in-notch, not in the
+                // pill. emit_saturated_toast would pill::show + toast.
+                crate::pill::emit_notch_phase(
+                    app,
+                    "error",
+                    Some("One at a time — try again in a moment".into()),
+                );
+            } else {
+                session::emit_saturated_toast(app, in_flight, MAX_CONCURRENT_SESSIONS);
+            }
         }
         BeginOutcome::DictationDisabled => {
             // No-op — the master kill-switch is in effect; logged inside begin().
