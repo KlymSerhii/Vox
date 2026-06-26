@@ -285,9 +285,13 @@ button {
 
 /* Compact variant — the whole EMPTY+hover drawer row is this click target, so
  * an empty notch invites a first typed task. Holds the plus, the label, and the
- * tiny voice keys on one short line. */
+ * tiny voice keys on one short line. Block-level `flex` (not `inline-flex`): it
+ * sits directly inside the block drawer, so an inline-level box would gain a
+ * line-box baseline strut and get pushed out the bottom of the EMPTY_HINT_H
+ * (14px) `overflow-hidden` drawer — clipping the label. `width: 100%` already
+ * makes it a full-width row, so block flex is the intended box anyway. */
 .notch-add-cta-compact {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   justify-content: center;
   gap: 5px;
