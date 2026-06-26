@@ -112,13 +112,22 @@ fn refresh_geometry_cache<R: Runtime>(app: &AppHandle<R>) -> bool {
         return false;
     };
     let next = match notch_geometry(&win) {
-        Some(m) => NotchGeometry {
+        // A screen resolved and reported a physical notch.
+        Some(Some(m)) => NotchGeometry {
             has_notch: true,
             width: m.notch_width,
             height: m.top_inset,
         },
-        // Notchless display (or an unreadable screen) → no notch.
-        None => NotchGeometry::default(),
+        // A screen resolved with no physical notch (notchless display).
+        Some(None) => NotchGeometry::default(),
+        // Couldn't resolve a screen at all — typically because this ran off the
+        // macOS main thread (the settings-toggle re-enable path, where
+        // `MainThreadMarker` is unavailable). DON'T clobber a previously-good
+        // cache with a bogus notchless reading: leave it untouched and report
+        // "unchanged" so the follower's next main-thread tick refreshes it for
+        // real. Without this, re-enabling the notch briefly flashed the
+        // notchless layout before the follower corrected it.
+        None => return false,
     };
     let changed = match GEOMETRY.lock() {
         Ok(mut slot) => {
@@ -151,7 +160,11 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         if let Err(e) = window.show() {
             log::warn!("notch: failed to re-show window: {e}");
         }
-        arm(app, &window);
+        // Re-show (disable→enable): the hidden window kept the size the webview
+        // last drove, so PRESERVE it — `fresh = false`. Snapping back to the
+        // placeholder here is what left a re-enabled notch as a tiny nub behind
+        // the camera until a hover re-triggered the frontend's size push.
+        arm(app, &window, false);
         return Ok(());
     }
 
@@ -185,7 +198,8 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         log::warn!("notch: failed to apply macOS panel style: {e}");
     }
 
-    arm(app, &window);
+    // First build: no real size yet, so seed the placeholder — `fresh = true`.
+    arm(app, &window, true);
 
     Ok(())
 }
@@ -194,18 +208,36 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
 /// edge, and the two background pollers under a fresh generation. Run once on
 /// first build AND on every re-show: a `destroy` bumps the generation to stand
 /// the old followers down, so a re-enabled notch needs them spawned anew.
-fn arm<R: Runtime>(app: &AppHandle<R>, window: &tauri::WebviewWindow<R>) {
-    // Populate the geometry cache up front so the very first `reposition`
-    // (and the webview's first `notch_geometry` read) already know the
-    // camera-bump width and band height. On the common launch path this runs
-    // on the main thread and resolves the real notch; on the off-main
-    // settings-toggle path the `NSScreen` read no-ops and the follower
-    // refreshes + re-places within one tick.
+///
+/// `fresh` distinguishes the two callers: `true` on first build (no real size
+/// exists yet, so seed the placeholder and let the webview drive the true size
+/// once it mounts) vs `false` on re-show (the hidden window already carries the
+/// size the webview drove, so PRESERVE it — snapping to the placeholder is what
+/// left a re-enabled notch as a tiny nub behind the camera, because nothing
+/// re-syncs the size when neither the geometry nor the DOM changes).
+fn arm<R: Runtime>(app: &AppHandle<R>, window: &tauri::WebviewWindow<R>, fresh: bool) {
+    // Populate the geometry cache up front so the very first placement (and the
+    // webview's first `notch_geometry` read) already know the camera-bump width
+    // and band height. On the common launch path this runs on the main thread
+    // and resolves the real notch; on the off-main settings-toggle path the
+    // `NSScreen` read genuinely no-ops (leaving any prior cache intact — see
+    // `refresh_geometry_cache`) and the follower refreshes + re-places within
+    // one tick.
     refresh_geometry_cache(app);
 
-    if let Err(e) = reposition(window) {
-        log::warn!("notch reposition failed: {e}");
+    if fresh {
+        if let Err(e) = reposition(window) {
+            log::warn!("notch reposition failed: {e}");
+        }
+    } else if let Some(frame) = target_frame(window) {
+        // Re-show: re-center at the PRESERVED current size (handles a display
+        // that changed while the notch was hidden) instead of the placeholder.
+        reposition_to_frame(window, frame);
     }
+    // If `target_frame` couldn't resolve here (a transient monitor-read miss
+    // during the toggle), we intentionally do nothing and leave the window
+    // where it is — the display follower's next tick re-places it within
+    // `FOLLOW_POLL_MS`.
 
     // The window is persistent, so we re-key the pollers on a fresh
     // generation each time: a later destroy bumps the counter and the old
@@ -282,8 +314,13 @@ pub fn refresh_placement<R: Runtime>(app: &AppHandle<R>) {
     let Some(win) = app.get_webview_window(LABEL) else {
         return;
     };
-    if let Err(e) = reposition(&win) {
-        log::warn!("notch refresh_placement failed: {e}");
+    // Re-center at the PRESERVED current size, not the placeholder — a live
+    // notch already carries the webview-driven size, and `reposition`'s
+    // placeholder snap would shrink it to a tiny nub on the new display (the
+    // same bug the re-show path had) since nothing re-syncs the size when the
+    // geometry is unchanged across the hop.
+    if let Some(frame) = target_frame(&win) {
+        reposition_to_frame(&win, frame);
     }
 }
 
@@ -682,12 +719,20 @@ fn with_target_nsscreen<T>(
 /// struct-return ABI is generated by objc2 rather than hand-rolled
 /// `msg_send!`. These selectors have existed on `NSScreen` since macOS 12;
 /// Vox's deployment target is macOS 14, so no `respondsToSelector:` guard
-/// is needed (they always resolve). A zero `top_inset` (notchless display)
-/// returns `None` so the caller treats the display as notchless. The notch
-/// width is derived from the two ear NSRects' widths (origin/flip are
-/// irrelevant — only the widths matter). (The whole module is already
-/// macOS-gated at `mod notch;`.)
-fn notch_geometry<R: Runtime>(win: &tauri::WebviewWindow<R>) -> Option<NotchMetrics> {
+/// is needed (they always resolve). The notch width is derived from the two ear
+/// NSRects' widths (origin/flip are irrelevant — only the widths matter). (The
+/// whole module is already macOS-gated at `mod notch;`.)
+///
+/// Tri-state return, so the caller can tell "couldn't read" from "notchless":
+/// - `None` — no target screen resolved (e.g. called off the macOS main thread,
+///   where `MainThreadMarker` is unavailable). The caller must leave its cache
+///   as-is rather than assume notchless.
+/// - `Some(None)` — a screen resolved with no physical notch (a zero
+///   `top_inset`): a genuinely notchless display.
+/// - `Some(Some(m))` — a screen resolved with physical-notch metrics `m`.
+fn notch_geometry<R: Runtime>(
+    win: &tauri::WebviewWindow<R>,
+) -> Option<Option<NotchMetrics>> {
     use objc2_foundation::NSRect;
 
     let display = crate::settings::load(win.app_handle()).notch_list_display;
@@ -718,7 +763,9 @@ fn notch_geometry<R: Runtime>(win: &tauri::WebviewWindow<R>) -> Option<NotchMetr
             notch_width,
         })
     })
-    .flatten()
+    // NOT flattened: the outer `Option` is "did a screen resolve?" (the
+    // off-main `None`), the inner is "does it have a notch?". Collapsing them
+    // would make the off-main path indistinguishable from a notchless display.
 }
 
 /// Fullscreen auto-hide probe (Stage 6). Compares the target display's
