@@ -154,10 +154,13 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             .minimizable(false)
             .decorations(false)
             .transparent(true)
-            // OS shadow follows the rounded alpha of the content on macOS
-            // (same rationale as the pill). The notch is macOS-only, so we
-            // always keep the OS shadow on.
-            .shadow(true)
+            // NO OS drop shadow. Against the wallpaper its soft halo reads as a
+            // greyish rim around the otherwise pure-#000 ears, making them look
+            // less black than the physical (true-black) camera bump they're
+            // meant to extend. The panel is solid #000 with rounded corners and
+            // needs no extra depth, so we draw it flat — the ears stay pitch
+            // black with crisp edges.
+            .shadow(false)
             .always_on_top(true)
             .skip_taskbar(true)
             .focused(false)
