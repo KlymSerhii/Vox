@@ -22,7 +22,7 @@
 //! Whole module is `#[cfg(target_os = "macos")]` (gated at the `mod notch;`
 //! declaration in `lib.rs`), so this file is only ever compiled on macOS.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -65,6 +65,13 @@ static NOTCH_HOVER_INSIDE: AtomicBool = AtomicBool::new(false);
 /// `create` per enable), the follower is spawned once at creation and
 /// torn down on destroy.
 static NOTCH_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// PID of the application that was frontmost when the in-notch quick-add input
+/// last took keyboard focus. Captured by `focus_input` BEFORE the notch becomes
+/// key (the notch is a non-activating panel, so the OS still reports the user's
+/// app as frontmost at that instant) and consumed by `release_input_focus` to
+/// hand keyboard control back on Escape. `0` = none captured.
+static PRIOR_FRONTMOST_PID: AtomicI32 = AtomicI32::new(0);
 
 /// Initial window size at creation time. The frontend immediately measures
 /// its content and drives the real size via `set_size` — the idle "nub" is
@@ -284,6 +291,96 @@ pub fn refresh_placement<R: Runtime>(app: &AppHandle<R>) {
     };
     if let Err(e) = reposition(&win) {
         log::warn!("notch refresh_placement failed: {e}");
+    }
+}
+
+/// Make the notch the key window so its in-notch quick-add input receives
+/// keystrokes, first stashing the currently-frontmost app's PID so Escape can
+/// restore it. The notch's `NonactivatingPanel` style mask means becoming key
+/// does NOT activate Vox — the user's app stays the active application; only
+/// the key window moves to the notch. tao leaves the window `focusable`, so
+/// `canBecomeKeyWindow` is true and `makeKeyAndOrderFront:` succeeds.
+///
+/// We deliberately do NOT use Tauri/tao `set_focus()`: tao's implementation
+/// also fires `[NSApp activateIgnoringOtherApps:YES]`, which would
+/// force-foreground the whole Vox process (stealing the menu bar / app
+/// activation) — exactly what the non-activating panel design avoids. Sending
+/// `makeKeyAndOrderFront:` straight to the NSWindow keeps activation untouched.
+pub fn focus_input<R: Runtime>(app: &AppHandle<R>) {
+    // Capture the frontmost app BEFORE we take key focus. Because the notch is
+    // a non-activating panel, taking key focus won't change the active app, so
+    // this snapshot is the app keystrokes should return to on dismiss.
+    let pid = frontmost_app_pid().unwrap_or(0);
+    PRIOR_FRONTMOST_PID.store(pid, Ordering::SeqCst);
+    // `makeKeyAndOrderFront:` isn't thread-safe — hop to the main thread.
+    let app_main = app.clone();
+    let _ = app.run_on_main_thread(move || make_notch_key(&app_main));
+}
+
+/// Send `makeKeyAndOrderFront:` directly to the notch's NSWindow (MAIN THREAD)
+/// so it becomes the key window WITHOUT activating Vox. Mirrors the raw NSWindow
+/// access in `apply_macos_panel_style`. No window / null handle → no-op.
+fn make_notch_key<R: Runtime>(app: &AppHandle<R>) {
+    use objc2_app_kit::NSWindow;
+    let Some(win) = app.get_webview_window(LABEL) else {
+        return;
+    };
+    let raw = match win.ns_window() {
+        Ok(p) if !p.is_null() => p,
+        _ => return,
+    };
+    let ns_window: &NSWindow = unsafe { &*(raw as *const NSWindow) };
+    // `makeKeyAndOrderFront:` is a safe objc2 method — only the pointer deref
+    // above needs `unsafe`. Becoming key here does NOT activate Vox: the panel's
+    // NonactivatingPanel style mask keeps the user's app the active app.
+    ns_window.makeKeyAndOrderFront(None);
+}
+
+/// Hand keyboard focus back to the app that was frontmost when the quick-add
+/// input opened (Escape path). Best-effort: a zero/stale PID or a failed lookup
+/// just leaves focus where it is. The AppKit activation runs on the main
+/// thread. Clears the stored PID either way so a later open re-captures fresh.
+pub fn release_input_focus<R: Runtime>(app: &AppHandle<R>) {
+    let pid = PRIOR_FRONTMOST_PID.swap(0, Ordering::SeqCst);
+    if pid <= 0 {
+        return;
+    }
+    let _ = app.run_on_main_thread(move || reactivate_app_by_pid(pid));
+}
+
+/// PID of the frontmost application via `NSWorkspace`. `None` on failure.
+/// Mirrors `frontmost::frontmost_id_and_pid`'s NSWorkspace read (safe off the
+/// main thread). macOS-only (the whole module is macOS-gated).
+fn frontmost_app_pid() -> Option<i32> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::NSWorkspace;
+    unsafe {
+        let workspace = NSWorkspace::sharedWorkspace();
+        let app = workspace.frontmostApplication()?;
+        let app_obj: &AnyObject = &app;
+        let pid: i32 = msg_send![app_obj, processIdentifier];
+        (pid > 0).then_some(pid)
+    }
+}
+
+/// Re-activate the app with `pid` so its focused window becomes key again,
+/// returning keyboard control to it. MUST run on the main thread (AppKit
+/// activation). Best-effort: a missing process just no-ops.
+fn reactivate_app_by_pid(pid: i32) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    unsafe {
+        let cls = class!(NSRunningApplication);
+        let running: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
+        if running.is_null() {
+            return;
+        }
+        // `activateWithOptions:` with no flags re-keys the app's focused window
+        // (it was already the active app, since the notch panel is
+        // non-activating — only the key window moved). Deprecated in macOS 14
+        // but still functional, and the simplest "give the keyboard back" call.
+        let _: bool = msg_send![running, activateWithOptions: 0u64];
     }
 }
 

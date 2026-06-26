@@ -218,6 +218,115 @@ button {
   background: rgba(255, 255, 255, 0.4);
 }
 
+/* Click-to-add CTA in the list footer ("＋ Add a task"). A quiet button on the
+ * black panel that brightens on hover, signalling the notch can be typed into
+ * (not just dictated). Paired with the voice keycaps to its right. */
+.notch-add-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 7px;
+  border-radius: 7px;
+  color: var(--color-ink-faint);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+.notch-add-cta:hover {
+  color: var(--color-ink);
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Compact variant — the whole EMPTY+hover drawer row is this click target, so
+ * an empty notch invites a first typed task. Holds the plus, the label, and the
+ * tiny voice keys on one short line. */
+.notch-add-cta-compact {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  width: 100%;
+  padding: 0 6px;
+  color: var(--color-ink-mute);
+  font-weight: 600;
+  transition: color 120ms ease;
+}
+.notch-add-cta-compact:hover {
+  color: var(--color-ink);
+}
+
+/* Quick-add text input. Transparent field on the black panel — no boxy border,
+ * just a subtle underline-less inset — so it reads as part of the notch rather
+ * than a transplanted form control. */
+.notch-add-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 24px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--color-ink);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 24px;
+  outline: none;
+  transition: background 120ms ease;
+}
+.notch-add-input::placeholder {
+  color: var(--color-ink-faint);
+}
+.notch-add-input:focus {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+/* Priority picker dots in the composer. Each dot's hue comes from a `--dot`
+ * custom property set inline (high=red, med=amber, low=grey). Unselected dots
+ * are a faint hollow ring; the active one fills with its hue. */
+.notch-prio-dot {
+  width: 11px;
+  height: 11px;
+  border-radius: 9999px;
+  border: 1.5px solid rgba(255, 255, 255, 0.28);
+  background: transparent;
+  transition:
+    background 120ms ease,
+    border-color 120ms ease,
+    transform 120ms ease;
+}
+.notch-prio-dot:hover {
+  border-color: var(--dot, rgba(255, 255, 255, 0.5));
+}
+.notch-prio-dot.is-active {
+  border-color: var(--dot, #fff);
+  background: var(--dot, #fff);
+  transform: scale(1.05);
+}
+
+/* Thin, subtle scrollbar for the bounded task viewport. Overlay-style (zero
+ * layout width on macOS WebKit) so adding it never shifts the list; the thumb
+ * only shows a faint track when there's overflow to scroll. */
+.notch-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) transparent;
+}
+.notch-scroll::-webkit-scrollbar {
+  width: 4px;
+}
+.notch-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.notch-scroll::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 9999px;
+}
+.notch-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.36);
+}
+
 /* Reduced-motion safety net. Notch.tsx already gates its transitions in JS;
  * this covers any future CSS animation that slips in. */
 @media (prefers-reduced-motion: reduce) {

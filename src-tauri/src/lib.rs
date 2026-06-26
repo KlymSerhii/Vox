@@ -138,6 +138,8 @@ pub fn run() {
             commands::notch_geometry,
             commands::notch_list_mark_done,
             commands::notch_list_add,
+            commands::notch_focus_input,
+            commands::notch_release_input_focus,
             commands::notch_list_edit,
             commands::notch_list_remove,
             commands::notch_list_reorder,
