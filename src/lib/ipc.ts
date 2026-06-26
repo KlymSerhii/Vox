@@ -263,6 +263,42 @@ export async function onNotchGeometry(
   return listen<NotchGeometry>("notch:geometry", (e) => cb(e.payload));
 }
 
+/// Cursor-over-notch hit-testing, pushed from Rust. The notch webview
+/// can't observe the cursor while another app is focused (DOM mouse
+/// events don't fire across the window boundary), so Rust hit-tests the
+/// physical notch rect against the global cursor and emits `true` when
+/// the cursor enters the notch area, `false` when it leaves. This is the
+/// authoritative driver for expand-on-hover (the DOM `onMouseEnter` /
+/// `onMouseLeave` handlers remain only as a secondary trigger).
+export async function onNotchHover(
+  cb: (over: boolean) => void,
+): Promise<UnlistenFn> {
+  return listen<boolean>("notch:hover", (e) => cb(e.payload));
+}
+
+/// Voice-capture phase for the in-notch ⌘L flow. `listening` = mic open,
+/// show the waveform ribbon; `compiling` = interpreting the utterance,
+/// show a pulsing indicator; `error` = surface `message` briefly; `idle`
+/// = fade back to the resting collapsed/empty drawer.
+export interface NotchListeningState {
+  phase: "listening" | "compiling" | "idle" | "error";
+  message?: string;
+}
+
+export async function onNotchListening(
+  cb: (s: NotchListeningState) => void,
+): Promise<UnlistenFn> {
+  return listen<NotchListeningState>("notch:listening", (e) => cb(e.payload));
+}
+
+/// Live audio levels for the in-notch waveform. Length-32 array, each
+/// value 0..1 — the same shape/cadence as the pill's `pill:levels`.
+export async function onNotchLevels(
+  cb: (levels: number[]) => void,
+): Promise<UnlistenFn> {
+  return listen<number[]>("notch:levels", (e) => cb(e.payload));
+}
+
 export interface UpdateCheckResult {
   status: "available" | "up-to-date" | "error" | "unconfigured";
   current_version?: string;

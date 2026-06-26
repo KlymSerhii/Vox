@@ -1512,13 +1512,16 @@ pub fn notch_list_remove<R: Runtime>(
     Ok(())
 }
 
+/// Reorder the list. Callable from the notch window itself (so drag-reorder
+/// works there) as well as the settings/onboarding windows — mirroring
+/// `notch_list_mark_done`, which takes no `webview` and is deliberately NOT
+/// gated by `assert_secret_window`. Reorder is the ONLY other mutator opened
+/// up this way; add/edit/remove/etc. stay settings-window-only.
 #[tauri::command]
 pub fn notch_list_reorder<R: Runtime>(
     app: AppHandle<R>,
-    webview: Webview<R>,
     ordered_ids: Vec<String>,
 ) -> Result<(), String> {
-    assert_secret_window(&webview)?;
     notch_list::store(&app)
         .reorder(&ordered_ids)
         .map_err(|e| e.to_string())?;
@@ -1526,14 +1529,18 @@ pub fn notch_list_reorder<R: Runtime>(
     Ok(())
 }
 
+/// Reassign an item's priority. Callable from the notch window itself (so
+/// drag-reorder across priority bands works there — the list sorts
+/// priority-first, so a cross-band drag would otherwise snap back) as well as
+/// the settings/onboarding windows — mirroring `notch_list_mark_done` and
+/// `notch_list_reorder`, which take no `webview` and are deliberately NOT gated
+/// by `assert_secret_window`. add/edit/remove/etc. stay settings-window-only.
 #[tauri::command]
 pub fn notch_list_set_priority<R: Runtime>(
     app: AppHandle<R>,
-    webview: Webview<R>,
     id: String,
     priority: Priority,
 ) -> Result<(), String> {
-    assert_secret_window(&webview)?;
     notch_list::store(&app)
         .reprioritize(&id, priority)
         .map_err(|e| e.to_string())?;

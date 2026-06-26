@@ -629,12 +629,20 @@ fn spawn_async_killer(mut h: ServerHandle, label: &'static str) {
 }
 
 /// Conditionally pre-warm the inference server in the background so the
-/// first polish doesn't pay the ~5-10 s cold spawn + GGUF-load cost on
-/// top of the actual roundtrip. No-op when:
-/// - the user hasn't finished onboarding,
-/// - polishing is disabled,
-/// - the LLM engine isn't `gemma-local`, or
-/// - the `llama-server` binary isn't installed yet.
+/// first Gemma polish (or first ⌘L notch command on a Gemma user) doesn't
+/// pay the ~5-10 s cold spawn + GGUF-load cost on top of the actual
+/// roundtrip.
+///
+/// Trigger: the user's polish engine is `gemma-local`. Warming for that
+/// case also covers the notch interpreter, which runs through whatever
+/// `llm_engine` the user selected — so a Gemma-polish user's first ⌘L is
+/// hot too, on the same already-warm server. (Apple-Intelligence users run
+/// their notch through `apple-fm` in-process, which never spawns
+/// llama-server, so there is nothing to pre-warm for them here.)
+///
+/// No-op when the user hasn't finished onboarding, the `llama-server`
+/// binary isn't installed, the trigger doesn't apply, or the resolved
+/// Gemma model isn't on disk yet.
 ///
 /// Idempotent: a concurrent `ensure_running` call serialises against
 /// the spawn lock so a fast user dictating during the warmup window
@@ -642,9 +650,12 @@ fn spawn_async_killer(mut h: ServerHandle, label: &'static str) {
 /// "binary not installed yet" is a normal pre-onboarding state.
 pub fn prewarm_in_background<R: Runtime>(app: &AppHandle<R>) {
     let s = settings::load(app);
+
+    // Trigger: Gemma is the polish engine.
+    let polish_wants_gemma = s.polishing_enabled && s.llm_engine == "gemma-local";
+
     if !(s.onboarded
-        && s.polishing_enabled
-        && s.llm_engine == "gemma-local"
+        && polish_wants_gemma
         && !s.llm_model_id.is_empty()
         && inference_server::is_installed(app))
     {

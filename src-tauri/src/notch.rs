@@ -1,20 +1,28 @@
 //! Notch List window (macOS-only). A transparent, decoration-less,
-//! always-on-top **black** panel that HANGS just below the physical camera
-//! notch (or the top edge on a notchless display) on the chosen display.
-//! When idle it shrinks to a slim "nub" no wider than the camera bump; it
-//! grows downward into clear screen space as it shows tasks. The black
-//! surface lets it read as an extension of the physical notch.
+//! always-on-top **black** panel that TOP-anchors to the display's top edge
+//! so its "ear" row flanks the physical camera cutout, with the task drawer
+//! hanging below the bump (or just under the top edge on a notchless
+//! display). When idle it shrinks to a slim "nub" no wider than the camera
+//! bump; it grows downward into clear screen space as it shows tasks. The
+//! black surface lets it read as an extension of the physical notch.
 //!
 //! The window builder + macOS panel style are lifted from `pill.rs` (the
 //! proven pattern). KEY DIFFERENCE from the pill: we do NOT call
 //! `set_ignore_cursor_events(true)` — the notch needs hover + click (the
-//! checkbox) to work. Placement is TOP-anchored *below* the notch band, not
+//! checkbox) to work. Placement is TOP-anchored at the display top edge, not
 //! the pill's bottom-anchored math.
+//!
+//! Hover is driven by a passive Rust cursor poll (`spawn_hover_poll`) that
+//! emits a `notch:hover` bool on enter/exit of the window's on-screen rect.
+//! AppKit only delivers `mouseEntered`/`mouseExited` to a non-activating
+//! panel once it has been clicked, so CSS `:hover` alone makes the reveal
+//! "do nothing unless the notch is focused" — the poll fixes that without an
+//! event tap (no Accessibility / TCC) and without stealing keyboard focus.
 //!
 //! Whole module is `#[cfg(target_os = "macos")]` (gated at the `mod notch;`
 //! declaration in `lib.rs`), so this file is only ever compiled on macOS.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -29,6 +37,26 @@ pub const LABEL: &str = "notch";
 /// action, so a ~300 ms tick keeps the notch on the right screen without
 /// the cost of a tight loop. Mirrors `pill::FOLLOW_POLL_MS`.
 const FOLLOW_POLL_MS: u64 = 300;
+
+/// Poll cadence for the hover detector. Hovering the notch must feel
+/// instant, so this is far tighter than the display follower — but each
+/// tick is cheap (one `NSEvent::mouseLocation()` read + arithmetic) and we
+/// only emit on an enter/exit EDGE, so the steady state is near-free. ~70 ms
+/// is responsive without the cost of a tight loop. The hot loop also
+/// early-outs before the rect math when the cursor is nowhere near the top
+/// band (see `hover_tick`).
+const HOVER_POLL_MS: u64 = 70;
+
+/// Vertical slack (logical pt) below the notch window's bottom edge inside
+/// which the cursor still counts as "near the top band" for the cheap
+/// early-out in `hover_tick`. Keeps the early-out from flickering right at
+/// the drawer's lower edge.
+const HOVER_NEAR_BAND_SLACK: f64 = 24.0;
+
+/// Last emitted hover state (true = cursor inside the notch rect). The hover
+/// poll only emits `notch:hover` on a transition, so this stores the edge.
+/// Reset to `false` on create/destroy so a fresh window starts collapsed.
+static NOTCH_HOVER_INSIDE: AtomicBool = AtomicBool::new(false);
 
 /// Bumped every time the notch window is created or destroyed. The
 /// display follower captures the value at spawn time and stands down the
@@ -157,16 +185,23 @@ pub fn create<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // follower exactly once here, keyed on a fresh generation. A later
     // destroy bumps the generation and the follower stands down.
     let generation = NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    // A fresh window starts collapsed (not hovered) — seed the edge state so
+    // the first real enter emits a `true` transition.
+    NOTCH_HOVER_INSIDE.store(false, Ordering::SeqCst);
     spawn_display_follower(app.clone(), generation);
+    spawn_hover_poll(app.clone(), generation);
 
     Ok(())
 }
 
 /// Destroy the notch window (used when the user turns the feature off).
 pub fn destroy<R: Runtime>(app: &AppHandle<R>) {
-    // Bump the generation FIRST so the running follower stands down on its
-    // next tick instead of touching a window we're about to close.
+    // Bump the generation FIRST so the running follower + hover poll stand
+    // down on their next tick instead of touching a window we're about to
+    // close.
     NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst);
+    // Clear the hover edge so a re-created window starts collapsed.
+    NOTCH_HOVER_INSIDE.store(false, Ordering::SeqCst);
     if let Some(win) = app.get_webview_window(LABEL) {
         if let Err(e) = win.close() {
             log::warn!("notch: failed to close window: {e}");
@@ -315,6 +350,124 @@ fn follower_tick<R: Runtime>(
     });
 }
 
+/// Passive hover detector. Polls the global cursor position on a tight
+/// cadence and emits `notch:hover` (a bare bool) whenever the cursor ENTERS
+/// or LEAVES the notch window's on-screen rect. This is the IPC the frontend
+/// uses to expand/collapse the panel, and it fixes "hover does nothing unless
+/// the notch is focused": a non-activating panel only gets
+/// `mouseEntered`/`mouseExited` after it's been clicked, so CSS `:hover`
+/// alone is dead until first focus.
+///
+/// FOCUS-SAFE / NO TCC: this reads `NSEvent::mouseLocation()` — a passive
+/// global cursor read, NOT an event tap — so it needs no Accessibility grant
+/// and never steals keyboard focus; the foreground app stays key. Same
+/// passive read `with_target_nsscreen` already uses for the `"active"`
+/// display hit-test.
+///
+/// Keyed on `NOTCH_GENERATION` (captured as `generation`) exactly like the
+/// display follower: a create/destroy bumps the counter and this task stands
+/// down on its next tick.
+fn spawn_hover_poll<R: Runtime>(app: AppHandle<R>, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(HOVER_POLL_MS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            // A create()/destroy() since spawn bumped the generation — stand
+            // down so we never touch a window we no longer own.
+            if NOTCH_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if app.get_webview_window(LABEL).is_none() {
+                return;
+            }
+            // The cursor + screen reads are main-thread-only (NSEvent /
+            // NSScreen via MainThreadMarker), so hop on. The closure is
+            // cheap: one cursor read, one rect compute, an edge compare, and
+            // an emit only on a transition.
+            let app_main = app.clone();
+            let _ = app.run_on_main_thread(move || hover_tick(&app_main));
+        }
+    });
+}
+
+/// One hover iteration (MAIN THREAD — touches `NSEvent`/`NSScreen`). Computes
+/// the notch window's current on-screen rect, hit-tests the global cursor
+/// against it, and emits `notch:hover` only on an enter/exit EDGE.
+///
+/// The rect is derived from the SAME `target_frame()` + `fuse_geometry()`
+/// math the placement path uses (reading the live window size so the hit rect
+/// tracks the hover-expanded drawer, not just the idle nub) rather than
+/// reading the window's reported frame — this keeps the hit rect in lockstep
+/// with where we actually placed the window, including the new top-anchor.
+///
+/// COORDINATES: `NSEvent::mouseLocation()` is in AppKit's bottom-left origin
+/// (relative to the primary screen); `fuse_geometry` returns Tauri's
+/// top-left logical frame. We flip the cursor's Y into top-left space the
+/// same way `pill::macos_active_screen_frame` does
+/// (`top_left_y = primary_height - appkit_y`) before comparing.
+fn hover_tick<R: Runtime>(app: &AppHandle<R>) {
+    use objc2_app_kit::{NSEvent, NSScreen};
+    use objc2_foundation::MainThreadMarker;
+
+    let Some(win) = app.get_webview_window(LABEL) else {
+        return;
+    };
+
+    // Skip while hidden (e.g. fullscreen auto-hide): never hit-test/emit on a
+    // window the user can't see. If we were "inside" when it hid, drop the flag
+    // (and emit a final `false`) so a later re-show + hover re-triggers cleanly.
+    if let Ok(false) = win.is_visible() {
+        if NOTCH_HOVER_INSIDE.swap(false, Ordering::SeqCst) {
+            let _ = app.emit_to(LABEL, "notch:hover", false);
+        }
+        return;
+    }
+
+    // Resolve the cursor (AppKit bottom-left) + the primary screen height for
+    // the Y flip. Bail (no state change) if we can't read a screen.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(primary) = NSScreen::screens(mtm).firstObject() else {
+        return;
+    };
+    let primary_height = primary.frame().size.height;
+    let cursor = NSEvent::mouseLocation();
+    // Flip the cursor into Tauri's top-left logical space.
+    let cx = cursor.x;
+    let cy = primary_height - cursor.y;
+
+    // The notch's current on-screen rect, derived from the same placement
+    // math (top-anchored) using the live window size so the rect covers the
+    // ears AND the expanded drawer.
+    let Some((mx, my, mw, _mh)) = target_frame(&win) else {
+        return;
+    };
+    let scale = win.scale_factor().unwrap_or(1.0);
+    let cur = win.inner_size().ok();
+    let cur_w = cur.as_ref().map(|s| s.width as f64 / scale).unwrap_or(WIDTH);
+    let cur_h = cur.map(|s| s.height as f64 / scale).unwrap_or(HEIGHT);
+    let (x, y, w, h) = fuse_geometry(mx, my, mw, cur_w, cur_h);
+
+    // Cheap early-out: if the cursor sits well below the window's bottom edge
+    // (and we're not currently inside), it can't be a hover — skip the full
+    // compare. The slack keeps this from flickering right at the drawer edge.
+    let was_inside = NOTCH_HOVER_INSIDE.load(Ordering::SeqCst);
+    if !was_inside && cy > y + h + HOVER_NEAR_BAND_SLACK {
+        return;
+    }
+
+    let inside = cx >= x && cx < x + w && cy >= y && cy < y + h;
+    if inside == was_inside {
+        return; // No edge — stay quiet.
+    }
+    NOTCH_HOVER_INSIDE.store(inside, Ordering::SeqCst);
+    if let Err(e) = app.emit_to(LABEL, "notch:hover", inside) {
+        log::warn!("notch: failed to emit notch:hover: {e}");
+    }
+}
+
 /// Re-center the notch onto `frame` (logical x, y, w, h) while preserving
 /// its current size — TOP-anchored, mirroring `apply_size`. Used by the
 /// display follower so a hover-expanded panel keeps its dimensions when
@@ -358,17 +511,24 @@ fn apply_size<R: Runtime>(
 /// screen frame origin/width (`mx`, `my`, `mw`) and the desired content
 /// size (`req_w`, `req_h`).
 ///
-/// PLACEMENT: the panel ALWAYS hangs just BELOW the physical notch so the
-/// camera bump can never occlude it — the prior v1.1 "kiss the top, occupy
-/// the menu-bar band" placement put the collapsed strip directly behind the
-/// bump (the centered strip got split in two by the camera). On a notched
-/// display the top edge sits at `my + notch_height + TOP_MARGIN` (bottom of
-/// the notch band + a hair of gap); on a notchless display it falls back to
-/// `my + TOP_MARGIN` (just under the menu bar / top edge). Either way the
-/// panel is centered on the notch (screen center) and its size is exactly
-/// what the frontend requested — the idle "nub" is sized to the camera-bump
-/// width by the webview, and taller list panels grow downward into clear
-/// screen space.
+/// PLACEMENT: on a notched display the window TOP-anchors to the very top
+/// edge of the display (`y = my`) so it spans the menu-bar/notch band. The
+/// frontend lays out the "Vox"/"Notch" ear blocks beside the camera at the
+/// top and hangs the task drawer below the bump — so the window must START at
+/// the top edge and be tall enough (height is frontend-driven via
+/// `notchResize`/`set_size`) for the drawer to clear the bump. The anchor
+/// moved up from the prior "hang just below the band" math because the ears
+/// have to FLANK the physical cutout, which is only possible if the window
+/// reaches the top edge. TRADE-OFF: in the ear regions the window now overlaps
+/// the immediate menu-bar band beside the camera — legitimate, since the
+/// window is `NSStatusWindowLevel` + always-on-top and draws there by design.
+/// On a notchless display there's no bump to flank, so we keep the slight
+/// `TOP_MARGIN` offset below the top edge (`y = my + TOP_MARGIN`).
+///
+/// Either way the panel is centered on the cutout (screen center) and its size
+/// is exactly what the frontend requested — the idle "nub" is sized to the
+/// camera-bump width by the webview, and taller list panels grow downward
+/// into clear screen space.
 ///
 /// Reads the cached `GEOMETRY` (kept fresh on the main thread by
 /// `refresh_geometry_cache`) rather than calling `NSScreen` live, so this
@@ -376,10 +536,11 @@ fn apply_size<R: Runtime>(
 fn fuse_geometry(mx: f64, my: f64, mw: f64, req_w: f64, req_h: f64) -> (f64, f64, f64, f64) {
     let geo = geometry_snapshot();
     let y = if geo.has_notch && geo.height > 0.0 {
-        // Drop below the physical notch band.
-        my + geo.height + TOP_MARGIN
+        // Top-anchor to the display's top edge so the ear row sits in the
+        // notch band beside the camera and the drawer hangs below the bump.
+        my
     } else {
-        // Notchless display: just under the top edge / menu bar.
+        // Notchless display: no bump to flank, so sit just under the top edge.
         my + TOP_MARGIN
     };
     let x = mx + (mw - req_w) / 2.0;
@@ -608,11 +769,13 @@ fn apply_macos_panel_style<R: Runtime>(win: &tauri::WebviewWindow<R>) -> anyhow:
             .setStyleMask(NSWindowStyleMask::Borderless | NSWindowStyleMask::NonactivatingPanel);
         let raw_obj: &AnyObject = &*(ns_window as *const NSWindow as *const AnyObject);
         let _: () = msg_send![raw_obj, setCanHide: false];
-        // Non-activating panels don't receive mouseMoved / mouseEntered /
-        // mouseExited until they opt into moved events — without this the
-        // CSS :hover / onMouseEnter reveal only fires after the user first
-        // clicks the notch (which momentarily routes events to it). Enabling
-        // moved-event delivery makes hover work while another app is focused.
+        // Cross-focus hover is driven by the Rust `notch:hover` poll
+        // (`hover_tick`), NOT by AppKit moved events: a non-activating panel
+        // won't deliver mouseMoved / mouseEntered / mouseExited to the WebView
+        // unless it's the key window, so DOM `:hover` alone wouldn't fire while
+        // another app is focused. This call keeps CSS `:hover` / onMouseEnter
+        // working as a retained SECONDARY path for when the notch IS key (e.g.
+        // just after a click); harmless otherwise, so we keep it.
         let _: () = msg_send![raw_obj, setAcceptsMouseMovedEvents: true];
     }
     Ok(())
@@ -627,23 +790,25 @@ mod tests {
     /// test functions on parallel threads, and this is the only test that
     /// touches the cache.
     #[test]
-    fn fuse_geometry_always_hangs_below_the_notch() {
-        // Notched display: the panel drops BELOW the notch band (+ gap) so
-        // the camera bump can never occlude it, and stays centered on the
-        // notch (= screen center) at exactly the requested size.
+    fn fuse_geometry_top_anchors_on_notched_display() {
+        // Notched display: the window TOP-anchors to the display's top edge
+        // (y == my) so the ear row flanks the camera cutout, and stays
+        // centered on the notch (= screen center) at exactly the requested
+        // size. The drawer hangs below the bump via the frontend-driven
+        // height.
         *GEOMETRY.lock().unwrap() = NotchGeometry {
             has_notch: true,
             width: 200.0,
             height: 37.0,
         };
         let (x, y, w, h) = fuse_geometry(100.0, 50.0, 1512.0, 200.0, 14.0);
-        assert_eq!(y, 50.0 + 37.0 + TOP_MARGIN, "below the notch band + gap");
+        assert_eq!(y, 50.0, "top-anchored to the display top edge (my)");
         assert_eq!(x, 100.0 + (1512.0 - 200.0) / 2.0, "centered on the notch");
         assert_eq!(w, 200.0, "width is honored verbatim");
         assert_eq!(h, 14.0, "height is honored verbatim");
 
-        // Notchless display: just under the top edge, and the height floor
-        // guards a too-small request.
+        // Notchless display: just under the top edge (no bump to flank), and
+        // the height floor guards a too-small request.
         *GEOMETRY.lock().unwrap() = NotchGeometry::default();
         let (_x, y2, _w, h2) = fuse_geometry(0.0, 0.0, 1440.0, 168.0, 4.0);
         assert_eq!(y2, TOP_MARGIN, "notchless: just below the top edge");
