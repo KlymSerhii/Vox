@@ -1,5 +1,4 @@
 import {
-  createEffect,
   createMemo,
   createSignal,
   For,
@@ -38,15 +37,20 @@ const DEFAULT_HOVER_DELAY_MS = 120;
 const ROW_H = 28;
 /// Vertical padding inside the expanded list (top + bottom).
 const LIST_PAD_Y = 6;
-/// Collapsed single-line drawer height (the #1-task bar). Kept tight (a 12px
-/// line at leading-16 exactly fills it, no extra padding) so the idle nub
-/// hangs as little as possible below the camera bump — at the old 30px it
-/// overlapped app chrome right under the menu bar (e.g. browser tabs).
+/// Collapsed single-line drawer height (the #1-task bar). Kept at 16px (a slim
+/// glanceable strip the user liked) so the idle slab hangs as little as
+/// possible below the camera bump — at the old 30px it overlapped app chrome
+/// right under the menu bar (e.g. browser tabs). The idle task sits at the
+/// small (8px) word size, dimmed and centered, within this band.
 const COLLAPSED_H = 16;
-/// Add-task hint row height — the keycap affordance revealed on hover. It's
-/// the only drawer content when the list is empty, and a faint footer beneath
-/// the rows when it isn't.
+/// Add-task hint row height — the keycap affordance. Full size as the faint
+/// FOOTER beneath a non-empty hovered list.
 const HINT_H = 30;
+/// Compact add-task hint height for the EMPTY + hovered state, where the
+/// keycap affordance is the sole drawer content. Under half the old 30px (and
+/// a hair under the task bar) so hovering an empty notch no longer hangs over
+/// app chrome, while still teaching ⌘⌥L via the smaller `.notch-kbd-sm` chips.
+const EMPTY_HINT_H = 14;
 
 /* ---------------------------------------------------------------------------
  * Ear-row + cutout geometry — logical px. The window is TOP-ANCHORED at the
@@ -54,11 +58,15 @@ const HINT_H = 30;
  * vertical stack:
  *
  *   [ear-row]   <- always visible: [Vox ear][black spacer][Notch ear]
- *   [drawer]    <- below the cutout: 0-height when idle/empty, grows on hover
+ *   [drawer]    <- below the cutout: 0-height when idle+empty; otherwise a
+ *                  connected slab (collapsed task / hint / voice / list)
  *
- * The ear row is width-pinned (earW*2 + cutoutWidth) and centered so the
- * black spacer always sits under the physical camera bump. Only the drawer
- * changes width.
+ * The ear row is width-pinned (earW*2 + cutoutWidth) and centered so the black
+ * spacer always sits under the physical camera bump. Both the ears and the
+ * drawer are hover-responsive: idle they're a slim nub; on hover the ears snap
+ * to full size and the drawer fans out to the task list. The connected slab
+ * (every non-`list` drawer state) matches the ear-row width so it reads as one
+ * black panel rather than a narrow tab under the bump.
  * ------------------------------------------------------------------------ */
 
 /// Fallback central-cutout width when the real camera-bump width is unknown
@@ -74,11 +82,21 @@ const CUTOUT_H_FALLBACK = 34;
 const CUTOUT_H_MIN = 24;
 const CUTOUT_H_MAX = 48;
 
-/// Ear width clamp + bounds. Sized to seat the longer "Notch" label with
-/// comfortable horizontal padding at the word size below, tied to the cutout
-/// so the assembly stays proportional across notch geometries.
+/// Ear width clamp — HOVER (full) size. Seats the longer "Notch" label with
+/// comfortable padding at the hovered 11px word size, tied to the cutout so
+/// the assembly stays proportional across notch geometries.
 const EAR_W_MIN = 46;
 const EAR_W_MAX = 56;
+/// Ear width clamp — IDLE (resting) size. The ears shrink to a slim nub when
+/// the notch isn't hovered (smaller word size), then snap back to the full
+/// size above on hover. Sized to seat "Notch" at the idle 8px word size.
+const EAR_W_IDLE_MIN = 28;
+const EAR_W_IDLE_MAX = 33;
+/// Word size in the ears: slim when idle, full (the original) on hover. Snaps
+/// with the ear width (no size transition) so the wrapper still measures once
+/// per hover edge — the smooth hover feedback is the opacity fade below.
+const EAR_FONT_IDLE = 8;
+const EAR_FONT_HOVER = 11;
 
 /// Expanded-drawer width clamp (relative to the cutout width).
 const EXPANDED_W_MIN = 280;
@@ -100,10 +118,21 @@ const WAVE_COLOR = "rgba(207, 216, 224, 0.7)";
 const EASE_IN = "cubic-bezier(0.32, 0.72, 0, 1)";
 /// Overshoot ease for the drag-settle.
 const EASE_SETTLE = "cubic-bezier(0.34, 1.4, 0.64, 1)";
-/// How long the reserved drawer height is held after collapse so the exit
-/// animation can play before the single resize-down. Slightly over the
-/// longest exit transition.
-const RETRACT_MS = 210;
+/// Duration for the fluid size animations — the hover grow/shrink of the ears
+/// and the drawer box. The window CHASES this (a rAF-coalesced ResizeObserver
+/// drives `notch_resize` per frame) so the OS panel glides instead of snapping.
+const NOTCH_ANIM_MS = 260;
+
+/// Task-completion choreography (checkbox → strike-through → undo → remove).
+/// `STRIKE_MS`: how long the line takes to draw across the text. `UNDO_MS`: the
+/// window the Undo button stays clickable (unless the user leaves first).
+/// `EXIT_MS`: the row's collapse-and-fade once it finally commits.
+const STRIKE_MS = 1600;
+const UNDO_MS = 5000;
+/// Kept just under NOTCH_ANIM_MS so the row finishes collapsing a hair before
+/// the drawer settles — any momentary mismatch is an invisible black gap at the
+/// bottom rather than a visible clip of the footer.
+const EXIT_MS = 240;
 /// Change-flash duration (keep in sync with the `.notch-flash` keyframe).
 const FLASH_MS = 400;
 /// How long an `error` phase (mis-heard / silence / clarify / confirm prompt)
@@ -132,7 +161,8 @@ function reducedMotion(): boolean {
   );
 }
 
-/// Priority dot color. high = red, med = amber, low = muted grey.
+/// Priority dot color. high = red, med = amber, low = muted grey. Used in the
+/// bright hovered list.
 function priorityColor(p: NotchItem["priority"]): string {
   switch (p) {
     case "high":
@@ -141,6 +171,21 @@ function priorityColor(p: NotchItem["priority"]): string {
       return "var(--color-warning, #f5a623)";
     default:
       return "var(--color-ink-faint, #8a8a8a)";
+  }
+}
+
+/// Dimmed priority dot for the idle (collapsed) task bar — desaturated toward
+/// the ear-grey ramp so the single glanceable task reads as calm/ambient
+/// rather than an alert. The vibrant `priorityColor()` stays for the hovered
+/// expanded list, where the user is actively triaging.
+function priorityColorDim(p: NotchItem["priority"]): string {
+  switch (p) {
+    case "high":
+      return "#a85a5c";
+    case "med":
+      return "#b08a4a";
+    default:
+      return "var(--color-ink-faint, rgba(255,255,255,0.4))";
   }
 }
 
@@ -164,6 +209,15 @@ export default function NotchView() {
   const [hovered, setHovered] = createSignal(false);
   const [topN, setTopN] = createSignal(DEFAULT_TOP_N);
   const [hoverDelayMs, setHoverDelayMs] = createSignal(DEFAULT_HOVER_DELAY_MS);
+  // Task-completion limbo state — declared here (before the `headItem` memo,
+  // which excludes `exitingIds`). The functions that drive these live further
+  // down by `commitTask`.
+  const [completingIds, setCompletingIds] = createSignal<Set<string>>(
+    new Set(),
+  );
+  const [exitingIds, setExitingIds] = createSignal<Set<string>>(new Set());
+  const undoTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const exitTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /// The notch voice hotkey (default ⌥⌘L), shown in the on-hover add-task
   /// hint. Kept in sync via `applySettings` / `settings:changed`.
   const [voiceHotkey, setVoiceHotkey] = createSignal<string>("Cmd+Alt+L");
@@ -207,6 +261,9 @@ export default function NotchView() {
   let panelRef: HTMLDivElement | undefined;
   let listRef: HTMLDivElement | undefined;
   let ro: ResizeObserver | undefined;
+  /// rAF handle coalescing a burst of ResizeObserver ticks into one
+  /// `syncWindowSize` per frame while the box is mid-animation.
+  let resizeRaf: number | null = null;
   /// Pending hover-intent timer; cleared on leave / before re-arming.
   let hoverTimer: ReturnType<typeof setTimeout> | undefined;
   /// Pending change-flash clear.
@@ -255,6 +312,9 @@ export default function NotchView() {
 
   function collapse() {
     clearHoverTimer();
+    // Leaving the notch confirms any in-flight task completions — there's no
+    // way to reach the Undo button once the panel is shut.
+    commitPendingCompletions();
     setHovered(false);
     queueMicrotask(syncWindowSize);
   }
@@ -273,7 +333,15 @@ export default function NotchView() {
 
   const top = createMemo(() => activeItems().slice(0, topN()));
   const isEmpty = createMemo(() => activeItems().length === 0);
-  const headItem = createMemo(() => activeItems()[0] ?? null);
+  // The idle collapsed bar shows the top task that ISN'T mid-completion, so a
+  // task ticked/committed just before leaving doesn't flash there while its echo
+  // is in flight.
+  const headItem = createMemo(
+    () =>
+      activeItems().find(
+        (i) => !exitingIds().has(i.id) && !completingIds().has(i.id),
+      ) ?? null,
+  );
 
   /// Central-cutout width: real camera-bump width when known, else fallback,
   /// clamped so a bad geometry read can't stretch it absurdly wide.
@@ -291,13 +359,17 @@ export default function NotchView() {
     return Math.min(CUTOUT_H_MAX, Math.max(CUTOUT_H_MIN, base));
   });
 
-  /// Ear width — tied to the cutout (~0.24×), clamped to
-  /// [EAR_W_MIN, EAR_W_MAX] so the "Notch" label keeps padding on both edges.
-  const earWidth = createMemo(() =>
-    Math.round(
-      Math.min(EAR_W_MAX, Math.max(EAR_W_MIN, cutoutWidth() * 0.24)),
-    ),
-  );
+  /// Ear width — hover-responsive. Idle it's a slim nub (~0.15× cutout); on
+  /// hover it snaps to the full size (~0.24×, the original) so the grown 11px
+  /// label keeps padding. A hard style value (no CSS width transition) so the
+  /// wrapper's measured size still steps exactly once per hover edge.
+  const earWidth = createMemo(() => {
+    const hov = hovered();
+    const factor = hov ? 0.24 : 0.15;
+    const lo = hov ? EAR_W_MIN : EAR_W_IDLE_MIN;
+    const hi = hov ? EAR_W_MAX : EAR_W_IDLE_MAX;
+    return Math.round(Math.min(hi, Math.max(lo, cutoutWidth() * factor)));
+  });
 
   /// Width of the expanded list drawer.
   const expandedWidth = createMemo(() =>
@@ -311,12 +383,29 @@ export default function NotchView() {
 
   const hasNotch = createMemo(() => geo().has_notch);
 
+  /// Full ear-row width = both ears + the camera-bump spacer. The connected
+  /// drawer (collapsed task / empty-hover hint / voice strip) matches this so
+  /// it reads as ONE black slab flush under the ears rather than a narrow tab
+  /// under the bump. Notchless has no bump to flank, so the slab falls back to
+  /// the cutout width (preserving the pre-existing notchless layout).
+  const bridgeW = createMemo(() =>
+    hasNotch() ? earWidth() * 2 + cutoutWidth() : cutoutWidth(),
+  );
+
   /// Drawer shows the voice strip whenever a phase is active.
   const voiceActive = createMemo(() => phase() !== null);
   /// Hover-expanded drawer: any time the notch is hovered and not mid-voice.
   /// Drives both the task list (when there are items) and the add-task hint
   /// (always — the hint is the sole drawer content when the list is empty).
   const hoverExpanded = createMemo(() => hovered() && !voiceActive());
+
+  /// Whether a drawer hangs below the ears right now (everything except an
+  /// empty, un-hovered, idle notch). When true the ear bottoms square off so
+  /// they merge into the connected slab; when false the ears round their
+  /// bottom corners into a standalone resting nub.
+  const drawerPresent = createMemo(
+    () => !isEmpty() || hovered() || voiceActive(),
+  );
 
   async function refresh() {
     try {
@@ -343,13 +432,30 @@ export default function NotchView() {
   }
 
   /// Push the measured content size up to the OS window so it grows on hover
-  /// and snaps back on leave. `notch_resize` re-centers the window below the
-  /// notch (the frontend can't know the display origin), so it owns sizing.
+  /// and shrinks on leave. `notch_resize` re-centers the window below the notch
+  /// (the frontend can't know the display origin), so it owns sizing.
+  ///
+  /// Reads the RENDERED rect (`getBoundingClientRect`) rather than `scrollWidth`
+  /// so it tracks the live, mid-transition size: with the ears + drawer now CSS
+  /// -animating their width/height, the ResizeObserver fires every frame and
+  /// this CHASES the box so the OS window glides in lockstep (the pill's proven
+  /// model) instead of the old single snap. A 1px dedup skips redundant IPC once
+  /// the size settles.
+  let lastSyncW = -1;
+  let lastSyncH = -1;
   function syncWindowSize() {
     const el = panelRef;
     if (!el) return;
-    const w = Math.ceil(el.scrollWidth);
-    const h = Math.ceil(el.scrollHeight);
+    const r = el.getBoundingClientRect();
+    const w = Math.ceil(r.width);
+    const h = Math.ceil(r.height);
+    // Exact dedup. No feedback loop: the panel shrink-wraps to explicit-px
+    // content (ear widths, drawer box), so its measured size is independent of
+    // the window/viewport `notch_resize` sets — a fixed layout measures the same
+    // every frame and settles in one tick once the CSS transition ends.
+    if (w === lastSyncW && h === lastSyncH) return;
+    lastSyncW = w;
+    lastSyncH = h;
     void notchResize(w, h).catch((e) => console.warn("notchResize:", e));
   }
 
@@ -364,6 +470,9 @@ export default function NotchView() {
     unlistenList = await onNotchListChanged((next) => {
       flashChangedRows(doc(), next);
       setDoc(next);
+      // Reconcile completion bookkeeping against the new list (clears rows whose
+      // markDone just landed; drops anything deleted elsewhere).
+      pruneCompletionState(next);
     });
     unlistenSettings = await onSettingsChanged(() => {
       void applySettings();
@@ -437,7 +546,16 @@ export default function NotchView() {
     }, LEVELS_DECAY_MS);
 
     if (panelRef && typeof ResizeObserver !== "undefined") {
-      ro = new ResizeObserver(() => syncWindowSize());
+      // Coalesce a burst of observer ticks (the CSS size transitions fire one
+      // per animation frame) into a single `syncWindowSize` per frame so the
+      // window chase stays smooth without flooding the IPC bridge.
+      ro = new ResizeObserver(() => {
+        if (resizeRaf !== null) cancelAnimationFrame(resizeRaf);
+        resizeRaf = requestAnimationFrame(() => {
+          resizeRaf = null;
+          syncWindowSize();
+        });
+      });
       ro.observe(panelRef);
     }
     // Initial size sync after first paint.
@@ -452,11 +570,14 @@ export default function NotchView() {
     unlistenListening?.();
     unlistenLevels?.();
     ro?.disconnect();
+    if (resizeRaf !== null) cancelAnimationFrame(resizeRaf);
     clearHoverTimer();
     clearErrorTimer();
     if (flashTimer !== undefined) clearTimeout(flashTimer);
     if (settleTimer !== undefined) clearTimeout(settleTimer);
     if (levelsDecayTimer !== undefined) clearInterval(levelsDecayTimer);
+    undoTimers.forEach((t) => clearTimeout(t));
+    exitTimers.forEach((t) => clearTimeout(t));
     detachDragListeners();
   });
 
@@ -481,13 +602,140 @@ export default function NotchView() {
     }, FLASH_MS);
   }
 
-  async function markDone(id: string) {
-    try {
-      await notchListMarkDone(id);
-    } catch (e) {
+  /// Commit a completion to the backend. The list echo then prunes the id from
+  /// the completion sets. On failure (rare — e.g. the item is already gone) the
+  /// row is restored ONLY if the task genuinely still exists, so a commit that
+  /// raced an echo-prune can't resurrect an already-removed row, and a real
+  /// failure doesn't strand a task collapsed-and-invisible.
+  function commitTask(id: string) {
+    void notchListMarkDone(id).catch((e) => {
       console.error("notchListMarkDone:", e);
+      if (doc().items.some((it) => it.id === id && !it.done)) {
+        setExitingIds((s) => withId(s, id, false));
+      }
+    });
+  }
+
+  // --- Task completion (strike-through → undo → remove) -------------------
+  // Ticking a task no longer removes it instantly. It enters a soft "limbo":
+  // the row darkens, a line draws across it, and an Undo button is live for a
+  // few seconds. We DEFER the backend `markDone` until the limbo resolves so
+  // the row stays in the list and can animate in place. Resolutions:
+  //   • Undo (button or re-tick the box)  → back to normal, nothing committed.
+  //   • UNDO_MS elapses while hovering    → row collapses out, then commits.
+  //   • Cursor leaves the notch           → commit at once (the panel is
+  //                                          collapsing anyway, which is the
+  //                                          smooth "it just happened" motion).
+  // `completingIds` = struck + Undo live; `exitingIds` = past the window,
+  // playing the collapse before commit. (The signals + timer maps are declared
+  // up with the other state so the `headItem` memo can read `exitingIds`.)
+  function clearTaskTimer(
+    map: Map<string, ReturnType<typeof setTimeout>>,
+    id: string,
+  ) {
+    const t = map.get(id);
+    if (t !== undefined) {
+      clearTimeout(t);
+      map.delete(id);
     }
   }
+  function withId(set: Set<string>, id: string, add: boolean): Set<string> {
+    const next = new Set(set);
+    if (add) next.add(id);
+    else next.delete(id);
+    return next;
+  }
+
+  /// Tick the checkbox: start (or, if already completing, undo) the limbo.
+  /// All set mutations use functional updates so a concurrent echo-prune or a
+  /// late markDone `.catch` can't clobber the latest state with a stale snapshot.
+  function toggleComplete(id: string) {
+    if (completingIds().has(id)) {
+      cancelComplete(id);
+      return;
+    }
+    if (exitingIds().has(id)) return; // already collapsing — past undo
+    setCompletingIds((s) => withId(s, id, true));
+    clearTaskTimer(undoTimers, id);
+    undoTimers.set(id, setTimeout(() => finalizeComplete(id), UNDO_MS));
+  }
+
+  /// Undo: cancel the limbo entirely, leave the task active.
+  function cancelComplete(id: string) {
+    clearTaskTimer(undoTimers, id);
+    clearTaskTimer(exitTimers, id);
+    setCompletingIds((s) => withId(s, id, false));
+    setExitingIds((s) => withId(s, id, false));
+  }
+
+  /// Window elapsed while still hovering → play the collapse-out, then commit.
+  function finalizeComplete(id: string) {
+    clearTaskTimer(undoTimers, id);
+    setCompletingIds((s) => withId(s, id, false));
+    setExitingIds((s) => withId(s, id, true));
+    clearTaskTimer(exitTimers, id);
+    exitTimers.set(
+      id,
+      setTimeout(() => {
+        clearTaskTimer(exitTimers, id);
+        // Commit, KEEPING the id in `exitingIds` (row stays collapsed) until the
+        // echo prunes it — clearing it here would spring the row back to full
+        // height for a frame before the backend removal lands.
+        commitTask(id);
+      }, EXIT_MS),
+    );
+  }
+
+  /// Cursor left the notch — finalize every in-flight completion (the panel is
+  /// gliding shut, so there's no per-row collapse). Called from `collapse()`.
+  /// Only `completingIds` are committed here: ids already `exiting` own their
+  /// commit via their own exit timer, so re-committing them would double-fire
+  /// `markDone`. They stay marked `exiting` (excluded from the collapsed-bar
+  /// head) until the echo prunes them.
+  function commitPendingCompletions() {
+    const completing = [...completingIds()];
+    if (completing.length === 0) return;
+    setExitingIds((s) => {
+      const next = new Set(s);
+      completing.forEach((id) => next.add(id));
+      return next;
+    });
+    completing.forEach((id) => {
+      clearTaskTimer(undoTimers, id);
+      commitTask(id);
+    });
+    setCompletingIds(new Set<string>());
+  }
+
+  /// Drop completion bookkeeping for any task that has left the active list
+  /// (committed `done`, or deleted) so the sets never leak stale ids. Driven by
+  /// the `notch-list:changed` echo, this is also what finally clears a row out
+  /// of `exitingIds` once its `markDone` lands. Functional updates + same-ref
+  /// return (no change) keep it safe against interleaving mutations.
+  function pruneCompletionState(next: NotchListDoc) {
+    const active = new Set(next.items.filter((i) => !i.done).map((i) => i.id));
+    const prune = (s: Set<string>): Set<string> => {
+      let changed = false;
+      const out = new Set<string>();
+      s.forEach((id) => {
+        if (active.has(id)) out.add(id);
+        else {
+          changed = true;
+          clearTaskTimer(undoTimers, id);
+          clearTaskTimer(exitTimers, id);
+        }
+      });
+      return changed ? out : s;
+    };
+    setCompletingIds(prune);
+    setExitingIds(prune);
+  }
+
+  /// True while a task is mid-completion — used to keep its row out of the
+  /// drag gesture and to size the drawer as the row collapses.
+  const pendingComplete = createMemo(
+    () => new Set<string>([...completingIds(), ...exitingIds()]),
+  );
 
   // --- Drag-to-reorder ----------------------------------------------------
 
@@ -501,6 +749,9 @@ export default function NotchView() {
     // Only in the expanded list; never in the collapsed single line. (Empty
     // lists expand to just the hint, which has no rows or drag handles.)
     if (!hoverExpanded()) return;
+    // Don't start a drag while ANY row is mid-completion: a 0-height collapsing
+    // row would throw off the row-index math (clamps, drop-line, sibling shifts).
+    if (pendingComplete().size > 0) return;
     e.preventDefault();
     e.stopPropagation();
     dragStartY = e.clientY;
@@ -648,6 +899,7 @@ export default function NotchView() {
         height={cutoutHeight()}
         hovered={hovered()}
         hasNotch={hasNotch()}
+        drawerPresent={drawerPresent()}
         reduced={reducedMotion()}
       />
 
@@ -664,9 +916,18 @@ export default function NotchView() {
         head={headItem()}
         rows={top()}
         expandedWidth={expandedWidth()}
+        bridgeW={bridgeW()}
         voiceHotkey={voiceHotkey()}
         flashIds={flashIds()}
         reduced={reducedMotion()}
+        // Completion (strike-through → undo → remove). `exitingCount` is scoped
+        // to the VISIBLE rows so a task that sorts below the top-N fold while
+        // mid-exit can't subtract height for a row that isn't rendered.
+        completingIds={completingIds()}
+        exitingIds={exitingIds()}
+        exitingCount={top().filter((r) => exitingIds().has(r.id)).length}
+        onToggleComplete={toggleComplete}
+        onUndo={cancelComplete}
         // Drag
         dragId={dragId()}
         dragLifted={dragLifted()}
@@ -677,7 +938,6 @@ export default function NotchView() {
         // Refs / callbacks
         setListRef={(el) => (listRef = el)}
         onHandleDown={onHandlePointerDown}
-        onMarkDone={markDone}
         rowTransition={rowTransition()}
         checkboxTransition={checkboxTransition()}
       />
@@ -699,11 +959,28 @@ function EarRow(props: {
   height: number;
   hovered: boolean;
   hasNotch: boolean;
+  drawerPresent: boolean;
   reduced: boolean;
 }) {
   const wordOpacity = () => (props.hovered ? 0.95 : 0.62);
+  /// Word size eases between the slim idle and full hovered size. The ear box
+  /// width animates in lockstep (same duration/easing) so the label stays
+  /// proportional and never overflows mid-transition.
+  const wordSize = () => (props.hovered ? EAR_FONT_HOVER : EAR_FONT_IDLE);
   const wordTransition = () =>
-    props.reduced ? "opacity 100ms linear" : `opacity 180ms ${EASE_IN}`;
+    props.reduced
+      ? "none"
+      : `opacity 180ms ${EASE_IN}, font-size ${NOTCH_ANIM_MS}ms ${EASE_IN}`;
+  /// Outer bottom-corner radius: square (0) when a drawer hangs below so the
+  /// ear fuses into the connected slab; rounded into a standalone nub when the
+  /// idle notch is empty (no drawer).
+  const outerBottom = () => (props.drawerPresent ? 0 : 12);
+  /// The ear box glides its width (idle nub ↔ full) and its bottom-corner
+  /// rounding (nub ↔ fused slab) so the whole assembly grows fluidly.
+  const earBoxTransition = () =>
+    props.reduced
+      ? "none"
+      : `width ${NOTCH_ANIM_MS}ms ${EASE_IN}, border-radius ${NOTCH_ANIM_MS}ms ${EASE_IN}`;
 
   // Notchless: collapse the cutout spacer to 0 and fuse the ears into one
   // pill, rounding the inner corners and dropping a 1px divider between them.
@@ -714,7 +991,9 @@ function EarRow(props: {
       class="flex"
       style={{
         height: `${props.height}px`,
-        width: `${props.earWidth * 2 + (showCutout() ? props.cutoutWidth : 0)}px`,
+        // No explicit width — the row shrink-wraps its (CSS-transitioning) ear
+        // boxes + fixed spacer so it tracks the animating width frame-by-frame
+        // (the wrapper is centered, so it needs no pinned width).
       }}
     >
       {/* Left ear — "Vox" */}
@@ -725,18 +1004,22 @@ function EarRow(props: {
           height: "100%",
           background: "var(--color-notch-surface, #000)",
           // With-notch: inner (right, toward cutout) corners SQUARE so the ear
-          // hugs the cutout wall; outer (left) corners rounded.
+          // hugs the cutout wall; outer (left) corners rounded — bottom-outer
+          // squares off when a drawer fuses below (the connected slab).
           // Notchless: round all four so the fused [Vox|Notch] reads as one
           // pill, with a hairline divider on the seam.
-          "border-radius": showCutout() ? "6px 0 0 12px" : "8px 0 0 12px",
+          "border-radius": showCutout()
+            ? `6px 0 0 ${outerBottom()}px`
+            : `8px 0 0 ${outerBottom()}px`,
           "border-right": showCutout()
             ? undefined
             : "1px solid rgba(255,255,255,0.1)",
+          transition: earBoxTransition(),
         }}
       >
         <span
           style={{
-            "font-size": "11px",
+            "font-size": `${wordSize()}px`,
             "font-weight": 600,
             "letter-spacing": "-0.01em",
             color: "#fff",
@@ -773,14 +1056,18 @@ function EarRow(props: {
           height: "100%",
           background: "var(--color-notch-surface, #000)",
           // With-notch: inner (left, toward cutout) corners SQUARE; outer
-          // (right) corners rounded. Notchless: round all four (the seam is
-          // drawn by the left ear's right divider).
-          "border-radius": showCutout() ? "0 6px 12px 0" : "0 8px 12px 0",
+          // (right) corners rounded — bottom-outer squares off when a drawer
+          // fuses below. Notchless: round all four (the seam is drawn by the
+          // left ear's right divider).
+          "border-radius": showCutout()
+            ? `0 6px ${outerBottom()}px 0`
+            : `0 8px ${outerBottom()}px 0`,
+          transition: earBoxTransition(),
         }}
       >
         <span
           style={{
-            "font-size": "11px",
+            "font-size": `${wordSize()}px`,
             "font-weight": 600,
             "letter-spacing": "-0.01em",
             color: "#fff",
@@ -797,18 +1084,22 @@ function EarRow(props: {
 
 /* ===========================================================================
  * Drawer — the variable region below the cutout. State machine:
- *   idle + empty           → height 0 (nothing)
- *   items + collapsed      → one line (cutout width): #1 task
- *   items + expanded       → wide; top-N rows (drag handle + checkbox + dot + text)
- *   voice: listening       → waveform ribbon (cutout width)
- *   voice: compiling       → pulsing dots (cutout width)
+ *   empty (idle)           → height 0 (nothing; ears are a standalone nub)
+ *   collapsed (items, idle)→ one slim line, full slab width: dimmed #1 task
+ *   list (items, hover)    → wide; top-N rows (drag handle + checkbox + dot + text) + hint footer
+ *   hint (empty, hover)    → compact ⌘⌥L keycap affordance, full slab width
+ *   voice: listening       → waveform ribbon (full slab width)
+ *   voice: compiling       → pulsing dots (full slab width)
  *   voice: error           → message text (briefly), then idle
  *
- * Single-resize discipline: the drawer's height is reserved INSTANTLY when it
- * changes (no height transition), so `scrollHeight` jumps once → one OS resize.
- * Content fades/slides INSIDE the reserved space via transform/opacity. On
- * collapse the reserved height is held for one retract duration so the exit
- * animation plays, then released in a single step.
+ * Connected slab: every state except the wide hovered `list` spans the full
+ * ear-row width (`bridgeW`) so the drawer fuses with the ears into one black
+ * panel rather than a narrow tab under the bump.
+ *
+ * Fluid size: the box width + height CSS-transition between states and the
+ * outer ResizeObserver chases the live rect (`syncWindowSize`), so the OS
+ * window glides with the box instead of snapping. `overflow-hidden` turns a
+ * height change into a content wipe.
  * ======================================================================== */
 function Drawer(props: {
   phase: DrawerPhase | null;
@@ -820,9 +1111,15 @@ function Drawer(props: {
   head: NotchItem | null;
   rows: NotchItem[];
   expandedWidth: number;
+  bridgeW: number;
   voiceHotkey: string;
   flashIds: Set<string>;
   reduced: boolean;
+  completingIds: Set<string>;
+  exitingIds: Set<string>;
+  exitingCount: number;
+  onToggleComplete: (id: string) => void;
+  onUndo: (id: string) => void;
   dragId: string | null;
   dragLifted: boolean;
   dragOffsetY: number;
@@ -831,19 +1128,18 @@ function Drawer(props: {
   rowH: number;
   setListRef: (el: HTMLDivElement) => void;
   onHandleDown: (e: PointerEvent, index: number) => void;
-  onMarkDone: (id: string) => void;
   rowTransition: string;
   checkboxTransition: string;
 }) {
   // What the drawer should render right now (priority: voice > hover > list).
-  // On hover we always "expand" — to the task list when there are items, or to
-  // just the add-task hint when the list is empty. Off hover: the #1-task line
-  // when there are items, nothing when empty.
+  // On hover: the task LIST when there are items, or the compact add-task HINT
+  // when the list is empty. Off hover: the #1-task line when there are items,
+  // nothing when empty.
   const mode = createMemo<
-    "voice" | "expanded" | "collapsed" | "empty"
+    "voice" | "list" | "hint" | "collapsed" | "empty"
   >(() => {
     if (props.phase !== null) return "voice";
-    if (props.hoverExpanded) return "expanded";
+    if (props.hoverExpanded) return props.rows.length > 0 ? "list" : "hint";
     return props.rows.length === 0 ? "empty" : "collapsed";
   });
 
@@ -853,14 +1149,18 @@ function Drawer(props: {
       case "voice":
         // Waveform / dots / error strip — short calm ribbon.
         return Math.round(props.cutoutHeight * 0.65) + 10;
-      case "expanded":
-        // Task rows (when any) + the always-present add-task hint footer. When
-        // the list is empty the hint stands alone.
+      case "list":
+        // Task rows + the add-task hint footer beneath them. Rows mid-collapse
+        // (a finalized completion) are subtracted so the drawer shrinks in step
+        // with the row's own collapse, instead of leaving a gap until commit.
         return (
-          (props.rows.length > 0
-            ? props.rows.length * props.rowH + LIST_PAD_Y * 2
-            : 0) + HINT_H
+          Math.max(0, props.rows.length - props.exitingCount) * props.rowH +
+          LIST_PAD_Y * 2 +
+          HINT_H
         );
+      case "hint":
+        // Empty + hovered: the compact keycap affordance, standing alone.
+        return EMPTY_HINT_H;
       case "collapsed":
         return COLLAPSED_H;
       default:
@@ -868,62 +1168,35 @@ function Drawer(props: {
     }
   });
 
-  // Target content width. The ear row owns its own pinned width; the drawer
-  // is independent. Collapsed/voice = cutout width; expanded = wide.
+  // Target content width. Collapsed task / empty-hover hint / voice strip all
+  // span the full ear-row width (`bridgeW`) so they fuse into one connected
+  // black slab under the ears. Only the hovered task LIST fans out wider.
   const targetWidth = createMemo(() => {
     switch (mode()) {
-      case "expanded":
-        // Wide for the task list; narrow (cutout-width) when it's just the
-        // add-task hint, so an empty hover doesn't fan out a near-empty panel.
-        return props.rows.length > 0 ? props.expandedWidth : props.cutoutWidth;
+      case "list":
+        return props.expandedWidth;
       default:
-        return props.cutoutWidth;
+        return props.bridgeW;
     }
   });
-
-  // --- Single-resize height reservation ----------------------------------
-  // `reservedH` toggles instantly to the target so the window resizes once;
-  // on the way DOWN it's held for one retract before releasing to 0.
-  const [reservedH, setReservedH] = createSignal(0);
-  let collapseTimer: ReturnType<typeof setTimeout> | undefined;
-  const clearCollapse = () => {
-    if (collapseTimer !== undefined) {
-      clearTimeout(collapseTimer);
-      collapseTimer = undefined;
-    }
-  };
-  createEffect(() => {
-    const target = targetHeight();
-    clearCollapse();
-    if (target > 0) {
-      setReservedH(target);
-    } else if (props.reduced) {
-      setReservedH(0);
-    } else {
-      // Hold the height through the exit animation, then drop in one step.
-      collapseTimer = setTimeout(() => {
-        collapseTimer = undefined;
-        setReservedH(0);
-      }, RETRACT_MS);
-    }
-  });
-  onCleanup(clearCollapse);
 
   return (
     <div
       class="overflow-hidden"
       style={{
-        // Single-resize discipline (mirrors the old IdleStrip): BOTH width
-        // and height jump instantly to their target — NO CSS size transition
-        // on the measured element — so `scrollWidth`/`scrollHeight` each step
-        // exactly once and the OS window resizes a single time per state
-        // change instead of chasing a multi-frame animation. The visible
-        // "expand" feel comes from the content fading/rising in (the
-        // staggered row reveal), not from animating the window box.
-        height: `${reservedH()}px`,
+        // Fluid size: width + height CSS-transition to their target, and the
+        // outer ResizeObserver chases the live rect so the OS window glides in
+        // lockstep (replaces the old instant-snap "single-resize" discipline).
+        // `overflow-hidden` makes the height transition double as a content
+        // wipe. Background stays solid black always — at height 0 the box is
+        // invisible anyway, and keeping it black avoids a flash to transparent
+        // while a collapse animates down.
+        height: `${targetHeight()}px`,
         width: `${targetWidth()}px`,
-        background:
-          reservedH() > 0 ? "var(--color-notch-surface, #000)" : "transparent",
+        transition: props.reduced
+          ? "none"
+          : `height ${NOTCH_ANIM_MS}ms ${EASE_IN}, width ${NOTCH_ANIM_MS}ms ${EASE_IN}`,
+        background: "var(--color-notch-surface, #000)",
         // Top corners SQUARE (fused under the cutout); bottom rounded.
         "border-radius": "0 0 16px 16px",
         color: "var(--color-ink)",
@@ -942,33 +1215,44 @@ function Drawer(props: {
       <Show when={mode() === "collapsed"}>
         <Show when={props.head}>
           {(item) => (
-            // Centered under the camera when idle (the user reads the single
-            // top task at a glance); the hovered list switches to the
-            // left-aligned ExpandedList. `min-w-0` lets a long task shrink +
-            // truncate instead of centering off both edges.
+            // Idle glance: the single top task, DIMMED (muted-grey text + a
+            // desaturated priority dot) and small (8px), centered both axes.
+            // The full-width slab keeps the pair centered under the camera; the
+            // inner wrapper is capped to the cutout zone so a long task
+            // truncates under the bump rather than sprawling beneath the ears.
+            // Hovering swaps to the bright, full-size left-aligned ExpandedList.
             <div
-              class="flex items-center justify-center gap-2 px-3"
+              class="flex w-full items-center justify-center"
               classList={{ "notch-flash": props.flashIds.has(item().id) }}
               style={{ height: `${COLLAPSED_H}px` }}
             >
-              <span
-                class="h-[7px] w-[7px] shrink-0 rounded-full"
-                style={{ background: priorityColor(item().priority) }}
-                aria-hidden="true"
-              />
-              <span class="min-w-0 truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
-                {item().text}
-              </span>
+              <div
+                class="flex min-w-0 items-center gap-1.5"
+                style={{ "max-width": `${props.cutoutWidth}px` }}
+              >
+                <span
+                  class="h-[4px] w-[4px] shrink-0 rounded-full"
+                  style={{ background: priorityColorDim(item().priority) }}
+                  aria-hidden="true"
+                />
+                <span class="min-w-0 truncate text-[8px] leading-[12px] text-[var(--color-ink-mute)]">
+                  {item().text}
+                </span>
+              </div>
             </div>
           )}
         </Show>
       </Show>
 
-      <Show when={mode() === "expanded" && props.rows.length > 0}>
+      <Show when={mode() === "list"}>
         <ExpandedList
           rows={props.rows}
           flashIds={props.flashIds}
           reduced={props.reduced}
+          completingIds={props.completingIds}
+          exitingIds={props.exitingIds}
+          onToggleComplete={props.onToggleComplete}
+          onUndo={props.onUndo}
           dragId={props.dragId}
           dragLifted={props.dragLifted}
           dragOffsetY={props.dragOffsetY}
@@ -977,14 +1261,14 @@ function Drawer(props: {
           rowH={props.rowH}
           setListRef={props.setListRef}
           onHandleDown={props.onHandleDown}
-          onMarkDone={props.onMarkDone}
           rowTransition={props.rowTransition}
           checkboxTransition={props.checkboxTransition}
         />
+        <AddHint hotkey={props.voiceHotkey} />
       </Show>
 
-      <Show when={mode() === "expanded"}>
-        <AddHint hotkey={props.voiceHotkey} />
+      <Show when={mode() === "hint"}>
+        <AddHintCompact hotkey={props.voiceHotkey} />
       </Show>
     </div>
   );
@@ -1016,6 +1300,43 @@ function AddHint(props: { hotkey: string }) {
       </span>
       <span
         class="text-[11px] leading-none text-[var(--color-ink-faint)]"
+        aria-hidden="true"
+      >
+        to add a task
+      </span>
+    </div>
+  );
+}
+
+/* ===========================================================================
+ * Compact add-task hint — the EMPTY + hovered drawer content. Same affordance
+ * as AddHint but shrunk (smaller `.notch-kbd-sm` chips, EMPTY_HINT_H tall) so
+ * an empty hovered notch teaches ⌘⌥L without hanging over app chrome below the
+ * menu bar.
+ * ======================================================================== */
+function AddHintCompact(props: { hotkey: string }) {
+  const tokens = createMemo(() => formatHotkeyTokens(props.hotkey));
+  const label = createMemo(() => {
+    const k = formatHotkey(props.hotkey);
+    return k ? `Press ${k} to add a task` : "Add a task by voice";
+  });
+  return (
+    <div
+      class="flex items-center justify-center gap-1"
+      style={{ height: `${EMPTY_HINT_H}px` }}
+      role="note"
+      aria-label={label()}
+    >
+      <span class="flex items-center gap-0.5" aria-hidden="true">
+        <For each={tokens()}>
+          {(t) => <kbd class="notch-kbd-sm">{t.symbol}</kbd>}
+        </For>
+      </span>
+      {/* Always pair the keys with what they DO so a first-time user who just
+          got this update understands the notch is a voice task list, not just
+          a bare shortcut. Kept legible (9px) even though the row is compact. */}
+      <span
+        class="text-[9px] leading-none text-[var(--color-ink-mute)]"
         aria-hidden="true"
       >
         to add a task
@@ -1119,6 +1440,10 @@ function ExpandedList(props: {
   rows: NotchItem[];
   flashIds: Set<string>;
   reduced: boolean;
+  completingIds: Set<string>;
+  exitingIds: Set<string>;
+  onToggleComplete: (id: string) => void;
+  onUndo: (id: string) => void;
   dragId: string | null;
   dragLifted: boolean;
   dragOffsetY: number;
@@ -1127,12 +1452,18 @@ function ExpandedList(props: {
   rowH: number;
   setListRef: (el: HTMLDivElement) => void;
   onHandleDown: (e: PointerEvent, index: number) => void;
-  onMarkDone: (id: string) => void;
   rowTransition: string;
   checkboxTransition: string;
 }) {
   const draggingActive = () =>
     props.dragId !== null && props.dragLifted;
+
+  // `<For>` is reference-keyed and every list echo hands it fresh item objects,
+  // so it re-mounts every row — which would replay the fade-rise entrance on
+  // untouched rows after each voice edit / completion. Track which ids have
+  // already entered (per open session — this whole list unmounts on collapse)
+  // so the entrance only plays the first time a row appears.
+  const seenRowIds = new Set<string>();
 
   // The slot index the dragged row currently occupies (its origin).
   const dragOriginIndex = () =>
@@ -1206,6 +1537,15 @@ function ExpandedList(props: {
                 : `transform 160ms ${EASE_IN}`;
             return `${t}, ${props.rowTransition}, box-shadow 120ms ease`;
           };
+          // Completion limbo: `completing` = struck + Undo live; `exiting` =
+          // past the window, collapsing out before commit. Both DIM the row.
+          const completing = () => props.completingIds.has(item.id);
+          const exiting = () => props.exitingIds.has(item.id);
+          const dimmed = () => completing() || exiting();
+          // Only the FIRST appearance of an id plays the entrance (see
+          // `seenRowIds`); re-mounts from later echoes skip it.
+          const firstSeen = !seenRowIds.has(item.id);
+          onMount(() => seenRowIds.add(item.id));
           return (
             <div
               class="flex items-center gap-2 rounded-[8px] px-1.5 hover:bg-white/[0.06]"
@@ -1213,31 +1553,46 @@ function ExpandedList(props: {
                 "notch-flash": props.flashIds.has(item.id),
                 // Mount-reveal: fade + rise with a per-row stagger. Disabled
                 // for any row once a drag is in flight (the lift/shift
-                // transform would fight the keyframe's transform) and while a
-                // row is flashing (both use the `animation` shorthand).
+                // transform would fight the keyframe's transform), while a row
+                // is flashing, and while it's mid-completion (its own
+                // strike/collapse owns the motion).
                 "notch-row-enter":
+                  firstSeen &&
                   !draggingActive() &&
                   !props.reduced &&
+                  !dimmed() &&
                   !props.flashIds.has(item.id),
               }}
               style={{
-                height: `${props.rowH}px`,
+                // Exiting rows collapse to 0 height + fade — the list above
+                // reflows up and the drawer shrinks in step (see exitingCount).
+                height: exiting() ? "0px" : `${props.rowH}px`,
+                "min-height": "0",
+                overflow: exiting() ? "hidden" : undefined,
                 "z-index": isDragged() ? 5 : 1,
                 position: "relative",
                 transform: liftTransform(),
-                transition: dragTransition(),
+                transition: exiting()
+                  ? `height ${EXIT_MS}ms ${EASE_IN}, opacity ${EXIT_MS}ms ${EASE_IN}`
+                  : dragTransition(),
                 background: isDragged() ? "rgba(255,255,255,0.10)" : undefined,
                 "box-shadow": isDragged()
                   ? "0 6px 16px rgba(0,0,0,0.55)"
                   : "none",
-                opacity: 1,
+                opacity: exiting() ? 0 : 1,
+                "pointer-events": exiting() ? "none" : undefined,
                 "animation-delay": draggingActive() ? "0ms" : enterDelay(),
               }}
             >
-              {/* Drag handle — always faintly visible when expanded. */}
+              {/* Drag handle — fades out once a row is mid-completion (it can't
+                  be dragged then). */}
               <div
                 class="notch-drag-handle shrink-0"
-                style={{ "touch-action": "none" }}
+                style={{
+                  "touch-action": "none",
+                  opacity: dimmed() ? "0" : undefined,
+                  transition: "opacity 160ms ease",
+                }}
                 onPointerDown={(e) => props.onHandleDown(e, i())}
                 aria-hidden="true"
               >
@@ -1249,27 +1604,95 @@ function ExpandedList(props: {
                 <span class="notch-drag-dot" />
               </div>
 
+              {/* Checkbox — tick starts the completion; re-ticking it undoes.
+                  Fills accent-teal with a check while completing. */}
               <button
                 type="button"
-                aria-label="Mark done"
+                aria-label={dimmed() ? "Undo complete" : "Mark done"}
                 onClick={(e) => {
                   e.stopPropagation();
-                  props.onMarkDone(item.id);
+                  props.onToggleComplete(item.id);
                 }}
                 class="flex h-[15px] w-[15px] shrink-0 items-center justify-center rounded-full border"
                 style={{
-                  "border-color": CHECKBOX_BORDER,
+                  "border-color": dimmed()
+                    ? "var(--color-accent, #3fb8b0)"
+                    : CHECKBOX_BORDER,
+                  background: dimmed()
+                    ? "var(--color-accent, #3fb8b0)"
+                    : "transparent",
                   transition: props.checkboxTransition,
                 }}
-              />
+              >
+                <Show when={dimmed()}>
+                  <svg
+                    width="9"
+                    height="9"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <path
+                      d="M2.5 6.4 L5 8.8 L9.5 3.6"
+                      stroke="#06231f"
+                      stroke-width="2"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    />
+                  </svg>
+                </Show>
+              </button>
+
               <span
                 class="h-[7px] w-[7px] shrink-0 rounded-full"
-                style={{ background: priorityColor(item.priority) }}
+                style={{
+                  background: priorityColor(item.priority),
+                  opacity: dimmed() ? "0.4" : "1",
+                  transition: "opacity 200ms ease",
+                }}
                 aria-hidden="true"
               />
-              <span class="truncate text-[12px] leading-[16px] text-[var(--color-ink)]">
+
+              {/* Task text with the strike-through overlay. The span shrink-
+                  wraps the text (truncating when long) so the line matches the
+                  text width; it draws across over STRIKE_MS, retracts fast on
+                  undo. */}
+              <span
+                class="relative min-w-0 truncate text-[12px] leading-[16px]"
+                style={{
+                  color: "var(--color-ink)",
+                  opacity: dimmed() ? "0.45" : "1",
+                  transition: "opacity 200ms ease",
+                }}
+              >
                 {item.text}
+                <span
+                  class="notch-strike-line"
+                  style={{
+                    transform: dimmed() ? "scaleX(1)" : "scaleX(0)",
+                    transition: props.reduced
+                      ? "none"
+                      : `transform ${dimmed() ? STRIKE_MS : 220}ms ${
+                          dimmed() ? "linear" : EASE_IN
+                        }`,
+                  }}
+                  aria-hidden="true"
+                />
               </span>
+
+              {/* Undo — live during the window, gone once the row collapses. */}
+              <Show when={completing()}>
+                <button
+                  type="button"
+                  class="notch-undo ml-auto shrink-0"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    props.onUndo(item.id);
+                  }}
+                >
+                  Undo
+                </button>
+              </Show>
             </div>
           );
         }}
