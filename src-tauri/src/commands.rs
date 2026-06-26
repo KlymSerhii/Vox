@@ -23,6 +23,12 @@ pub struct TestConnectionResult {
 
 const SECRET_WINDOWS: &[&str] = &["settings", "onboarding"];
 
+/// Label of the notch window (mirrors `notch::LABEL`, which is macOS-gated so
+/// it can't be referenced from this cross-platform file). Used to extend the
+/// content-creating `notch_list_add` mutation to the notch's own quick-add
+/// input without opening it to every window.
+const NOTCH_WINDOW: &str = "notch";
+
 fn assert_secret_window<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {
     let label = webview.label();
     if SECRET_WINDOWS.contains(&label) {
@@ -30,6 +36,23 @@ fn assert_secret_window<R: Runtime>(webview: &Webview<R>) -> Result<(), String> 
     } else {
         Err(format!(
             "command not available from window '{label}' — restricted to settings/onboarding"
+        ))
+    }
+}
+
+/// Like `assert_secret_window`, but ALSO allows the notch window. Gates
+/// `notch_list_add` so the in-notch quick-add input can create tasks while the
+/// other content mutators (edit/remove/restore/clear/undo) stay
+/// settings/onboarding-only. The already-ungated mark_done/reorder/set_priority
+/// commands keep their no-`webview` signatures — this is only for `add`, which
+/// is a content-creating mutation we'd rather not leave fully open.
+fn assert_notch_or_secret<R: Runtime>(webview: &Webview<R>) -> Result<(), String> {
+    let label = webview.label();
+    if SECRET_WINDOWS.contains(&label) || label == NOTCH_WINDOW {
+        Ok(())
+    } else {
+        Err(format!(
+            "command not available from window '{label}' — restricted to settings/onboarding/notch"
         ))
     }
 }
@@ -1472,6 +1495,10 @@ pub fn notch_list_mark_done<R: Runtime>(app: AppHandle<R>, id: String) -> Result
     Ok(())
 }
 
+/// Add a task. Callable from the notch window itself (so the in-notch
+/// quick-add input works) as well as the settings/onboarding windows — see
+/// `assert_notch_or_secret`. Appends to the bottom of its priority band
+/// (`position: None`), defaulting to medium priority.
 #[tauri::command]
 pub fn notch_list_add<R: Runtime>(
     app: AppHandle<R>,
@@ -1479,12 +1506,49 @@ pub fn notch_list_add<R: Runtime>(
     text: String,
     priority: Option<Priority>,
 ) -> Result<NotchItem, String> {
-    assert_secret_window(&webview)?;
+    assert_notch_or_secret(&webview)?;
     let item = notch_list::store(&app)
         .add(&text, priority.unwrap_or(Priority::Med), None)
         .map_err(|e| e.to_string())?;
     emit_notch_list_changed(&app);
     Ok(item)
+}
+
+/// Give the in-notch quick-add input keyboard focus by making the notch the
+/// key window, first stashing the currently-frontmost app so Escape can hand
+/// focus back. The notch is a NON-ACTIVATING panel (tao leaves its `focusable`
+/// ivar set, so `canBecomeKeyWindow` is true), so taking key focus does NOT
+/// activate Vox — the user's app stays the active app; only the key window
+/// moves. No-op off macOS (the notch window only exists there).
+#[tauri::command]
+pub fn notch_focus_input<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::notch::focus_input(&app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &app;
+    }
+    Ok(())
+}
+
+/// Hand keyboard focus back to the app that was frontmost when the quick-add
+/// input opened (captured by `notch_focus_input`). Called when the user
+/// dismisses the input with Escape — a click into another app returns key
+/// focus on its own, so this only covers the keyboard-dismiss path.
+/// Best-effort + fail-open. No-op off macOS.
+#[tauri::command]
+pub fn notch_release_input_focus<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::notch::release_input_focus(&app);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = &app;
+    }
+    Ok(())
 }
 
 #[tauri::command]

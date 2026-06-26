@@ -228,6 +228,20 @@ export async function notchResize(
   await invoke("notch_resize", { width, height });
 }
 
+/// Give the in-notch quick-add input keyboard focus: makes the notch the key
+/// window (without activating Vox — it's a non-activating panel) and remembers
+/// the previously-frontmost app for `notchReleaseInputFocus`.
+export async function notchFocusInput(): Promise<void> {
+  await invoke("notch_focus_input");
+}
+
+/// Hand keyboard focus back to the app that was frontmost when the quick-add
+/// input opened. Called when the user dismisses the input with Escape (a click
+/// into another app returns focus on its own).
+export async function notchReleaseInputFocus(): Promise<void> {
+  await invoke("notch_release_input_focus");
+}
+
 /// Fired by the backend whenever the notch list changes (any mutation,
 /// including voice commands). Payload is the full current doc. Subscribed
 /// by the notch window and the Settings → Notch List tab so both stay in

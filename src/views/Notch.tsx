@@ -11,9 +11,12 @@ import {
   getNotchGeometry,
   getNotchList,
   getPublicSettings,
+  notchFocusInput,
+  notchListAdd,
   notchListMarkDone,
   notchListReorder,
   notchListSetPriority,
+  notchReleaseInputFocus,
   notchResize,
   onNotchGeometry,
   onNotchHover,
@@ -24,8 +27,9 @@ import {
   type NotchGeometry,
   type NotchItem,
   type NotchListDoc,
+  type NotchPriority,
 } from "../lib/ipc";
-import { formatHotkey, formatHotkeyTokens } from "../lib/hotkey";
+import { formatHotkeyTokens } from "../lib/hotkey";
 
 /// Default top-N if settings haven't loaded yet (matches the backend
 /// `default_notch_list_top_n`).
@@ -51,6 +55,14 @@ const HINT_H = 30;
 /// a hair under the task bar) so hovering an empty notch no longer hangs over
 /// app chrome, while still teaching ⌘⌥L via the smaller `.notch-kbd-sm` chips.
 const EMPTY_HINT_H = 14;
+/// Quick-add composer row height — the typed-task input + priority picker that
+/// replaces the add-task hint while the user is composing. A touch taller than
+/// HINT_H so the input has comfortable vertical room.
+const COMPOSE_H = 36;
+/// Grace window (ms) after the composer opens during which a transient `blur`
+/// is treated as the focus handshake (re-grab the input) rather than a real
+/// dismiss. Covers the brief gap before `set_focus` makes the notch key.
+const COMPOSE_BLUR_GRACE_MS = 300;
 
 /* ---------------------------------------------------------------------------
  * Ear-row + cutout geometry — logical px. The window is TOP-ANCHORED at the
@@ -143,6 +155,11 @@ const FLASH_MS = 400;
 const ERROR_AUTO_CLEAR_MS = 4500;
 /// Drag threshold before a pointerdown becomes a lift.
 const DRAG_THRESHOLD = 4;
+/// While a lifted row's pointer is within this many px of the scroll viewport's
+/// top/bottom edge, the list auto-scrolls so below-the-fold slots are reachable.
+const DRAG_EDGE_PX = 22;
+/// Per-frame auto-scroll step (px) while the pointer sits in the edge band.
+const DRAG_SCROLL_STEP = 7;
 /// After the user stops speaking, STT runs but `phase` is still "listening"
 /// and `notch:levels` stop arriving — the bars would freeze mid-amplitude.
 /// Once levels go stale past this window we ease them down to a calm resting
@@ -228,6 +245,19 @@ export default function NotchView() {
     height: 0,
   });
 
+  // --- Quick-add composer (typed task entry) -----------------------------
+  /// True while the in-notch typed-task input is open. Keeps the drawer
+  /// expanded even if the cursor leaves (the user is typing, not hovering).
+  const [composing, setComposing] = createSignal(false);
+  const [newText, setNewText] = createSignal("");
+  const [newPriority, setNewPriority] = createSignal<NotchPriority>("med");
+  /// The live composer <input>, for programmatic focus/refocus.
+  let composerInput: HTMLInputElement | undefined;
+  /// Armed COMPOSE_BLUR_GRACE_MS after the composer opens — until then a blur
+  /// is the focus handshake (re-grab), after it a real dismiss (close).
+  let composeBlurArmed = false;
+  let composeArmTimer: ReturnType<typeof setTimeout> | undefined;
+
   // --- Voice (⌘L) drawer state -------------------------------------------
   /// Current voice phase, or null when not capturing. Drives the waveform /
   /// compiling / error drawer.
@@ -278,6 +308,13 @@ export default function NotchView() {
   let dragStartY = 0;
   let dragStartIndex = 0;
   let dragRowH = ROW_H;
+  /// Pointer Y (CONTENT space — viewport-top-relative + scrollTop) at grab, so
+  /// drag math survives the list scrolling under the pointer during a drag.
+  let dragStartContentY = 0;
+  /// Last pointer Y (screen space), read by the edge auto-scroll ticker.
+  let dragLastClientY = 0;
+  /// rAF handle for the edge auto-scroll loop while a row is lifted.
+  let autoScrollRaf: number | null = null;
   /// Pending settle-state clear.
   let settleTimer: ReturnType<typeof setTimeout> | undefined;
   /// Timestamp (ms) of the last `notch:levels` payload, for stale-detection.
@@ -313,10 +350,92 @@ export default function NotchView() {
   function collapse() {
     clearHoverTimer();
     // Leaving the notch confirms any in-flight task completions — there's no
-    // way to reach the Undo button once the panel is shut.
-    commitPendingCompletions();
+    // way to reach the Undo button once the panel is shut. EXCEPT while
+    // composing: the drawer stays open (so Undo is still reachable), so we must
+    // NOT commit yet — `endCompose` handles the commit when the drawer really
+    // closes.
+    if (!composing()) commitPendingCompletions();
     setHovered(false);
     queueMicrotask(syncWindowSize);
+  }
+
+  // --- Quick-add composer -------------------------------------------------
+  /// Open the typed-task input. Makes the notch the key window (so keystrokes
+  /// reach the input) without activating Vox — the click that opened the
+  /// composer usually already did, but `notchFocusInput` covers every path and
+  /// stashes the prior frontmost app for Escape. Blur-to-close is armed only
+  /// after the focus handshake settles so the initial grab can't self-close.
+  function startCompose() {
+    if (voiceActive()) return;
+    setNewText("");
+    setNewPriority("med");
+    setComposing(true);
+    composeBlurArmed = false;
+    if (composeArmTimer !== undefined) clearTimeout(composeArmTimer);
+    void notchFocusInput().catch((e) => console.warn("notchFocusInput:", e));
+    composeArmTimer = setTimeout(() => {
+      composeArmTimer = undefined;
+      composeBlurArmed = true;
+    }, COMPOSE_BLUR_GRACE_MS);
+    queueMicrotask(syncWindowSize);
+  }
+
+  /// Close the composer. `release` hands keyboard focus back to the app that
+  /// was frontmost before composing (the Escape path); a blur-driven close
+  /// passes `false` because whatever the user clicked already took focus.
+  function endCompose(release: boolean) {
+    if (composeArmTimer !== undefined) {
+      clearTimeout(composeArmTimer);
+      composeArmTimer = undefined;
+    }
+    composeBlurArmed = false;
+    setComposing(false);
+    setNewText("");
+    // If the cursor already left the notch, closing the composer is what
+    // actually shuts the drawer — so commit any completions still in limbo now
+    // (their Undo is about to disappear), mirroring `collapse()`.
+    if (!hovered()) commitPendingCompletions();
+    if (release) {
+      void notchReleaseInputFocus().catch((e) =>
+        console.warn("notchReleaseInputFocus:", e),
+      );
+    }
+    queueMicrotask(syncWindowSize);
+  }
+
+  /// Commit the typed task and keep the input open + focused for rapid
+  /// multi-add. The list refreshes via the `notch-list:changed` echo.
+  function submitCompose() {
+    const text = newText().trim();
+    if (!text) return;
+    void notchListAdd(text, newPriority()).catch((e) =>
+      console.error("notchListAdd:", e),
+    );
+    setNewText("");
+    composerInput?.focus();
+    queueMicrotask(syncWindowSize);
+  }
+
+  function onComposerBlur() {
+    // During the initial focus handshake, a transient blur can fire before
+    // `makeKeyAndOrderFront` settles. Re-grab ONLY if our window is still the
+    // key window (`document.hasFocus()`); if the user actually clicked into
+    // another app (we lost key), close instead of fighting for focus back.
+    if (!composeBlurArmed) {
+      if (typeof document !== "undefined" && document.hasFocus()) {
+        requestAnimationFrame(() => composerInput?.focus());
+        return;
+      }
+    }
+    // A real blur (the user clicked into another app/window, which already took
+    // key focus) closes the composer without re-activating anything.
+    endCompose(false);
+  }
+
+  /// Bind + auto-focus the composer <input> the moment it mounts.
+  function bindComposerInput(el: HTMLInputElement) {
+    composerInput = el;
+    requestAnimationFrame(() => el.focus());
   }
 
   /// Active items sorted by (priority desc, order asc). The backend already
@@ -331,7 +450,11 @@ export default function NotchView() {
       .sort((a, b) => rank(a.priority) - rank(b.priority) || a.order - b.order);
   });
 
-  const top = createMemo(() => activeItems().slice(0, topN()));
+  // Every active item is rendered (not just the top-N): the expanded list is a
+  // bounded, scrollable viewport, so overflow scrolls into view rather than
+  // being clipped away. `topN` now caps the viewport HEIGHT (rows shown before
+  // scrolling), not which items exist.
+  const rows = createMemo(() => activeItems());
   const isEmpty = createMemo(() => activeItems().length === 0);
   // The idle collapsed bar shows the top task that ISN'T mid-completion, so a
   // task ticked/committed just before leaving doesn't flash there while its echo
@@ -394,17 +517,21 @@ export default function NotchView() {
 
   /// Drawer shows the voice strip whenever a phase is active.
   const voiceActive = createMemo(() => phase() !== null);
-  /// Hover-expanded drawer: any time the notch is hovered and not mid-voice.
-  /// Drives both the task list (when there are items) and the add-task hint
-  /// (always — the hint is the sole drawer content when the list is empty).
-  const hoverExpanded = createMemo(() => hovered() && !voiceActive());
+  /// Hover-expanded drawer: any time the notch is hovered (or the user is
+  /// typing a new task) and not mid-voice. Drives both the task list (when
+  /// there are items) and the add-task hint / composer. `composing` keeps the
+  /// drawer open even after the cursor leaves, so typing isn't interrupted by
+  /// the hover-collapse.
+  const hoverExpanded = createMemo(
+    () => (hovered() || composing()) && !voiceActive(),
+  );
 
   /// Whether a drawer hangs below the ears right now (everything except an
   /// empty, un-hovered, idle notch). When true the ear bottoms square off so
   /// they merge into the connected slab; when false the ears round their
   /// bottom corners into a standalone resting nub.
   const drawerPresent = createMemo(
-    () => !isEmpty() || hovered() || voiceActive(),
+    () => !isEmpty() || hovered() || voiceActive() || composing(),
   );
 
   async function refresh() {
@@ -494,6 +621,9 @@ export default function NotchView() {
       const p = s.phase;
       // Any new phase supersedes a pending error auto-clear.
       clearErrorTimer();
+      // Voice capture supersedes the typed quick-add — close it and hand the
+      // keyboard back so the two input modes never fight over the drawer.
+      if (p !== "idle" && composing()) endCompose(true);
       if (p === "idle") {
         setPhase(null);
         setPhaseMessage("");
@@ -575,6 +705,7 @@ export default function NotchView() {
     clearErrorTimer();
     if (flashTimer !== undefined) clearTimeout(flashTimer);
     if (settleTimer !== undefined) clearTimeout(settleTimer);
+    if (composeArmTimer !== undefined) clearTimeout(composeArmTimer);
     if (levelsDecayTimer !== undefined) clearInterval(levelsDecayTimer);
     undoTimers.forEach((t) => clearTimeout(t));
     exitTimers.forEach((t) => clearTimeout(t));
@@ -743,6 +874,16 @@ export default function NotchView() {
     window.removeEventListener("pointermove", onDragMove);
     window.removeEventListener("pointerup", onDragEnd);
     window.removeEventListener("pointercancel", onDragEnd);
+    stopAutoScroll();
+  }
+
+  /// CONTENT-space pointer Y for the current gesture: viewport-top-relative plus
+  /// the live `scrollTop`, so the math is stable as the list scrolls under the
+  /// pointer during a drag. Falls back to raw client Y if the list ref is gone.
+  function pointerContentY(clientY: number): number {
+    if (!listRef) return clientY;
+    const r = listRef.getBoundingClientRect();
+    return clientY - r.top + listRef.scrollTop;
   }
 
   function onHandlePointerDown(e: PointerEvent, index: number) {
@@ -755,9 +896,11 @@ export default function NotchView() {
     e.preventDefault();
     e.stopPropagation();
     dragStartY = e.clientY;
+    dragLastClientY = e.clientY;
+    dragStartContentY = pointerContentY(e.clientY);
     dragStartIndex = index;
     dragRowH = ROW_H;
-    setDragId(top()[index]?.id ?? null);
+    setDragId(rows()[index]?.id ?? null);
     setDragLifted(false);
     setDragOffsetY(0);
     setDropIndex(index);
@@ -768,24 +911,71 @@ export default function NotchView() {
 
   function onDragMove(e: PointerEvent) {
     if (dragId() === null) return;
-    const dy = e.clientY - dragStartY;
     if (!dragLifted()) {
-      if (Math.abs(dy) < DRAG_THRESHOLD) return;
+      if (Math.abs(e.clientY - dragStartY) < DRAG_THRESHOLD) return;
       setDragLifted(true);
+      startAutoScroll();
     }
-    const rows = top();
-    // Clamp the lifted row to the list bounds (Y only — X is locked).
+    dragLastClientY = e.clientY;
+    recomputeDrag();
+  }
+
+  /// Recompute the lifted row's offset + drop slot from the LAST pointer
+  /// position, in content space (so it's correct mid-scroll). Shared by
+  /// `onDragMove` and the auto-scroll ticker (which moves content with the
+  /// pointer held still). X is locked — only Y matters.
+  function recomputeDrag() {
+    if (dragId() === null) return;
+    const list = rows();
+    const offset = pointerContentY(dragLastClientY) - dragStartContentY;
+    // Clamp the lifted row to the list bounds.
     const maxUp = -dragStartIndex * dragRowH;
-    const maxDown = (rows.length - 1 - dragStartIndex) * dragRowH;
-    const clamped = Math.max(maxUp, Math.min(maxDown, dy));
+    const maxDown = (list.length - 1 - dragStartIndex) * dragRowH;
+    const clamped = Math.max(maxUp, Math.min(maxDown, offset));
     setDragOffsetY(clamped);
     // Insertion index = origin shifted by whole-row steps.
     const steps = Math.round(clamped / dragRowH);
-    const idx = Math.max(0, Math.min(rows.length - 1, dragStartIndex + steps));
+    const idx = Math.max(0, Math.min(list.length - 1, dragStartIndex + steps));
     setDropIndex(idx);
   }
 
-  function onDragEnd(e: PointerEvent) {
+  /// Edge auto-scroll: while a lifted row's pointer sits within DRAG_EDGE_PX of
+  /// the scroll viewport's top/bottom, nudge `scrollTop` each frame so
+  /// below-the-fold slots become reachable (the list is now taller than its
+  /// viewport). Recomputes the drag after scrolling so the row + drop-line track
+  /// the content. Self-cancels when the lift ends or there's nothing to scroll.
+  function startAutoScroll() {
+    if (autoScrollRaf !== null) return;
+    const tick = () => {
+      if (dragId() === null || !dragLifted() || !listRef) {
+        autoScrollRaf = null;
+        return;
+      }
+      const r = listRef.getBoundingClientRect();
+      const maxScroll = listRef.scrollHeight - listRef.clientHeight;
+      let next = listRef.scrollTop;
+      if (dragLastClientY < r.top + DRAG_EDGE_PX) {
+        next = Math.max(0, next - DRAG_SCROLL_STEP);
+      } else if (dragLastClientY > r.bottom - DRAG_EDGE_PX) {
+        next = Math.min(maxScroll, next + DRAG_SCROLL_STEP);
+      }
+      if (next !== listRef.scrollTop) {
+        listRef.scrollTop = next;
+        recomputeDrag();
+      }
+      autoScrollRaf = requestAnimationFrame(tick);
+    };
+    autoScrollRaf = requestAnimationFrame(tick);
+  }
+
+  function stopAutoScroll() {
+    if (autoScrollRaf !== null) {
+      cancelAnimationFrame(autoScrollRaf);
+      autoScrollRaf = null;
+    }
+  }
+
+  function onDragEnd() {
     detachDragListeners();
     const id = dragId();
     const lifted = dragLifted();
@@ -805,24 +995,22 @@ export default function NotchView() {
         setSettleId(null);
       }, 240);
     }
-    if (id === null || !lifted) return;
+    if (id === null || !lifted || target === null) return;
 
-    // Released outside the drawer → spring back, no reorder.
-    const within = listRef && pointerWithin(listRef, e.clientX, e.clientY);
-    if (!within || target === null) return;
-
-    const rows = top().map((i) => i.id);
-    const from = rows.indexOf(id);
+    // Commit to the previewed slot (the drop-line the user was aiming at). We
+    // do NOT gate on the pointer being inside the list rect: the list is now a
+    // bounded scroll viewport, so reaching a far slot legitimately parks the
+    // pointer at the auto-scrolling edge (outside the clipped rect). `target` is
+    // already clamped to a valid slot, and an unchanged slot no-ops below.
+    const ids = rows().map((i) => i.id);
+    const from = ids.indexOf(id);
     if (from === -1 || from === target) return;
-    const reordered = rows.slice();
+    const reordered = ids.slice();
     reordered.splice(from, 1);
     reordered.splice(target, 0, id);
-    // Full active-id order: reordered top-N, then the remaining tail in its
-    // existing relative order, so items below the fold keep their positions.
-    const tail = activeItems()
-      .map((i) => i.id)
-      .filter((x) => !rows.includes(x));
-    const fullOrder = [...reordered, ...tail];
+    // The whole active list is rendered now, so `reordered` already IS the full
+    // active-id order — no below-the-fold tail to append.
+    const fullOrder = reordered;
 
     // Cross-band stick: the list sorts by (priority desc, order asc) and the
     // backend re-sorts on the echo, so a flat `order` rewrite alone makes a
@@ -863,13 +1051,6 @@ export default function NotchView() {
     } else {
       void reorder();
     }
-  }
-
-  function pointerWithin(el: HTMLElement, x: number, y: number): boolean {
-    const r = el.getBoundingClientRect();
-    // Generous horizontal slop (the lifted row may overhang) but require
-    // the pointer to stay within the vertical band.
-    return y >= r.top - 8 && y <= r.bottom + 8 && x >= r.left - 40 && x <= r.right + 40;
   }
 
   // --- Transitions --------------------------------------------------------
@@ -914,20 +1095,32 @@ export default function NotchView() {
         // List
         hoverExpanded={hoverExpanded()}
         head={headItem()}
-        rows={top()}
+        rows={rows()}
+        topN={topN()}
         expandedWidth={expandedWidth()}
         bridgeW={bridgeW()}
         voiceHotkey={voiceHotkey()}
         flashIds={flashIds()}
         reduced={reducedMotion()}
-        // Completion (strike-through → undo → remove). `exitingCount` is scoped
-        // to the VISIBLE rows so a task that sorts below the top-N fold while
-        // mid-exit can't subtract height for a row that isn't rendered.
+        // Completion (strike-through → undo → remove). `exitingCount` counts
+        // the exiting rows so the drawer height shrinks in step as they
+        // collapse (capped to the viewport in the height memo).
         completingIds={completingIds()}
         exitingIds={exitingIds()}
-        exitingCount={top().filter((r) => exitingIds().has(r.id)).length}
+        exitingCount={rows().filter((r) => exitingIds().has(r.id)).length}
         onToggleComplete={toggleComplete}
         onUndo={cancelComplete}
+        // Quick-add composer
+        composing={composing()}
+        newText={newText()}
+        newPriority={newPriority()}
+        onStartCompose={startCompose}
+        onComposeInput={setNewText}
+        onComposePriority={setNewPriority}
+        onComposeSubmit={submitCompose}
+        onComposeCancel={() => endCompose(true)}
+        onComposeBlur={onComposerBlur}
+        setComposerInput={bindComposerInput}
         // Drag
         dragId={dragId()}
         dragLifted={dragLifted()}
@@ -1110,6 +1303,7 @@ function Drawer(props: {
   hoverExpanded: boolean;
   head: NotchItem | null;
   rows: NotchItem[];
+  topN: number;
   expandedWidth: number;
   bridgeW: number;
   voiceHotkey: string;
@@ -1120,6 +1314,17 @@ function Drawer(props: {
   exitingCount: number;
   onToggleComplete: (id: string) => void;
   onUndo: (id: string) => void;
+  // Quick-add composer
+  composing: boolean;
+  newText: string;
+  newPriority: NotchPriority;
+  onStartCompose: () => void;
+  onComposeInput: (text: string) => void;
+  onComposePriority: (p: NotchPriority) => void;
+  onComposeSubmit: () => void;
+  onComposeCancel: () => void;
+  onComposeBlur: () => void;
+  setComposerInput: (el: HTMLInputElement) => void;
   dragId: string | null;
   dragLifted: boolean;
   dragOffsetY: number;
@@ -1143,24 +1348,31 @@ function Drawer(props: {
     return props.rows.length === 0 ? "empty" : "collapsed";
   });
 
+  // Height of the footer beneath the task rows: the typed-task composer when
+  // open, otherwise the voice add-task hint.
+  const footerH = () => (props.composing ? COMPOSE_H : HINT_H);
+
   // Target content height (px) for the current mode. 0 collapses the window.
   const targetHeight = createMemo(() => {
     switch (mode()) {
       case "voice":
         // Waveform / dots / error strip — short calm ribbon.
         return Math.round(props.cutoutHeight * 0.65) + 10;
-      case "list":
-        // Task rows + the add-task hint footer beneath them. Rows mid-collapse
-        // (a finalized completion) are subtracted so the drawer shrinks in step
-        // with the row's own collapse, instead of leaving a gap until commit.
-        return (
-          Math.max(0, props.rows.length - props.exitingCount) * props.rowH +
-          LIST_PAD_Y * 2 +
-          HINT_H
+      case "list": {
+        // The list is a bounded, scrollable viewport: it shows at most `topN`
+        // rows, then scrolls. Rows mid-collapse (a finalized completion) are
+        // subtracted so the drawer shrinks in step as they collapse, but the
+        // viewport never exceeds `topN` rows even with a long list.
+        const visibleRows = Math.min(
+          Math.max(0, props.rows.length - props.exitingCount),
+          props.topN,
         );
+        return visibleRows * props.rowH + LIST_PAD_Y * 2 + footerH();
+      }
       case "hint":
-        // Empty + hovered: the compact keycap affordance, standing alone.
-        return EMPTY_HINT_H;
+        // Empty + hovered: the compact keycap affordance — or, while composing,
+        // the typed-task input standing alone.
+        return props.composing ? COMPOSE_H : EMPTY_HINT_H;
       case "collapsed":
         return COLLAPSED_H;
       default:
@@ -1170,14 +1382,11 @@ function Drawer(props: {
 
   // Target content width. Collapsed task / empty-hover hint / voice strip all
   // span the full ear-row width (`bridgeW`) so they fuse into one connected
-  // black slab under the ears. Only the hovered task LIST fans out wider.
+  // black slab under the ears. The hovered task LIST — and the composer in any
+  // mode (so the input has room to type) — fan out wider.
   const targetWidth = createMemo(() => {
-    switch (mode()) {
-      case "list":
-        return props.expandedWidth;
-      default:
-        return props.bridgeW;
-    }
+    if (mode() === "list" || props.composing) return props.expandedWidth;
+    return props.bridgeW;
   });
 
   return (
@@ -1244,103 +1453,215 @@ function Drawer(props: {
         </Show>
       </Show>
 
-      <Show when={mode() === "list"}>
-        <ExpandedList
-          rows={props.rows}
-          flashIds={props.flashIds}
-          reduced={props.reduced}
-          completingIds={props.completingIds}
-          exitingIds={props.exitingIds}
-          onToggleComplete={props.onToggleComplete}
-          onUndo={props.onUndo}
-          dragId={props.dragId}
-          dragLifted={props.dragLifted}
-          dragOffsetY={props.dragOffsetY}
-          dropIndex={props.dropIndex}
-          settleId={props.settleId}
-          rowH={props.rowH}
-          setListRef={props.setListRef}
-          onHandleDown={props.onHandleDown}
-          rowTransition={props.rowTransition}
-          checkboxTransition={props.checkboxTransition}
-        />
-        <AddHint hotkey={props.voiceHotkey} />
-      </Show>
-
-      <Show when={mode() === "hint"}>
-        <AddHintCompact hotkey={props.voiceHotkey} />
+      {/* Hover-expanded content (the "list" and "hint" modes share one block).
+          The task list mounts only when there are rows; the footer is ONE
+          element — composer or add-hint. Keeping the composer in a single
+          `<Show when={composing}>` (NOT duplicated per mode) means adding the
+          first task, which flips empty→list, never unmounts/remounts the
+          focused <input> — so a remove-from-DOM blur can't slam the composer
+          shut mid-multi-add. */}
+      <Show when={mode() === "list" || mode() === "hint"}>
+        <Show when={props.rows.length > 0}>
+          <ExpandedList
+            rows={props.rows}
+            maxRows={props.topN}
+            flashIds={props.flashIds}
+            reduced={props.reduced}
+            completingIds={props.completingIds}
+            exitingIds={props.exitingIds}
+            onToggleComplete={props.onToggleComplete}
+            onUndo={props.onUndo}
+            dragId={props.dragId}
+            dragLifted={props.dragLifted}
+            dragOffsetY={props.dragOffsetY}
+            dropIndex={props.dropIndex}
+            settleId={props.settleId}
+            rowH={props.rowH}
+            setListRef={props.setListRef}
+            onHandleDown={props.onHandleDown}
+            rowTransition={props.rowTransition}
+            checkboxTransition={props.checkboxTransition}
+          />
+        </Show>
+        <Show
+          when={props.composing}
+          fallback={
+            <Show
+              when={props.rows.length > 0}
+              fallback={
+                <AddHintCompact
+                  hotkey={props.voiceHotkey}
+                  onAdd={props.onStartCompose}
+                />
+              }
+            >
+              <AddHint
+                hotkey={props.voiceHotkey}
+                onAdd={props.onStartCompose}
+              />
+            </Show>
+          }
+        >
+          <AddComposer
+            text={props.newText}
+            priority={props.newPriority}
+            onInput={props.onComposeInput}
+            onPriority={props.onComposePriority}
+            onSubmit={props.onComposeSubmit}
+            onCancel={props.onComposeCancel}
+            onBlur={props.onComposeBlur}
+            setInputRef={props.setComposerInput}
+          />
+        </Show>
       </Show>
     </div>
   );
 }
 
+/// Plus glyph for the click-to-add affordances. `currentColor` so it inherits
+/// the surrounding text color (which brightens on hover via CSS).
+function PlusGlyph(props: { size?: number }) {
+  const s = () => props.size ?? 10;
+  return (
+    <svg
+      width={s()}
+      height={s()}
+      viewBox="0 0 12 12"
+      fill="none"
+      aria-hidden="true"
+    >
+      <path
+        d="M6 2.4V9.6M2.4 6H9.6"
+        stroke="currentColor"
+        stroke-width="1.6"
+        stroke-linecap="round"
+      />
+    </svg>
+  );
+}
+
 /* ===========================================================================
- * Add-task hint — the keyboard affordance revealed on hover. Renders the notch
- * voice hotkey (default ⌥⌘L) as keycaps + a short label, so a user hovering an
- * empty notch learns how to capture a task. It's the sole drawer content when
- * the list is empty and a faint footer beneath the rows when it isn't.
+ * Add-task footer (non-empty list) — a CLICK-to-type "＋ Add a task" button on
+ * the left plus the notch voice hotkey (default ⌥⌘L) as keycaps on the right.
+ * Two ways to add a task without leaving the notch: click the CTA to type, or
+ * press the shown shortcut to dictate. Clicking the CTA opens the composer.
  * ======================================================================== */
-function AddHint(props: { hotkey: string }) {
+function AddHint(props: { hotkey: string; onAdd: () => void }) {
   const tokens = createMemo(() => formatHotkeyTokens(props.hotkey));
-  const label = createMemo(() => {
-    const k = formatHotkey(props.hotkey);
-    return k ? `Press ${k} to add a task` : "Add a task by voice";
-  });
   return (
     <div
-      class="flex items-center justify-center gap-1.5"
+      class="flex items-center justify-between gap-2 px-2.5"
       style={{ height: `${HINT_H}px` }}
-      role="note"
-      aria-label={label()}
     >
-      <span class="flex items-center gap-1" aria-hidden="true">
+      <button
+        type="button"
+        class="notch-add-cta"
+        onClick={props.onAdd}
+        aria-label="Add a task"
+      >
+        <PlusGlyph />
+        <span>Add a task</span>
+      </button>
+      <span
+        class="flex items-center gap-1"
+        aria-hidden="true"
+        title="…or add by voice"
+      >
         <For each={tokens()}>
           {(t) => <kbd class="notch-kbd">{t.symbol}</kbd>}
         </For>
       </span>
-      <span
-        class="text-[11px] leading-none text-[var(--color-ink-faint)]"
-        aria-hidden="true"
-      >
-        to add a task
-      </span>
     </div>
   );
 }
 
 /* ===========================================================================
- * Compact add-task hint — the EMPTY + hovered drawer content. Same affordance
- * as AddHint but shrunk (smaller `.notch-kbd-sm` chips, EMPTY_HINT_H tall) so
- * an empty hovered notch teaches ⌘⌥L without hanging over app chrome below the
- * menu bar.
+ * Compact add-task footer — the EMPTY + hovered drawer content. The whole row
+ * is one click-to-type "＋ Add a task" button (with the tiny ⌥⌘L keys trailing
+ * as the voice hint), shrunk to EMPTY_HINT_H so an empty hovered notch invites
+ * a first task without hanging over app chrome below the menu bar.
  * ======================================================================== */
-function AddHintCompact(props: { hotkey: string }) {
+function AddHintCompact(props: { hotkey: string; onAdd: () => void }) {
   const tokens = createMemo(() => formatHotkeyTokens(props.hotkey));
-  const label = createMemo(() => {
-    const k = formatHotkey(props.hotkey);
-    return k ? `Press ${k} to add a task` : "Add a task by voice";
-  });
   return (
-    <div
-      class="flex items-center justify-center gap-1"
+    <button
+      type="button"
+      class="notch-add-cta-compact"
       style={{ height: `${EMPTY_HINT_H}px` }}
-      role="note"
-      aria-label={label()}
+      onClick={props.onAdd}
+      aria-label="Add a task"
     >
+      <PlusGlyph size={8} />
+      <span class="text-[9px] leading-none">Add a task</span>
       <span class="flex items-center gap-0.5" aria-hidden="true">
         <For each={tokens()}>
           {(t) => <kbd class="notch-kbd-sm">{t.symbol}</kbd>}
         </For>
       </span>
-      {/* Always pair the keys with what they DO so a first-time user who just
-          got this update understands the notch is a voice task list, not just
-          a bare shortcut. Kept legible (9px) even though the row is compact. */}
-      <span
-        class="text-[9px] leading-none text-[var(--color-ink-mute)]"
-        aria-hidden="true"
-      >
-        to add a task
-      </span>
+    </button>
+  );
+}
+
+/* ===========================================================================
+ * Quick-add composer — the typed-task input that replaces the add-task footer
+ * while the user is composing. A 3-dot priority picker on the left + a text
+ * input. Enter adds the task and keeps the input open for rapid multi-add;
+ * Escape closes it. The priority dots `preventDefault` on mousedown so clicking
+ * one never blurs (and closes) the input.
+ * ======================================================================== */
+function AddComposer(props: {
+  text: string;
+  priority: NotchPriority;
+  onInput: (t: string) => void;
+  onPriority: (p: NotchPriority) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+  onBlur: () => void;
+  setInputRef: (el: HTMLInputElement) => void;
+}) {
+  const priorities: NotchPriority[] = ["high", "med", "low"];
+  return (
+    <div
+      class="flex items-center gap-2 px-2.5"
+      style={{ height: `${COMPOSE_H}px` }}
+    >
+      <div class="flex items-center gap-1" role="group" aria-label="Priority">
+        <For each={priorities}>
+          {(p) => (
+            <button
+              type="button"
+              class="notch-prio-dot"
+              classList={{ "is-active": props.priority === p }}
+              style={{ "--dot": priorityColor(p) }}
+              aria-label={`${p} priority`}
+              aria-pressed={props.priority === p}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => props.onPriority(p)}
+            />
+          )}
+        </For>
+      </div>
+      <input
+        ref={props.setInputRef}
+        type="text"
+        class="notch-add-input"
+        placeholder="Add a task…"
+        value={props.text}
+        spellcheck={false}
+        autocomplete="off"
+        onInput={(e) => props.onInput(e.currentTarget.value)}
+        onBlur={props.onBlur}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            props.onSubmit();
+          } else if (e.key === "Escape") {
+            e.preventDefault();
+            props.onCancel();
+          }
+          e.stopPropagation();
+        }}
+      />
     </div>
   );
 }
@@ -1431,13 +1752,15 @@ function VoiceStrip(props: {
 }
 
 /* ===========================================================================
- * Expanded list — top-N rows. Each: drag handle + checkbox + priority dot +
- * text. Rows fade+rise in on mount with a ~20ms stagger. Drag lifts a row to
- * follow the pointer; siblings slide; a 2px accent drop-line marks the
- * insertion point.
+ * Expanded list — every active row (drag handle + checkbox + priority dot +
+ * text), in a bounded VIEWPORT that shows up to `maxRows` and SCROLLS the rest
+ * into view, so a long list is fully reachable rather than clipped at the fold.
+ * Rows fade+rise in on mount with a ~20ms stagger. Drag lifts a row to follow
+ * the pointer; siblings slide; a 2px accent drop-line marks the insertion point.
  * ======================================================================== */
 function ExpandedList(props: {
   rows: NotchItem[];
+  maxRows: number;
   flashIds: Set<string>;
   reduced: boolean;
   completingIds: Set<string>;
@@ -1491,8 +1814,18 @@ function ExpandedList(props: {
   return (
     <div
       ref={props.setListRef}
-      class="relative flex flex-col px-2"
-      style={{ "padding-top": `${LIST_PAD_Y}px`, "padding-bottom": `${LIST_PAD_Y}px` }}
+      class="notch-scroll relative flex flex-col px-2"
+      style={{
+        "padding-top": `${LIST_PAD_Y}px`,
+        "padding-bottom": `${LIST_PAD_Y}px`,
+        // Bounded viewport: show up to `maxRows`, then scroll the rest into
+        // view. `overflow-x: hidden` keeps the lifted-row shadow from spawning a
+        // horizontal scrollbar; the drop-line + row transforms live in the
+        // scrolled content box, so they track the rows as the user scrolls.
+        "max-height": `${props.maxRows * props.rowH + LIST_PAD_Y * 2}px`,
+        "overflow-y": "auto",
+        "overflow-x": "hidden",
+      }}
     >
       {/* Accent drop-line at the insertion point (drag only). */}
       <Show when={draggingActive() && props.dropIndex !== null}>
