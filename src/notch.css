@@ -136,6 +136,68 @@ button {
   line-height: 1;
 }
 
+/* Compact keycaps for the EMPTY + hover hint, where the whole affordance is
+ * only EMPTY_HINT_H (~14px) tall. Same look as `.notch-kbd`, scaled down. */
+.notch-kbd-sm {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 11px;
+  height: 12px;
+  padding: 0 2px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--color-ink);
+  font-size: 8px;
+  font-weight: 600;
+  line-height: 1;
+}
+
+/* Strike-through line for a task in completion limbo. Sits centered over the
+ * task text; Notch.tsx animates its `transform: scaleX()` inline — 0→1 to draw
+ * it across (slow), →0 to retract on undo (fast). */
+.notch-strike-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  margin-top: -0.75px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: var(--color-ink-mute);
+  transform-origin: left center;
+  pointer-events: none;
+}
+
+/* Undo affordance at the right of a completing row. Fades + slides in. */
+@keyframes notch-undo-in {
+  from {
+    opacity: 0;
+    transform: translateX(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+.notch-undo {
+  padding: 1px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--color-ink-mute);
+  background: rgba(255, 255, 255, 0.08);
+  animation: notch-undo-in 200ms ease both;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
+}
+.notch-undo:hover {
+  color: var(--color-ink);
+  background: rgba(255, 255, 255, 0.16);
+}
+
 /* Drag handle — a faint 2×3 dot grid shown when the drawer is expanded.
  * Always visible (not gated on row :hover, which can't fire reliably when
  * another app holds focus). */
