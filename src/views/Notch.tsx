@@ -29,7 +29,7 @@ import {
   type NotchListDoc,
   type NotchPriority,
 } from "../lib/ipc";
-import { formatHotkeyTokens } from "../lib/hotkey";
+import { formatHotkey, formatHotkeyTokens } from "../lib/hotkey";
 
 /// Default top-N if settings haven't loaded yet (matches the backend
 /// `default_notch_list_top_n`).
@@ -51,10 +51,15 @@ const COLLAPSED_H = 16;
 /// FOOTER beneath a non-empty hovered list.
 const HINT_H = 30;
 /// Compact add-task hint height for the EMPTY + hovered state, where the
-/// keycap affordance is the sole drawer content. Under half the old 30px (and
-/// a hair under the task bar) so hovering an empty notch no longer hangs over
-/// app chrome, while still teaching ⌘⌥L via the smaller `.notch-kbd-sm` chips.
-const EMPTY_HINT_H = 14;
+/// type-a-task button + voice keys are the sole drawer content. Sized so the
+/// row sits VERTICALLY CENTERED (via the band's `align-items: center`) with ~6px
+/// of breathing room above and below — not jammed against the rounded bottom
+/// edge as it was at 14px. Kept a touch under the populated footer's 30px
+/// (`HINT_H`) so the empty teaser reads slimmer than a real task list, and well
+/// within the menu-bar band so the hover drawer never reaches down into app
+/// chrome (this is the HOVER state — the idle/collapsed slimness lives in
+/// `COLLAPSED_H`, and an empty idle notch has a 0-height drawer anyway).
+const EMPTY_HINT_H = 26;
 /// Quick-add composer row height — the typed-task input + priority picker that
 /// replaces the add-task hint while the user is composing. A touch taller than
 /// HINT_H so the input has comfortable vertical room.
@@ -1557,48 +1562,73 @@ function AddHint(props: { hotkey: string; onAdd: () => void }) {
         type="button"
         class="notch-add-cta"
         onClick={props.onAdd}
-        aria-label="Add a task"
+        aria-label="Type a task"
       >
         <PlusGlyph />
-        <span>Add a task</span>
+        <span>Type a task</span>
       </button>
+      {/* The keyboard alternative: press the shortcut to ADD a task by voice.
+          The "or speak" label names what the keys do so the shortcut isn't a
+          bare, unexplained glyph. Informational (not a button) — the user
+          presses the real keys; nothing here is a click target. */}
       <span
-        class="flex items-center gap-1"
-        aria-hidden="true"
-        title="…or add by voice"
+        class="flex items-center gap-1.5"
+        aria-label={`or speak — press ${formatHotkey(props.hotkey)} to dictate a task`}
       >
-        <For each={tokens()}>
-          {(t) => <kbd class="notch-kbd">{t.symbol}</kbd>}
-        </For>
+        <span class="text-[10px] leading-none text-[var(--color-ink-faint)]">
+          or speak
+        </span>
+        <span class="flex items-center gap-1" aria-hidden="true">
+          <For each={tokens()}>
+            {(t) => <kbd class="notch-kbd">{t.symbol}</kbd>}
+          </For>
+        </span>
       </span>
     </div>
   );
 }
 
 /* ===========================================================================
- * Compact add-task footer — the EMPTY + hovered drawer content. The whole row
- * is one click-to-type "＋ Add a task" button (with the tiny ⌥⌘L keys trailing
- * as the voice hint), shrunk to EMPTY_HINT_H so an empty hovered notch invites
- * a first task without hanging over app chrome below the menu bar.
+ * Compact add-task footer — the EMPTY + hovered drawer content. Mirrors the
+ * full `AddHint` (so the two read as one consistent affordance), scaled down:
+ * a click-to-type "＋ Type a task" button on the LEFT and the voice alternative
+ * ("or speak" + the ⌥⌘L keys) on the RIGHT, pushed apart with `justify-between`
+ * so the two ways to add — type vs speak — read as distinct, parallel options.
+ * The band is EMPTY_HINT_H tall with `align-items: center`, so the row sits
+ * vertically centered with breathing room rather than jammed at the bottom.
  * ======================================================================== */
 function AddHintCompact(props: { hotkey: string; onAdd: () => void }) {
   const tokens = createMemo(() => formatHotkeyTokens(props.hotkey));
   return (
-    <button
-      type="button"
-      class="notch-add-cta-compact"
+    <div
+      class="flex items-center justify-between gap-2 px-3"
       style={{ height: `${EMPTY_HINT_H}px` }}
-      onClick={props.onAdd}
-      aria-label="Add a task"
     >
-      <PlusGlyph size={8} />
-      <span class="text-[9px] leading-none">Add a task</span>
-      <span class="flex items-center gap-0.5" aria-hidden="true">
-        <For each={tokens()}>
-          {(t) => <kbd class="notch-kbd-sm">{t.symbol}</kbd>}
-        </For>
+      <button
+        type="button"
+        class="notch-add-cta-compact"
+        onClick={props.onAdd}
+        aria-label="Type a task"
+      >
+        <PlusGlyph size={9} />
+        <span>Type a task</span>
+      </button>
+      {/* Voice alternative — press the shortcut to dictate a task. "or speak"
+          names what the keys do; informational, not a click target. */}
+      <span
+        class="flex items-center gap-1.5"
+        aria-label={`or speak — press ${formatHotkey(props.hotkey)} to dictate a task`}
+      >
+        <span class="text-[9px] leading-none text-[var(--color-ink-faint)]">
+          or speak
+        </span>
+        <span class="flex items-center gap-0.5" aria-hidden="true">
+          <For each={tokens()}>
+            {(t) => <kbd class="notch-kbd-sm">{t.symbol}</kbd>}
+          </For>
+        </span>
       </span>
-    </button>
+    </div>
   );
 }
 

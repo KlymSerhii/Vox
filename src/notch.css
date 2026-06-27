@@ -179,19 +179,20 @@ button {
   line-height: 1;
 }
 
-/* Compact keycaps for the EMPTY + hover hint, where the whole affordance is
- * only EMPTY_HINT_H (~14px) tall. Same look as `.notch-kbd`, scaled down. */
+/* Compact keycaps for the EMPTY + hover hint, where the affordance sits in the
+ * slimmer EMPTY_HINT_H band. Same look as `.notch-kbd`, scaled down — a hair
+ * larger than before so the keys stay legible now that the band is centered. */
 .notch-kbd-sm {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-width: 11px;
-  height: 12px;
-  padding: 0 2px;
+  min-width: 12px;
+  height: 13px;
+  padding: 0 3px;
   border-radius: 3px;
   background: rgba(255, 255, 255, 0.1);
   color: var(--color-ink);
-  font-size: 8px;
+  font-size: 9px;
   font-weight: 600;
   line-height: 1;
 }
@@ -283,26 +284,29 @@ button {
   background: rgba(255, 255, 255, 0.08);
 }
 
-/* Compact variant — the whole EMPTY+hover drawer row is this click target, so
- * an empty notch invites a first typed task. Holds the plus, the label, and the
- * tiny voice keys on one short line. Block-level `flex` (not `inline-flex`): it
- * sits directly inside the block drawer, so an inline-level box would gain a
- * line-box baseline strut and get pushed out the bottom of the EMPTY_HINT_H
- * (14px) `overflow-hidden` drawer — clipping the label. `width: 100%` already
- * makes it a full-width row, so block flex is the intended box anyway. */
+/* Compact variant of the type-a-task CTA — the LEFT half of the EMPTY+hover
+ * drawer row. Same quiet-button-that-brightens-on-hover as `.notch-add-cta`,
+ * one notch smaller (10px label, tighter padding) for the slimmer empty teaser.
+ * It's now a flex ITEM inside the row's flex container (not a bare child of the
+ * block drawer), so an inline-level box is fine here — the parent flex blockifies
+ * it, so there's no line-box baseline strut to clip it. */
 .notch-add-cta-compact {
-  display: flex;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
   gap: 5px;
-  width: 100%;
-  padding: 0 6px;
+  padding: 2px 6px;
+  border-radius: 7px;
   color: var(--color-ink-mute);
+  font-size: 10px;
   font-weight: 600;
-  transition: color 120ms ease;
+  line-height: 1;
+  transition:
+    background 120ms ease,
+    color 120ms ease;
 }
 .notch-add-cta-compact:hover {
   color: var(--color-ink);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 /* Quick-add text input. Transparent field on the black panel — no boxy border,
