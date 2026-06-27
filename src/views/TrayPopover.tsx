@@ -1,0 +1,1653 @@
+import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { HotkeyKeys } from "../components/HotkeyKeys";
+import { SparkleGlyph } from "../components/SparkleGlyph";
+import {
+  cancelSession,
+  checkPermissions,
+  closeTrayPopover,
+  copyText,
+  dismissUpdate,
+  donationOptOut,
+  donationSnooze,
+  downloadAndInstallUpdate,
+  getDonationPrompt,
+  getPublicSettings,
+  getTimeSavedStats,
+  getUpdateState,
+  inferenceServerStatus,
+  listAudioInputDevices,
+  listModels,
+  listModes,
+  onModesChanged,
+  onSessionsChanged,
+  onSettingsChanged,
+  onStatsChanged,
+  onUpdateState,
+  onUpdaterProgress,
+  openAccessibilitySettings,
+  openExternalUrl,
+  openSettingsWindow,
+  quitApp,
+  rePolishTranscript,
+  sessionsSnapshot,
+  setActiveMode,
+  setAppearance,
+  setAudioAttenuation,
+  setAudioInputDevice,
+  setAutoPasteEnabled,
+  setEnableThinking,
+  setHandsFreeEnabled,
+  setLiveTranscriptEnabled,
+  setPolishingEnabled,
+  setStreamingPillEnabled,
+  type AudioInputDevice,
+  type CompletedEntry,
+  type DonationPrompt,
+  type InProgressEntry,
+  type ModelStatus,
+  type Period,
+  type SessionsSnapshot,
+  type Settings,
+  type TimeSavedStats,
+  type UpdateState,
+  type VoiceMode,
+} from "../lib/ipc";
+import { AppearanceToggle } from "./tray-popover/components/AppearanceToggle";
+import { CommunityRow } from "./tray-popover/components/CommunityRow";
+import { DonateBanner } from "./tray-popover/components/DonateBanner";
+import { DonateRow } from "./tray-popover/components/DonateRow";
+import { InProgressRow } from "./tray-popover/components/InProgressRow";
+import { LocalBadge } from "./tray-popover/components/LocalBadge";
+import { SmallSpinner } from "./tray-popover/components/SmallSpinner";
+import { StatusDot } from "./tray-popover/components/StatusDot";
+import { UpdateBanner } from "./tray-popover/components/UpdateBanner";
+import { Toggle } from "../components/Toggle";
+import { isMac, isWindows } from "../lib/platform";
+import { DISCORD_URL, DONATE_URL, PERIOD_OPTIONS } from "./tray-popover/constants";
+import {
+  computeDropdownPosition,
+  type DropdownPosition,
+} from "./tray-popover/dropdownPosition";
+import {
+  ago,
+  formatDuration,
+  sessionsSubLine,
+  shortRepolishError,
+} from "./tray-popover/helpers";
+
+// All four dropdowns (mode, period, mic, re-polish) share the same
+// `DropdownPosition` shape so the rendering picks the anchor side
+// (top vs bottom) via `placement` without per-call-site branching.
+// The mode, mic, and re-polish pickers flip up when there's more
+// headroom above (their lists can outgrow the space below); the
+// period picker has few options and stays "below".
+function initialDropdownPos(): DropdownPosition {
+  return {
+    placement: "below",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    minWidth: 0,
+    maxHeight: 240,
+  };
+}
+
+export default function TrayPopoverView() {
+  const [loaded, setLoaded] = createSignal(false);
+  const [s, setS] = createSignal<Settings | null>(null);
+  const [recents, setRecents] = createSignal<CompletedEntry[]>([]);
+  const [inProgress, setInProgress] = createSignal<InProgressEntry[]>([]);
+  const [copyFlash, setCopyFlash] = createSignal<number | null>(null);
+  // Per-row "Re-polished as X" hint timer keyed by session id. Cleared
+  // after a short delay so the row collapses back to the default look.
+  const [repolishFlash, setRepolishFlash] = createSignal<{
+    sessionId: number;
+    modeName: string;
+    warning: boolean;
+  } | null>(null);
+  // Sessions currently being re-polished (background LLM call in
+  // flight). Used to render a small spinner / disable the picker on
+  // the affected row.
+  const [repolishBusy, setRepolishBusy] = createSignal<Set<number>>(new Set());
+  // Per-row picker state. Only one row's picker is open at a time so
+  // the dense popover doesn't pile up flyouts. Stored as the row's
+  // session id (or null for closed).
+  const [repolishPickerSessionId, setRepolishPickerSessionId] = createSignal<
+    number | null
+  >(null);
+  let repolishPickerRef: HTMLDivElement | undefined;
+  const repolishTriggerRefs = new Map<number, HTMLButtonElement>();
+  const [repolishMenuPos, setRepolishMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
+  // Per-row inline error (cleared on retry / outside-click). Keyed by
+  // session id so error from one row doesn't shadow another.
+  const [repolishError, setRepolishError] = createSignal<{
+    sessionId: number;
+    message: string;
+  } | null>(null);
+  const [modes, setModes] = createSignal<VoiceMode[]>([]);
+  const [modeMenuOpen, setModeMenuOpen] = createSignal(false);
+  // Header status uses these to detect "models not yet installed". A
+  // non-empty configured id whose ModelStatus reports `installed: false`
+  // means the user is past onboarding but the artifact didn't survive
+  // (manual delete, partial download). The header should say
+  // "Setup needed" so they don't trust the "ready" badge for a pipeline
+  // that will fail on first use.
+  const [models, setModels] = createSignal<ModelStatus[]>([]);
+  const [inferenceInstalled, setInferenceInstalled] = createSignal<boolean | null>(null);
+  const [period, setPeriod] = createSignal<Period>("day");
+  const [stats, setStats] = createSignal<TimeSavedStats>({
+    saved_seconds: 0,
+    sessions: 0,
+  });
+  // Donation nudge. The backend (`get_donation_prompt`) owns the
+  // whether/which-tier decision — opt-out, snooze, and the 1h/10h/50h
+  // gating all live in Rust so this surface can't drift from the policy.
+  // `null` = show only the always-present passive Support row. Refreshed
+  // on mount, on every stats change (a dictation may have just crossed a
+  // tier), and on focus (backstop for a tier crossed while hidden).
+  const [donation, setDonation] = createSignal<DonationPrompt | null>(null);
+  const [quickSettingsOpen, setQuickSettingsOpen] = createSignal(false);
+  // Accessibility grant status for the auto-paste toggle. `null` =
+  // not yet probed; treated as "ungranted" for nudging purposes until
+  // the first probe lands. Re-probed on mount and whenever the
+  // popover regains focus (the user may have flipped the grant in
+  // System Settings while the popover was hidden).
+  const [accessibility, setAccessibility] = createSignal<boolean | null>(null);
+  // Anchor for the mode-picker dropdown. Used by Show-when-open to
+  // position the listbox via fixed coordinates so it isn't clipped by
+  // the popover root's `overflow-hidden`.
+  let modeTriggerRef: HTMLButtonElement | undefined;
+  let modeMenuRef: HTMLDivElement | undefined;
+  const [modeMenuPos, setModeMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
+  const [periodMenuOpen, setPeriodMenuOpen] = createSignal(false);
+  let periodTriggerRef: HTMLButtonElement | undefined;
+  let periodMenuRef: HTMLDivElement | undefined;
+  const [periodMenuPos, setPeriodMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
+  // Refreshed on popover mount + every time the window regains focus
+  // so plugging an AirPods doesn't leave the dropdown stale.
+  const [audioDevices, setAudioDevices] = createSignal<AudioInputDevice[]>([]);
+  const [micMenuOpen, setMicMenuOpen] = createSignal(false);
+  let micTriggerRef: HTMLButtonElement | undefined;
+  let micMenuRef: HTMLDivElement | undefined;
+  // The Mic row sits in the middle of the popover, so a long device
+  // list spills past the bottom edge. Mirror the repolish picker's
+  // flip-up logic — when there isn't room below, anchor by `bottom`
+  // and pin `max-height` to whichever side we landed on so the menu
+  // scrolls instead of clipping at the OS window edge.
+  const [micMenuPos, setMicMenuPos] =
+    createSignal<DropdownPosition>(initialDropdownPos());
+  const periodLabel = () =>
+    PERIOD_OPTIONS.find((o) => o.value === period())?.label ?? "Today";
+
+  let unlistenSettings: (() => void) | null = null;
+  let unlistenSessions: (() => void) | null = null;
+  let unlistenStats: (() => void) | null = null;
+  let unlistenModes: (() => void) | null = null;
+  let unlistenFocus: (() => void) | null = null;
+  let unlistenUpdates: (() => void) | null = null;
+  let unlistenUpdaterProgress: (() => void) | null = null;
+  // Updater state is shared with the tray-icon dot (via the backend
+  // emit) and the Settings → About row. We mirror it here only for
+  // the banner — the banner gates on `state.status === "available"`
+  // AND `dismissed_version !== available_version`. The popover
+  // webview is built once and reused, so the live subscription is
+  // load-bearing for "Later" to take effect on this surface without
+  // needing the user to re-open the popover.
+  const [updateState, setUpdateState] = createSignal<UpdateState | null>(null);
+  const [installingUpdate, setInstallingUpdate] = createSignal(false);
+
+  async function refreshStats() {
+    try {
+      setStats(await getTimeSavedStats(period()));
+    } catch (e) {
+      console.warn(e);
+      setStats({ saved_seconds: 0, sessions: 0 });
+    }
+  }
+
+  async function refreshDonation() {
+    try {
+      setDonation(await getDonationPrompt());
+    } catch (e) {
+      console.warn("getDonationPrompt failed:", e);
+      setDonation(null);
+    }
+  }
+
+  function applySnapshot(snap: SessionsSnapshot) {
+    setInProgress(snap.in_progress);
+    // RECENT keeps the richer `CompletedEntry` shape so the per-row
+    // re-polish action has the `session_id` it needs to call back
+    // into the backend. The old `transcripts:changed` projection is
+    // still emitted by the Rust side, but we drop the legacy
+    // subscription here — `sessions:changed` carries the same data
+    // (and more), so there's no value in maintaining both wiring.
+    setRecents(snap.recent);
+  }
+
+  onMount(async () => {
+    document.body.classList.add("translucent");
+    try {
+      const [settings, snap, list] = await Promise.all([
+        getPublicSettings(),
+        sessionsSnapshot(),
+        listModes(),
+      ]);
+      setS(settings);
+      applySnapshot(snap);
+      setModes(list);
+      // Probe installed-model status so the header can flag
+      // "Setup needed" when the configured ids aren't on disk yet.
+      // Failures here are non-fatal — we fall back to the conservative
+      // "is the configured id non-empty" check.
+      try {
+        const [allModels, infer] = await Promise.all([
+          listModels(),
+          inferenceServerStatus(),
+        ]);
+        setModels(allModels);
+        setInferenceInstalled(infer.installed);
+      } catch (err) {
+        console.warn("model status probes failed:", err);
+      }
+      try {
+        setAudioDevices(await listAudioInputDevices());
+      } catch (err) {
+        console.warn("listAudioInputDevices failed:", err);
+      }
+      // Probe Accessibility so the auto-paste nudge can render
+      // correctly on the very first popover open. Non-fatal.
+      void refreshAccessibility();
+    } finally {
+      setLoaded(true);
+    }
+
+    // The popover webview is built once and reused on every tray click,
+    // so onMount only runs the first time. Live events keep state fresh
+    // across reopens; the focus handler is a backstop for events that
+    // fire while the popover is hidden.
+    unlistenSettings = await onSettingsChanged(setS);
+    unlistenSessions = await onSessionsChanged(applySnapshot);
+    unlistenStats = await onStatsChanged(() => {
+      void refreshStats();
+      void refreshDonation();
+    });
+    // Keep the mode picker fresh when the user creates, edits, or
+    // deletes a Voice Mode in the Settings window. The popover
+    // webview is built once and reused on every tray click, so the
+    // initial `listModes()` call would otherwise go stale.
+    unlistenModes = await onModesChanged(setModes);
+    // Updater banner: snapshot on first mount, then subscribe to
+    // live state. Same pattern as `onSessionsChanged` — without the
+    // live event, a check that completes while the popover is
+    // hidden would only land on the next reopen.
+    try {
+      setUpdateState(await getUpdateState());
+    } catch (err) {
+      console.warn("getUpdateState failed:", err);
+    }
+    unlistenUpdates = await onUpdateState(setUpdateState);
+    // Track installer progress so the banner button can show its
+    // "Installing…" state. The Settings → About row owns the
+    // detailed progress bar; the tray banner just disables the
+    // button — the app restarts on success so a long-running
+    // progress UI in the popover would never be read.
+    unlistenUpdaterProgress = await onUpdaterProgress((p) => {
+      if (p.phase === "error" || p.phase === "done") {
+        setInstallingUpdate(false);
+      } else {
+        setInstallingUpdate(true);
+      }
+    });
+    void refreshStats();
+    void refreshDonation();
+
+    window.addEventListener("focus", () => {
+      void sessionsSnapshot().then(applySnapshot);
+      void listAudioInputDevices()
+        .then(setAudioDevices)
+        .catch((err) => console.warn("listAudioInputDevices failed:", err));
+      // User may have flipped Accessibility in System Settings while
+      // the popover was hidden — keep the nudge in sync.
+      void refreshAccessibility();
+      // A dictation may have crossed a donation milestone while the
+      // popover was hidden; stats:changed already covers the subscribed
+      // case, but re-check on focus as a cheap backstop.
+      void refreshDonation();
+    });
+
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeTrayPopover();
+    });
+
+    // Outside-click handler closes the fixed-positioned mode-picker
+    // dropdown. Without it, the menu can persist after losing focus
+    // and reappear out-of-context when the popover hides + re-shows.
+    document.addEventListener("mousedown", (e) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (modeMenuOpen()) {
+        const inMenu = !!modeMenuRef && modeMenuRef.contains(target);
+        const inTrigger =
+          !!modeTriggerRef && modeTriggerRef.contains(target);
+        if (!inMenu && !inTrigger) setModeMenuOpen(false);
+      }
+      if (periodMenuOpen()) {
+        const inMenu = !!periodMenuRef && periodMenuRef.contains(target);
+        const inTrigger =
+          !!periodTriggerRef && periodTriggerRef.contains(target);
+        if (!inMenu && !inTrigger) setPeriodMenuOpen(false);
+      }
+      if (micMenuOpen()) {
+        const inMenu = !!micMenuRef && micMenuRef.contains(target);
+        const inTrigger = !!micTriggerRef && micTriggerRef.contains(target);
+        if (!inMenu && !inTrigger) setMicMenuOpen(false);
+      }
+      const openId = repolishPickerSessionId();
+      if (openId !== null) {
+        const inMenu =
+          !!repolishPickerRef && repolishPickerRef.contains(target);
+        const trigger = repolishTriggerRefs.get(openId);
+        const inTrigger = !!trigger && trigger.contains(target);
+        if (!inMenu && !inTrigger) setRepolishPickerSessionId(null);
+      }
+    });
+
+    // Tauri fires this when the popover loses key window status, e.g.
+    // when the user clicks outside the popover entirely.
+    try {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload }) => {
+        if (!payload) {
+          setModeMenuOpen(false);
+          setPeriodMenuOpen(false);
+          setRepolishPickerSessionId(null);
+          setMicMenuOpen(false);
+        }
+      });
+    } catch (err) {
+      console.warn("focus listener init failed:", err);
+    }
+  });
+
+  onCleanup(() => {
+    unlistenSettings?.();
+    unlistenSessions?.();
+    unlistenStats?.();
+    unlistenModes?.();
+    unlistenFocus?.();
+    unlistenUpdates?.();
+    unlistenUpdaterProgress?.();
+  });
+
+  async function pickMode(id: string) {
+    const cur = s();
+    if (!cur) return;
+    setModeMenuOpen(false);
+    try {
+      await setActiveMode(id);
+      setS({ ...cur, active_mode_id: id });
+    } catch (err) {
+      console.error("setActiveMode failed:", err);
+    }
+  }
+
+  // `set_settings` is gated to the settings/onboarding windows, so
+  // the tray uses the dedicated `set_audio_input_device` IPC — same
+  // path the Settings UI now goes through. The backend probes the
+  // device on a background thread to surface the macOS Continuity
+  // Microphone wake UI when the user picks an iPhone.
+  async function pickMic(name: string | null) {
+    const cur = s();
+    if (!cur) return;
+    setMicMenuOpen(false);
+    if ((cur.audio_input_device ?? null) === name) return;
+    const next = { ...cur, audio_input_device: name } as Settings;
+    setS(next);
+    try {
+      await setAudioInputDevice(name);
+    } catch (err) {
+      console.error("setAudioInputDevice failed:", err);
+      // Roll back the optimistic update so the dropdown reflects
+      // what's actually on disk.
+      setS(cur);
+    }
+  }
+
+  function micLabel(): string {
+    const v = s()?.audio_input_device;
+    if (!v) return "System default";
+    return v;
+  }
+
+  function micIsCustom(): boolean {
+    return !!s()?.audio_input_device;
+  }
+
+  function activeMode(): VoiceMode | undefined {
+    const id = s()?.active_mode_id;
+    if (!id) return undefined;
+    return modes().find((m) => m.id === id) ?? modes()[0];
+  }
+
+  async function toggleHandsFree(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, hands_free_enabled: v });
+    await setHandsFreeEnabled(v);
+  }
+
+  async function togglePolishing(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    // Optimistically flip only the toggle's own field. The backend's
+    // `set_polishing_enabled` preserves the user's chosen `llm_engine`
+    // (e.g. apple-fm) — hardcoding it to "gemma-local"/"none" here
+    // would clobber that choice for the brief window before
+    // `settings:changed` reconciles. Engine name reflows naturally
+    // through the onSettingsChanged listener.
+    setS({ ...cur, polishing_enabled: v });
+    await setPolishingEnabled(v);
+  }
+
+  async function toggleStreamingPill(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, streaming_pill_enabled: v });
+    await setStreamingPillEnabled(v);
+  }
+
+  async function toggleLiveTranscript(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, live_transcript_enabled: v });
+    try {
+      await setLiveTranscriptEnabled(v);
+    } catch (err) {
+      console.error("setLiveTranscriptEnabled failed:", err);
+      setS(cur);
+    }
+  }
+
+  async function refreshAccessibility() {
+    try {
+      const r = await checkPermissions();
+      setAccessibility(r.accessibility);
+    } catch (e) {
+      console.warn("checkPermissions failed:", e);
+      setAccessibility(false);
+    }
+  }
+
+  async function toggleAutoPaste(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, auto_paste_enabled: v });
+    await setAutoPasteEnabled(v);
+    // Re-probe on flip-on so the nudge surfaces immediately if
+    // Accessibility isn't granted yet.
+    if (v) await refreshAccessibility();
+  }
+
+  // Single-row tri-state cycle (duck → pause → off → duck) so all three
+  // choices fit one compact tray row. Uses the dedicated
+  // `set_audio_attenuation` IPC — `set_settings` is gated to the
+  // settings/onboarding windows. Optimistic flip with rollback, mirroring
+  // `toggleLiveTranscript`.
+  function audioAttenuationLabel(v: Settings["audio_attenuation"]): string {
+    return v === "duck" ? "Lower" : v === "pause" ? "Pause" : "Off";
+  }
+  async function cycleAudioAttenuation() {
+    const cur = s();
+    if (!cur) return;
+    const next: Settings["audio_attenuation"] =
+      cur.audio_attenuation === "duck"
+        ? "pause"
+        : cur.audio_attenuation === "pause"
+          ? "off"
+          : "duck";
+    setS({ ...cur, audio_attenuation: next });
+    try {
+      await setAudioAttenuation(next);
+    } catch (err) {
+      console.error("setAudioAttenuation failed:", err);
+      setS(cur);
+    }
+  }
+
+  async function toggleEnableThinking(v: boolean) {
+    const cur = s();
+    if (!cur) return;
+    setS({ ...cur, enable_thinking: v });
+    await setEnableThinking(v);
+  }
+
+  async function copyRecent(idx: number, text: string) {
+    try {
+      await copyText(text);
+      setCopyFlash(idx);
+      setTimeout(() => setCopyFlash(null), 900);
+    } catch (e) {
+      console.error("copy failed:", e);
+    }
+  }
+
+  async function openDonatePage() {
+    try {
+      await openExternalUrl(DONATE_URL);
+    } catch (e) {
+      console.error("openExternalUrl failed:", e);
+    }
+  }
+
+  async function openDiscord() {
+    try {
+      await openExternalUrl(DISCORD_URL);
+    } catch (e) {
+      console.error("openExternalUrl failed:", e);
+    }
+  }
+
+  // Nudge "Support Vox": open the donation page AND stop future nudges —
+  // the user has engaged with donating, so we don't interrupt again
+  // (the passive Support row stays for repeat giving). Opening the page
+  // is the load-bearing half; don't let a failed opt-out swallow it.
+  async function onDonateFromNudge() {
+    await openDonatePage();
+    try {
+      await donationOptOut();
+    } catch (e) {
+      console.warn("donationOptOut failed:", e);
+    }
+    setDonation(null);
+  }
+
+  // Honour-system permanent dismissal — believed on the user's word.
+  async function onAlreadyDonated() {
+    try {
+      await donationOptOut();
+    } catch (e) {
+      console.warn("donationOptOut failed:", e);
+    }
+    setDonation(null);
+  }
+
+  // Tier is passed in from the banner's own `p()` rather than re-read
+  // from the signal after the await, so a stats:changed mid-click can't
+  // make us snooze a different tier than the one shown.
+  async function onDonateLater(milestoneSecs: number) {
+    try {
+      await donationSnooze(milestoneSecs);
+    } catch (e) {
+      console.warn("donationSnooze failed:", e);
+    }
+    setDonation(null);
+  }
+
+  // Mirror of `UpdateState::banner_visible` on the Rust side. Hides
+  // the banner when there's no pending update, or when the user
+  // dismissed the current version. Settings → About is the dedicated
+  // surface for the pending state and is intentionally NOT gated on
+  // the dismissal — that's why this predicate lives on the banner,
+  // not in Settings.
+  function showUpdateBanner(): boolean {
+    const u = updateState();
+    if (!u) return false;
+    if (u.status !== "available") return false;
+    const av = u.available_version;
+    if (!av) return false;
+    const dv = u.dismissed_version;
+    return !dv || dv !== av;
+  }
+
+  async function onUpdateInstall() {
+    if (installingUpdate()) return;
+    setInstallingUpdate(true);
+    try {
+      // Resolves only on failure — success ends with `app.restart()`
+      // on the Rust side. The updater:progress listener drives the
+      // button's disabled state in either direction.
+      await downloadAndInstallUpdate();
+    } catch (err) {
+      console.error("install failed:", err);
+      setInstallingUpdate(false);
+    }
+  }
+
+  async function onUpdateLater() {
+    try {
+      const next = await dismissUpdate();
+      setUpdateState(next);
+    } catch (err) {
+      console.error("dismissUpdate failed:", err);
+    }
+  }
+
+  function openRepolishPicker(sessionId: number) {
+    const trigger = repolishTriggerRefs.get(sessionId);
+    if (trigger) {
+      // Right-align to the trigger via fixed coords so the dropdown
+      // can escape the popover root's overflow-hidden clipping. The
+      // tray popover is a small window — a Recent row near the bottom
+      // doesn't have room below for 6 modes, so flip the dropdown
+      // above when there's more headroom there. Either way, cap
+      // maxHeight to whichever side we land on so the list scrolls
+      // instead of clipping past the window edge.
+      setRepolishMenuPos(
+        computeDropdownPosition({
+          trigger: trigger.getBoundingClientRect(),
+          viewport: {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          },
+          minMenuWidth: 200,
+          // ~28px header + 6 modes × ~32px row; below this threshold
+          // the flip-up branch is preferable if we have more room up
+          // there.
+          desiredHeight: 220,
+          preferred: "auto",
+          align: "end",
+        }),
+      );
+    }
+    // Clear any stale per-row error so the picker opens clean.
+    setRepolishError(null);
+    setRepolishPickerSessionId(sessionId);
+  }
+
+  async function runRepolish(sessionId: number, modeId: string) {
+    setRepolishPickerSessionId(null);
+    setRepolishError(null);
+    // Mark this session as busy so the row shows a spinner and the
+    // trigger is disabled (immutable Set replace so Solid re-runs).
+    setRepolishBusy((prev) => {
+      const next = new Set(prev);
+      next.add(sessionId);
+      return next;
+    });
+    try {
+      const result = await rePolishTranscript(sessionId, modeId);
+      setRecents((rs) =>
+        rs.map((r) =>
+          r.session_id === sessionId
+            ? {
+                ...r,
+                text: result.text,
+                mode_id: result.mode_id,
+                warning: result.warning,
+              }
+            : r,
+        ),
+      );
+      setRepolishFlash({
+        sessionId,
+        modeName: result.mode_name,
+        warning: result.warning,
+      });
+      // Match the existing copy-flash timing (~900ms) so success
+      // confirmations feel consistent. Re-polish takes longer to
+      // produce so the user actually sees the affirmation; we hold
+      // for a beat longer than copy.
+      setTimeout(() => {
+        setRepolishFlash((f) => (f && f.sessionId === sessionId ? null : f));
+      }, 2200);
+    } catch (e) {
+      const message = typeof e === "string" ? e : String(e);
+      console.error("rePolishTranscript failed:", message);
+      setRepolishError({ sessionId, message: shortRepolishError(message) });
+      setTimeout(() => {
+        setRepolishError((cur) =>
+          cur && cur.sessionId === sessionId ? null : cur,
+        );
+      }, 3200);
+    } finally {
+      setRepolishBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(sessionId);
+        return next;
+      });
+    }
+  }
+
+  function statusLine(): { label: string; tone: "ok" | "off" | "warn" } {
+    const cur = s();
+    if (!cur) return { label: "Loading…", tone: "ok" };
+    if (!cur.dictation_enabled) return { label: "Dictation off", tone: "off" };
+    if (setupNeeded()) return { label: "Setup needed", tone: "warn" };
+    return { label: "Local · ready", tone: "ok" };
+  }
+
+  /// True when the user has the polishing pipeline configured but a
+  /// required artifact is missing. The header "Local · ready" badge
+  /// would otherwise lie before the user has actually downloaded
+  /// anything. Conservative fallback: when we couldn't probe (null
+  /// `inferenceInstalled`), only flag missing configuration ids — once
+  /// the probe lands the full check kicks in.
+  function setupNeeded(): boolean {
+    const cur = s();
+    if (!cur) return false;
+    if (!cur.stt_model_id) return true;
+    const sttId = cur.stt_model_id;
+    const llmId = cur.llm_model_id;
+    const probed = models();
+    if (probed.length > 0) {
+      const sttOk = probed.find((m) => m.descriptor.id === sttId)?.installed ?? false;
+      if (!sttOk) return true;
+      // Apple FM has no GGUF/llama-server requirement.
+      if (cur.llm_engine === "gemma-local") {
+        if (!llmId) return true;
+        const llmOk = probed.find((m) => m.descriptor.id === llmId)?.installed ?? false;
+        if (!llmOk) return true;
+        const inf = inferenceInstalled();
+        if (inf === false) return true;
+      }
+    }
+    return false;
+  }
+
+  return (
+    <div class="liquid-glass-window flex h-screen w-screen flex-col overflow-hidden rounded-[14px] text-[13px] text-[var(--color-ink)]">
+      <Show
+        when={loaded() && s()}
+        fallback={
+          <div class="flex h-full items-center justify-center text-[var(--color-ink-mute)]">
+            Loading…
+          </div>
+        }
+      >
+        {(st) => (
+          <>
+            <header class="flex shrink-0 items-center justify-between border-b border-[var(--color-border)] px-4 py-3">
+              <Show
+                when={setupNeeded()}
+                fallback={
+                  <div class="flex items-center gap-2">
+                    <StatusDot tone={statusLine().tone} />
+                    <span class="text-[13px] font-semibold tracking-[-0.005em] text-[var(--color-ink)]">
+                      {statusLine().label}
+                    </span>
+                  </div>
+                }
+              >
+                <button
+                  type="button"
+                  class="-mx-1 inline-flex items-center gap-2 rounded-[6px] px-1 py-0.5 text-left transition-colors hover:bg-[var(--color-overlay)]"
+                  onClick={() => openSettingsWindow()}
+                  title="Open Settings → Models"
+                >
+                  <StatusDot tone={statusLine().tone} />
+                  <span class="text-[13px] font-semibold tracking-[-0.005em] text-[var(--color-ink)]">
+                    {statusLine().label}
+                  </span>
+                  <span class="text-[11px] text-[var(--color-ink-mute)]">
+                    Open Models →
+                  </span>
+                </button>
+              </Show>
+              <button
+                type="button"
+                class="inline-flex h-7 w-7 items-center justify-center rounded-[6px] p-1.5 text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
+                title="Open Settings"
+                onClick={() => openSettingsWindow()}
+              >
+                <svg
+                  width="14"
+                  height="14"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="1.75"
+                >
+                  <circle cx="12" cy="12" r="3" />
+                  <path d="M19.4 15a7.97 7.97 0 0 0 .1-3l2-1.5-2-3.4-2.3.8a8 8 0 0 0-2.6-1.5L14 3h-4l-.6 2.4a8 8 0 0 0-2.6 1.5l-2.3-.8-2 3.4L4.5 12a8 8 0 0 0 .1 3l-2 1.5 2 3.4 2.3-.8a8 8 0 0 0 2.6 1.5l.6 2.4h4l.6-2.4a8 8 0 0 0 2.6-1.5l2.3.8 2-3.4z" />
+                </svg>
+              </button>
+            </header>
+
+            <div class="flex min-h-0 flex-1 flex-col overflow-y-auto">
+            <div class="border-b border-[var(--color-border)] px-4 py-3">
+              <div class="liquid-card flex items-center gap-3 rounded-[10px] px-3 py-2.5 ring-1 ring-[var(--color-border)]">
+                <div class="flex min-w-0 flex-1 flex-col">
+                  <span class="text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-mute)]">
+                    Time saved
+                  </span>
+                  <span class="mt-0.5 text-[20px] font-semibold leading-none tracking-[-0.01em] text-[var(--color-ink)] tabular-nums">
+                    {formatDuration(stats().saved_seconds)}
+                  </span>
+                  <span class="mt-1 text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    {sessionsSubLine(stats().sessions)}
+                  </span>
+                </div>
+                <button
+                  ref={(el) => (periodTriggerRef = el)}
+                  type="button"
+                  class="liquid-card inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                  onClick={() => {
+                    const next = !periodMenuOpen();
+                    if (next && periodTriggerRef) {
+                      setPeriodMenuPos(
+                        computeDropdownPosition({
+                          trigger: periodTriggerRef.getBoundingClientRect(),
+                          viewport: {
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                          },
+                          minMenuWidth: 140,
+                          preferred: "below",
+                          align: "end",
+                        }),
+                      );
+                    }
+                    setPeriodMenuOpen(next);
+                  }}
+                  aria-haspopup="listbox"
+                  aria-expanded={periodMenuOpen()}
+                  aria-label="Time saved period"
+                >
+                  <span>{periodLabel()}</span>
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+              </div>
+              <Show when={periodMenuOpen()}>
+                <div
+                  ref={(el) => (periodMenuRef = el)}
+                  class="liquid-glass z-50 max-h-60 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  role="listbox"
+                  style={{
+                    position: "fixed",
+                    ...(periodMenuPos().placement === "above"
+                      ? { bottom: `${periodMenuPos().bottom}px` }
+                      : { top: `${periodMenuPos().top}px` }),
+                    left: `${periodMenuPos().left}px`,
+                    "min-width": `${periodMenuPos().minWidth}px`,
+                  }}
+                >
+                  <For each={PERIOD_OPTIONS}>
+                    {(o) => (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={o.value === period()}
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                        classList={{
+                          "text-[var(--color-accent)]": o.value === period(),
+                          "text-[var(--color-ink)]": o.value !== period(),
+                        }}
+                        onClick={() => {
+                          setPeriod(o.value);
+                          setPeriodMenuOpen(false);
+                          void refreshStats();
+                        }}
+                      >
+                        <span class="flex-1">{o.label}</span>
+                        <Show when={o.value === period()}>
+                          <span class="text-[10px]">●</span>
+                        </Show>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+
+            <Show
+              when={donation()}
+              fallback={
+                <div class="border-b border-[var(--color-border)]">
+                  <DonateRow onClick={() => void openDonatePage()} />
+                </div>
+              }
+            >
+              {(p) => (
+                <div class="border-b border-[var(--color-border)] px-4 py-3">
+                  <DonateBanner
+                    savedLabel={formatDuration(p().saved_secs)}
+                    onDonate={() => void onDonateFromNudge()}
+                    onAlreadyDonated={() => void onAlreadyDonated()}
+                    onLater={() => void onDonateLater(p().milestone_secs)}
+                  />
+                </div>
+              )}
+            </Show>
+
+            <div class="border-b border-[var(--color-border)]">
+              <CommunityRow onClick={() => void openDiscord()} />
+            </div>
+
+            <div class="border-b border-[var(--color-border)]">
+              <button
+                type="button"
+                class="flex w-full items-center justify-between px-4 py-3 text-left transition-colors hover:bg-[var(--color-overlay)]"
+                aria-expanded={quickSettingsOpen()}
+                aria-controls="quick-settings-panel"
+                onClick={() => setQuickSettingsOpen(!quickSettingsOpen())}
+              >
+                <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                  Quick Settings
+                </span>
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  class="text-[var(--color-ink-mute)] transition-transform duration-200 ease-out"
+                  style={{
+                    transform: quickSettingsOpen()
+                      ? "rotate(180deg)"
+                      : "rotate(0deg)",
+                  }}
+                  aria-hidden="true"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+              <div
+                id="quick-settings-panel"
+                class="overflow-hidden transition-all duration-200 ease-out"
+                style={{
+                  "max-height": quickSettingsOpen() ? "500px" : "0px",
+                  opacity: quickSettingsOpen() ? 1 : 0,
+                }}
+              >
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        {st().hands_free_enabled ? "Press to talk" : "Hold to talk"}
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {st().hands_free_enabled
+                          ? "Press the hotkey to start, press again to stop."
+                          : "Hold the hotkey while speaking, release to stop."}
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().hands_free_enabled}
+                      onChange={toggleHandsFree}
+                    />
+                  </div>
+                </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Polish transcripts
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {st().polishing_enabled
+                          ? "Gemma cleans up the transcript before copying."
+                          : "Raw output is copied as-is."}
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().polishing_enabled}
+                      onChange={togglePolishing}
+                    />
+                  </div>
+                  <Show
+                    when={
+                      st().polishing_enabled &&
+                      st().llm_engine === "gemma-local"
+                    }
+                  >
+                    <div class="mt-3 flex items-center justify-between gap-3 pl-6">
+                      <div class="flex min-w-0 flex-col">
+                        <span class="text-[12px] font-medium text-[var(--color-ink)]">
+                          Thinking
+                        </span>
+                        <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                          Reason silently before polishing.
+                        </span>
+                      </div>
+                      <Toggle
+                        checked={st().enable_thinking}
+                        onChange={(v) => void toggleEnableThinking(v)}
+                      />
+                    </div>
+                  </Show>
+                </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Streaming pill
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        See the transcript appear live before it's copied.
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().streaming_pill_enabled}
+                      onChange={(v) => void toggleStreamingPill(v)}
+                    />
+                  </div>
+                  <div class="mt-3 flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Live transcript
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        Show a caption inside the pill while you speak.
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().live_transcript_enabled}
+                      onChange={(v) => void toggleLiveTranscript(v)}
+                    />
+                  </div>
+                </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Paste into focused field
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {isMac
+                          ? "Vox sends ⌘V for you and restores your clipboard."
+                          : "Vox sends Ctrl+V for you and restores your clipboard."}
+                      </span>
+                    </div>
+                    <Toggle
+                      checked={st().auto_paste_enabled}
+                      onChange={(v) => void toggleAutoPaste(v)}
+                    />
+                  </div>
+                  <Show
+                    when={
+                      !isWindows &&
+                      st().auto_paste_enabled &&
+                      accessibility() === false
+                    }
+                  >
+                    <div class="mt-2 flex items-center justify-between gap-3 rounded-[6px] bg-[var(--color-overlay)] px-3 py-2">
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        Needs Accessibility. Falls back to clipboard otherwise.
+                      </span>
+                      <button
+                        type="button"
+                        class="shrink-0 rounded-[6px] bg-[var(--color-control)] px-2.5 py-1 text-[11px] font-medium text-[var(--color-ink)] hover:bg-[var(--color-control-hover)]"
+                        onClick={() => void openAccessibilitySettings()}
+                      >
+                        Grant
+                      </button>
+                    </div>
+                  </Show>
+                </div>
+
+                <div class="border-t border-[var(--color-border)] px-4 py-3">
+                  <div class="flex items-center justify-between gap-3">
+                    <div class="flex min-w-0 flex-col">
+                      <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                        Audio
+                      </span>
+                      <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                        {st().audio_attenuation === "off"
+                          ? "Other audio keeps playing while you dictate."
+                          : st().audio_attenuation === "pause"
+                            ? "Other audio pauses while you dictate."
+                            : "Other audio gets quieter while you dictate."}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      class="liquid-card inline-flex shrink-0 items-center justify-center rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                      onClick={() => void cycleAudioAttenuation()}
+                      aria-label="Quiet other audio while dictating"
+                      title="Tap to switch: Lower → Pause → Off"
+                    >
+                      {audioAttenuationLabel(st().audio_attenuation)}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Press to talk
+                  </span>
+                  <span class="inline-flex flex-wrap items-center gap-1 text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    Trigger with
+                    <HotkeyKeys
+                      spec={st().hotkey || "CommandOrControl+Alt+Period"}
+                    />
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div class="relative border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Voice mode
+                  </span>
+                  <span class="inline-flex flex-wrap items-center gap-1 text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    Cycle with
+                    <HotkeyKeys
+                      spec={st().mode_cycle_hotkey || "Alt+M"}
+                    />
+                  </span>
+                </div>
+                <button
+                  ref={(el) => (modeTriggerRef = el)}
+                  type="button"
+                  class="liquid-card inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                  onClick={() => {
+                    const next = !modeMenuOpen();
+                    if (next && modeTriggerRef) {
+                      // The popover root has `overflow-hidden` so an
+                      // `absolute` dropdown would clip inside the
+                      // popover. Anchor via fixed coords from the
+                      // trigger's bounding rect so the listbox can
+                      // escape the clipped container without bringing
+                      // a positioning library along for the ride.
+                      setModeMenuPos(
+                        computeDropdownPosition({
+                          trigger: modeTriggerRef.getBoundingClientRect(),
+                          viewport: {
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                          },
+                          minMenuWidth: 224,
+                          // The Voice mode row sits mid-popover and the
+                          // list now carries 8 built-ins, so a forced
+                          // "below" placement clips the lower modes at
+                          // the window's bottom edge. Mirror the mic /
+                          // re-polish pickers: flip above when there's
+                          // more headroom up there, and cap max-height
+                          // to the chosen side so the list scrolls
+                          // instead of clipping.
+                          desiredHeight: 280,
+                          preferred: "auto",
+                          align: "end",
+                        }),
+                      );
+                    }
+                    setModeMenuOpen(next);
+                  }}
+                  aria-haspopup="listbox"
+                  aria-expanded={modeMenuOpen()}
+                >
+                  <Show when={activeMode()} fallback={<span>—</span>}>
+                    {(m) => (
+                      <>
+                        <span aria-hidden="true">{m().icon}</span>
+                        <span class="max-w-[120px] truncate">{m().name}</span>
+                      </>
+                    )}
+                  </Show>
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+              </div>
+              <Show when={modeMenuOpen()}>
+                <div
+                  ref={(el) => (modeMenuRef = el)}
+                  class="liquid-glass z-50 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  role="listbox"
+                  style={{
+                    position: "fixed",
+                    ...(modeMenuPos().placement === "above"
+                      ? { bottom: `${modeMenuPos().bottom}px` }
+                      : { top: `${modeMenuPos().top}px` }),
+                    left: `${modeMenuPos().left}px`,
+                    "min-width": `${modeMenuPos().minWidth}px`,
+                    "max-height": `${modeMenuPos().maxHeight}px`,
+                  }}
+                >
+                  <For each={modes()}>
+                    {(m) => (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={m.id === st().active_mode_id}
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                        classList={{
+                          "text-[var(--color-accent)]":
+                            m.id === st().active_mode_id,
+                          "text-[var(--color-ink)]":
+                            m.id !== st().active_mode_id,
+                        }}
+                        onClick={() => pickMode(m.id)}
+                      >
+                        <span aria-hidden="true">{m.icon}</span>
+                        <span class="flex-1 truncate">{m.name}</span>
+                        <Show when={m.id === st().active_mode_id}>
+                          <span class="text-[10px]">●</span>
+                        </Show>
+                      </button>
+                    )}
+                  </For>
+                </div>
+              </Show>
+            </div>
+
+            <div class="relative border-b border-[var(--color-border)] px-4 py-3">
+              <div class="flex items-center justify-between gap-3">
+                <div class="flex min-w-0 flex-col">
+                  <span class="text-[13px] font-semibold text-[var(--color-ink)]">
+                    Microphone
+                  </span>
+                  <span class="text-[11px] leading-snug text-[var(--color-ink-mute)]">
+                    {micIsCustom()
+                      ? "Custom input selected."
+                      : isMac
+                        ? "Follows the macOS Sound input."
+                        : "Follows the Windows sound input."}
+                  </span>
+                </div>
+                <button
+                  ref={(el) => (micTriggerRef = el)}
+                  type="button"
+                  class="liquid-card inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[12px] font-medium text-[var(--color-ink)] ring-1 ring-[var(--color-border-strong)] transition-[filter] hover:brightness-105"
+                  onClick={() => {
+                    const next = !micMenuOpen();
+                    if (next && micTriggerRef) {
+                      // Same fixed-position trick as the mode picker
+                      // so the dropdown can escape the popover root's
+                      // overflow-hidden. Cap the width at 280px so a
+                      // long device name doesn't stretch the menu
+                      // wider than the popover itself. Flip the menu
+                      // above the trigger when there's more headroom
+                      // up there — the Mic row lives mid-popover so a
+                      // 6-device list otherwise clips at the bottom
+                      // window edge.
+                      setMicMenuPos(
+                        computeDropdownPosition({
+                          trigger: micTriggerRef.getBoundingClientRect(),
+                          viewport: {
+                            width: window.innerWidth,
+                            height: window.innerHeight,
+                          },
+                          minMenuWidth: 240,
+                          maxMenuWidth: 280,
+                          // ~"Follow system default" + divider + 6 rows.
+                          desiredHeight: 220,
+                          preferred: "auto",
+                          align: "end",
+                        }),
+                      );
+                    }
+                    setMicMenuOpen(next);
+                  }}
+                  aria-haspopup="listbox"
+                  aria-expanded={micMenuOpen()}
+                  title={micLabel()}
+                >
+                  <span class="max-w-[140px] truncate">{micLabel()}</span>
+                  <svg
+                    width="10"
+                    height="10"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    aria-hidden="true"
+                  >
+                    <polyline points="6 9 12 15 18 9" />
+                  </svg>
+                </button>
+              </div>
+              <Show when={micMenuOpen()}>
+                <div
+                  ref={(el) => (micMenuRef = el)}
+                  class="liquid-glass z-50 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                  role="listbox"
+                  aria-label="Audio input device"
+                  style={{
+                    position: "fixed",
+                    ...(micMenuPos().placement === "above"
+                      ? { bottom: `${micMenuPos().bottom}px` }
+                      : { top: `${micMenuPos().top}px` }),
+                    left: `${micMenuPos().left}px`,
+                    "min-width": `${micMenuPos().minWidth}px`,
+                    "max-height": `${micMenuPos().maxHeight}px`,
+                  }}
+                >
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={!micIsCustom()}
+                    class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                    classList={{
+                      "text-[var(--color-accent)]": !micIsCustom(),
+                      "text-[var(--color-ink)]": micIsCustom(),
+                    }}
+                    onClick={() => void pickMic(null)}
+                  >
+                    <span class="flex-1 truncate">Follow system default</span>
+                    <Show when={!micIsCustom()}>
+                      <span class="text-[10px]">●</span>
+                    </Show>
+                  </button>
+                  <Show when={audioDevices().length > 0}>
+                    <div class="my-1 mx-2 h-px bg-[var(--color-border)]" />
+                  </Show>
+                  <For each={audioDevices()}>
+                    {(d) => {
+                      const active = () => st().audio_input_device === d.name;
+                      return (
+                        <button
+                          type="button"
+                          role="option"
+                          aria-selected={active()}
+                          class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                          classList={{
+                            "text-[var(--color-accent)]": active(),
+                            "text-[var(--color-ink)]": !active(),
+                          }}
+                          onClick={() => void pickMic(d.name)}
+                          title={d.name}
+                        >
+                          <span class="flex-1 truncate">
+                            {d.name}
+                            {d.is_default ? " · system default" : ""}
+                          </span>
+                          <Show when={active()}>
+                            <span class="text-[10px]">●</span>
+                          </Show>
+                        </button>
+                      );
+                    }}
+                  </For>
+                  <Show
+                    when={
+                      !!st().audio_input_device &&
+                      !audioDevices().some(
+                        (d) => d.name === st().audio_input_device,
+                      )
+                    }
+                  >
+                    <div class="my-1 mx-2 h-px bg-[var(--color-border)]" />
+                    <div class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[11px] text-[var(--color-ink-mute)]">
+                      <span
+                        class="flex-1 truncate"
+                        title={st().audio_input_device ?? ""}
+                      >
+                        {st().audio_input_device} · not connected
+                      </span>
+                    </div>
+                  </Show>
+                </div>
+              </Show>
+            </div>
+
+            <div class="flex min-h-[180px] flex-1 flex-col px-2 py-2">
+              <Show when={showUpdateBanner()}>
+                <UpdateBanner
+                  availableVersion={updateState()?.available_version ?? ""}
+                  installing={installingUpdate()}
+                  onInstall={() => void onUpdateInstall()}
+                  onLater={() => void onUpdateLater()}
+                />
+              </Show>
+              <Show when={inProgress().length > 0}>
+                <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-violet,#a78bfa)]">
+                  In progress
+                </div>
+                <For each={inProgress()}>
+                  {(entry) => (
+                    <InProgressRow
+                      entry={entry}
+                      onCancel={() => {
+                        void cancelSession(entry.session_id);
+                      }}
+                    />
+                  )}
+                </For>
+                <div class="mb-2 mt-2 h-px bg-[var(--color-border)]" />
+              </Show>
+              <Show
+                when={recents().length > 0}
+                fallback={
+                  <>
+                    <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+                      Recent
+                    </div>
+                    <div class="px-2 py-4 text-[12px] text-[var(--color-ink-mute)]">
+                      Your last 5 transcripts will appear here.
+                    </div>
+                  </>
+                }
+              >
+                <div class="mb-1 px-2 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+                  Recent (cleared on quit)
+                </div>
+                <For each={recents()}>
+                  {(r, idx) => {
+                    const busy = () => repolishBusy().has(r.session_id);
+                    const flash = () => {
+                      const f = repolishFlash();
+                      return f && f.sessionId === r.session_id ? f : null;
+                    };
+                    const err = () => {
+                      const e = repolishError();
+                      return e && e.sessionId === r.session_id ? e : null;
+                    };
+                    return (
+                      <div class="group flex flex-col gap-1 rounded-[8px] px-2 py-2 transition-colors hover:bg-[var(--color-overlay)]">
+                        <div class="flex items-center gap-2">
+                          <span class="w-10 shrink-0 text-[11px] font-medium text-[var(--color-ink-faint)]">
+                            {ago(r.ts)}
+                          </span>
+                          <span class="flex-1 truncate text-[12px] text-[var(--color-ink)]">
+                            {r.text}
+                          </span>
+                          <button
+                            ref={(el) => {
+                              if (el) repolishTriggerRefs.set(r.session_id, el);
+                              else repolishTriggerRefs.delete(r.session_id);
+                            }}
+                            type="button"
+                            disabled={busy()}
+                            class="repolish-trigger inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] opacity-0 transition-opacity duration-150 ease-out hover:bg-[var(--color-overlay)] hover:text-[var(--color-accent)] group-hover:opacity-100 focus-visible:opacity-100 disabled:cursor-not-allowed disabled:opacity-100"
+                            classList={{
+                              "!opacity-100":
+                                busy() ||
+                                repolishPickerSessionId() === r.session_id,
+                            }}
+                            aria-haspopup="listbox"
+                            aria-expanded={
+                              repolishPickerSessionId() === r.session_id
+                            }
+                            aria-label={`Re-polish as another mode`}
+                            title="Re-polish as…"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (busy()) return;
+                              if (repolishPickerSessionId() === r.session_id) {
+                                setRepolishPickerSessionId(null);
+                              } else {
+                                openRepolishPicker(r.session_id);
+                              }
+                            }}
+                          >
+                            <Show
+                              when={!busy()}
+                              fallback={<SmallSpinner />}
+                            >
+                              <SparkleGlyph />
+                            </Show>
+                          </button>
+                          <button
+                            type="button"
+                            class="inline-flex h-7 w-7 items-center justify-center rounded p-1.5 text-[var(--color-ink-mute)] hover:bg-[var(--color-overlay)] hover:text-[var(--color-ink)]"
+                            onClick={() => copyRecent(idx(), r.text)}
+                            title={
+                              isMac
+                                ? "Copy to clipboard (⌘V to paste)"
+                                : "Copy to clipboard (Ctrl+V to paste)"
+                            }
+                          >
+                            <Show
+                              when={copyFlash() === idx()}
+                              fallback={
+                                <svg
+                                  width="14"
+                                  height="14"
+                                  viewBox="0 0 24 24"
+                                  fill="none"
+                                  stroke="currentColor"
+                                  stroke-width="1.75"
+                                  stroke-linecap="round"
+                                  stroke-linejoin="round"
+                                >
+                                  <rect x="9" y="9" width="12" height="12" rx="2" />
+                                  <path d="M5 15V5a2 2 0 0 1 2-2h10" />
+                                </svg>
+                              }
+                            >
+                              <span class="text-[var(--color-success)] text-[11px]">
+                                ✓
+                              </span>
+                            </Show>
+                          </button>
+                        </div>
+                        <Show when={flash()}>
+                          {(f) => (
+                            <div
+                              class="ml-12 flex items-center gap-1 text-[10.5px] leading-none transition-opacity duration-150 ease-out"
+                              classList={{
+                                "text-[var(--color-success)]": !f().warning,
+                                "text-[var(--color-warning)]": f().warning,
+                              }}
+                            >
+                              <span aria-hidden="true">
+                                {f().warning ? "!" : "✓"}
+                              </span>
+                              <span>
+                                {f().warning
+                                  ? `Raw copy — ${f().modeName} polish failed`
+                                  : `Re-polished as ${f().modeName} — copied`}
+                              </span>
+                            </div>
+                          )}
+                        </Show>
+                        <Show when={err()}>
+                          {(e) => (
+                            <div class="ml-12 flex items-center gap-1 text-[10.5px] leading-none text-[var(--color-danger)]">
+                              <span aria-hidden="true">!</span>
+                              <span>{e().message}</span>
+                            </div>
+                          )}
+                        </Show>
+                      </div>
+                    );
+                  }}
+                </For>
+              </Show>
+            </div>
+
+            <Show when={repolishPickerSessionId() !== null}>
+              <div
+                ref={(el) => (repolishPickerRef = el)}
+                class="liquid-glass z-50 overflow-y-auto rounded-[10px] py-1 scrollbar-thin"
+                role="listbox"
+                aria-label="Re-polish with mode"
+                style={{
+                  position: "fixed",
+                  ...(repolishMenuPos().placement === "above"
+                    ? { bottom: `${repolishMenuPos().bottom}px` }
+                    : { top: `${repolishMenuPos().top}px` }),
+                  left: `${repolishMenuPos().left}px`,
+                  "min-width": `${repolishMenuPos().minWidth}px`,
+                  "max-height": `${repolishMenuPos().maxHeight}px`,
+                }}
+              >
+                <div class="px-3 pb-1 pt-1.5 text-[10px] font-semibold uppercase tracking-[0.06em] text-[var(--color-ink-faint)]">
+                  Re-polish as…
+                </div>
+                <For each={modes()}>
+                  {(m) => {
+                    const target = repolishPickerSessionId();
+                    const targetEntry = () =>
+                      recents().find((r) => r.session_id === target);
+                    const isCurrent = () => targetEntry()?.mode_id === m.id;
+                    return (
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={isCurrent()}
+                        class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] hover:bg-[var(--color-overlay)]"
+                        classList={{
+                          "text-[var(--color-accent)]": isCurrent(),
+                          "text-[var(--color-ink)]": !isCurrent(),
+                        }}
+                        onClick={() => {
+                          const sid = repolishPickerSessionId();
+                          if (sid !== null) void runRepolish(sid, m.id);
+                        }}
+                      >
+                        <span aria-hidden="true">{m.icon}</span>
+                        <span class="flex-1 truncate">{m.name}</span>
+                        <Show when={isCurrent()}>
+                          <span class="text-[10px]">●</span>
+                        </Show>
+                      </button>
+                    );
+                  }}
+                </For>
+              </div>
+            </Show>
+
+            </div>
+            <div class="flex shrink-0 items-center justify-between border-t border-[var(--color-border)] px-4 py-3">
+              <span class="text-[12px] font-medium text-[var(--color-ink-mute)]">
+                Appearance
+              </span>
+              <AppearanceToggle
+                value={st().appearance}
+                onChange={(v) => {
+                  const cur = s();
+                  if (cur) setS({ ...cur, appearance: v });
+                  void setAppearance(v);
+                }}
+              />
+            </div>
+            <footer class="flex shrink-0 items-center justify-between gap-2 border-t border-[var(--color-border)] px-4 py-2.5">
+              <LocalBadge />
+              <button
+                type="button"
+                class="rounded-[6px] px-3 py-1.5 text-[12px] font-medium text-[var(--color-ink-mute)] transition-colors hover:bg-[var(--color-overlay)] hover:text-[var(--color-danger)]"
+                onClick={() => quitApp()}
+              >
+                Quit
+              </button>
+            </footer>
+          </>
+        )}
+      </Show>
+    </div>
+  );
+}

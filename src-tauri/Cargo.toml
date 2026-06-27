@@ -1,0 +1,211 @@
+[package]
+name = "vox"
+version = "1.10.0"
+description = "Fully on-device dictation for macOS and Windows — press a hotkey, speak, paste."
+authors = ["Resonance Logic, LLC"]
+edition = "2021"
+rust-version = "1.77"
+license-file = "../LICENSE"
+repository = "https://github.com/KlymSerhii/Vox"
+homepage = "https://vox.rizenhq.com"
+
+[lib]
+name = "vox_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+png = "0.17"
+
+[features]
+# Heavy native STT engine (whisper-rs). ON by default because Vox is a
+# local-first app and shipping a binary that says "Local engines not
+# enabled" at runtime is worse UX than the longer first compile. CI /
+# fast UI iteration can still opt out via `--no-default-features`. The
+# engine traits + registry + downloader all compile either way; the
+# whisper engine falls back to a clear runtime error when the feature
+# is off so the app still builds and runs in stub mode.
+#
+# Gemma 4 polishing is OUT-OF-PROCESS (a downloaded `llama-server`
+# subprocess we talk to over HTTP — see `inference_proc.rs`), so it
+# does not participate in this feature gate. Crash isolation, not a
+# compile-time toggle, was the whole point of moving it out.
+#
+# `apple-fm` builds the Swift static library that talks to Apple
+# Intelligence's Foundation Models framework. macOS-only at link time
+# (build.rs gates on `target_os = "macos"`); the feature compiles
+# cleanly on Linux/Windows but produces no native code there. CI
+# machines without Xcode/Swift can opt out via
+# `--no-default-features --features local-engines`.
+default = ["local-engines", "apple-fm", "parakeet"]
+local-engines = ["dep:whisper-rs"]
+apple-fm = []
+# Parakeet STT.
+#   - macOS aarch64: FluidAudio (Swift/CoreML/ANE) via swift-parakeet.
+#     build.rs::build_parakeet_bridge gates on `target_arch == aarch64`
+#     and a working `swift` toolchain.
+#   - Windows x86_64: parakeet-rs + ort (ONNX Runtime) with DirectML EP
+#     and CPU EP fallback. ort's default `download-binaries` +
+#     `copy-dylibs` features baked into the Cargo target dir; Tauri's
+#     WiX/NSIS bundler ships them in the installer.
+#   The Rust engine module (`engines::parakeet_local`) is the same name
+#   on both hosts; the concrete impl is selected by `cfg(target_os)`.
+parakeet = ["dep:parakeet-rs"]
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "macos-private-api"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-store = "2"
+tauri-plugin-autostart = "2"
+# `native-tls` makes the updater plugin route HTTPS through the
+# platform's native stack (Secure Transport on macOS, SChannel on
+# Windows). Both read the OS trust store, so a Netskope/Zscaler-style
+# TLS-intercepting proxy whose CA only lives in the keychain is
+# trusted. Default features (`rustls-tls`) pull a separate reqwest
+# tree with webpki-roots only — the keychain isn't consulted, so
+# every update check would fail behind a corporate proxy. The
+# `zip` feature is kept because the macOS .app install path needs
+# the tar/zip/flate2 extractors it pulls in.
+tauri-plugin-updater = { version = "2", default-features = false, features = ["native-tls", "zip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+# `rustls-tls-native-roots` is the load-bearing one on managed/work
+# Macs: it merges the system keychain trust store into rustls's
+# RootCertStore alongside webpki-roots. Without it, TLS-intercepting
+# proxies (Netskope, Zscaler, corporate MITM) that re-sign traffic with
+# a CA installed only in the macOS keychain cause every HTTPS download
+# (HF model weights, llama.cpp release archive) to fail with
+# `error sending request for url` while Chrome — which uses the system
+# trust store — works fine on the same network.
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "json", "rustls-tls", "rustls-tls-native-roots", "stream"] }
+futures-util = "0.3"
+cpal = "0.15"
+hound = "3.5"
+arboard = "3"
+log = "0.4"
+env_logger = "0.11"
+thiserror = "1"
+parking_lot = "0.12"
+anyhow = "1"
+async-trait = "0.1"
+once_cell = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+sha2 = "0.10"
+# `system` covers `System::processes()` (used by
+# `inference_proc::reap_orphans_at_startup` to find leftover
+# `llama-server` instances whose `--api-key` matches our persisted
+# token, after a parent SIGKILL — macOS has no
+# `prctl(PR_SET_PDEATHSIG)`) and `total_memory()` (used by
+# `physical_ram_gb`).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+dirs = "5"
+num_cpus = "1"
+# Heavy native STT engine — see `local-engines` feature above. The
+# crate is declared per-target (macOS table below pins the Apple
+# CoreML+Metal backends; the Windows table takes the plain CPU backend)
+# so the Apple-only backends never reach a Windows build. Cargo does not
+# merge features across target tables for the same crate, which is
+# exactly what we want here. `local-engines = ["dep:whisper-rs"]`
+# resolves against the union of all dependency tables regardless of which
+# one declares the optional dep.
+# Out-of-process Gemma polishing dependencies.
+# `command-group` puts the child in its own process group on Unix and
+# assigns it to a Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+# The Job Object is a true kernel-level kill-on-parent-exit guarantee on
+# Windows. On macOS `setpgid(0,0)` is just signal grouping — there is no
+# `PR_SET_PDEATHSIG` equivalent, so a parent SIGKILL still leaks the child
+# to launchd; `inference_proc::reap_orphans_at_startup` cleans those up on
+# the next launch by matching `--api-key` against our persisted token.
+# Tokio's `kill_on_drop` is strictly weaker — graceful Drop only.
+command-group = { version = "5", features = ["with-tokio"] }
+# Archive extraction for the downloaded `llama-server` artifacts.
+# macOS releases ship as .tar.gz, Windows as .zip.
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+rand = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Apple-only STT backends (Core ML + Metal). See the `whisper-rs` note in
+# `[dependencies]` for why the crate is target-split.
+whisper-rs = { version = "0.16", features = ["coreml", "metal"], optional = true }
+objc2 = "0.6"
+block2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSWindow",
+  "NSPanel",
+  "NSResponder",
+  "NSApplication",
+  "NSScreen",
+  "NSWorkspace",
+  "NSRunningApplication",
+  "NSEvent",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSGeometry",
+  "NSArray",
+  "NSString",
+  "NSValue",
+  "NSDictionary",
+  "NSEnumerator",
+  "NSObjCRuntime",
+  "NSThread",
+] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "CFCGTypes",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# Plain CPU backend for v1 — no GPU feature, so the build needs neither
+# the Vulkan SDK at compile time nor a Vulkan ICD at runtime. Vulkan is a
+# clean fast-follow (flip to `features = ["vulkan"]`). The Gemma
+# `llama-server` stays Vulkan because it's a downloaded binary, not linked.
+whisper-rs = { version = "0.16", optional = true }
+# Parakeet ONNX backend — Windows only. `directml` enables
+# ort::ep::DirectML; default features (`cpu`, `ort-defaults`) keep the
+# CPU EP fallback path always available. ort's `download-binaries` +
+# `copy-dylibs` (pulled via `ort-defaults`) fetch onnxruntime.dll and
+# DirectML.dll at build time and copy them next to the binary for the
+# WiX/NSIS bundler to pick up. Pinned exact: unstable rc series.
+parakeet-rs = { version = "=0.3.5", default-features = true, features = ["directml"], optional = true }
+# Win32 FFI for the synthetic Ctrl+V (auto-paste), the foreground-window
+# probe (mode suggestion), ShellExecuteW (external links / settings
+# deep-link), and the WASAPI audio-control module (`win_audio.rs`:
+# IAudioEndpointVolume master volume + IAudioMeterInformation peak probe +
+# the media Play/Pause SendInput). Mirrors the macOS objc2/CoreGraphics FFI
+# convention. `Win32_Media_Audio{,_Endpoints}` carry the WASAPI device /
+# endpoint-volume / meter interfaces; `Win32_System_Com` gates COM init
+# (`CoInitializeEx`/`CoCreateInstance`) and the generic `IMMDevice::Activate`.
+# `PROPVARIANT` rides in via `windows-core`, so no
+# `Win32_System_Com_StructuredStorage`/`Win32_Devices_FunctionDiscovery` are
+# needed.
+windows = { version = "0.58", features = [
+  "Win32_Foundation",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_Media_Audio",
+  "Win32_Media_Audio_Endpoints",
+  "Win32_System_Com",
+] }
+
+# Unix-only: `xattr` strips `com.apple.quarantine` from the extracted
+# llama-server binary so Gatekeeper doesn't block first launch with a
+# silent "killed: 9". `tar -xzf` does not propagate the quarantine bit
+# in our testing, but Apple keeps tightening Gatekeeper's heuristics —
+# the strip is defensive insurance.
+[target.'cfg(unix)'.dependencies]
+xattr = "1"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

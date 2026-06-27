@@ -1,0 +1,36 @@
+name: 💡 Feature request
+description: Suggest an idea or improvement for Vox
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: What are you trying to do that Vox makes hard or impossible today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What would you like Vox to do?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches or workarounds you've thought about.
+    validations:
+      required: false
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Which platform(s) does this apply to?
+      multiple: true
+      options:
+        - macOS
+        - Windows
+        - Both
+    validations:
+      required: false

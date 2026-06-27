@@ -1,0 +1,83 @@
+name: 🐛 Bug report
+description: Something in Vox isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug! Please don't use this form for
+        security issues — see [SECURITY.md](../blob/main/SECURITY.md) to report those privately.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: When I press the hotkey and speak, …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. …
+        2. …
+        3. …
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS (Apple Silicon)
+        - Windows 11 (x86_64)
+        - Windows 10 (x86_64)
+        - Windows on ARM (x64 emulation)
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "e.g. macOS 26.0 / Windows 11 23H2"
+    validations:
+      required: true
+  - type: input
+    id: vox-version
+    attributes:
+      label: Vox version
+      description: Shown in Settings → About.
+      placeholder: "e.g. 1.10.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: stt-engine
+    attributes:
+      label: Speech-to-text engine
+      options:
+        - Whisper
+        - Parakeet
+        - Not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: llm-engine
+    attributes:
+      label: Polishing engine
+      options:
+        - Apple Intelligence
+        - Gemma (local)
+        - Polishing off
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs (optional)
+      description: |
+        If you can, run with `VOX_LOG=debug` and paste relevant output. Remove anything personal.
+      render: shell
+    validations:
+      required: false

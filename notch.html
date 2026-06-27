@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The notch is ALWAYS dark — a near-black panel that blends with the
+         physical (true-black) camera notch. Unlike every other window it does
+         not follow the app's light/dark appearance, so there is no theme
+         bootstrap script here; all styling lives in `src/notch.css`. -->
+    <meta name="color-scheme" content="dark" />
+    <title>Vox Notch</title>
+    <!-- Pre-CSS transparent background to avoid any first-paint flash before
+         notch.css loads (it sets the same). -->
+    <style>
+      html,
+      body,
+      #root {
+        background: transparent !important;
+      }
+    </style>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/entries/notch.tsx"></script>
+  </body>
+</html>

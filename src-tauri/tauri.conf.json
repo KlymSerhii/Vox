@@ -1,0 +1,77 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vox",
+  "version": "1.10.0",
+  "identifier": "com.vox.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "settings",
+        "title": "Vox — Settings",
+        "width": 660,
+        "height": 620,
+        "minWidth": 480,
+        "minHeight": 520,
+        "resizable": true,
+        "center": true,
+        "visible": false,
+        "decorations": true,
+        "titleBarStyle": "Visible"
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "macOSPrivateApi": true
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
+    "category": "Utility",
+    "shortDescription": "On-device voice dictation",
+    "longDescription": "Vox is a menu-bar app that lets you hold a hotkey, speak, and copy the transcript to the clipboard ready for ⌘V. Fully on-device — no cloud, no telemetry, no API keys.",
+    "publisher": "Resonance Logic, LLC",
+    "copyright": "© 2026 Resonance Logic, LLC",
+    "macOS": {
+      "minimumSystemVersion": "14.0",
+      "entitlements": "entitlements.plist",
+      "exceptionDomain": "",
+      "frameworks": [],
+      "signingIdentity": "Developer ID Application: Serhii Klymenko (4NUJDWKWX5)",
+      "providerShortName": "4NUJDWKWX5"
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper"
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["English"]
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/KlymSerhii/vox-releases/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDNFMzBGM0IzREMwMzA2NEQKUldSTkJnUGNzL013UGl4bkZZeGVnbXBLOGZCdEtkTDlFM3krVUlMYUx1ZUtSUmtQNFh1WEpsUmsK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

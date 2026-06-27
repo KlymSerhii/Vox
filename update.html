@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Update Available</title>
+    <script>
+      // Resolve theme before any markup paints. Mirrors onto
+      // `colorScheme` so native form controls and scrollbars inherit the
+      // right hue.
+      (function () {
+        var v = null;
+        try { v = localStorage.getItem('vox-theme'); } catch (_) {}
+        var t = v === 'light' || v === 'dark' ? v : 'dark';
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+      })();
+    </script>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+    <script type="module" src="/src/entries/update.tsx"></script>
+  </body>
+</html>

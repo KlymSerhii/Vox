@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 🔒 Security / vulnerability report
+    url: https://github.com/KlymSerhii/Vox/security/advisories/new
+    about: Report security issues privately — please do NOT open a public issue. See SECURITY.md.
+  - name: 💼 Commercial / enterprise licensing
+    url: mailto:vox@rizenhq.com
+    about: Licensing Vox for a company or team.
+  - name: 🌐 Rizen ecosystem
+    url: https://rizenhq.com
+    about: Learn about Rizen — the career operating system Vox is part of.

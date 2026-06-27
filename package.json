@@ -1,0 +1,37 @@
+{
+  "name": "vox",
+  "version": "1.10.0",
+  "private": true,
+  "type": "module",
+  "description": "Fully on-device dictation for macOS and Windows — press a hotkey, speak, paste.",
+  "author": "Resonance Logic, LLC",
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://vox.rizenhq.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KlymSerhii/Vox.git"
+  },
+  "bugs": {
+    "url": "https://github.com/KlymSerhii/Vox/issues"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.1.1",
+    "@tauri-apps/plugin-store": "^2.2.0",
+    "solid-js": "^1.9.3"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@tauri-apps/cli": "^2.1.0",
+    "@types/node": "^25.6.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3",
+    "vite-plugin-solid": "^2.11.0"
+  }
+}

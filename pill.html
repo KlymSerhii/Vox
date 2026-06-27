@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Vox</title>
+    <script>
+      // Resolve `data-theme` BEFORE any markup paints so the inline
+      // theme tokens used by the placeholder below pick up the right
+      // values on first paint. Mirroring `colorScheme` keeps native
+      // controls in sync with the rest of the UI in case anything
+      // ever lands inside the pill webview.
+      (function () {
+        var v = null;
+        try { v = localStorage.getItem('vox-theme'); } catch (_) {}
+        var t = v === 'light' || v === 'dark' ? v : 'dark';
+        document.documentElement.dataset.theme = t;
+        document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+      })();
+    </script>
+    <style>
+      html,
+      body,
+      #root {
+        background: transparent !important;
+      }
+      body {
+        overflow: hidden;
+      }
+      /* First-paint placeholder. Without this the pill webview shows a
+       * fully transparent body until SolidJS mounts, which on slow
+       * frames flashes as a "missing" pill at hotkey-down. The compact
+       * 16x16 silhouette at center matches the Rust window's compact
+       * pill default — once the real pill mounts it covers the
+       * placeholder seamlessly. Theme tokens come from styles.css via
+       * the early-paint script that ran above. */
+      [data-theme="dark"] {
+        --pill-bootstrap-surface: rgba(34, 34, 38, 0.78);
+      }
+      [data-theme="light"] {
+        --pill-bootstrap-surface: rgba(252, 250, 247, 0.95);
+      }
+      #pill-bootstrap {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        width: 16px;
+        height: 16px;
+        margin: -8px 0 0 -8px;
+        border-radius: 9999px;
+        background: var(--pill-bootstrap-surface);
+        pointer-events: none;
+      }
+      /* Hide once Solid has rendered children into #root. The presence
+       * of any descendant flips this off via the :has() check. */
+      #root:not(:empty) ~ #pill-bootstrap {
+        display: none;
+      }
+    </style>
+  </head>
+  <body class="antialiased">
+    <div id="root"></div>
+    <div id="pill-bootstrap" aria-hidden="true"></div>
+    <script type="module" src="/src/entries/pill.tsx"></script>
+  </body>
+</html>

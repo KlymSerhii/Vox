@@ -1,0 +1,646 @@
+@import "tailwindcss";
+
+@theme {
+  /* Deep teal as the primary accent. Replaces the previous cobalt-blue
+   * accent because (a) it carves Vox a distinct lane in the menu bar
+   * vs. the blue-skewed peer set (Things 3, Wispr Flow, iA Writer),
+   * (b) it pairs with the warm-cream light surface without going cold,
+   * and (c) it lets the existing palette read as a coherent
+   * teal/violet/coral trio instead of a near-blue/violet near-collision.
+   * The recording-state coral and the polishing-state violet keep their
+   * roles. */
+  --color-accent: #3fb8b0;
+  --color-accent-strong: #5bcfc6;
+  --color-accent-soft: rgb(63 184 176 / 0.18);
+  /* Foreground colour for text/icons rendered on top of `--color-accent`
+   * fills. Inverted across themes for optimal contrast and a designed
+   * feel: in dark mode the teal accent is bright (`#3fb8b0`), so a
+   * near-black foreground reads cleanest; in light mode the teal is
+   * dark (`#0f8c8c`), so a near-white foreground takes over.
+   *
+   * Both shades are deliberately not pure: the dark variant carries a
+   * touch of warmth so it doesn't feel inky-cold against the teal,
+   * and the light variant uses the brand cream (the same hue as the
+   * icon glyph) so primary buttons inherit a subtle thread of brand
+   * identity. */
+  --color-on-accent: #16161a;
+  --color-violet: #b49bff;
+  /* Cyan reserved for the Transcribing stage caret + glow. Lives next
+   * to teal/violet so the pipeline's three processing colours
+   * (recording coral, transcribing cyan, polishing violet) form a
+   * coherent palette. */
+  --color-cyan: #5BD6E0;
+  /* Caret + dot glows are theme-tokenised so the cyan/violet halos
+   * stay on-hue across light and dark surfaces. The dark-mode rgbas
+   * sit at slightly higher alpha because the surrounding pill glass
+   * eats more of the bloom; the light-mode redeclarations below
+   * pull them down a touch and shift the hue darker so the glow
+   * doesn't hot-spot against the cream pill background. */
+  --caret-glow-cyan: rgba(91, 214, 224, 0.55);
+  --caret-glow-violet: rgba(180, 155, 255, 0.55);
+  --caret-glow-coral: rgba(255, 142, 106, 0.55);
+  --polishing-dot-glow: rgba(180, 155, 255, 0.6);
+  /* Pill outer glows for terminal states. Theme-tokenised so the
+   * Done/Warning/Saturated halos pick up alpha tuned for each surface
+   * — replaces the previously hardcoded rgba on the pill box-shadow. */
+  --pill-glow-success: rgba(74, 222, 128, 0.42);
+  --pill-glow-warning: rgba(245, 158, 11, 0.4);
+  --pill-glow-saturated: rgba(168, 85, 247, 0.4);
+  --color-danger: #ff6b6b;
+  --color-success: #4ade80;
+  --color-warning: #fbbf24;
+  /* Coral lifted from the icon gradient. Lives only in moments where
+   * the brand earns the spotlight (active dictation). DESIGN.md §5.4. */
+  --color-coral: #ff8e6a;
+  --color-ink: #f4f4f5;
+  --color-ink-mute: #a1a1aa;
+  --color-ink-faint: #71717a;
+  --color-bg: #0b0b0d;
+  --color-surface: rgb(39 39 42 / 0.85);
+  --color-surface-raised: rgb(50 50 55 / 0.94);
+  --color-surface-glass: rgba(28, 28, 32, 0.95);
+  /* Dedicated pill background. Sits a touch below the heavier
+   * surface-glass token so the pill still reads as floating glass,
+   * but stays opaque enough that the rim doesn't outshine the
+   * interior on dark wallpapers. */
+  --color-pill-surface: rgba(34, 34, 38, 0.78);
+  --color-sidebar: rgba(24, 24, 27, 0.78);
+  --color-border: rgb(255 255 255 / 0.08);
+  --color-border-strong: rgb(255 255 255 / 0.14);
+  --color-control: rgb(255 255 255 / 0.08);
+  --color-control-hover: rgb(255 255 255 / 0.12);
+  --color-input-bg: rgb(255 255 255 / 0.05);
+  --color-overlay: rgb(255 255 255 / 0.06);
+  --color-scrim: rgb(0 0 0 / 0.60);
+
+  --color-meter: var(--color-accent);
+  --color-meter-shadow: rgba(0, 0, 0, 0.30);
+
+  /* Glass shadow stacks reference per-theme primitives so they
+   * auto-adapt across light/dark. */
+  --glass-highlight: rgb(255 255 255 / 0.08);
+  --glass-shadow: rgba(0, 0, 0, 0.45);
+  --glass-shadow-soft: rgba(0, 0, 0, 0.22);
+  --glass-shadow-contact: rgba(0, 0, 0, 0.18);
+  --glass-edge-bottom: rgba(0, 0, 0, 0.30);
+  --glass-rim: rgba(255, 255, 255, 0.10);
+  --glass-blur: blur(24px) saturate(180%);
+
+  --glass-shadow-stack: inset 0 1px 0 var(--glass-highlight),
+    inset 0 -1px 0 var(--glass-edge-bottom),
+    0 1px 2px var(--glass-shadow-contact), 0 8px 24px var(--glass-shadow-soft),
+    0 28px 64px var(--glass-shadow);
+  --glass-shadow-stack-sm: inset 0 1px 0 var(--glass-highlight),
+    0 1px 2px var(--glass-shadow-contact), 0 6px 16px var(--glass-shadow-soft);
+  /* Pill-specific shadow. CSS outer drop shadows get hard-clipped to
+   * the NSWindow's rectangular bounds and read as a dark halo around
+   * the rounded pill — same trap as `.liquid-glass-window`. The pill
+   * window owns its drop shadow via `hasShadow=YES`, which follows the
+   * rounded alpha. We keep only inset rim cues here. */
+  --glass-shadow-pill: inset 0 1px 0 var(--glass-highlight),
+    inset 0 -1px 0 var(--glass-edge-bottom);
+}
+
+/* Light theme. Tailwind 4's `@theme` only accepts static defaults, so
+ * overrides live here and are applied synchronously by the early-paint
+ * script in each HTML entry to avoid a flash. */
+[data-theme="light"] {
+  /* Light-mode accent: deep teal. White text on this hue clears WCAG
+   * AA Large on filled buttons; the chip on cream surface clears AA
+   * Large for small toggles. */
+  --color-accent: #0f8c8c;
+  --color-accent-strong: #0a7575;
+  --color-accent-soft: rgb(15 140 140 / 0.12);
+  /* Brand cream — same hue as the icon glyph. Slightly warmer than
+   * pure white so the buttons feel designed rather than clinical. */
+  --color-on-accent: #fff4e8;
+  --color-violet: #8a6dff;
+  /* Light-mode cyan: deeper to keep contrast against the cream pill
+   * surface. Matches the design system's pattern of pulling each
+   * accent towards a darker shade for the light theme. */
+  --color-cyan: #0AB5C2;
+  /* Light-mode glows: derived from the deeper cyan/violet hues above
+   * with a slight alpha drop so the bloom reads as a soft halo
+   * against the cream pill surface instead of a hot ring. The dot
+   * glow stays a touch hotter (0.55) than the caret glow because the
+   * dot's own paint is small enough that the halo carries most of
+   * the visual weight. */
+  --caret-glow-cyan: rgba(10, 181, 194, 0.50);
+  --caret-glow-violet: rgba(138, 109, 255, 0.48);
+  --caret-glow-coral: rgba(255, 117, 86, 0.50);
+  --polishing-dot-glow: rgba(138, 109, 255, 0.55);
+  /* Light-mode pill glows: hue shifted darker + alpha softened so the
+   * halo reads as elevation against the cream pill instead of a
+   * neon ring on a near-white surface. */
+  --pill-glow-success: rgba(34, 160, 80, 0.32);
+  --pill-glow-warning: rgba(180, 110, 10, 0.32);
+  --pill-glow-saturated: rgba(120, 60, 180, 0.30);
+  --color-danger: #e5484d;
+  --color-success: #22a06b;
+  --color-warning: #d9870f;
+  /* On light glass the pure-coral icon hue glares; we step the saturation
+   * down a touch so the meter reads warm without dominating the panel. */
+  --color-coral: #ff7556;
+  --color-ink: #161618;
+  /* Mute/faint carry extra contrast — the gradient wallpaper + 24px
+   * blur + 180% saturate softens any text sitting on glass. */
+  --color-ink-mute: #3a3a40;
+  --color-ink-faint: #5b5b62;
+  --color-bg: #eef0f5;
+  /* Upper Liquid Glass opacity band. Going opaque here defeats the
+   * macOS NSWindow "fade-when-inactive" behaviour that made the
+   * popover half-disappear when the cursor stopped moving. The
+   * backdrop-filter still tints against the wallpaper. */
+  --color-surface: rgba(252, 250, 247, 0.78);
+  --color-surface-raised: rgba(252, 250, 247, 0.84);
+  --color-surface-glass: rgba(252, 250, 247, 0.88);
+  /* Pill-specific glass — slightly more translucent than the rest of
+   * the UI but still opaque enough that the bright rim doesn't read
+   * as a separate ring against the cream interior on dark wallpapers
+   * (the "pill-inside-a-pill" effect). */
+  --color-pill-surface: rgba(252, 250, 247, 0.95);
+  --color-sidebar: rgba(252, 250, 247, 0.78);
+  --color-border: rgb(15 15 20 / 0.08);
+  --color-border-strong: rgb(15 15 20 / 0.14);
+  /* 0.14 (not 0.06) so toggle off-states are perceptible against the
+   * white-ish glass surfaces. */
+  --color-control: rgb(15 15 20 / 0.14);
+  --color-control-hover: rgb(15 15 20 / 0.20);
+  --color-input-bg: rgb(255 255 255 / 0.55);
+  --color-overlay: rgb(15 15 20 / 0.07);
+  --color-scrim: rgb(15 15 20 / 0.35);
+
+  --color-meter: rgba(40, 44, 56, 0.75);
+  --color-meter-shadow: rgba(20, 24, 40, 0.25);
+
+  /* Cool blue-grey shadow hue + bumped alphas so floating panels carry
+   * visible weight against arbitrary wallpapers. The bright top inner
+   * highlight is the load-bearing "bevelled glass rim" cue. */
+  --glass-highlight: rgba(255, 255, 255, 0.75);
+  --glass-shadow: rgba(20, 24, 40, 0.22);
+  --glass-shadow-soft: rgba(20, 24, 40, 0.12);
+  --glass-shadow-contact: rgba(20, 24, 40, 0.06);
+  --glass-edge-bottom: rgba(20, 24, 40, 0.08);
+  --glass-rim: rgba(255, 255, 255, 0.55);
+  --glass-blur: blur(24px) saturate(180%) contrast(96%);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* Global keyboard-focus ring. Components that paint their own
+ * `focus-visible:ring-*` override this via Tailwind utility specificity,
+ * so the rule below acts as a safety net for everything else.
+ * `outline` follows the element's existing border-radius in WebKit, so
+ * we deliberately do NOT set a radius here — doing so would clobber
+ * `rounded-full` controls (mode picker, pill state buttons, tab pills). */
+*:focus-visible {
+  outline: 2px solid var(--color-accent, #5b8cff);
+  outline-offset: 2px;
+}
+
+body {
+  color: var(--color-ink);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Inter",
+    "Helvetica Neue", Helvetica, Arial, sans-serif;
+  font-feature-settings: "cv11", "ss01", "ss03";
+  font-size: 13px;
+  line-height: 18px;
+  margin: 0;
+  padding: 0;
+  -webkit-font-smoothing: antialiased;
+  background-color: var(--color-bg);
+  /* Restricted to bg/color so hover transitions elsewhere don't get a
+   * 150ms lag from the theme flip. */
+  transition: background-color 150ms ease, color 150ms ease;
+}
+
+body.translucent {
+  background: transparent !important;
+}
+
+/* Form-control inheritance has to live inside `@layer base` so that
+ * Tailwind utility classes (in the `utilities` layer) win over it. As
+ * an unlayered rule it would beat every layered rule regardless of
+ * specificity — that's exactly the cascade trap that made
+ * `text-[var(--color-on-accent)]` get struck out in DevTools by this
+ * rule's `color: inherit`, leaving primary-button text as the body's
+ * `--color-ink`. The Tailwind 4 layer order is `theme, base,
+ * components, utilities`, so dropping into `base` keeps the inherit
+ * defaults for unstyled controls while letting any explicit utility
+ * override them. */
+@layer base {
+  input,
+  button,
+  select,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+  }
+}
+
+@keyframes pulse-mic {
+
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes spinner {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pill-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes flash-done {
+  0% {
+    background: rgba(74, 222, 128, 0.2);
+  }
+
+  100% {
+    background: transparent;
+  }
+}
+
+/* Continuous left-to-right luminance sweep across processing-state
+ * labels. The base sits at ink-mute; a ~30% wide bright band travels
+ * through the glyphs on a 1.6s loop. Reads as "alive and progressing"
+ * without any spinner geometry — the word itself is the indicator. */
+@keyframes pill-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+
+  to {
+    background-position: 0% 0;
+  }
+}
+
+.pill-shimmer {
+  background-image: linear-gradient(100deg,
+      var(--shimmer-base, var(--color-ink-mute)) 0%,
+      var(--shimmer-base, var(--color-ink-mute)) 38%,
+      var(--shimmer-tint, var(--color-ink)) 50%,
+      var(--shimmer-base, var(--color-ink-mute)) 62%,
+      var(--shimmer-base, var(--color-ink-mute)) 100%);
+  /* 250% size + animating from 100% → 0% keeps the peak inside the
+   * container for the whole cycle and minimises the snap at wrap. */
+  background-size: 250% 100%;
+  background-repeat: no-repeat;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  color: transparent;
+  animation: pill-shimmer 1.6s linear infinite;
+}
+
+/* Inline blinking cursor at the trailing end of streaming text.
+ * Steps animation (no easing) gives the hard on/off look of a real
+ * terminal caret rather than a fade — easier to read at 2px wide. */
+@keyframes streaming-caret-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+.streaming-caret {
+  animation: streaming-caret-blink 1.05s steps(1, end) infinite;
+  /* Soft outer glow keyed to the active stage tint via a CSS variable
+   * so the cyan/violet caret each carries its own halo. Inline styles
+   * on the caret element set `--caret-glow` to either
+   * `var(--caret-glow-cyan)` or `var(--caret-glow-violet)` per-state,
+   * which themselves pick up theme-aware rgbas from the root. The
+   * fallback below covers the (unlikely) case where the inline
+   * variable isn't set yet — defaulting to the cyan token keeps the
+   * fallback theme-aware too. */
+  box-shadow: 0 0 6px var(--caret-glow, var(--caret-glow-cyan));
+}
+
+/* Pulsing violet dot that anchors the persistent "Polishing…" label
+ * row. Gentle 1.4s opacity sine — fast enough to read as alive,
+ * slow enough not to distract from the streaming text below. */
+@keyframes polishing-dot-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+.polishing-dot {
+  animation: polishing-dot-pulse 1.4s ease-in-out infinite;
+}
+
+/* Staggered 3-dot loading indicator used below sticky headers while
+ * no streamed text has arrived yet. Each dot cycles opacity at the
+ * same 1.4s period as the polishing-dot with a 120ms stagger so
+ * they read as a wave rather than a unison blink. */
+@keyframes typing-dot-pulse {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
+}
+
+.typing-dot {
+  animation: typing-dot-pulse 1.4s ease-in-out infinite;
+}
+
+/* 3-bar audio-EQ loader used in the onboarding pre-warm card. Each
+ * bar bounces vertically on a 1.05s sine; staggered animation-delays
+ * (set inline at the callsite) give the read of a wave rather than a
+ * unison pulse. Matches the pill's voice/audio language without
+ * coupling to RMS input — this loader runs indeterminately while the
+ * STT encoder compiles and the LLM weights page in. */
+@keyframes prewarm-bar-bounce {
+  0%, 100% { transform: scaleY(0.32); }
+  50% { transform: scaleY(1); }
+}
+
+.prewarm-bar {
+  display: inline-block;
+  transform-origin: center;
+  animation: prewarm-bar-bounce 1.05s ease-in-out infinite;
+}
+
+/* Once-only attention pulse on the onboarding Repolish illustration's
+ * sparkle button. Plays after a short delay so the user has time to
+ * read the card title first, then a single double-bounce that draws
+ * the eye to the affordance. */
+@keyframes onboarding-sparkle-pulse {
+  0%, 60%, 100% { transform: scale(1); }
+  10%, 30% { transform: scale(1.08); }
+}
+
+.onboarding-sparkle-pulse {
+  animation: onboarding-sparkle-pulse 2s ease-out 0.6s 1;
+  transform-origin: center;
+}
+
+/* Streaming body: no visible scrollbar, top-fade mask so older text
+ * dissolves rather than hard-clipping at the sticky header edge. */
+.streaming-body {
+  overflow-y: auto;
+  scrollbar-width: none;
+}
+
+.streaming-body::-webkit-scrollbar {
+  display: none;
+}
+
+/* Processing header (both transcribing and polishing). Inherits the
+ * pill surface background — no extra translucency layer needed. */
+.processing-header {}
+
+/* Suppress bar height/opacity transitions while the pill itself is
+ * resizing (200ms window after a stage change). The two animations
+ * running simultaneously produced a visible squeeze on the waveform
+ * bars; freezing the bars for the layout flip removes the jitter. */
+.pill-transitioning > div > div {
+  transition: none !important;
+}
+
+.animate-pulse-mic {
+  animation: pulse-mic 1.2s ease-in-out infinite;
+}
+
+.animate-spinner {
+  animation: spinner 900ms linear infinite;
+}
+
+.animate-pill-in {
+  animation: pill-in 150ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+.animate-flash-done {
+  animation: flash-done 180ms ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* Global reduced-motion baseline. Without this, Tailwind's
+   * `transition-*` utilities (used on the pill width / waveform bars
+   * etc.) keep running at full duration even when the user has opted
+   * out. Setting a near-zero override at the universal selector
+   * collapses those animations to instant; specific components can
+   * still opt back in via `!important` if they truly need motion. */
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .animate-pulse-mic,
+  .animate-spinner,
+  .animate-pill-in,
+  .animate-flash-done,
+  .pill-shimmer,
+  .streaming-caret,
+  .polishing-dot {
+    animation: none !important;
+  }
+
+  /* Caret stays visible (solid) when the blink is suppressed —
+   * without forcing opacity:1 it would freeze at whatever frame the
+   * keyframes happened to be on. */
+  .streaming-caret {
+    opacity: 1 !important;
+  }
+
+  /* Frozen pulse settles at full intensity rather than mid-fade so the
+   * dot still reads as the active indicator. */
+  .polishing-dot {
+    opacity: 1 !important;
+  }
+
+  /* Polishing label row crossfade snaps to instant when the user has
+   * opted into reduced motion. */
+  .polishing-label-row {
+    transition: none !important;
+  }
+
+  /* Typing dots freeze at full opacity when motion is suppressed. */
+  .typing-dot {
+    animation: none !important;
+    opacity: 1 !important;
+  }
+
+  /* Prewarm bars freeze at a mid-height so they still read as "three
+   * loading bars" without the bouncing motion. */
+  .prewarm-bar {
+    animation: none !important;
+    transform: scaleY(0.7) !important;
+  }
+
+  .pill-shimmer {
+    /* Without the sweep the word would render transparent under
+     * background-clip: text. Hand the glyphs back to a solid colour. */
+    -webkit-text-fill-color: var(--color-ink);
+    color: var(--color-ink);
+    background-image: none;
+  }
+}
+
+/* Wallpaper-like backdrop for opaque app windows. Translucent overlay
+ * windows use the desktop wallpaper directly via `body.translucent`.
+ * The radial gradient stack gives glass cards something to refract —
+ * without it, surfaces collapse to flat paint. */
+.liquid-canvas {
+  background-color: var(--color-bg);
+}
+
+[data-theme="light"] .liquid-canvas {
+  background-image:
+    radial-gradient(ellipse 90% 65% at 0% 0%,
+      rgba(124, 156, 255, 0.10),
+      transparent 60%),
+    radial-gradient(ellipse 80% 55% at 100% 0%,
+      rgba(255, 196, 158, 0.07),
+      transparent 60%),
+    radial-gradient(ellipse 100% 70% at 100% 100%,
+      rgba(180, 155, 255, 0.10),
+      transparent 60%),
+    radial-gradient(ellipse 70% 50% at 0% 100%,
+      rgba(112, 220, 200, 0.06),
+      transparent 60%);
+  background-color: var(--color-bg);
+  background-attachment: fixed;
+}
+
+[data-theme="dark"] .liquid-canvas {
+  background-image:
+    radial-gradient(ellipse 90% 65% at 0% 0%,
+      rgba(124, 156, 255, 0.08),
+      transparent 60%),
+    radial-gradient(ellipse 100% 70% at 100% 100%,
+      rgba(180, 155, 255, 0.06),
+      transparent 60%);
+  background-color: var(--color-bg);
+  background-attachment: fixed;
+}
+
+/* The transition smooths macOS NSWindow vibrancy fades (popover losing
+ * cursor) so they ease out over ~250ms instead of stepping. */
+.liquid-card {
+  background: var(--color-surface-raised);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-shadow-stack-sm);
+  transition:
+    background-color 250ms ease,
+    box-shadow 250ms ease,
+    backdrop-filter 250ms ease,
+    -webkit-backdrop-filter 250ms ease;
+}
+
+/* Light-mode card elevation. The default stack reads as flat against
+ * cream-on-cream surfaces, so we layer a softer ambient + tighter
+ * contact shadow so cards sit visibly above the wallpaper-tinted
+ * background. */
+[data-theme="light"] .liquid-card {
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    0 1px 2px var(--glass-shadow-contact),
+    0 4px 10px var(--glass-shadow-soft),
+    0 12px 28px var(--glass-shadow);
+}
+
+.liquid-glass {
+  background: var(--color-surface-glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-rim);
+  box-shadow: var(--glass-shadow-stack);
+  transition:
+    background-color 250ms ease,
+    box-shadow 250ms ease,
+    backdrop-filter 250ms ease,
+    -webkit-backdrop-filter 250ms ease;
+}
+
+/* Window-root variant of .liquid-glass. The full glass-shadow-stack adds
+ * a 28px-blur outer drop shadow that gets hard-clipped to the NSWindow's
+ * rectangular bounds when the glass element fills the whole window
+ * (h-screen w-screen) — visible as a dark rectangular halo around the
+ * rounded corners. NSWindow's own system shadow (`shadow(true)`) already
+ * follows the alpha channel of the rounded content, so we keep just the
+ * inset rim cues here and let the OS draw the drop shadow. */
+.liquid-glass-window {
+  background: var(--color-surface-glass);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-rim);
+  box-shadow:
+    inset 0 1px 0 var(--glass-highlight),
+    inset 0 -1px 0 var(--glass-edge-bottom);
+  transition:
+    background-color 250ms ease,
+    backdrop-filter 250ms ease,
+    -webkit-backdrop-filter 250ms ease;
+}
+
+.toggle-knob {
+  background: white;
+  box-shadow:
+    0 0 0 0.5px rgba(20, 24, 40, 0.06),
+    0 1px 2px rgba(20, 24, 40, 0.18),
+    0 2px 4px rgba(20, 24, 40, 0.08);
+}
+
+[data-theme="dark"] .toggle-knob {
+  box-shadow:
+    0 0 0 0.5px rgba(0, 0, 0, 0.20),
+    0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+.keycap {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas,
+    monospace;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-ink);
+  background: var(--color-control);
+  box-shadow: inset 0 0 0 1px var(--color-border);
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 3px;
+}
+
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-faint);
+}

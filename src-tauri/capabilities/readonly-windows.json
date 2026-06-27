@@ -1,0 +1,17 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "readonly-windows",
+  "description": "Read-only window permissions for Vox's display-only surfaces. The pill renders pipeline state but never emits arbitrary events or invokes privileged commands — so it gets event-listen + minimal window control only, NOT event-emit or webview-create.",
+  "windows": ["pill"],
+  "permissions": [
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-is-visible",
+    "core:app:allow-version",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

@@ -1,0 +1,56 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build outputs
+dist/
+dist-ssr/
+build/
+*.local
+
+# Rust
+src-tauri/target/
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tauri generated
+src-tauri/gen/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Editor / OS
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript
+*.tsbuildinfo
+
+# Scratch & agent state
+.tmp/
+.claude/
+
+# Internal working docs (kept locally, not published)
+/CLAUDE.md
+/DESIGN.md
+/docs/*.md

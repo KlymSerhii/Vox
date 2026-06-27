@@ -1,0 +1,29 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Privileged permissions for Vox's interactive windows (settings, onboarding, tray-popover, migration, donation, update). The pill window — which is read-only — is covered by `readonly-windows.json` instead so it can't emit arbitrary events.",
+  "windows": ["settings", "onboarding", "tray-popover", "migration", "donation", "update"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-close",
+    "core:window:allow-set-focus",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-is-visible",
+    "core:app:allow-version",
+    "core:app:allow-name",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:event:allow-emit",
+    "core:event:allow-emit-to",
+    "core:webview:allow-create-webview-window",
+    "global-shortcut:default",
+    "store:default",
+    "autostart:default",
+    "updater:default"
+  ]
+}
