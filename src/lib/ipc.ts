@@ -228,6 +228,19 @@ export async function notchResize(
   await invoke("notch_resize", { width, height });
 }
 
+/// Push the collapsed-pill hit shape (logical px) to Rust so the hover poll
+/// only expands the notch over the actually-painted black shape — not the
+/// transparent window corners the narrow pill leaves beside/below the ears
+/// (where the user reaches for app chrome). `band` = the full-width ear-bar
+/// band height, `core` = the centered pill width below it. Pass `(0, 0)` for
+/// every non-pill state, where the whole window rect is opaque.
+export async function notchSetHitShape(
+  band: number,
+  core: number,
+): Promise<void> {
+  await invoke("notch_set_hit_shape", { band, core });
+}
+
 /// Give the in-notch quick-add input keyboard focus: makes the notch the key
 /// window (without activating Vox — it's a non-activating panel) and remembers
 /// the previously-frontmost app for `notchReleaseInputFocus`.
