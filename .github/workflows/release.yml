@@ -361,6 +361,32 @@ jobs:
             --repo KlymSerhii/vox-releases \
             --yes || true
 
+          # Carry the latest Windows installer forward (mirrors scripts/release.sh):
+          # this macOS build becomes the "latest" release the marketing site and
+          # auto-updater point at, so /releases/latest/download/Vox_x64-setup.exe
+          # would 404 if we published only the macOS assets. Re-attach the newest
+          # Windows installer found on the releases repo. Artifact only — we leave
+          # latest.json macOS-only, because its single version field (now
+          # v${VERSION}) can't advertise the older Windows build without looping the
+          # Windows updater. release-windows.ps1 adds the manifest entry, with a
+          # matching version, when Windows next ships.
+          WIN_EXE="Vox_x64-setup.exe"
+          echo "==> Carrying the latest Windows installer forward..."
+          WIN_TAG=$(gh api "repos/KlymSerhii/vox-releases/releases?per_page=100" \
+            --jq "[.[] | select(.tag_name != \"v${VERSION}\") | select(any(.assets[]?; .name == \"${WIN_EXE}\")) | .tag_name] | .[]" \
+            2>/dev/null | sort -V | tail -1 || true)
+
+          # Base macOS asset list; append the Windows installer if a prior one exists.
+          set -- "$STAGE/Vox.app.tar.gz" "$STAGE/Vox.app.tar.gz.sig" "$STAGE/Vox.dmg" "$STAGE/latest.json"
+          if [ -n "$WIN_TAG" ]; then
+            echo "    newest Windows build is $WIN_TAG — re-attaching its installer to v${VERSION}"
+            gh release download "$WIN_TAG" --repo KlymSerhii/vox-releases \
+              --pattern "$WIN_EXE" --pattern "${WIN_EXE}.sig" --dir "$STAGE" --clobber
+            set -- "$@" "$STAGE/$WIN_EXE" "$STAGE/${WIN_EXE}.sig"
+          else
+            echo "    no prior Windows installer found — publishing macOS assets only"
+          fi
+
           # `--notes-file` reads the markdown body assembled in the
           # "Generate release notes" step (changelog + install/license
           # boilerplate). Avoids re-escaping the same content inline and
@@ -369,9 +395,6 @@ jobs:
             --repo KlymSerhii/vox-releases \
             --title "Vox ${VERSION}" \
             --notes-file "$NOTES_BODY" \
-            "$STAGE/Vox.app.tar.gz" \
-            "$STAGE/Vox.app.tar.gz.sig" \
-            "$STAGE/Vox.dmg" \
-            "$STAGE/latest.json"
+            "$@"
 
           echo "Released v${VERSION} to https://github.com/KlymSerhii/vox-releases/releases/tag/v${VERSION}"
