@@ -125,13 +125,14 @@ button {
 
 /* Collapsed single-task PILL — the idle drawer shrinks from a full-width slab
  * to a content-hugging pill centered under the cutout. Its bottom corners are
- * rounded inline by `--pill-r` (PILL_R in Notch.tsx); these two flares paint
- * the SAME radius INVERTED at the top corners — a concave fillet that merges
- * the pill up into the flat underside of the ear bar. Each is a `--pill-r`
- * square sitting just OUTSIDE the pill (the box runs `overflow: visible` in
- * this mode), filled #000 except for a transparent quarter-disc on the
- * wallpaper-facing corner. They only ever paint black where they meet the bar
- * and the pill, so a sub-pixel misalignment is invisible (black on black). */
+ * rounded inline (PILL_BOTTOM_R in Notch.tsx); these two flares paint the top
+ * corners INVERTED at `--pill-r` (PILL_FLARE_R — independent of the bottom
+ * radius) — a concave fillet that merges the pill up into the flat underside of
+ * the ear bar. Each is a `--pill-r` square sitting just OUTSIDE the pill (the
+ * box runs `overflow: visible` in this mode), filled #000 except for a
+ * transparent quarter-disc on the wallpaper-facing corner. They only ever paint
+ * black where they meet the bar and the pill, so a sub-pixel misalignment is
+ * invisible (black on black). */
 .notch-pill::before,
 .notch-pill::after {
   content: "";
