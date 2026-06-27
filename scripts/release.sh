@@ -243,18 +243,45 @@ fi
 # ---------------------------------------------------------------------------
 # Publish. Deleting any existing release first makes manual retries idempotent
 # (no-op if it doesn't exist). This creates tag v${VERSION} on the releases
-# repo and uploads all four artifacts.
+# repo and uploads the macOS artifacts + latest.json.
 # ---------------------------------------------------------------------------
 echo "==> Publishing v${VERSION} to ${RELEASES_REPO}..."
+
+# Carry the latest Windows installer forward. This macOS build becomes the
+# "latest" release that both the marketing site and the auto-updater point at
+# (tauri.conf.json endpoint = /releases/latest/download/latest.json; the site
+# links /releases/latest/download/Vox_x64-setup.exe). Publishing only the macOS
+# assets would 404 that Windows download whenever macOS is ahead of Windows, so
+# we find the newest release that carries the installer and re-attach it here.
+#
+# We re-attach the ARTIFACT only and intentionally leave latest.json macOS-only.
+# The manifest has a single version field (now v${VERSION}); a windows-x86_64
+# entry pointing at the older build would make Windows updaters loop (offer
+# v${VERSION}, install the older .exe, never converge). release-windows.ps1 adds
+# the manifest entry — with a matching version — when Windows next ships.
+WIN_EXE="Vox_x64-setup.exe"
+echo "==> Carrying the latest Windows installer forward..."
+WIN_TAG=$(gh api "repos/${RELEASES_REPO}/releases?per_page=100" \
+  --jq "[.[] | select(.tag_name != \"v${VERSION}\") | select(any(.assets[]?; .name == \"${WIN_EXE}\")) | .tag_name] | .[]" \
+  2>/dev/null | sort -V | tail -1 || true)
+
+# Base macOS asset list; append the Windows installer if a prior one exists.
+set -- "$STAGE/Vox.app.tar.gz" "$STAGE/Vox.app.tar.gz.sig" "$STAGE/Vox.dmg" "$STAGE/latest.json"
+if [ -n "$WIN_TAG" ]; then
+  echo "    newest Windows build is $WIN_TAG — re-attaching its installer to v${VERSION}"
+  gh release download "$WIN_TAG" --repo "$RELEASES_REPO" \
+    --pattern "$WIN_EXE" --pattern "${WIN_EXE}.sig" --dir "$STAGE" --clobber
+  set -- "$@" "$STAGE/$WIN_EXE" "$STAGE/${WIN_EXE}.sig"
+else
+  echo "    no prior Windows installer found — publishing macOS assets only"
+fi
+
 gh release delete "v${VERSION}" --repo "$RELEASES_REPO" --yes || true
 gh release create "v${VERSION}" \
   --repo "$RELEASES_REPO" \
   --title "Vox ${VERSION}" \
   --notes-file "$NOTES_BODY" \
-  "$STAGE/Vox.app.tar.gz" \
-  "$STAGE/Vox.app.tar.gz.sig" \
-  "$STAGE/Vox.dmg" \
-  "$STAGE/latest.json"
+  "$@"
 
 echo
 echo "Released v${VERSION}: https://github.com/${RELEASES_REPO}/releases/tag/v${VERSION}"
