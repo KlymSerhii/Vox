@@ -52,12 +52,15 @@ const COLLAPSED_H = 16;
 /// Collapsed single-task PILL geometry. Idle with one (or more) tasks, the
 /// drawer is no longer a full-width slab fused under the ears — it shrinks to a
 /// content-hugging pill centered under the cutout. Its bottom corners round by
-/// `PILL_R`; the SAME radius is painted INVERTED at the top corners (the
-/// `.notch-pill` flares in notch.css) so the pill flares up into the flat
-/// underside of the ear bar. `PILL_R` is published to CSS as `--pill-r` so the
-/// flares and the bottom radius stay locked to one value; it must stay
-/// ≤ COLLAPSED_H / 2 (top inverse + bottom convex corners share the height).
-const PILL_R = 4;
+/// `PILL_BOTTOM_R`; the top corners are painted INVERTED (the `.notch-pill`
+/// flares in notch.css) at `PILL_FLARE_R`, flaring the pill up into the flat
+/// underside of the ear bar. The two are INDEPENDENT — a tighter inverted top
+/// over a rounder bottom — and `PILL_FLARE_R` is published to CSS as
+/// `--pill-r`. Their sum must stay ≤ COLLAPSED_H so the top-inverse and
+/// bottom-convex corners don't overlap on the pill's side edge (here 4 + 8 = 12
+/// ≤ 16, leaving a 4px straight side).
+const PILL_FLARE_R = 4;
+const PILL_BOTTOM_R = 8;
 /// Horizontal padding inside the pill (each side) — the gap from the text to
 /// the rounded edge.
 const PILL_PAD_X = 10;
@@ -1536,15 +1539,15 @@ function Drawer(props: {
           ? "none"
           : `height ${NOTCH_ANIM_MS}ms ${EASE_IN}, width ${NOTCH_ANIM_MS}ms ${EASE_IN}`,
         background: "var(--color-notch-surface, #000)",
-        // Published to the `.notch-pill` flares so the inverted top corners and
-        // this bottom radius stay locked to one value.
-        "--pill-r": `${PILL_R}px`,
-        // Collapsed pill (notched): bottom corners PILL_R, top corners the same
-        // radius INVERTED (the flares). Every other mode — and the notchless
-        // collapsed slab: the full slab, square top (fused under the cutout) /
-        // 16px rounded bottom.
+        // Published to the `.notch-pill` flares — sizes the inverted top
+        // corners, independent of the bottom radius below.
+        "--pill-r": `${PILL_FLARE_R}px`,
+        // Collapsed pill (notched): bottom corners round by PILL_BOTTOM_R; the
+        // top corners are the (tighter) PILL_FLARE_R radius INVERTED via the
+        // flares. Every other mode — and the notchless collapsed slab: the full
+        // slab, square top (fused under the cutout) / 16px rounded bottom.
         "border-radius": isPill()
-          ? `0 0 ${PILL_R}px ${PILL_R}px`
+          ? `0 0 ${PILL_BOTTOM_R}px ${PILL_BOTTOM_R}px`
           : "0 0 16px 16px",
         color: "var(--color-ink)",
       }}
