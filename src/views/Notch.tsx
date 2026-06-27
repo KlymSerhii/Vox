@@ -1,4 +1,5 @@
 import {
+  createEffect,
   createMemo,
   createSignal,
   For,
@@ -47,6 +48,24 @@ const LIST_PAD_Y = 6;
 /// right under the menu bar (e.g. browser tabs). The idle task sits at the
 /// small (8px) word size, dimmed and centered, within this band.
 const COLLAPSED_H = 16;
+/// Collapsed single-task PILL geometry. Idle with one (or more) tasks, the
+/// drawer is no longer a full-width slab fused under the ears — it shrinks to a
+/// content-hugging pill centered under the cutout. Its bottom corners round by
+/// `PILL_R`; the SAME radius is painted INVERTED at the top corners (the
+/// `.notch-pill` flares in notch.css) so the pill flares up into the flat
+/// underside of the ear bar. `PILL_R` is published to CSS as `--pill-r` so the
+/// flares and the bottom radius stay locked to one value; it must stay
+/// ≤ COLLAPSED_H / 2 (top inverse + bottom convex corners share the height).
+const PILL_R = 8;
+/// Horizontal padding inside the pill (each side) — the gap from the text to
+/// the rounded edge.
+const PILL_PAD_X = 10;
+/// Priority dot (4px) + its gap (6px) before the text, reserved when sizing the
+/// pill to its content.
+const PILL_DOT_GAP = 10;
+/// Pill width floor, so a short task still reads as a deliberate pill centered
+/// under the bump rather than a tiny tab. Capped above at the cutout width.
+const PILL_MIN_W = 96;
 /// Add-task hint row height — the keycap affordance. Full size as the faint
 /// FOOTER beneath a non-empty hovered list.
 const HINT_H = 30;
@@ -531,12 +550,50 @@ export default function NotchView() {
     () => (hovered() || composing()) && !voiceActive(),
   );
 
-  /// Whether a drawer hangs below the ears right now (everything except an
-  /// empty, un-hovered, idle notch). When true the ear bottoms square off so
-  /// they merge into the connected slab; when false the ears round their
-  /// bottom corners into a standalone resting nub.
-  const drawerPresent = createMemo(
-    () => !isEmpty() || hovered() || voiceActive() || composing(),
+  /// Whether the drawer is a full-width slab the ears FUSE into (hover list /
+  /// hint, voice strip, composer) — every state whose drawer spans the ear-row
+  /// width. When true the ear bottoms square off to merge into that slab; when
+  /// false (empty idle, OR the collapsed single-task pill, which is a narrow
+  /// content-hugging pill under the cutout — NOT under the ears) the ears round
+  /// their bottom corners into a standalone resting nub and the pill hangs
+  /// below the bar's flat underside. The collapsed pill is a NOTCHED-only
+  /// treatment (it needs a cutout to center under and room for the flares);
+  /// notchless the collapsed drawer stays the old full-width slab, so the ears
+  /// must keep fusing there too.
+  const earsFused = createMemo(
+    () =>
+      hovered() ||
+      voiceActive() ||
+      composing() ||
+      (!isEmpty() && !hasNotch()),
+  );
+
+  /// Natural pixel width of the head task's text at the idle 8px size, measured
+  /// off a hidden off-screen span (unconstrained by the pill, unlike the live
+  /// truncating one). Drives the collapsed pill's content-hugging width.
+  let headMeasureRef: HTMLSpanElement | undefined;
+  const [headTextW, setHeadTextW] = createSignal(0);
+  const measureHead = () => {
+    if (headMeasureRef)
+      setHeadTextW(Math.ceil(headMeasureRef.getBoundingClientRect().width));
+  };
+  // Re-measure whenever the head task text changes. Deferred a microtask so the
+  // hidden span's text node is updated first (its DOM binding runs after this
+  // effect). The one-off font-load case is handled in onMount via
+  // `document.fonts.ready`.
+  createEffect(() => {
+    headItem()?.text;
+    queueMicrotask(measureHead);
+  });
+
+  /// Collapsed pill width: hugs the head task (dot + gap + text + padding),
+  /// floored at PILL_MIN_W and capped at the cutout so it never sprawls under
+  /// the ears (where the inverse-corner flares would have no room to live).
+  const pillWidth = createMemo(() =>
+    Math.min(
+      cutoutWidth(),
+      Math.max(PILL_MIN_W, headTextW() + PILL_DOT_GAP + PILL_PAD_X * 2),
+    ),
   );
 
   async function refresh() {
@@ -695,6 +752,10 @@ export default function NotchView() {
     }
     // Initial size sync after first paint.
     queueMicrotask(syncWindowSize);
+    // The idle pill is measured at the bundled Fraunces metrics; before the
+    // font loads the hidden span measures in the fallback face. Re-measure once
+    // it's ready so the pill settles to the right content width.
+    document.fonts?.ready.then(measureHead).catch(() => {});
   });
 
   onCleanup(() => {
@@ -1085,7 +1146,7 @@ export default function NotchView() {
         height={cutoutHeight()}
         hovered={hovered()}
         hasNotch={hasNotch()}
-        drawerPresent={drawerPresent()}
+        earsFused={earsFused()}
         reduced={reducedMotion()}
       />
 
@@ -1104,6 +1165,8 @@ export default function NotchView() {
         topN={topN()}
         expandedWidth={expandedWidth()}
         bridgeW={bridgeW()}
+        pillWidth={pillWidth()}
+        hasNotch={hasNotch()}
         voiceHotkey={voiceHotkey()}
         flashIds={flashIds()}
         reduced={reducedMotion()}
@@ -1139,6 +1202,27 @@ export default function NotchView() {
         rowTransition={rowTransition()}
         checkboxTransition={checkboxTransition()}
       />
+
+      {/* Off-screen ruler — measures the head task's text at the idle 8px size
+          so the collapsed pill can hug it. `position: fixed` keeps it out of
+          flow (no effect on the measured panel rect); it just needs the notch's
+          font context to measure in the same face as the live pill text. */}
+      <span
+        ref={headMeasureRef}
+        aria-hidden="true"
+        style={{
+          position: "fixed",
+          top: "-9999px",
+          left: "0",
+          visibility: "hidden",
+          "white-space": "nowrap",
+          "font-size": "8px",
+          "font-weight": 400,
+          "pointer-events": "none",
+        }}
+      >
+        {headItem()?.text ?? ""}
+      </span>
     </div>
   );
 }
@@ -1157,7 +1241,7 @@ function EarRow(props: {
   height: number;
   hovered: boolean;
   hasNotch: boolean;
-  drawerPresent: boolean;
+  earsFused: boolean;
   reduced: boolean;
 }) {
   const wordOpacity = () => (props.hovered ? 0.95 : 0.62);
@@ -1169,10 +1253,12 @@ function EarRow(props: {
     props.reduced
       ? "none"
       : `opacity 180ms ${EASE_IN}, font-size ${NOTCH_ANIM_MS}ms ${EASE_IN}`;
-  /// Outer bottom-corner radius: square (0) when a drawer hangs below so the
-  /// ear fuses into the connected slab; rounded into a standalone nub when the
-  /// idle notch is empty (no drawer).
-  const outerBottom = () => (props.drawerPresent ? 0 : 12);
+  /// Outer bottom-corner radius: square (0) when the drawer is a full-width
+  /// slab the ear fuses into (hover list / hint, voice, composer); rounded into
+  /// a standalone nub otherwise — an empty idle notch, OR the collapsed
+  /// single-task pill, which hangs as a narrow pill under the cutout and leaves
+  /// the bar's outer corners free to round.
+  const outerBottom = () => (props.earsFused ? 0 : 12);
   /// The ear box glides its width (idle nub ↔ full) and its bottom-corner
   /// rounding (nub ↔ fused slab) so the whole assembly grows fluidly.
   const earBoxTransition = () =>
@@ -1311,6 +1397,8 @@ function Drawer(props: {
   topN: number;
   expandedWidth: number;
   bridgeW: number;
+  pillWidth: number;
+  hasNotch: boolean;
   voiceHotkey: string;
   flashIds: Set<string>;
   reduced: boolean;
@@ -1353,6 +1441,11 @@ function Drawer(props: {
     return props.rows.length === 0 ? "empty" : "collapsed";
   });
 
+  // The collapsed single-task PILL — a content-hugging pill with inverted top
+  // corners, NOTCHED displays only. Notchless keeps the old full-width slab (no
+  // cutout to center under, and the flares would overflow the narrow ear bar).
+  const isPill = () => mode() === "collapsed" && props.hasNotch;
+
   // Height of the footer beneath the task rows: the typed-task composer when
   // open, otherwise the voice add-task hint.
   const footerH = () => (props.composing ? COMPOSE_H : HINT_H);
@@ -1385,34 +1478,50 @@ function Drawer(props: {
     }
   });
 
-  // Target content width. Collapsed task / empty-hover hint / voice strip all
-  // span the full ear-row width (`bridgeW`) so they fuse into one connected
-  // black slab under the ears. The hovered task LIST — and the composer in any
-  // mode (so the input has room to type) — fan out wider.
+  // Target content width. The empty-hover hint / voice strip span the full
+  // ear-row width (`bridgeW`) so they fuse into one connected black slab under
+  // the ears. The hovered task LIST — and the composer in any mode (so the
+  // input has room to type) — fan out wider. The COLLAPSED single-task pill
+  // instead hugs its content (`pillWidth`), hanging as a narrow pill centered
+  // under the cutout rather than slabbing the whole ear row.
   const targetWidth = createMemo(() => {
     if (mode() === "list" || props.composing) return props.expandedWidth;
+    if (isPill()) return props.pillWidth;
     return props.bridgeW;
   });
 
   return (
     <div
-      class="overflow-hidden"
+      // `.notch-pill` (collapsed only) paints the two inverted top corners via
+      // ::before/::after flares — see notch.css. They sit just OUTSIDE the box,
+      // so this mode runs `overflow: visible`; every other mode keeps
+      // `overflow: hidden` to clip the height transition into a content wipe.
+      classList={{ "notch-pill": isPill() }}
       style={{
         // Fluid size: width + height CSS-transition to their target, and the
         // outer ResizeObserver chases the live rect so the OS window glides in
         // lockstep (replaces the old instant-snap "single-resize" discipline).
-        // `overflow-hidden` makes the height transition double as a content
-        // wipe. Background stays solid black always — at height 0 the box is
-        // invisible anyway, and keeping it black avoids a flash to transparent
-        // while a collapse animates down.
+        // Background stays solid black always — at height 0 the box is invisible
+        // anyway, and keeping it black avoids a flash to transparent while a
+        // collapse animates down.
+        position: "relative",
         height: `${targetHeight()}px`,
         width: `${targetWidth()}px`,
+        overflow: isPill() ? "visible" : "hidden",
         transition: props.reduced
           ? "none"
           : `height ${NOTCH_ANIM_MS}ms ${EASE_IN}, width ${NOTCH_ANIM_MS}ms ${EASE_IN}`,
         background: "var(--color-notch-surface, #000)",
-        // Top corners SQUARE (fused under the cutout); bottom rounded.
-        "border-radius": "0 0 16px 16px",
+        // Published to the `.notch-pill` flares so the inverted top corners and
+        // this bottom radius stay locked to one value.
+        "--pill-r": `${PILL_R}px`,
+        // Collapsed pill (notched): bottom corners PILL_R, top corners the same
+        // radius INVERTED (the flares). Every other mode — and the notchless
+        // collapsed slab: the full slab, square top (fused under the cutout) /
+        // 16px rounded bottom.
+        "border-radius": isPill()
+          ? `0 0 ${PILL_R}px ${PILL_R}px`
+          : "0 0 16px 16px",
         color: "var(--color-ink)",
       }}
     >
@@ -1430,11 +1539,12 @@ function Drawer(props: {
         <Show when={props.head}>
           {(item) => (
             // Idle glance: the single top task, DIMMED (muted-grey text + a
-            // desaturated priority dot) and small (8px), centered both axes.
-            // The full-width slab keeps the pair centered under the camera; the
-            // inner wrapper is capped to the cutout zone so a long task
-            // truncates under the bump rather than sprawling beneath the ears.
-            // Hovering swaps to the bright, full-size left-aligned ExpandedList.
+            // desaturated priority dot) and small (8px), centered both axes
+            // inside the content pill. The inner wrapper is capped to the pill's
+            // text zone (pillWidth minus padding) so a long task truncates with
+            // an ellipsis instead of overflowing the pill (which now runs
+            // `overflow: visible` for the flares). Hovering swaps to the bright,
+            // full-size left-aligned ExpandedList.
             <div
               class="flex w-full items-center justify-center"
               classList={{ "notch-flash": props.flashIds.has(item().id) }}
@@ -1442,7 +1552,11 @@ function Drawer(props: {
             >
               <div
                 class="flex min-w-0 items-center gap-1.5"
-                style={{ "max-width": `${props.cutoutWidth}px` }}
+                style={{
+                  "max-width": `${
+                    isPill() ? props.pillWidth - PILL_PAD_X * 2 : props.cutoutWidth
+                  }px`,
+                }}
               >
                 <span
                   class="h-[4px] w-[4px] shrink-0 rounded-full"

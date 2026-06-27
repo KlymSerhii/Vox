@@ -123,6 +123,41 @@ button {
   animation: notch-row-flash 400ms ease-out;
 }
 
+/* Collapsed single-task PILL — the idle drawer shrinks from a full-width slab
+ * to a content-hugging pill centered under the cutout. Its bottom corners are
+ * rounded inline by `--pill-r` (PILL_R in Notch.tsx); these two flares paint
+ * the SAME radius INVERTED at the top corners — a concave fillet that merges
+ * the pill up into the flat underside of the ear bar. Each is a `--pill-r`
+ * square sitting just OUTSIDE the pill (the box runs `overflow: visible` in
+ * this mode), filled #000 except for a transparent quarter-disc on the
+ * wallpaper-facing corner. They only ever paint black where they meet the bar
+ * and the pill, so a sub-pixel misalignment is invisible (black on black). */
+.notch-pill::before,
+.notch-pill::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  width: var(--pill-r, 8px);
+  height: var(--pill-r, 8px);
+  pointer-events: none;
+}
+.notch-pill::before {
+  left: calc(-1 * var(--pill-r, 8px));
+  background: radial-gradient(
+    circle at bottom left,
+    transparent calc(var(--pill-r, 8px) - 0.5px),
+    var(--color-notch-surface, #000) var(--pill-r, 8px)
+  );
+}
+.notch-pill::after {
+  right: calc(-1 * var(--pill-r, 8px));
+  background: radial-gradient(
+    circle at bottom right,
+    transparent calc(var(--pill-r, 8px) - 0.5px),
+    var(--color-notch-surface, #000) var(--pill-r, 8px)
+  );
+}
+
 /* Expanded-list row entry — fade + rise as the drawer grows. A per-row
  * `animation-delay` (set inline in Notch.tsx) staggers them ~20ms apart. */
 @keyframes notch-row-enter {
