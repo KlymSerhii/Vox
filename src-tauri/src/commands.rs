@@ -1453,6 +1453,26 @@ pub fn notch_resize<R: Runtime>(
     Ok(())
 }
 
+/// Push the collapsed-pill hit shape (logical px) so the notch hover poll only
+/// expands when the cursor is over the actually-painted black shape, not the
+/// transparent window corners the narrow pill leaves beside/below the ears
+/// (where the user reaches for app chrome). `band` = full-width ear-bar band
+/// height, `core` = centered pill width below it; `(0, 0)` = whole rect opaque
+/// (every non-pill state). No-op on non-macOS. Unrestricted — the notch webview
+/// is the only caller.
+#[tauri::command]
+pub fn notch_set_hit_shape(band: f64, core: f64) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::notch::set_hit_shape(band, core);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (band, core);
+    }
+    Ok(())
+}
+
 /// Physical-notch geometry for the notch webview, in logical points. Lets
 /// the notch UI size its idle "nub" to the camera-bump width and know
 /// whether it's hanging below a real notch (vs. a notchless display, where

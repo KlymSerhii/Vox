@@ -19,6 +19,7 @@ import {
   notchListSetPriority,
   notchReleaseInputFocus,
   notchResize,
+  notchSetHitShape,
   onNotchGeometry,
   onNotchHover,
   onNotchLevels,
@@ -56,7 +57,7 @@ const COLLAPSED_H = 16;
 /// underside of the ear bar. `PILL_R` is published to CSS as `--pill-r` so the
 /// flares and the bottom radius stay locked to one value; it must stay
 /// ≤ COLLAPSED_H / 2 (top inverse + bottom convex corners share the height).
-const PILL_R = 8;
+const PILL_R = 4;
 /// Horizontal padding inside the pill (each side) — the gap from the text to
 /// the rounded edge.
 const PILL_PAD_X = 10;
@@ -595,6 +596,29 @@ export default function NotchView() {
       Math.max(PILL_MIN_W, headTextW() + PILL_DOT_GAP + PILL_PAD_X * 2),
     ),
   );
+
+  /// The collapsed single-task PILL is the only state whose painted shape does
+  /// NOT fill the window rect — it's a narrow pill centered below the full-width
+  /// bar, leaving the lower corners transparent. Mirrors the Drawer's `isPill`
+  /// from the parent's inputs (notched + idle with tasks). Hovering those
+  /// transparent corners used to expand the notch; the hover hit-test below
+  /// fixes that.
+  const inPillMode = createMemo(
+    () =>
+      hasNotch() &&
+      !isEmpty() &&
+      !hovered() &&
+      !voiceActive() &&
+      !composing(),
+  );
+  /// Keep the Rust hover poll's hit-test in lockstep with the painted shape: in
+  /// pill mode push the bar height + pill width so hovering the transparent
+  /// corners no longer expands the notch; otherwise push the (0,0) "whole rect"
+  /// sentinel (every other state fills the window).
+  createEffect(() => {
+    if (inPillMode()) void notchSetHitShape(cutoutHeight(), pillWidth());
+    else void notchSetHitShape(0, 0);
+  });
 
   async function refresh() {
     try {

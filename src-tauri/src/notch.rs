@@ -7,10 +7,13 @@
 //! black surface lets it read as an extension of the physical notch.
 //!
 //! The window builder + macOS panel style are lifted from `pill.rs` (the
-//! proven pattern). KEY DIFFERENCE from the pill: we do NOT call
-//! `set_ignore_cursor_events(true)` — the notch needs hover + click (the
-//! checkbox) to work. Placement is TOP-anchored at the display top edge, not
-//! the pill's bottom-anchored math.
+//! proven pattern). KEY DIFFERENCE from the pill: the pill is ALWAYS
+//! click-through, but the notch needs hover + click (the checkbox), so the
+//! hover poll TOGGLES `set_ignore_cursor_events` per tick — interactive while
+//! the cursor is over the painted black shape, pass-through everywhere else so
+//! the transparent gaps the pill leaves beside/below the ears stay usable.
+//! Placement is TOP-anchored at the display top edge, not the pill's
+//! bottom-anchored math.
 //!
 //! Hover is driven by a passive Rust cursor poll (`spawn_hover_poll`) that
 //! emits a `notch:hover` bool on enter/exit of the window's on-screen rect.
@@ -57,6 +60,20 @@ const HOVER_NEAR_BAND_SLACK: f64 = 24.0;
 /// poll only emits `notch:hover` on a transition, so this stores the edge.
 /// Reset to `false` on create/destroy so a fresh window starts collapsed.
 static NOTCH_HOVER_INSIDE: AtomicBool = AtomicBool::new(false);
+
+/// Frontend-pushed opaque hit shape for the COLLAPSED pill. The one-task drawer
+/// shrank to a narrow pill centered below the full-width ear bar (#36), so the
+/// window rect now over-covers transparent space beside and below the ears.
+/// `hover_tick` uses this shape for BOTH jobs: deciding whether a hover expands
+/// the notch, and toggling click-through — so the cursor over those transparent
+/// gaps neither expands the notch nor eats the click (it reaches the app
+/// behind, the user's free space). The webview pushes the painted shape: `band`
+/// = the full-width top band height (the ear bar), `core` = the centered pill
+/// width below it. `(0.0, 0.0)` is the sentinel "the whole window rect is
+/// opaque" — every non-pill state (empty nub, hovered list, voice, composer,
+/// notchless) pushes it to restore the plain full-rect test. See
+/// `set_hit_shape`.
+static NOTCH_HIT_SHAPE: Mutex<(f64, f64)> = Mutex::new((0.0, 0.0));
 
 /// Bumped every time the notch window is created or destroyed. The
 /// display follower captures the value at spawn time and stands down the
@@ -108,6 +125,15 @@ pub fn geometry_snapshot() -> NotchGeometry {
     GEOMETRY.lock().map(|g| *g).unwrap_or_default()
 }
 
+/// Store the collapsed-pill hit shape pushed from the webview. See
+/// `NOTCH_HIT_SHAPE`. Cheap (a mutex write); called off the main thread from
+/// the `notch_set_hit_shape` command. Negatives are clamped to 0 (defensive).
+pub fn set_hit_shape(band: f64, core: f64) {
+    if let Ok(mut slot) = NOTCH_HIT_SHAPE.lock() {
+        *slot = (band.max(0.0), core.max(0.0));
+    }
+}
+
 /// Re-read the target display's physical-notch geometry (MAIN THREAD only —
 /// it touches `NSScreen`), store it in `GEOMETRY`, and on a change emit
 /// `notch:geometry` so the webview can resize its nub. Returns whether the
@@ -154,7 +180,9 @@ fn refresh_geometry_cache<R: Runtime>(app: &AppHandle<R>) -> bool {
 
 /// Create (or re-show) the notch window. Mirrors `pill::create`:
 /// transparent, decoration-less, always-on-top, skip-taskbar, non-focusing.
-/// Unlike the pill it stays interactive (no `set_ignore_cursor_events`).
+/// Unlike the always-click-through pill, the notch toggles
+/// `set_ignore_cursor_events` from the hover poll (interactive only over the
+/// painted shape) — see the module-level comment and `hover_tick`.
 ///
 /// The notch window is **persistent**: turning the feature off HIDES it (the
 /// `CloseRequested` handler in `lib.rs` keeps it alive), so a later re-enable
@@ -253,6 +281,14 @@ fn arm<R: Runtime>(app: &AppHandle<R>, window: &tauri::WebviewWindow<R>, fresh: 
     // emits a `true` transition.
     let generation = NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     NOTCH_HOVER_INSIDE.store(false, Ordering::SeqCst);
+    // Reset to full-rect hit-testing until the (re-)shown webview re-pushes its
+    // pill shape, so a stale narrow shape from a prior show can't suppress hover.
+    set_hit_shape(0.0, 0.0);
+    // Default the window to click-through (non-interactive): the poll flips it
+    // interactive only while the cursor sits over the painted shape, so the
+    // transparent gaps stay pass-through. The first tick corrects this within
+    // HOVER_POLL_MS if the cursor is already over the notch.
+    let _ = window.set_ignore_cursor_events(true);
     spawn_display_follower(app.clone(), generation);
     spawn_hover_poll(app.clone(), generation);
 }
@@ -267,8 +303,10 @@ pub fn destroy<R: Runtime>(app: &AppHandle<R>) {
     // down on their next tick instead of touching a window we're about to
     // hide.
     NOTCH_GENERATION.fetch_add(1, Ordering::SeqCst);
-    // Clear the hover edge so a re-shown window starts collapsed.
+    // Clear the hover edge + hit shape so a re-shown window starts collapsed and
+    // full-rect until its webview re-pushes.
     NOTCH_HOVER_INSIDE.store(false, Ordering::SeqCst);
+    set_hit_shape(0.0, 0.0);
     if let Some(win) = app.get_webview_window(LABEL) {
         if let Err(e) = win.hide() {
             log::warn!("notch: failed to hide window: {e}");
@@ -620,11 +658,31 @@ fn hover_tick<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
-    let inside = cx >= x && cx < x + w && cy >= y && cy < y + h;
+    // Hit-test against the actually-painted shape, not just the window rect.
+    // The collapsed pill leaves the window's lower corners (beside and below the
+    // ears) transparent; hovering there must not expand. The shape is a
+    // full-width top band (`band` tall) plus a centered `core`-wide pill below
+    // it — `(0, 0)` means "whole rect opaque" (every non-pill state), which
+    // reduces to the plain rect test.
+    let in_rect = cx >= x && cx < x + w && cy >= y && cy < y + h;
+    let inside = in_rect && {
+        let (band, core) = NOTCH_HIT_SHAPE.lock().map(|s| *s).unwrap_or((0.0, 0.0));
+        if core <= 0.0 || cy < y + band {
+            true
+        } else {
+            let gap = (w - core) / 2.0;
+            cx >= x + gap && cx < x + w - gap
+        }
+    };
     if inside == was_inside {
         return; // No edge — stay quiet.
     }
     NOTCH_HOVER_INSIDE.store(inside, Ordering::SeqCst);
+    // Click-through follows the same shape: interactive (hover + clicks land on
+    // the notch) only while the cursor is over the painted black; pass-through
+    // everywhere else so the transparent gaps beside/below the ears stay usable
+    // free space (a click there reaches the app behind, not the invisible rect).
+    let _ = win.set_ignore_cursor_events(!inside);
     if let Err(e) = app.emit_to(LABEL, "notch:hover", inside) {
         log::warn!("notch: failed to emit notch:hover: {e}");
     }
