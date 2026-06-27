@@ -1911,7 +1911,15 @@ function ExpandedList(props: {
           onMount(() => seenRowIds.add(item.id));
           return (
             <div
-              class="flex items-center gap-2 rounded-[8px] px-1.5 hover:bg-white/[0.06]"
+              // `shrink-0` is load-bearing: this row is a flex child of the
+              // bounded, `overflow-y: auto` viewport. Without it, once the rows'
+              // combined height exceeds the viewport's `max-height` the default
+              // `flex-shrink: 1` (paired with the `min-height: 0` below) squashes
+              // every row down past its content instead of letting the list
+              // overflow — so the scrollbar never engages and the checkboxes /
+              // text spill out and overlap. Pinning shrink to 0 keeps each row at
+              // `rowH`, forcing real overflow + scroll past `topN` rows.
+              class="flex shrink-0 items-center gap-2 rounded-[8px] px-1.5 hover:bg-white/[0.06]"
               classList={{
                 "notch-flash": props.flashIds.has(item.id),
                 // Mount-reveal: fade + rise with a per-row stagger. Disabled
