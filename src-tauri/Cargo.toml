@@ -5,7 +5,7 @@ description = "Fully on-device dictation for macOS and Windows — press a hotke
 authors = ["Resonance Logic, LLC"]
 edition = "2021"
 rust-version = "1.77"
-license-file = "../LICENSE"
+license = "MIT"
 repository = "https://github.com/KlymSerhii/Vox"
 homepage = "https://vox.rizenhq.com"
 

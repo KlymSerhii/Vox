@@ -10,7 +10,10 @@ summary that follows [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-- Public, source-available repository: added README, LICENSE, and contributor /
+- Vox is now open source under the MIT License and free for everyone, including
+  companies and teams using it at work. It replaces the PolyForm Noncommercial
+  license, which required a paid license for company or team use.
+- Public repository: added README, LICENSE, and contributor /
   security / third-party documentation.
 
 ## [1.10.0]

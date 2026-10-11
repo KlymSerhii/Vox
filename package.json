@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Fully on-device dictation for macOS and Windows — press a hotkey, speak, paste.",
   "author": "Resonance Logic, LLC",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "MIT",
   "homepage": "https://vox.rizenhq.com",
   "repository": {
     "type": "git",

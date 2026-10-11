@@ -77,15 +77,10 @@ that touch dictation — which **STT/LLM engine** you used.
 
 ## Contribution terms
 
-Vox is source-available and dual-licensed (free for individuals; commercial for
-organizations — see [LICENSE](LICENSE)). By submitting a contribution, you
-confirm you have the right to submit it and you agree that your contribution is
-provided under the project's license **and** that you grant Resonance Logic, LLC
-a perpetual, irrevocable, royalty-free right to use, modify, and license your
-contribution, including as part of the commercially-licensed version of Vox.
-This lets us keep offering Vox free to individuals while licensing it to
-companies. If you're contributing on behalf of an employer, make sure you have
-permission to do so.
+Vox is open source under the [MIT License](LICENSE). By submitting a
+contribution, you confirm you have the right to submit it and you agree that
+your contribution is licensed under the same MIT License. If you're contributing
+on behalf of an employer, make sure you have permission to do so.
 
 ## Security
 
