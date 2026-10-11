@@ -187,7 +187,7 @@ jobs:
             echo "The auto-updater fetches \`latest.json\` from this release. Existing v${VERSION}+ users will receive future updates automatically."
             echo
             echo "## License"
-            echo "Free for personal and individual use, including freelancers using it for their own paid work. Company or team use requires a paid license — contact \`vox@rizenhq.com\`. See [LICENSE](https://github.com/KlymSerhii/vox-releases/blob/main/LICENSE)."
+            echo "Free for everyone — personal use, freelance work, and use at work or across a team. Vox is open source under the MIT License. See [LICENSE](https://github.com/KlymSerhii/Vox/blob/main/LICENSE)."
           } > "$NOTES_BODY"
 
           echo "--- release notes (plain) ---"

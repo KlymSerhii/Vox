@@ -5,7 +5,7 @@
 
   <p>
     <a href="https://github.com/KlymSerhii/vox-releases/releases/latest"><img alt="Download for macOS and Windows" src="https://img.shields.io/badge/%E2%AC%87_download-macOS_%7C_Windows-2ea44f"></a>
-    <a href="LICENSE"><img alt="License: source-available" src="https://img.shields.io/badge/license-source--available-blue"></a>
+    <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue"></a>
     <img alt="Platform: macOS and Windows" src="https://img.shields.io/badge/platform-macOS_%7C_Windows-lightgrey">
     <a href="https://rizenhq.com"><img alt="Part of Rizen" src="https://img.shields.io/badge/part_of-Rizen-7c3aed"></a>
   </p>
@@ -13,7 +13,7 @@
   <p><a href="https://vox.rizenhq.com">vox.rizenhq.com</a></p>
 </div>
 
-> **Heads up on the license:** this is source-available, *not* open source. The code's all here and it's free for personal use, freelancers included. If you're a company putting it in front of a team, you'll need a commercial license. Use it, change it, pass it around for free — just don't sell it. The full story is under [Licensing](#licensing). We did it this way so individuals never have to pay and companies keep the project funded.
+> **Free for everyone, including at work.** Vox is open source under the [MIT License](LICENSE). Use it yourself, roll it out to your whole team, change it, share it — no license fees, no sign-up. More under [Licensing](#licensing).
 
 <!-- TODO: drop a short looping demo GIF here — it's worth more than any paragraph.
      A good one: hit ⌘⌥., the pill starts listening with a live waveform, you mumble
@@ -133,16 +133,14 @@ Have a look at the rest at [rizenhq.com](https://rizenhq.com).
 
 ## Licensing
 
-Vox is **source-available, not open source.** In plain terms:
+Vox is **open source under the [MIT License](LICENSE)** and free for everyone. In plain terms:
 
-- If you're a person — yourself, a hobby project, a freelancer doing paid client work — Vox is free. Forever.
-- You can read the code, change it, and share your version, as long as you give it away (no charge) and keep the license and notices in place.
-- If you're a company and you want it on your team's machines, that's a commercial license. Same goes for bundling it into something you sell.
-- You can't sell Vox or wrap a paid product around it.
+- Use it for yourself, for freelance or client work, or at your job. Free.
+- Companies can put it on every machine on the team. Also free, with no commercial license to buy.
+- Read the code, change it, fork it, and share your version.
+- The one ask: keep the copyright and license notice in any copies you pass on.
 
-The actual legal text is the [PolyForm Noncommercial License 1.0.0](LICENSE), with an extra grant that covers individuals and freelancers and a note about commercial use. For a company or enterprise license, email [vox@rizenhq.com](mailto:vox@rizenhq.com).
-
-We say "source-available" rather than "open source" on purpose. It doesn't meet the [OSI definition](https://opensource.org/osd) because it restricts company-wide use, and we'd rather be straight about that than play word games. Vox started out this way, so nobody's having anything taken away.
+Vox comes as is, without warranty; the [LICENSE](LICENSE) file has the exact wording. If Vox is useful to you and you'd like to support it, there's a [donation page](https://vox.rizenhq.com/donation).
 
 ## Known limitations
 
